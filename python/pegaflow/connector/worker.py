@@ -47,6 +47,82 @@ class SaveTask:
     request_ids: list[str]
 
 
+@dataclass(frozen=True)
+class _KVCacheRegistrationInfo:
+    layout: str
+    num_blocks: int
+    bytes_per_block: int
+    kv_stride_bytes: int
+    segments: int
+    physical_blocks_per_logical_block: int
+
+
+def _infer_kv_cache_registration(
+    kv_cache: torch.Tensor,
+    logical_block_size: int,
+) -> _KVCacheRegistrationInfo:
+    """Infer the PegaFlow registration from a vLLM KV cache tensor.
+
+    vLLM may split one scheduler/manager block into multiple kernel KV rows
+    when the attention backend only supports a smaller kernel block size. For
+    example, FlashMLA supports 64-token kernel blocks while the manager can use
+    128-token blocks. PegaFlow stores hashes at scheduler-block granularity, so
+    each registered PegaFlow block must cover all physical rows for that logical
+    block.
+    """
+    shape = tuple(kv_cache.shape)
+    stride = tuple(kv_cache.stride())
+    element_size = kv_cache.element_size()
+
+    if len(shape) >= 2 and shape[0] == 2:
+        layout = "KV-first"
+        physical_num_blocks = shape[1]
+        physical_block_size = shape[2] if len(shape) >= 3 else logical_block_size
+        physical_bytes_per_block = stride[1] * element_size
+        kv_stride_bytes = stride[0] * element_size
+        segments = 2
+    else:
+        layout = "blocks-first"
+        physical_num_blocks = shape[0]
+        if len(shape) >= 3 and shape[1] == 2:
+            physical_block_size = shape[2]
+        else:
+            physical_block_size = shape[1] if len(shape) >= 2 else logical_block_size
+        physical_bytes_per_block = stride[0] * element_size
+        kv_stride_bytes = 0
+        segments = 1
+
+    if logical_block_size <= 0:
+        raise ValueError(f"logical block size must be > 0, got {logical_block_size}")
+    if physical_block_size <= 0:
+        raise ValueError(f"physical block size must be > 0, got {physical_block_size}")
+    if logical_block_size % physical_block_size != 0:
+        raise ValueError(
+            "logical block size must be a multiple of physical block size "
+            f"(logical={logical_block_size}, physical={physical_block_size})"
+        )
+
+    physical_blocks_per_logical_block = logical_block_size // physical_block_size
+    if physical_num_blocks % physical_blocks_per_logical_block != 0:
+        raise ValueError(
+            "physical block count must be divisible by physical/logical split ratio "
+            f"(physical_blocks={physical_num_blocks}, ratio={physical_blocks_per_logical_block})"
+        )
+
+    bytes_per_block = physical_bytes_per_block * physical_blocks_per_logical_block
+    if bytes_per_block == 0:
+        raise ValueError(f"Invalid bytes_per_block: shape={shape} stride={stride}")
+
+    return _KVCacheRegistrationInfo(
+        layout=layout,
+        num_blocks=physical_num_blocks // physical_blocks_per_logical_block,
+        bytes_per_block=bytes_per_block,
+        kv_stride_bytes=kv_stride_bytes,
+        segments=segments,
+        physical_blocks_per_logical_block=physical_blocks_per_logical_block,
+    )
+
+
 class WorkerConnector:
     """Holds worker-only state and behaviors."""
 
@@ -150,33 +226,29 @@ class WorkerConnector:
             wrapper = CudaIPCWrapper(kv_cache)
             wrapper_bytes = pickle.dumps(wrapper)
 
-            shape = tuple(kv_cache.shape)
-            stride = tuple(kv_cache.stride())
-            element_size = kv_cache.element_size()
+            registration = _infer_kv_cache_registration(kv_cache, self._ctx.block_size)
+            layout = registration.layout
 
-            if len(shape) >= 2 and shape[0] == 2:
-                num_blocks = shape[1]
-                bytes_per_block = stride[1] * element_size
-                kv_stride_bytes = stride[0] * element_size
-                segments = 2
-                layout = "KV-first"
-            else:
-                num_blocks = shape[0]
-                bytes_per_block = stride[0] * element_size
-                kv_stride_bytes = 0
-                segments = 1
-                layout = "blocks-first"
-
-            assert bytes_per_block != 0, (
-                f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+            assert registration.bytes_per_block != 0, (
+                f"Invalid bytes_per_block for {layer_name}: stride={tuple(kv_cache.stride())}"
             )
 
             layer_names.append(layer_name)
             ipc_wrappers.append(wrapper_bytes)
-            layer_num_blocks.append(num_blocks)
-            layer_bytes_per_block.append(bytes_per_block)
-            layer_kv_stride_bytes.append(kv_stride_bytes)
-            layer_segments.append(segments)
+            layer_num_blocks.append(registration.num_blocks)
+            layer_bytes_per_block.append(registration.bytes_per_block)
+            layer_kv_stride_bytes.append(registration.kv_stride_bytes)
+            layer_segments.append(registration.segments)
+
+            if registration.physical_blocks_per_logical_block > 1:
+                logger.info(
+                    "[PegaKVConnector] Registered %s with virtual block split: "
+                    "logical_block_size=%d physical_blocks_per_logical=%d logical_blocks=%d",
+                    layer_name,
+                    self._ctx.block_size,
+                    registration.physical_blocks_per_logical_block,
+                    registration.num_blocks,
+                )
 
         ok, message = self._ctx.engine_client.register_context_batch(
             self._ctx.instance_id,
