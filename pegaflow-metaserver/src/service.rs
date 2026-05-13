@@ -1,15 +1,17 @@
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
-    InsertBlockHashesRequest, InsertBlockHashesResponse, NodePrefixResult,
-    QueryPrefixBlocksRequest, QueryPrefixBlocksResponse, RemoveBlockHashesRequest,
-    RemoveBlockHashesResponse, ResponseStatus,
+    HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
+    InsertBlockHashesResponse, NodePrefixResult, QueryPrefixBlocksRequest,
+    QueryPrefixBlocksResponse, RegisterNodeRequest, RegisterNodeResponse, RemoveBlockHashesRequest,
+    RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeRequest, UnregisterNodeResponse,
 };
-use crate::store::BlockHashStore;
+use crate::store::{BlockHashStore, StoreError};
 use log::debug;
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status, async_trait};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct GrpcMetaService {
@@ -31,10 +33,85 @@ impl GrpcMetaService {
     fn error_status(message: String) -> ResponseStatus {
         ResponseStatus { ok: false, message }
     }
+
+    fn parse_node_id(node_id: &str) -> Result<Uuid, Status> {
+        Uuid::parse_str(node_id)
+            .map_err(|e| Status::invalid_argument(format!("invalid node_id: {e}")))
+    }
+
+    fn store_error_status(err: StoreError) -> Status {
+        match err {
+            StoreError::UnknownNode => Status::failed_precondition("unknown node"),
+            StoreError::StaleSession => Status::failed_precondition("stale node session"),
+        }
+    }
 }
 
 #[async_trait]
 impl MetaServer for GrpcMetaService {
+    async fn register_node(
+        &self,
+        request: Request<RegisterNodeRequest>,
+    ) -> Result<Response<RegisterNodeResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        if req.node.is_empty() {
+            let result = Err(Status::invalid_argument("node cannot be empty"));
+            record_rpc_result("register_node", &result, start);
+            return result;
+        }
+
+        let node_id = self.store.register_node(&req.node);
+        let result = Ok(Response::new(RegisterNodeResponse {
+            status: Some(Self::ok_status()),
+            node_id: node_id.to_string(),
+        }));
+        record_rpc_result("register_node", &result, start);
+        result
+    }
+
+    async fn heartbeat_node(
+        &self,
+        request: Request<HeartbeatNodeRequest>,
+    ) -> Result<Response<HeartbeatNodeResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        let result = async {
+            let node_id = Self::parse_node_id(&req.node_id)?;
+            self.store
+                .heartbeat_node(&req.node, node_id)
+                .map_err(Self::store_error_status)?;
+            Ok(Response::new(HeartbeatNodeResponse {
+                status: Some(Self::ok_status()),
+            }))
+        }
+        .await;
+        record_rpc_result("heartbeat_node", &result, start);
+        result
+    }
+
+    async fn unregister_node(
+        &self,
+        request: Request<UnregisterNodeRequest>,
+    ) -> Result<Response<UnregisterNodeResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        let result = async {
+            let node_id = Self::parse_node_id(&req.node_id)?;
+            let removed = self
+                .store
+                .unregister_node(&req.node, node_id)
+                .map_err(Self::store_error_status)?;
+            Ok(Response::new(UnregisterNodeResponse {
+                status: Some(Self::ok_status()),
+                removed_keys: removed as u64,
+            }))
+        }
+        .await;
+        record_rpc_result("unregister_node", &result, start);
+        result
+    }
+
     async fn insert_block_hashes(
         &self,
         request: Request<InsertBlockHashesRequest>,
@@ -61,10 +138,27 @@ impl MetaServer for GrpcMetaService {
             return result;
         }
 
-        // Insert hashes with node ownership
-        let inserted = self
-            .store
-            .insert_hashes(&req.namespace, &req.block_hashes, &req.node);
+        let node_id = match Self::parse_node_id(&req.node_id) {
+            Ok(id) => id,
+            Err(status) => {
+                let result = Err(status);
+                record_rpc_result("insert_block_hashes", &result, start);
+                return result;
+            }
+        };
+
+        let inserted =
+            match self
+                .store
+                .insert_hashes(&req.namespace, &req.block_hashes, &req.node, node_id)
+            {
+                Ok(inserted) => inserted,
+                Err(err) => {
+                    let result = Err(Self::store_error_status(err));
+                    record_rpc_result("insert_block_hashes", &result, start);
+                    return result;
+                }
+            };
 
         let elapsed = start.elapsed();
         debug!(
@@ -105,9 +199,27 @@ impl MetaServer for GrpcMetaService {
             return result;
         }
 
-        let removed = self
-            .store
-            .remove_hashes(&req.namespace, &req.block_hashes, &req.node);
+        let node_id = match Self::parse_node_id(&req.node_id) {
+            Ok(id) => id,
+            Err(status) => {
+                let result = Err(status);
+                record_rpc_result("remove_block_hashes", &result, start);
+                return result;
+            }
+        };
+
+        let removed =
+            match self
+                .store
+                .remove_hashes(&req.namespace, &req.block_hashes, &req.node, node_id)
+            {
+                Ok(removed) => removed,
+                Err(err) => {
+                    let result = Err(Self::store_error_status(err));
+                    record_rpc_result("remove_block_hashes", &result, start);
+                    return result;
+                }
+            };
 
         let elapsed = start.elapsed();
         debug!(
@@ -195,15 +307,25 @@ mod tests {
         GrpcMetaService::new(Arc::new(BlockHashStore::new()))
     }
 
+    async fn register_node(svc: &GrpcMetaService, node: &str) -> String {
+        svc.register_node(Request::new(RegisterNodeRequest { node: node.into() }))
+            .await
+            .unwrap()
+            .into_inner()
+            .node_id
+    }
+
     #[tokio::test]
     async fn test_remove_block_hashes_own_blocks() {
         let svc = make_service();
+        let node_id = register_node(&svc, "node-a").await;
 
         // Insert
         svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
             namespace: "ns".into(),
             block_hashes: vec![vec![1, 2, 3]],
             node: "node-a".into(),
+            node_id: node_id.clone(),
         }))
         .await
         .unwrap();
@@ -214,6 +336,7 @@ mod tests {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1, 2, 3]],
                 node: "node-a".into(),
+                node_id,
             }))
             .await
             .unwrap()
@@ -237,11 +360,14 @@ mod tests {
     #[tokio::test]
     async fn test_remove_block_hashes_wrong_owner_is_noop() {
         let svc = make_service();
+        let node_b_id = register_node(&svc, "node-b").await;
+        let node_a_id = register_node(&svc, "node-a").await;
 
         svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
             namespace: "ns".into(),
             block_hashes: vec![vec![1, 2, 3]],
             node: "node-b".into(),
+            node_id: node_b_id,
         }))
         .await
         .unwrap();
@@ -252,6 +378,7 @@ mod tests {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1, 2, 3]],
                 node: "node-a".into(),
+                node_id: node_a_id,
             }))
             .await
             .unwrap()
@@ -275,12 +402,14 @@ mod tests {
     #[tokio::test]
     async fn test_remove_block_hashes_empty_request_returns_error() {
         let svc = make_service();
+        let node_id = register_node(&svc, "node-a").await;
 
         let resp = svc
             .remove_block_hashes(Request::new(RemoveBlockHashesRequest {
                 namespace: "ns".into(),
                 block_hashes: vec![],
                 node: "node-a".into(),
+                node_id,
             }))
             .await
             .unwrap()
@@ -288,6 +417,80 @@ mod tests {
 
         assert!(!resp.status.unwrap().ok);
         assert_eq!(resp.removed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_node_accepts_current_session() {
+        let svc = make_service();
+        let node_id = register_node(&svc, "node-a").await;
+
+        let resp = svc
+            .heartbeat_node(Request::new(HeartbeatNodeRequest {
+                node: "node-a".into(),
+                node_id,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.status.unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn test_insert_with_old_session_is_rejected_after_reregister() {
+        let svc = make_service();
+        let old_id = register_node(&svc, "node-a").await;
+        let new_id = register_node(&svc, "node-a").await;
+        assert_ne!(old_id, new_id);
+
+        let err = svc
+            .insert_block_hashes(Request::new(InsertBlockHashesRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1]],
+                node: "node-a".into(),
+                node_id: old_id,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_node_removes_matching_owners() {
+        let svc = make_service();
+        let node_id = register_node(&svc, "node-a").await;
+
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: "ns".into(),
+            block_hashes: vec![vec![1], vec![2]],
+            node: "node-a".into(),
+            node_id: node_id.clone(),
+        }))
+        .await
+        .unwrap();
+
+        let resp = svc
+            .unregister_node(Request::new(UnregisterNodeRequest {
+                node: "node-a".into(),
+                node_id,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.status.unwrap().ok);
+        assert_eq!(resp.removed_keys, 2);
+
+        let query_resp = svc
+            .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1]],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(query_resp.nodes.is_empty());
     }
 
     #[tokio::test]
@@ -303,11 +506,14 @@ mod tests {
 
         let node_a = "node-a:50055";
         let node_b = "node-b:50055";
+        let node_a_id = register_node(&svc, node_a).await;
+        let node_b_id = register_node(&svc, node_b).await;
 
         svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
             namespace: namespace.into(),
             block_hashes: vec![h1.clone(), h2.clone(), h3.clone(), h4.clone()],
             node: node_a.into(),
+            node_id: node_a_id,
         }))
         .await
         .unwrap();
@@ -316,6 +522,7 @@ mod tests {
             namespace: namespace.into(),
             block_hashes: vec![h1.clone(), h2.clone(), h3.clone(), h5],
             node: node_b.into(),
+            node_id: node_b_id,
         }))
         .await
         .unwrap();

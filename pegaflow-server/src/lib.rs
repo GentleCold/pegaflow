@@ -674,6 +674,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         shutdown.notify_waiters();
         let _ = http_server_handle.await;
 
+        engine.shutdown_metaserver_client().await;
+
         // Flush metrics before exit
         if let Some(provider) = metrics_state.meter_provider
             && let Err(err) = provider.shutdown()

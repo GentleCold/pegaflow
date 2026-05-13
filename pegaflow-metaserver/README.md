@@ -60,11 +60,11 @@ cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056
 # With debug logging
 cargo run -p pegaflow-metaserver -- --log-level debug
 
-# Custom TTL (60 minutes)
-cargo run -p pegaflow-metaserver -- --ttl-minutes 60
+# Custom node lifecycle timings
+cargo run -p pegaflow-metaserver -- --node-stale-secs 30 --node-purge-secs 90 --sweep-interval-secs 10
 
 # All options combined
-cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --ttl-minutes 180 --log-level info
+cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --node-stale-secs 30 --node-purge-secs 90 --log-level info
 
 # Show all options
 cargo run -p pegaflow-metaserver -- --help
@@ -74,14 +74,18 @@ cargo run -p pegaflow-metaserver -- --help
 
 - `--addr <ADDR>`: Bind address (default: `127.0.0.1:50056`)
 - `--log-level <LEVEL>`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
-- `--ttl-minutes <MINUTES>`: Cache entry TTL in minutes (default: `120`)
+- `--node-stale-secs <SECONDS>`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
+- `--node-purge-secs <SECONDS>`: Purge nodes and ownership after this many seconds without heartbeat (default: `90`)
+- `--sweep-interval-secs <SECONDS>`: Background lifecycle sweep interval (default: `10`)
 
 ### Storage Configuration
 
 The MetaServer uses a DashMap-based in-memory store with the following characteristics:
 
 - **Multi-owner**: A block hash can be registered by multiple nodes simultaneously
-- **TTL (Time-To-Live)**: 120 minutes default (configurable via `--ttl-minutes`). A background task sweeps expired entries every 10 minutes to prevent leaks from crashed nodes.
+- **Node lifecycle**: Servers call `RegisterNode`, heartbeat periodically, and include the returned `node_id` in insert/remove RPCs.
+- **Stale filtering**: Nodes stop appearing in query results after 30 seconds without heartbeat by default.
+- **Purge sweep**: A background task removes stale owners and nodes after 90 seconds without heartbeat by default.
 - **Conditional removal**: `RemoveBlockHashes` only removes the requesting node's ownership; other nodes' entries are untouched.
 - **Memory**: Scales with unique blocks across all nodes. No hard capacity cap — memory is naturally bounded by the total number of blocks in the cluster.
 
@@ -89,9 +93,46 @@ The MetaServer uses a DashMap-based in-memory store with the following character
 
 The MetaServer provides the following gRPC endpoints:
 
-### 1. InsertBlockHashes
+### 1. RegisterNode
 
-Register a list of block hashes. Re-inserting refreshes the TTL timestamp.
+Register a pegaflow-server node URL and receive a session id.
+
+```protobuf
+message RegisterNodeRequest {
+  string node = 1;
+}
+
+message RegisterNodeResponse {
+  ResponseStatus status = 1;
+  string node_id = 2;
+}
+```
+
+### 2. HeartbeatNode
+
+Refresh node liveness for the current session.
+
+```protobuf
+message HeartbeatNodeRequest {
+  string node = 1;
+  string node_id = 2;
+}
+```
+
+### 3. UnregisterNode
+
+Gracefully remove a node and its matching ownership records.
+
+```protobuf
+message UnregisterNodeRequest {
+  string node = 1;
+  string node_id = 2;
+}
+```
+
+### 4. InsertBlockHashes
+
+Register a list of block hashes. The request must include the current `node_id`.
 
 **Request:**
 ```protobuf
@@ -99,6 +140,7 @@ message InsertBlockHashesRequest {
   string namespace = 1;         // Model namespace (part of BlockKey)
   repeated bytes block_hashes = 2;  // List of block hashes to insert (part of BlockKey)
   string node = 3;              // The pegaflow-server gRPC address that owns these blocks
+  string node_id = 4;           // Session id returned by RegisterNode
 }
 ```
 
@@ -110,7 +152,7 @@ message InsertBlockHashesResponse {
 }
 ```
 
-### 2. RemoveBlockHashes
+### 5. RemoveBlockHashes
 
 Remove block hashes owned by a specific node (conditional delete).
 
@@ -120,6 +162,7 @@ message RemoveBlockHashesRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;
   string node = 3;              // Only this node's ownership is removed
+  string node_id = 4;           // Only matching ownership is removed
 }
 ```
 
@@ -131,7 +174,7 @@ message RemoveBlockHashesResponse {
 }
 ```
 
-### 3. QueryPrefixBlocks
+### 6. QueryPrefixBlocks
 
 Query the longest contiguous prefix of block hashes that exist, with per-node prefix lengths.
 
@@ -155,14 +198,14 @@ message QueryPrefixBlocksResponse {
 }
 ```
 
-### 4. Health
+### 7. Health
 
 Health check endpoint.
 
 **Request:** `HealthRequest {}`
 **Response:** `HealthResponse { status }`
 
-### 5. Shutdown
+### 8. Shutdown
 
 Graceful shutdown trigger.
 
@@ -171,19 +214,21 @@ Graceful shutdown trigger.
 
 ## Storage Implementation
 
-- **Data structure**: `DashMap<BlockKey, HashMap<Arc<str>, Instant>>` — each block key maps to a set of owning nodes with their registration timestamps
+- **Data structure**: `blocks: DashMap<BlockKey, HashMap<Arc<str>, OwnerRecord>>` and `nodes: DashMap<Arc<str>, NodeRecord>`
 - **BlockKey**: `{ namespace: String, hash: Vec<u8> }` — matches pegaflow-core's BlockKey
 - **Multi-owner**: Multiple nodes can register the same block hash (e.g., after replication or shared prefill)
-- **TTL sweep**: Background task runs every 10 minutes, removing per-node registrations older than the configured TTL
+- **Lifecycle sweep**: Background task removes owners whose node record is missing or older than `--node-purge-secs`; superseded sessions are hidden from queries by `node_id` matching and purged by key registration age.
 - **Concurrency**: DashMap uses shard-level locking for high-throughput concurrent access
 - **Persistence**: In-memory only (restart clears state)
 
 ## Integration with PegaFlow Core
 
-1. **On block save**: Call `InsertBlockHashes` to register new blocks
-2. **On cache eviction**: Call `RemoveBlockHashes` to deregister evicted blocks
-3. **On block query**: Call `QueryPrefixBlocks` to discover which nodes hold a prefix
-4. **On block load**: Query metaserver, then fetch from the best remote node via RDMA
+1. **On server startup**: Call `RegisterNode` and retain the returned `node_id`
+2. **During server lifetime**: Call `HeartbeatNode` periodically
+3. **On block save**: Call `InsertBlockHashes` with `{ node, node_id }`
+4. **On cache eviction**: Call `RemoveBlockHashes` with `{ node, node_id }`
+5. **On block query**: Call `QueryPrefixBlocks` to discover which live nodes hold a prefix
+6. **On block load**: Query metaserver, then fetch from the best remote node via RDMA
 
 ## Environment Variables
 

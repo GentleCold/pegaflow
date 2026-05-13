@@ -2198,6 +2198,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tonic",
+ "uuid",
 ]
 
 [[package]]

@@ -568,6 +568,12 @@ impl StorageEngine {
     pub(crate) fn rdma_transport(&self) -> Option<&Arc<RdmaTransport>> {
         self.rdma_transport.as_ref()
     }
+
+    pub(crate) async fn shutdown_metaserver_client(&self) {
+        if let Some(client) = &self.metaserver_client {
+            client.shutdown().await;
+        }
+    }
 }
 
 #[cfg(test)]

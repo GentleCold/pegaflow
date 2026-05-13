@@ -3,9 +3,11 @@ use std::collections::HashMap;
 use log::{debug, error, info, warn};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest, RemoveBlockHashesRequest,
+    HeartbeatNodeRequest, InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest,
+    RegisterNodeRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::metrics::core_metrics;
@@ -28,6 +30,8 @@ impl std::fmt::Display for ClientError {
 
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 30_000;
+const HEARTBEAT_INTERVAL_SECS: u64 = 10;
+const UNREGISTER_TIMEOUT_SECS: u64 = 3;
 
 pub struct MetaServerClientConfig {
     pub metaserver_addr: String,
@@ -59,6 +63,7 @@ struct BlockHashBatch {
 enum MetaServerCommand {
     Insert(BlockHashBatch),
     Remove(BlockHashBatch),
+    Shutdown(oneshot::Sender<()>),
 }
 
 /// Unified MetaServer client handling both insert (fire-and-forget) and query (direct RPC).
@@ -139,8 +144,8 @@ impl MetaServerClient {
     /// Fire-and-forget removal of block hashes.
     ///
     /// Called after LRU eviction to notify MetaServer that this node no longer
-    /// holds these blocks. Losing an occasional remove message is acceptable —
-    /// TTL still serves as the ultimate fallback for node failures.
+    /// holds these blocks. Losing an occasional remove message is acceptable;
+    /// the node lifecycle sweep is the fallback for node failures.
     pub(crate) fn try_unregister(&self, entries: Vec<(String, Vec<u8>)>) {
         if entries.is_empty() {
             return;
@@ -169,6 +174,22 @@ impl MetaServerClient {
                     .add(count as u64, &[]);
             }
         }
+    }
+
+    /// Best-effort graceful unregister of this server's MetaServer node session.
+    pub async fn shutdown(&self) {
+        let (done_tx, done_rx) = oneshot::channel();
+        let shutdown_timeout = tokio::time::Duration::from_secs(UNREGISTER_TIMEOUT_SECS + 1);
+        match tokio::time::timeout(
+            shutdown_timeout,
+            self.command_tx.send(MetaServerCommand::Shutdown(done_tx)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return,
+        }
+        let _ = tokio::time::timeout(shutdown_timeout, done_rx).await;
     }
 
     /// Query MetaServer for the longest prefix of blocks that exist remotely.
@@ -208,9 +229,60 @@ async fn registration_loop(
     advertise_addr: String,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
+    let mut node_id: Option<String> = None;
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+    let heartbeat_period = tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat_period,
+        heartbeat_period,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        let cmd = tokio::select! {
+            cmd = rx.recv() => match cmd {
+                Some(cmd) => cmd,
+                None => break,
+            },
+            _ = heartbeat.tick() => {
+                if ensure_registered(
+                    &mut client,
+                    &mut node_id,
+                    &metaserver_addr,
+                    &advertise_addr,
+                    &mut backoff_ms,
+                ).await.is_err() {
+                    continue;
+                }
+                let mut reset_session = false;
+                if let (Some(c), Some(id)) = (client.as_mut(), node_id.as_ref()) {
+                    if let Err(e) = c.heartbeat_node(HeartbeatNodeRequest {
+                        node: advertise_addr.clone(),
+                        node_id: id.clone(),
+                    }).await {
+                        warn!("MetaServer heartbeat failed: {e}");
+                        core_metrics().metaserver_heartbeat_failures.add(1, &[]);
+                        if e.code() == Code::FailedPrecondition {
+                            core_metrics().metaserver_session_resets.add(1, &[]);
+                        }
+                        reset_session = true;
+                    }
+                }
+                if reset_session {
+                    client = None;
+                    node_id = None;
+                }
+                continue;
+            }
+        };
+
+        if let MetaServerCommand::Shutdown(done) = cmd {
+            unregister_current_session(&mut client, &metaserver_addr, &advertise_addr, &node_id)
+                .await;
+            let _ = done.send(());
+            break;
+        }
+
         // Drain all pending commands. For each (namespace, hash), keep only the last
         // operation (last-write-wins), so [Remove(X), Insert(X)] correctly resolves
         // to Insert(X) rather than being reversed by separate-bucket processing.
@@ -228,6 +300,18 @@ async fn registration_loop(
                         net.insert((ns, hash), false);
                     }
                 }
+                MetaServerCommand::Shutdown(done) => {
+                    unregister_current_session(
+                        &mut client,
+                        &metaserver_addr,
+                        &advertise_addr,
+                        &node_id,
+                    )
+                    .await;
+                    let _ = done.send(());
+                    info!("MetaServer registration loop shutting down");
+                    return;
+                }
             }
         }
 
@@ -242,32 +326,32 @@ async fn registration_loop(
             }
         }
 
-        // Lazy-connect with exponential backoff
-        if client.is_none() {
-            match MetaServerGrpcClient::connect(metaserver_addr.clone()).await {
-                Ok(c) => {
-                    info!("Connected to MetaServer at {}", metaserver_addr);
-                    client = Some(c);
-                    backoff_ms = INITIAL_BACKOFF_MS;
-                }
-                Err(e) => {
-                    error!("Failed to connect to MetaServer: {e}");
-                    let insert_total: usize = inserts.values().map(|v| v.len()).sum();
-                    let remove_total: usize = removes.values().map(|v| v.len()).sum();
-                    core_metrics()
-                        .metaserver_registration_failures
-                        .add(insert_total as u64, &[]);
-                    core_metrics()
-                        .metaserver_removal_failures
-                        .add(remove_total as u64, &[]);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                    continue;
-                }
-            }
+        let insert_total: usize = inserts.values().map(|v| v.len()).sum();
+        let remove_total: usize = removes.values().map(|v| v.len()).sum();
+        if ensure_registered(
+            &mut client,
+            &mut node_id,
+            &metaserver_addr,
+            &advertise_addr,
+            &mut backoff_ms,
+        )
+        .await
+        .is_err()
+        {
+            core_metrics()
+                .metaserver_registration_failures
+                .add(insert_total as u64, &[]);
+            core_metrics()
+                .metaserver_removal_failures
+                .add(remove_total as u64, &[]);
+            continue;
         }
 
         let c = client.as_mut().expect("client is Some after lazy-connect");
+        let id = node_id
+            .as_ref()
+            .expect("node_id is Some after ensure_registered")
+            .clone();
 
         // Process inserts
         let insert_namespaces: Vec<(String, Vec<Vec<u8>>)> = inserts.into_iter().collect();
@@ -279,6 +363,7 @@ async fn registration_loop(
                 namespace: namespace.clone(),
                 block_hashes: hashes.clone(),
                 node: advertise_addr.clone(),
+                node_id: id.clone(),
             };
 
             match c.insert_block_hashes(request).await {
@@ -294,6 +379,9 @@ async fn registration_loop(
                         "MetaServer insert_block_hashes failed (namespace={}, count={}): {e}",
                         namespace, count
                     );
+                    if e.code() == Code::FailedPrecondition {
+                        core_metrics().metaserver_session_resets.add(1, &[]);
+                    }
                     insert_failed_at = Some(i);
                     break;
                 }
@@ -312,6 +400,7 @@ async fn registration_loop(
                     .add(remove_total as u64, &[]);
             }
             client = None;
+            node_id = None;
             continue;
         }
 
@@ -325,6 +414,7 @@ async fn registration_loop(
                 namespace: namespace.clone(),
                 block_hashes: hashes.clone(),
                 node: advertise_addr.clone(),
+                node_id: id.clone(),
             };
 
             match c.remove_block_hashes(request).await {
@@ -340,6 +430,9 @@ async fn registration_loop(
                         "MetaServer remove_block_hashes failed (namespace={}, count={}): {e}",
                         namespace, count
                     );
+                    if e.code() == Code::FailedPrecondition {
+                        core_metrics().metaserver_session_resets.add(1, &[]);
+                    }
                     remove_failed_at = Some(i);
                     break;
                 }
@@ -352,8 +445,113 @@ async fn registration_loop(
                 .metaserver_removal_failures
                 .add(dropped as u64, &[]);
             client = None;
+            node_id = None;
         }
     }
 
     info!("MetaServer registration loop shutting down");
+}
+
+async fn ensure_registered(
+    client: &mut Option<MetaServerGrpcClient<Channel>>,
+    node_id: &mut Option<String>,
+    metaserver_addr: &str,
+    advertise_addr: &str,
+    backoff_ms: &mut u64,
+) -> Result<(), ()> {
+    if client.is_none() {
+        match MetaServerGrpcClient::connect(metaserver_addr.to_string()).await {
+            Ok(c) => {
+                info!("Connected to MetaServer at {}", metaserver_addr);
+                *client = Some(c);
+                *backoff_ms = INITIAL_BACKOFF_MS;
+            }
+            Err(e) => {
+                error!("Failed to connect to MetaServer: {e}");
+                tokio::time::sleep(tokio::time::Duration::from_millis(*backoff_ms)).await;
+                *backoff_ms = (*backoff_ms * 2).min(MAX_BACKOFF_MS);
+                return Err(());
+            }
+        }
+    }
+
+    if node_id.is_some() {
+        return Ok(());
+    }
+
+    let c = client.as_mut().expect("client is connected");
+    match c
+        .register_node(RegisterNodeRequest {
+            node: advertise_addr.to_string(),
+        })
+        .await
+    {
+        Ok(resp) => {
+            let id = resp.into_inner().node_id;
+            info!("Registered MetaServer node session: node={advertise_addr} node_id={id}");
+            *node_id = Some(id);
+            *backoff_ms = INITIAL_BACKOFF_MS;
+            Ok(())
+        }
+        Err(e) => {
+            error!("MetaServer register_node failed: {e}");
+            core_metrics().metaserver_node_register_failures.add(1, &[]);
+            *client = None;
+            tokio::time::sleep(tokio::time::Duration::from_millis(*backoff_ms)).await;
+            *backoff_ms = (*backoff_ms * 2).min(MAX_BACKOFF_MS);
+            Err(())
+        }
+    }
+}
+
+async fn unregister_current_session(
+    client: &mut Option<MetaServerGrpcClient<Channel>>,
+    metaserver_addr: &str,
+    advertise_addr: &str,
+    node_id: &Option<String>,
+) {
+    let Some(id) = node_id.as_ref() else {
+        return;
+    };
+
+    if client.is_none() {
+        match MetaServerGrpcClient::connect(metaserver_addr.to_string()).await {
+            Ok(c) => *client = Some(c),
+            Err(e) => {
+                warn!("Failed to connect to MetaServer for unregister: {e}");
+                core_metrics().metaserver_unregister_failures.add(1, &[]);
+                return;
+            }
+        }
+    }
+
+    let Some(c) = client.as_mut() else {
+        return;
+    };
+    let request = UnregisterNodeRequest {
+        node: advertise_addr.to_string(),
+        node_id: id.clone(),
+    };
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(UNREGISTER_TIMEOUT_SECS),
+        c.unregister_node(request),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            debug!(
+                "Unregistered MetaServer node session: node={} removed_keys={}",
+                advertise_addr,
+                resp.into_inner().removed_keys
+            );
+        }
+        Ok(Err(e)) => {
+            warn!("MetaServer unregister_node failed: {e}");
+            core_metrics().metaserver_unregister_failures.add(1, &[]);
+        }
+        Err(_) => {
+            warn!("MetaServer unregister_node timed out");
+            core_metrics().metaserver_unregister_failures.add(1, &[]);
+        }
+    }
 }

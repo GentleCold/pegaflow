@@ -433,6 +433,11 @@ impl PegaEngine {
         self.storage.cleanup_memory_cache()
     }
 
+    /// Best-effort graceful unregister from MetaServer, if configured.
+    pub async fn shutdown_metaserver_client(&self) {
+        self.storage.shutdown_metaserver_client().await;
+    }
+
     /// Batch load KV blocks for multiple layers asynchronously.
     ///
     /// Returns immediately after submitting the task to the GPU worker pool.
