@@ -104,14 +104,7 @@ impl BlockHashStore {
     }
 
     pub fn heartbeat_node(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
-        let Some(mut record) = self.nodes.get_mut(node) else {
-            return Err(StoreError::UnknownNode);
-        };
-        if record.node_id != node_id {
-            return Err(StoreError::StaleSession);
-        }
-        record.last_seen = Instant::now();
-        Ok(())
+        self.touch_node_session(node, node_id)
     }
 
     pub fn unregister_node(&self, node: &str, node_id: Uuid) -> Result<usize, StoreError> {
@@ -135,7 +128,7 @@ impl BlockHashStore {
         node: &str,
         node_id: Uuid,
     ) -> Result<usize, StoreError> {
-        self.validate_node_session(node, node_id)?;
+        self.touch_node_session(node, node_id)?;
         let node: Arc<str> = Arc::from(node);
         let now = Instant::now();
         for hash in hashes {
@@ -158,7 +151,7 @@ impl BlockHashStore {
         node: &str,
         node_id: Uuid,
     ) -> Result<usize, StoreError> {
-        self.validate_node_session(node, node_id)?;
+        self.touch_node_session(node, node_id)?;
         let mut removed = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
@@ -275,13 +268,14 @@ impl BlockHashStore {
         self.nodes.clear();
     }
 
-    fn validate_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
-        let Some(record) = self.nodes.get(node) else {
+    fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
+        let Some(mut record) = self.nodes.get_mut(node) else {
             return Err(StoreError::UnknownNode);
         };
         if record.node_id != node_id {
             return Err(StoreError::StaleSession);
         }
+        record.last_seen = Instant::now();
         Ok(())
     }
 
@@ -566,6 +560,44 @@ mod tests {
         assert!(existing.is_empty());
         assert_eq!(store.entry_count(), 1);
         assert_eq!(store.owner_count(), 1);
+    }
+
+    #[test]
+    fn test_insert_refreshes_node_liveness() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_secs(60),
+            ttl: Duration::from_secs(60),
+        });
+        let node_id = store.register_node("node-a");
+        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(61);
+
+        store
+            .insert_hashes("ns", &[vec![1]], "node-a", node_id)
+            .unwrap();
+
+        assert_eq!(store.node_counts(), (1, 0));
+        let existing = store.query_prefix("ns", &[vec![1]]);
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].nodes[0].as_ref(), "node-a");
+    }
+
+    #[test]
+    fn test_remove_refreshes_node_liveness() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_secs(60),
+            ttl: Duration::from_secs(60),
+        });
+        let node_id = store.register_node("node-a");
+        store
+            .insert_hashes("ns", &[vec![1]], "node-a", node_id)
+            .unwrap();
+        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(61);
+
+        store
+            .remove_hashes("ns", &[vec![2]], "node-a", node_id)
+            .unwrap();
+
+        assert_eq!(store.node_counts(), (1, 0));
     }
 
     #[test]
