@@ -254,7 +254,6 @@ async fn registration_loop(
                 ).await.is_err() {
                     continue;
                 }
-                let mut reset_session = false;
                 if let (Some(c), Some(id)) = (client.as_mut(), node_id.as_ref()) {
                     if let Err(e) = c.heartbeat_node(HeartbeatNodeRequest {
                         node: advertise_addr.clone(),
@@ -264,13 +263,10 @@ async fn registration_loop(
                         core_metrics().metaserver_heartbeat_failures.add(1, &[]);
                         if e.code() == Code::FailedPrecondition {
                             core_metrics().metaserver_session_resets.add(1, &[]);
+                            node_id = None;
                         }
-                        reset_session = true;
+                        client = None;
                     }
-                }
-                if reset_session {
-                    client = None;
-                    node_id = None;
                 }
                 continue;
             }
@@ -356,6 +352,7 @@ async fn registration_loop(
         // Process inserts
         let insert_namespaces: Vec<(String, Vec<Vec<u8>>)> = inserts.into_iter().collect();
         let mut insert_failed_at = None;
+        let mut reset_session_after_insert_failure = false;
 
         for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
             let count = hashes.len();
@@ -381,6 +378,7 @@ async fn registration_loop(
                     );
                     if e.code() == Code::FailedPrecondition {
                         core_metrics().metaserver_session_resets.add(1, &[]);
+                        reset_session_after_insert_failure = true;
                     }
                     insert_failed_at = Some(i);
                     break;
@@ -400,13 +398,16 @@ async fn registration_loop(
                     .add(remove_total as u64, &[]);
             }
             client = None;
-            node_id = None;
+            if reset_session_after_insert_failure {
+                node_id = None;
+            }
             continue;
         }
 
         // Process removes
         let remove_namespaces: Vec<(String, Vec<Vec<u8>>)> = removes.into_iter().collect();
         let mut remove_failed_at = None;
+        let mut reset_session_after_remove_failure = false;
 
         for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
             let count = hashes.len();
@@ -432,6 +433,7 @@ async fn registration_loop(
                     );
                     if e.code() == Code::FailedPrecondition {
                         core_metrics().metaserver_session_resets.add(1, &[]);
+                        reset_session_after_remove_failure = true;
                     }
                     remove_failed_at = Some(i);
                     break;
@@ -445,7 +447,9 @@ async fn registration_loop(
                 .metaserver_removal_failures
                 .add(dropped as u64, &[]);
             client = None;
-            node_id = None;
+            if reset_session_after_remove_failure {
+                node_id = None;
+            }
         }
     }
 
