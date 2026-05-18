@@ -478,6 +478,11 @@ impl InstanceContext {
         self.tp_size
     }
 
+    /// Number of worker GPU contexts currently registered for this instance.
+    pub(crate) fn registered_gpu_count(&self) -> usize {
+        self.metadata.lock().gpu_contexts.len()
+    }
+
     /// Return unique valid NUMA nodes for registered shards in one save group.
     pub(crate) fn registered_numa_nodes_for_save_group(
         &self,

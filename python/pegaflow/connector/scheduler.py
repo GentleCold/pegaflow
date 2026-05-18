@@ -123,6 +123,21 @@ class SchedulerConnector:
             return (None, False)
 
         hit_blocks = ready.num_hit_blocks
+        if (
+            hit_blocks > 0
+            and computed_blocks + hit_blocks >= len(block_hashes)
+            and num_tokens > len(block_hashes) * self._ctx.virtual_block_size
+        ):
+            hit_blocks -= 1
+            if hit_blocks == 0:
+                try:
+                    self._ctx.engine_client.release(ready.lease)
+                except Exception:
+                    logger.exception(
+                        "[PegaKVConnector] partial-hit query lease release exception: req=%s",
+                        req_id,
+                    )
+
         if hit_blocks > 0:
             self._pending_query_probes[req_id] = _PendingQueryProbe(
                 computed_blocks=computed_blocks,

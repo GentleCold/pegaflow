@@ -126,7 +126,7 @@ def _make_fake_request(req_id: str, block_hashes: list[bytes]):
     """Minimal object that quacks like vllm.v1.request.Request."""
     req = MagicMock()
     req.request_id = req_id
-    req.num_tokens = len(block_hashes) * 32  # arbitrary
+    req.num_tokens = len(block_hashes) * 16
     req.block_hashes = block_hashes  # mutable list, like the real Request
     return req
 
@@ -305,6 +305,24 @@ class TestSchedulerQueryProbeReuse:
         engine_client.release.assert_called_once_with(b"lease-1")
         assert "r1" not in sc._pending_query_probes
         assert "r1" not in sc._pending_load_intents
+
+    def test_partial_external_hit_loads_only_safe_prefix(self):
+        sc, engine_client = self._make_connector()
+        engine_client.query_prefetch.return_value = QueryReady(3, b"lease-1")
+        req = _make_fake_request("r1", [_hash(i) for i in range(3)])
+        req.num_tokens = 3 * sc._ctx.virtual_block_size + 5
+        blocks = _make_fake_blocks([10, 11])
+        blocks.blocks = [[
+            SimpleNamespace(block_hash=None),
+            SimpleNamespace(block_hash=None),
+        ]]
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+        sc.update_state_after_alloc(req, blocks, num_external_tokens=32)
+
+        load_intent = sc._pending_load_intents["r1"]
+        assert load_intent.block_ids == (10, 11)
+        assert load_intent.num_tokens == 32
 
     def test_different_probe_releases_previous_uncommitted_probe(self):
         sc, engine_client = self._make_connector()
