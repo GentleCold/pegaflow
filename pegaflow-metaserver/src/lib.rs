@@ -16,9 +16,12 @@ use prometheus::Registry;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Notify;
 use tonic::transport::Server;
+
+const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 600;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -39,9 +42,17 @@ pub struct Cli {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Cache entry TTL in minutes
-    #[arg(long, default_value = "120")]
+    /// Seconds without heartbeat before a node is hidden from query results.
+    #[arg(long, default_value_t = store::DEFAULT_NODE_STALE_SECS)]
+    pub node_stale_secs: u64,
+
+    /// Minutes before block ownership records are purged by the lifecycle sweep.
+    #[arg(long, default_value_t = store::DEFAULT_TTL_MINUTES)]
     pub ttl_minutes: u64,
+
+    /// Seconds between lifecycle sweeps.
+    #[arg(long, default_value_t = DEFAULT_SWEEP_INTERVAL_SECS)]
+    pub sweep_interval_secs: u64,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -98,30 +109,55 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
-    info!("Cache entry TTL: {} minutes", cli.ttl_minutes);
+    info!(
+        "Node lifecycle: stale_after={}s ttl={}m sweep_interval={}s",
+        cli.node_stale_secs, cli.ttl_minutes, cli.sweep_interval_secs
+    );
+    let ttl_secs = cli
+        .ttl_minutes
+        .checked_mul(60)
+        .ok_or("ttl-minutes is too large")?;
+    if cli.ttl_minutes == 0 {
+        return Err("ttl-minutes must be greater than 0".into());
+    }
+    if cli.sweep_interval_secs == 0 {
+        return Err("sweep-interval-secs must be greater than 0".into());
+    }
+    if ttl_secs < cli.node_stale_secs {
+        return Err(format!(
+            "ttl-minutes ({}) must be >= node-stale-secs ({})",
+            cli.ttl_minutes, cli.node_stale_secs
+        )
+        .into());
+    }
 
     // Initialize metrics
     let (meter_provider, prometheus_registry) = init_metrics()?;
 
-    // Create the block hash store with TTL
-    let store = Arc::new(BlockHashStore::with_ttl(cli.ttl_minutes));
+    let store = Arc::new(BlockHashStore::with_config(store::StoreConfig {
+        node_stale_after: Duration::from_secs(cli.node_stale_secs),
+        ttl: Duration::from_secs(ttl_secs),
+    }));
 
     // Register store observable gauges
     metric::register_store_gauges(&store);
 
-    // Spawn background TTL sweep task (every 10 minutes)
+    // Spawn background node lifecycle sweep task.
     {
         let store = Arc::clone(&store);
+        let sweep_interval = Duration::from_secs(cli.sweep_interval_secs);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+            let mut interval = tokio::time::interval(sweep_interval);
             loop {
                 interval.tick().await;
-                let removed = store.sweep_expired();
-                if removed > 0 {
-                    metric::record_ttl_sweep(removed as u64);
+                let stats = store.sweep_expired();
+                if !stats.is_empty() {
+                    metric::record_sweep(stats);
                     info!(
-                        "TTL sweep: removed {} stale block keys, {} remaining",
-                        removed,
+                        "Node sweep: removed keys={} owners={} nodes={}, {} keys remaining",
+                        stats.removed_keys,
+                        stats.removed_owners,
+                        stats.removed_nodes,
                         store.entry_count()
                     );
                 }

@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Instant;
 use tonic::Status;
 
-use crate::store::BlockHashStore;
+use crate::store::{BlockHashStore, SweepStats};
 
 // ---------------------------------------------------------------------------
 // Store gauges
@@ -12,6 +12,8 @@ use crate::store::BlockHashStore;
 
 struct StoreGaugeHandles {
     _entries: ObservableGauge<u64>,
+    _owners: ObservableGauge<u64>,
+    _nodes: ObservableGauge<u64>,
 }
 
 static STORE_GAUGES: OnceLock<StoreGaugeHandles> = OnceLock::new();
@@ -21,37 +23,78 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
     let s = Arc::clone(store);
     STORE_GAUGES.get_or_init(|| {
         let meter = global::meter("pegaflow_metaserver");
+        let entries_store = Arc::clone(&s);
         let entries = meter
             .u64_observable_gauge("pegaflow_metaserver_store_entries")
             .with_description("Number of unique block keys in the store")
             .with_callback(move |observer| {
-                observer.observe(s.entry_count(), &[]);
+                observer.observe(entries_store.entry_count(), &[]);
             })
             .build();
-        StoreGaugeHandles { _entries: entries }
+        let owners_store = Arc::clone(&s);
+        let owners = meter
+            .u64_observable_gauge("pegaflow_metaserver_block_owners")
+            .with_description("Number of node ownership records across all block keys")
+            .with_callback(move |observer| {
+                observer.observe(owners_store.owner_count(), &[]);
+            })
+            .build();
+        let nodes_store = Arc::clone(&s);
+        let nodes = meter
+            .u64_observable_gauge("pegaflow_metaserver_nodes")
+            .with_description("Number of registered nodes by liveness state")
+            .with_callback(move |observer| {
+                let (active, stale) = nodes_store.node_counts();
+                observer.observe(active, &[KeyValue::new("state", "active")]);
+                observer.observe(stale, &[KeyValue::new("state", "stale")]);
+            })
+            .build();
+        StoreGaugeHandles {
+            _entries: entries,
+            _owners: owners,
+            _nodes: nodes,
+        }
     });
 }
 
 // ---------------------------------------------------------------------------
-// TTL sweep counter
+// Node lifecycle sweep counters
 // ---------------------------------------------------------------------------
 
 struct SweepMetrics {
-    removed: Counter<u64>,
+    removed_owners: Counter<u64>,
+    removed_keys: Counter<u64>,
+    removed_nodes: Counter<u64>,
 }
 
 static SWEEP_METRICS: LazyLock<SweepMetrics> = LazyLock::new(|| {
     let meter = global::meter("pegaflow_metaserver");
     SweepMetrics {
-        removed: meter
-            .u64_counter("pegaflow_metaserver_ttl_sweep_removed")
-            .with_description("Total block keys removed by TTL sweep")
+        removed_owners: meter
+            .u64_counter("pegaflow_metaserver_sweep_removed_owners")
+            .with_description("Total node ownership records removed by lifecycle sweep")
+            .build(),
+        removed_keys: meter
+            .u64_counter("pegaflow_metaserver_sweep_removed_keys")
+            .with_description("Total block keys removed by lifecycle sweep")
+            .build(),
+        removed_nodes: meter
+            .u64_counter("pegaflow_metaserver_sweep_removed_nodes")
+            .with_description("Total node records removed by lifecycle sweep")
             .build(),
     }
 });
 
-pub fn record_ttl_sweep(removed: u64) {
-    SWEEP_METRICS.removed.add(removed, &[]);
+pub fn record_sweep(stats: SweepStats) {
+    SWEEP_METRICS
+        .removed_owners
+        .add(stats.removed_owners as u64, &[]);
+    SWEEP_METRICS
+        .removed_keys
+        .add(stats.removed_keys as u64, &[]);
+    SWEEP_METRICS
+        .removed_nodes
+        .add(stats.removed_nodes as u64, &[]);
 }
 
 // ---------------------------------------------------------------------------

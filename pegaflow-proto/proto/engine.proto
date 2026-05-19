@@ -203,6 +203,8 @@ message InsertBlockHashesRequest {
   repeated bytes block_hashes = 2;
   // The pegaflow-server address that owns these blocks, as ip:port (e.g., "10.0.0.1:50055")
   string node = 3;
+  // Server-generated session id announced by HeartbeatNode.
+  string node_id = 4;
 }
 
 message InsertBlockHashesResponse {
@@ -216,6 +218,8 @@ message RemoveBlockHashesRequest {
   // Only remove entries whose current owner matches this node address.
   // Prevents races where node A evicts but node B has since re-registered.
   string node = 3;
+  // Server-generated session id announced by HeartbeatNode.
+  string node_id = 4;
 }
 
 message RemoveBlockHashesResponse {
@@ -237,7 +241,27 @@ message QueryPrefixBlocksResponse {
   repeated NodePrefixResult nodes = 1;
 }
 
+message HeartbeatNodeRequest {
+  string node = 1;
+  string node_id = 2;
+}
+
+message HeartbeatNodeResponse {
+  uint64 stale_after_secs = 1;
+}
+
+message UnregisterNodeRequest {
+  string node = 1;
+  string node_id = 2;
+}
+
+message UnregisterNodeResponse {
+  uint64 removed_owners = 1;
+}
+
 service MetaServer {
+  rpc HeartbeatNode(HeartbeatNodeRequest) returns (HeartbeatNodeResponse);
+  rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
   rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
   rpc RemoveBlockHashes(RemoveBlockHashesRequest) returns (RemoveBlockHashesResponse);
   rpc QueryPrefixBlocks(QueryPrefixBlocksRequest) returns (QueryPrefixBlocksResponse);
