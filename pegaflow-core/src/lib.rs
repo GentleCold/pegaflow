@@ -496,15 +496,15 @@ impl PegaEngine {
                 .query_leases
                 .consume(instance_id, lease)
                 .map_err(EngineError::Storage)?;
-            if blocks.len() < lease_block_ids.len() {
+            if blocks.len() != lease_block_ids.len() {
                 return Err(EngineError::InvalidArgument(format!(
-                    "query lease block count {} is smaller than destination block count {}",
+                    "query lease block count {} does not match destination block count {}",
                     blocks.len(),
                     lease_block_ids.len()
                 )));
             }
             block_ids.extend_from_slice(lease_block_ids);
-            block_cache.extend(blocks.into_iter().take(lease_block_ids.len()));
+            block_cache.extend(blocks);
         }
         trace_drop!(_s);
 

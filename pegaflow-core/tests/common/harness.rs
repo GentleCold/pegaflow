@@ -74,14 +74,6 @@ impl TestGpuData {
         assert_eq!(self.gpu.copy_to_host(), self.expected, "GPU data mismatch");
     }
 
-    pub fn copy_to_host(&self) -> Vec<u8> {
-        self.gpu.copy_to_host()
-    }
-
-    pub fn expected(&self) -> &[u8] {
-        &self.expected
-    }
-
     pub fn ptr(&self) -> u64 {
         self.gpu.as_u64()
     }
