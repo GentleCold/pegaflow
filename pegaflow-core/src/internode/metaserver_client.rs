@@ -380,6 +380,10 @@ async fn registration_loop(
                         namespace, count
                     );
                     if e.code() == Code::FailedPrecondition {
+                        warn!(
+                            "MetaServer insert rejected current session; resetting node registration: node={} node_id={}",
+                            advertise_addr, node_id
+                        );
                         core_metrics().metaserver_session_resets.add(1, &[]);
                         heartbeat.node_registered = false;
                     }
@@ -431,6 +435,10 @@ async fn registration_loop(
                         namespace, count
                     );
                     if e.code() == Code::FailedPrecondition {
+                        warn!(
+                            "MetaServer remove rejected current session; resetting node registration: node={} node_id={}",
+                            advertise_addr, node_id
+                        );
                         core_metrics().metaserver_session_resets.add(1, &[]);
                         heartbeat.node_registered = false;
                     }
@@ -513,10 +521,17 @@ async fn send_heartbeat(
         Ok(resp) => {
             let heartbeat_period =
                 heartbeat_period_from_stale_after(resp.into_inner().stale_after_secs);
-            debug!(
-                "Heartbeat accepted by MetaServer: node={advertise_addr} node_id={node_id} next_in={:?}",
-                heartbeat_period
-            );
+            if !heartbeat.node_registered {
+                info!(
+                    "MetaServer heartbeat established: node={advertise_addr} node_id={node_id} next_in={:?}",
+                    heartbeat_period
+                );
+            } else {
+                debug!(
+                    "Heartbeat accepted by MetaServer: node={advertise_addr} node_id={node_id} next_in={:?}",
+                    heartbeat_period
+                );
+            }
             heartbeat.node_registered = true;
             heartbeat.backoff_ms = INITIAL_BACKOFF_MS;
             Ok(heartbeat_period)
@@ -525,6 +540,9 @@ async fn send_heartbeat(
             warn!("MetaServer heartbeat failed: {e}");
             core_metrics().metaserver_heartbeat_failures.add(1, &[]);
             if e.code() == Code::FailedPrecondition {
+                warn!(
+                    "MetaServer heartbeat rejected current session; resetting node registration: node={advertise_addr} node_id={node_id}"
+                );
                 core_metrics().metaserver_session_resets.add(1, &[]);
                 heartbeat.node_registered = false;
             }
@@ -578,9 +596,9 @@ async fn unregister_current_session(
     {
         Ok(Ok(resp)) => {
             debug!(
-                "Unregistered MetaServer node session: node={} removed_keys={}",
+                "Unregistered MetaServer node session: node={} removed_owners={}",
                 advertise_addr,
-                resp.into_inner().removed_keys
+                resp.into_inner().removed_owners
             );
         }
         Ok(Err(e)) => {
@@ -636,10 +654,6 @@ mod tests {
             self.state.heartbeat_count.fetch_add(1, Ordering::SeqCst);
             self.state.heartbeat_notify.notify_waiters();
             Ok(Response::new(HeartbeatNodeResponse {
-                status: Some(ResponseStatus {
-                    ok: true,
-                    message: String::new(),
-                }),
                 stale_after_secs: 2,
             }))
         }
@@ -650,7 +664,7 @@ mod tests {
         ) -> Result<Response<UnregisterNodeResponse>, Status> {
             self.state.unregister_count.fetch_add(1, Ordering::SeqCst);
             self.state.unregister_notify.notify_waiters();
-            Ok(Response::new(UnregisterNodeResponse { removed_keys: 0 }))
+            Ok(Response::new(UnregisterNodeResponse { removed_owners: 0 }))
         }
 
         async fn insert_block_hashes(

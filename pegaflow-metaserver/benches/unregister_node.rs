@@ -1,3 +1,15 @@
+//! Microbench for `unregister_node` synchronous owner cleanup.
+//!
+//! Reference numbers on h20:
+//!   cargo bench -p pegaflow-metaserver --bench unregister_node -- --sample-size 10
+//!   1m_keys_10k_owned: 315.95 / 320.52 / 326.10 ms
+//!
+//! `remove_node_owners` does a full `blocks.retain`, so cost is O(total_blocks),
+//! not O(owned). At roughly 3ms per 10k total blocks on h20, 10M total blocks
+//! would sit close to the 3s client-side unregister timeout. If that threshold
+//! becomes realistic, unregister should return after dropping the node record and
+//! leave owner cleanup to the lifecycle sweep.
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use pegaflow_metaserver::store::{BlockHashStore, StoreConfig};
 use std::time::Duration;

@@ -1,4 +1,5 @@
 use dashmap::{DashMap, mapref::entry::Entry};
+use log::{info, warn};
 use pegaflow_common::BlockKey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,12 +50,16 @@ pub enum StoreError {
     StaleSession,
 }
 
+/// Snapshot of the session that wrote this block ownership. Query compares it
+/// with the current `NodeRecord.node_id` to filter owners left by old sessions.
 #[derive(Debug, Clone)]
 struct OwnerRecord {
     node_id: Uuid,
     key_register_time: Instant,
 }
 
+/// Authoritative current session for a node URL. `last_seen` is bumped on
+/// heartbeat/insert/remove and gates query visibility.
 #[derive(Debug, Clone)]
 struct NodeRecord {
     node_id: Uuid,
@@ -99,6 +104,7 @@ impl BlockHashStore {
         let now = Instant::now();
         match self.nodes.entry(Arc::from(node)) {
             Entry::Vacant(entry) => {
+                info!("MetaServer node registered: node={node} node_id={node_id}");
                 entry.insert(NodeRecord {
                     node_id,
                     last_seen: now,
@@ -111,10 +117,20 @@ impl BlockHashStore {
                 let stale_session =
                     now.duration_since(record.last_seen) > self.config.node_stale_after;
                 if same_session || stale_session {
+                    if stale_session && !same_session {
+                        info!(
+                            "MetaServer node session takeover: node={} old_node_id={} new_node_id={}",
+                            node, record.node_id, node_id
+                        );
+                    }
                     record.node_id = node_id;
                     record.last_seen = now;
                     return Ok(());
                 }
+                warn!(
+                    "MetaServer heartbeat rejected stale session: node={} current_node_id={} rejected_node_id={}",
+                    node, record.node_id, node_id
+                );
                 Err(StoreError::StaleSession)
             }
         }
@@ -127,8 +143,16 @@ impl BlockHashStore {
             .is_none()
         {
             if self.nodes.contains_key(node) {
+                warn!(
+                    "MetaServer unregister rejected stale session: node={} rejected_node_id={}",
+                    node, node_id
+                );
                 return Err(StoreError::StaleSession);
             }
+            warn!(
+                "MetaServer unregister rejected unknown node: node={} node_id={}",
+                node, node_id
+            );
             return Err(StoreError::UnknownNode);
         }
         Ok(self.remove_node_owners(node, node_id))
@@ -239,8 +263,18 @@ impl BlockHashStore {
 
         let node_before = self.nodes.len();
         let ttl = self.config.ttl;
-        self.nodes
-            .retain(|_, record| now.duration_since(record.last_seen) <= ttl);
+        self.nodes.retain(|node, record| {
+            let keep = now.duration_since(record.last_seen) <= ttl;
+            if !keep {
+                info!(
+                    "MetaServer node swept: node={} node_id={} last_seen_age_secs={}",
+                    node,
+                    record.node_id,
+                    now.duration_since(record.last_seen).as_secs()
+                );
+            }
+            keep
+        });
         stats.removed_nodes = node_before.saturating_sub(self.nodes.len());
 
         stats
@@ -283,9 +317,17 @@ impl BlockHashStore {
 
     fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
         let Some(mut record) = self.nodes.get_mut(node) else {
+            warn!(
+                "MetaServer metadata write rejected unknown node: node={} node_id={}",
+                node, node_id
+            );
             return Err(StoreError::UnknownNode);
         };
         if record.node_id != node_id {
+            warn!(
+                "MetaServer metadata write rejected stale session: node={} current_node_id={} rejected_node_id={}",
+                node, record.node_id, node_id
+            );
             return Err(StoreError::StaleSession);
         }
         record.last_seen = Instant::now();
