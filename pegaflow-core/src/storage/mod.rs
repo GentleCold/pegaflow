@@ -27,6 +27,7 @@ use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
 const RECLAIM_BATCH_SIZE: usize = 64;
+pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryCacheCleanupStats {
@@ -47,6 +48,8 @@ pub struct StorageConfig {
     pub ssd_cache_config: Option<SsdCacheConfig>,
     /// Optional RDMA NIC names for inter-node transfer (e.g. `["mlx5_0", "mlx5_1"]`).
     pub rdma_nic_names: Option<Vec<String>>,
+    /// Number of RC QPs per (local NIC, remote NIC) pair.
+    pub rdma_qps_per_peer: usize,
     /// Enable NUMA-aware memory allocation.
     pub enable_numa_affinity: bool,
     /// Allocate each block separately instead of contiguous batch allocation.
@@ -73,6 +76,7 @@ impl Default for StorageConfig {
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
             rdma_nic_names: None,
+            rdma_qps_per_peer: DEFAULT_RDMA_QPS_PER_PEER,
             enable_numa_affinity: true,
             blockwise_alloc: false,
             transfer_lock_timeout: Duration::from_secs(120),
@@ -108,6 +112,7 @@ impl StorageEngine {
         let max_prefetch_blocks = config.max_prefetch_blocks;
         let ssd_cache_config = config.ssd_cache_config;
         let rdma_nic_names = config.rdma_nic_names;
+        let rdma_qps_per_peer = config.rdma_qps_per_peer;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
 
@@ -171,7 +176,11 @@ impl StorageEngine {
         // RDMA transport must be created after the allocator so it can
         // register the pinned memory regions with the RDMA NICs.
         let rdma_transport = match rdma_nic_names.as_deref().filter(|nics| !nics.is_empty()) {
-            Some(nics) => Some(crate::backing::new_rdma(nics, &allocator)?),
+            Some(nics) => Some(crate::backing::new_rdma(
+                nics,
+                &allocator,
+                rdma_qps_per_peer,
+            )?),
             None => None,
         };
 

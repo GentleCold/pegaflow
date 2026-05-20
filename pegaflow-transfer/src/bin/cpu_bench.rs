@@ -76,6 +76,10 @@ struct Cli {
     /// Restrict to a single NUMA node (e.g. 0).
     #[arg(long)]
     numa: Option<u32>,
+
+    /// QPs per peer per NIC.
+    #[arg(long, default_value_t = 2)]
+    qps_per_peer: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -511,13 +515,14 @@ fn create_engine_context(
     numa_node: u32,
     buf_size: usize,
     use_hugepages: bool,
+    qps_per_peer: usize,
 ) -> EngineContext {
     let server_buf = NumaBuffer::alloc(numa_node, buf_size, use_hugepages);
     let client_buf = NumaBuffer::alloc(numa_node, buf_size, use_hugepages);
     server_buf.fill(0xAA);
     client_buf.fill(0xBB);
 
-    let server = TransferEngine::new(nic_names).expect("server init failed");
+    let server = TransferEngine::new(nic_names, qps_per_peer).expect("server init failed");
     server
         .register_memory(&[MemoryRegion {
             ptr: server_buf.ptr,
@@ -525,7 +530,7 @@ fn create_engine_context(
         }])
         .expect("server register_memory failed");
 
-    let client = TransferEngine::new(nic_names).expect("client init failed");
+    let client = TransferEngine::new(nic_names, qps_per_peer).expect("client init failed");
     client
         .register_memory(&[MemoryRegion {
             ptr: client_buf.ptr,
@@ -728,6 +733,7 @@ fn main() {
                     group.node.0,
                     pool_size,
                     cli.use_hugepages,
+                    cli.qps_per_peer,
                 );
                 println!("  {} ready (handshake complete)", nic.name);
                 if op == TransferOp::Read {
@@ -755,6 +761,7 @@ fn main() {
                     group.node.0,
                     pool_size,
                     cli.use_hugepages,
+                    cli.qps_per_peer,
                 );
                 println!(
                     "  multi-NIC engine ready ({} NICs, handshake complete)",
