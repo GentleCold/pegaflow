@@ -65,10 +65,10 @@ impl LayerAlloc {
                     std::ptr::NonNull::new(k_ptr).expect("split block K pointer must be non-null");
                 let v_ptr =
                     std::ptr::NonNull::new(v_ptr).expect("split block V pointer must be non-null");
-                Arc::new(RawBlock::new(vec![
+                Arc::new(RawBlock::two_segments(
                     Segment::new(k_ptr, half, Arc::clone(k_allocation)),
                     Segment::new(v_ptr, half, Arc::clone(v_allocation)),
-                ]))
+                ))
             }
             LayerAlloc::Contiguous {
                 allocation,
@@ -78,11 +78,11 @@ impl LayerAlloc {
                 // Safety: pointer is within pinned allocation, validated during allocation.
                 let ptr =
                     std::ptr::NonNull::new(ptr).expect("contiguous block pointer must be non-null");
-                Arc::new(RawBlock::new(vec![Segment::new(
+                Arc::new(RawBlock::single_segment(Segment::new(
                     ptr,
                     block_size,
                     Arc::clone(allocation),
-                )]))
+                )))
             }
         }
     }
@@ -114,6 +114,10 @@ pub(crate) struct RawSaveBatch {
 pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64, usize) {
     use std::collections::HashMap;
 
+    if let Some(entries) = build_ordered_insert_entries(batch) {
+        return entries;
+    }
+
     let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, Arc<RawBlock>)>> = HashMap::new();
     let mut total_bytes: u64 = 0;
     let mut total_blocks: usize = 0;
@@ -144,6 +148,43 @@ pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64,
         .collect();
 
     (entries, total_bytes, total_blocks)
+}
+
+fn build_ordered_insert_entries(batch: &RawSaveBatch) -> Option<(InsertEntries, u64, usize)> {
+    let first_layer = batch.layers.first()?;
+    let num_entries = first_layer.block_hashes.len();
+    if batch.layers.iter().any(|layer| {
+        layer.block_hashes.len() != num_entries || layer.block_hashes != first_layer.block_hashes
+    }) {
+        return None;
+    }
+
+    let mut total_blocks = 0usize;
+    let mut total_bytes = 0u64;
+    for layer in &batch.layers {
+        total_blocks += layer.block_hashes.len();
+        total_bytes +=
+            (layer.padded_block_size as u64).saturating_mul(layer.block_hashes.len() as u64);
+    }
+
+    let mut entries = Vec::with_capacity(num_entries);
+    for (block_idx, hash) in first_layer.block_hashes.iter().enumerate() {
+        let mut slots = Vec::with_capacity(batch.layers.len());
+        for layer in &batch.layers {
+            let blockwise = layer.allocs.len() > 1;
+            let (alloc_idx, offset_in_alloc) = if blockwise {
+                (block_idx, 0)
+            } else {
+                (0, block_idx)
+            };
+            let block =
+                layer.allocs[alloc_idx].make_raw_block(offset_in_alloc, layer.padded_block_size);
+            slots.push((layer.slot_id, block));
+        }
+        entries.push((BlockKey::new(batch.namespace.clone(), hash.clone()), slots));
+    }
+
+    Some((entries, total_bytes, total_blocks))
 }
 
 // ============================================================================
@@ -298,9 +339,26 @@ impl PegaEngine {
 
         trace_scope!("save.hash_filter", _s);
 
-        // Collect union of all unique hashes across layers
+        let shared_hash_order = if let Some((first_layer, rest_layers)) = layers.split_first() {
+            rest_layers.iter().all(|layer| {
+                layer.blocks_to_save.len() == first_layer.blocks_to_save.len()
+                    && layer
+                        .blocks_to_save
+                        .iter()
+                        .zip(&first_layer.blocks_to_save)
+                        .all(|((_, hash), (_, first_hash))| hash == first_hash)
+            })
+        } else {
+            false
+        };
+
         let mut hashes_to_save: HashSet<Vec<u8>> = HashSet::new();
-        for layer in &layers {
+        let hash_source_layers = if shared_hash_order {
+            &layers[..1]
+        } else {
+            &layers[..]
+        };
+        for layer in hash_source_layers {
             for (_, hash) in &layer.blocks_to_save {
                 hashes_to_save.insert(hash.clone());
             }

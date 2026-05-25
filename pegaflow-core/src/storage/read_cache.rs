@@ -33,18 +33,15 @@ impl ReadCache {
     }
 
     /// Scan cache for a prefix of `keys`, stopping at the first miss.
-    pub(super) fn get_prefix_blocks(
-        &self,
-        keys: &[BlockKey],
-    ) -> (usize, Vec<(BlockKey, Arc<SealedBlock>)>) {
+    pub(super) fn get_prefix_blocks(&self, keys: &[BlockKey]) -> (usize, Vec<Arc<SealedBlock>>) {
         let mut hit = 0usize;
-        let mut blocks = Vec::new();
+        let mut blocks = Vec::with_capacity(keys.len());
         {
             let mut inner = self.inner.lock();
             for key in keys {
                 if let Some(block) = inner.cache.get(key) {
                     hit += 1;
-                    blocks.push((key.clone(), Arc::clone(&block)));
+                    blocks.push(block);
                 } else {
                     break;
                 }
@@ -56,18 +53,14 @@ impl ReadCache {
     pub(super) fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
         let mut inner = self.inner.lock();
         for (key, block) in blocks {
-            let footprint_bytes = block.memory_footprint();
-            match inner.cache.insert(key, block) {
-                CacheInsertOutcome::InsertedNew => {
-                    let m = core_metrics();
-                    m.cache_block_insertions.add(1, &[]);
-                    m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
-                }
-                CacheInsertOutcome::AlreadyExists => {}
-                CacheInsertOutcome::Rejected => {
-                    core_metrics().cache_block_admission_rejections.add(1, &[]);
-                }
-            }
+            insert_block(&mut inner, key, block);
+        }
+    }
+
+    pub(super) fn batch_insert_refs(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+        let mut inner = self.inner.lock();
+        for (key, block) in blocks {
+            insert_block(&mut inner, key.clone(), Arc::clone(block));
         }
     }
 
@@ -93,6 +86,21 @@ impl ReadCache {
 
     pub(super) fn remove_all(&self) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         self.inner.lock().cache.remove_all()
+    }
+}
+
+fn insert_block(inner: &mut ReadCacheInner, key: BlockKey, block: Arc<SealedBlock>) {
+    let footprint_bytes = block.memory_footprint();
+    match inner.cache.insert(key, block) {
+        CacheInsertOutcome::InsertedNew => {
+            let m = core_metrics();
+            m.cache_block_insertions.add(1, &[]);
+            m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
+        }
+        CacheInsertOutcome::AlreadyExists => {}
+        CacheInsertOutcome::Rejected => {
+            core_metrics().cache_block_admission_rejections.add(1, &[]);
+        }
     }
 }
 

@@ -86,9 +86,42 @@ unsafe impl Sync for Segment {}
 ///
 /// RawBlock automatically derives Send+Sync from Segment.
 pub struct RawBlock {
-    segments: Box<[Segment]>,
+    segments: BlockSegments,
     /// Total size across all segments (for footprint tracking).
     total_size: usize,
+}
+
+enum BlockSegments {
+    One(Segment),
+    Two([Segment; 2]),
+    Many(Box<[Segment]>),
+}
+
+impl BlockSegments {
+    fn from_vec(segments: Vec<Segment>) -> Self {
+        match segments.len() {
+            1 => {
+                let mut segments = segments.into_iter();
+                Self::One(segments.next().expect("length checked"))
+            }
+            2 => {
+                let mut segments = segments.into_iter();
+                Self::Two([
+                    segments.next().expect("length checked"),
+                    segments.next().expect("length checked"),
+                ])
+            }
+            _ => Self::Many(segments.into_boxed_slice()),
+        }
+    }
+
+    fn as_slice(&self) -> &[Segment] {
+        match self {
+            Self::One(segment) => std::slice::from_ref(segment),
+            Self::Two(segments) => segments,
+            Self::Many(segments) => segments,
+        }
+    }
 }
 
 impl RawBlock {
@@ -98,29 +131,45 @@ impl RawBlock {
         debug_assert!(!segments.is_empty(), "RawBlock requires at least 1 segment");
         let total_size = segments.iter().map(|s| s.size).sum();
         Self {
-            segments: segments.into_boxed_slice(),
+            segments: BlockSegments::from_vec(segments),
+            total_size,
+        }
+    }
+
+    pub(crate) fn single_segment(segment: Segment) -> Self {
+        let total_size = segment.size;
+        Self {
+            segments: BlockSegments::One(segment),
+            total_size,
+        }
+    }
+
+    pub(crate) fn two_segments(k_segment: Segment, v_segment: Segment) -> Self {
+        let total_size = k_segment.size + v_segment.size;
+        Self {
+            segments: BlockSegments::Two([k_segment, v_segment]),
             total_size,
         }
     }
 
     /// Number of segments.
     pub(crate) fn num_segments(&self) -> usize {
-        self.segments.len()
+        self.segments.as_slice().len()
     }
 
     /// Get segment pointer by index.
     pub(crate) fn segment_ptr(&self, index: usize) -> Option<NonNull<u8>> {
-        self.segments.get(index).map(|s| s.ptr)
+        self.segments.as_slice().get(index).map(|s| s.ptr)
     }
 
     /// Get segment size by index.
     pub(crate) fn segment_size(&self, index: usize) -> Option<usize> {
-        self.segments.get(index).map(|s| s.size)
+        self.segments.as_slice().get(index).map(|s| s.size)
     }
 
     /// Iterator over (NonNull<u8>, size) pairs -- used for SSD I/O.
     pub(crate) fn segment_iovecs(&self) -> impl Iterator<Item = (NonNull<u8>, usize)> + '_ {
-        self.segments.iter().map(|s| (s.ptr, s.size))
+        self.segments.as_slice().iter().map(|s| (s.ptr, s.size))
     }
 
     /// Total memory footprint.
@@ -231,6 +280,35 @@ impl SealedBlock {
             footprint,
             slot_numas,
         }
+    }
+
+    /// Create from a fully populated, slot-id ordered insert batch.
+    pub(crate) fn from_ordered_slot_inserts(
+        slots: Vec<(usize, Arc<RawBlock>)>,
+        total_slots: usize,
+        numa_node: NumaNode,
+    ) -> Result<Self, Vec<(usize, Arc<RawBlock>)>> {
+        if slots.len() != total_slots
+            || slots
+                .iter()
+                .enumerate()
+                .any(|(expected, (slot_id, _))| *slot_id != expected)
+        {
+            return Err(slots);
+        }
+
+        let mut footprint = 0u64;
+        let mut blocks = Vec::with_capacity(total_slots);
+        for (_, block) in slots {
+            footprint = footprint.saturating_add(block.memory_footprint());
+            blocks.push(block);
+        }
+
+        Ok(Self::from_slots_with_footprint(
+            blocks.into_boxed_slice(),
+            footprint,
+            vec![numa_node; total_slots],
+        ))
     }
 }
 

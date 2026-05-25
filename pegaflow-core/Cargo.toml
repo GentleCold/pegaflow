@@ -59,6 +59,10 @@ harness = false
 name = "uds_latency"
 harness = false
 
+[[bench]]
+name = "cpu_path"
+harness = false
+
 [[example]]
 name = "pinned_alloc"
 
