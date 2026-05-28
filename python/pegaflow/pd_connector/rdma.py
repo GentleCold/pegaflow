@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pd_connector.layout import BlockSlice, LayerBlockSlices
+from pegaflow.pd_connector.layout import BlockRegionSlice, LayerBlockSlices
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
-    LinearBlockAddrLayout,
     PdHandshake,
     handshake_to_dict,
+    layer_layout_from_dict,
 )
 
 logger = get_connector_logger()
@@ -112,7 +112,7 @@ class MockRdmaPort:
         self._finished_recving.discard(req_id)
 
 
-def _block_slice_to_native(block: BlockSlice) -> dict[str, int]:
+def _block_slice_to_native(block: BlockRegionSlice) -> dict[str, int]:
     return {
         "block_id": block.block_id,
         "src_offset_bytes": block.src_offset_bytes,
@@ -123,8 +123,10 @@ def _block_slice_to_native(block: BlockSlice) -> dict[str, int]:
 def _layer_blocks_to_native(blocks: list[LayerBlockSlices]) -> list[dict[str, Any]]:
     return [
         {
-            "k": _block_slice_to_native(block.k),
-            "v": _block_slice_to_native(block.v),
+            "regions": [
+                {"region_idx": region_idx, **_block_slice_to_native(region)}
+                for region_idx, region in enumerate(block.regions)
+            ],
         }
         for block in _coalesce_contiguous_blocks(blocks)
     ]
@@ -139,15 +141,17 @@ def _coalesce_contiguous_blocks(blocks: list[LayerBlockSlices]) -> list[LayerBlo
     for block in blocks[1:]:
         if _can_extend_block_range(current, block):
             current = LayerBlockSlices(
-                k=BlockSlice(
-                    block_id=current.k.block_id,
-                    src_offset_bytes=current.k.src_offset_bytes,
-                    bytes=current.k.bytes + block.k.bytes,
-                ),
-                v=BlockSlice(
-                    block_id=current.v.block_id,
-                    src_offset_bytes=current.v.src_offset_bytes,
-                    bytes=current.v.bytes + block.v.bytes,
+                regions=tuple(
+                    BlockRegionSlice(
+                        block_id=current_region.block_id,
+                        src_offset_bytes=current_region.src_offset_bytes,
+                        bytes=current_region.bytes + block_region.bytes,
+                    )
+                    for current_region, block_region in zip(
+                        current.regions,
+                        block.regions,
+                        strict=True,
+                    )
                 ),
             )
             continue
@@ -158,68 +162,40 @@ def _coalesce_contiguous_blocks(blocks: list[LayerBlockSlices]) -> list[LayerBlo
 
 
 def _can_extend_block_range(prev: LayerBlockSlices, nxt: LayerBlockSlices) -> bool:
-    return (
-        prev.k.block_id + (prev.k.bytes // nxt.k.bytes) == nxt.k.block_id
-        and prev.v.block_id + (prev.v.bytes // nxt.v.bytes) == nxt.v.block_id
-        and prev.k.src_offset_bytes + prev.k.bytes == nxt.k.src_offset_bytes
-        and prev.v.src_offset_bytes + prev.v.bytes == nxt.v.src_offset_bytes
-        and nxt.k.bytes == nxt.v.bytes
-        and prev.k.bytes % nxt.k.bytes == 0
-        and prev.v.bytes % nxt.v.bytes == 0
-    )
+    if len(prev.regions) != len(nxt.regions):
+        return False
+    for prev_region, next_region in zip(prev.regions, nxt.regions, strict=True):
+        if prev_region.bytes % next_region.bytes != 0:
+            return False
+        block_count = prev_region.bytes // next_region.bytes
+        if prev_region.block_id + block_count != next_region.block_id:
+            return False
+        if prev_region.src_offset_bytes + prev_region.bytes != next_region.src_offset_bytes:
+            return False
+    return True
 
 
 def _layer_to_native(layer: LayerRemoteLayout) -> dict[str, Any]:
-    block_ids, k_addrs, v_addrs = _expand_layer_addrs(layer)
     return {
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
-        "base_addr": layer.base_addr,
-        "block_bytes": layer.block_bytes,
-        "block_ids": block_ids,
-        "k_block_addrs": k_addrs,
-        "v_block_addrs": v_addrs,
+        "block_ids": list(layer.block_ids),
+        "regions": [
+            {
+                "region_idx": region.region_idx,
+                "base_addr": region.base_addr,
+                "block_len": region.block_len,
+            }
+            for region in layer.regions
+        ],
         "mr_desc": _mr_desc_to_native(layer.mr_desc),
     }
 
 
-def _expand_layer_addrs(
-    layer: LayerRemoteLayout,
-) -> tuple[list[int], list[int], list[int]]:
-    if layer.k_block_addrs:
-        return list(layer.block_ids), list(layer.k_block_addrs), list(layer.v_block_addrs)
-    lin = layer.linear
-    assert lin is not None, "LayerRemoteLayout has no addrs and no linear layout"
-    block_ids = [lin.block_id_start + i * lin.block_id_stride for i in range(lin.num_blocks)]
-    k_addrs = [lin.k_addr_start + i * lin.addr_stride for i in range(lin.num_blocks)]
-    v_addrs = [lin.v_addr_start + i * lin.addr_stride for i in range(lin.num_blocks)]
-    return block_ids, k_addrs, v_addrs
-
-
-def _layer_from_native(
-    layer: LayerRemoteLayout | dict[str, Any],
-    *,
-    linear: LinearBlockAddrLayout | None = None,
-) -> LayerRemoteLayout:
+def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemoteLayout:
     if isinstance(layer, LayerRemoteLayout):
         return layer
-    block_ids = tuple(int(block_id) for block_id in layer["block_ids"])
-    k_block_addrs = tuple(int(addr) for addr in layer["k_block_addrs"])
-    v_block_addrs = tuple(int(addr) for addr in layer["v_block_addrs"])
-    assert len(block_ids) == len(k_block_addrs) == len(v_block_addrs), (
-        "native RDMA layer must preserve a one-to-one block_id/K/V address mapping"
-    )
-    return LayerRemoteLayout(
-        layer_name=str(layer["layer_name"]),
-        layer_idx=int(layer["layer_idx"]),
-        base_addr=int(layer["base_addr"]),
-        block_bytes=int(layer["block_bytes"]),
-        block_ids=block_ids,
-        k_block_addrs=k_block_addrs,
-        v_block_addrs=v_block_addrs,
-        mr_desc=layer.get("mr_desc"),
-        linear=linear,
-    )
+    return layer_layout_from_dict(layer)
 
 
 def _handshake_to_native(handshake: PdHandshake) -> dict[str, Any]:
@@ -256,10 +232,8 @@ class RealRdmaPort:
     ) -> tuple[LayerRemoteLayout, ...]:
         native_layers = [_layer_to_native(layer) for layer in layers]
         registered = self.engine.register_local_layers(native_layers)
-        return tuple(
-            _layer_from_native(layer, linear=original.linear)
-            for original, layer in zip(layers, registered, strict=True)
-        )
+        assert len(registered) == len(layers)
+        return tuple(_layer_from_native(layer) for layer in registered)
 
     def open_request(self, req_id: str, handshake: PdHandshake) -> None:
         self.engine.register_remote(req_id, _handshake_to_native(handshake))

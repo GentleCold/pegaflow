@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.kv_params import ProducerKvParams
-from pegaflow.pd_connector.layout import FlashAttnHndLayout
+from pegaflow.pd_connector.layout import KvCacheLayout
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdHandshake,
@@ -36,7 +36,7 @@ class DecodeHandler:
     ) -> None:
         self._w = worker
         self._wait_reqs: dict[str, WaitReqMeta] = {}
-        self._peer_layouts: dict[int, dict[str, FlashAttnHndLayout]] = {}
+        self._peer_layouts: dict[int, dict[str, KvCacheLayout]] = {}
         self._peer_mr_descs: dict[int, dict[str, Any]] = {}
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
@@ -246,12 +246,12 @@ class _AsyncRdmaDoneWaiter:
 
 
 def _all_gather_peer_info(
-    layouts: dict[str, FlashAttnHndLayout],
+    layouts: dict[str, KvCacheLayout],
     mr_descs: dict[str, Any],
     tp_size: int,
-) -> list[tuple[dict[str, FlashAttnHndLayout], dict[str, Any]]]:
+) -> list[tuple[dict[str, KvCacheLayout], dict[str, Any]]]:
     import torch.distributed as dist
 
-    gathered: list[tuple[dict[str, FlashAttnHndLayout], dict[str, Any]] | None] = [None] * tp_size
+    gathered: list[tuple[dict[str, KvCacheLayout], dict[str, Any]] | None] = [None] * tp_size
     dist.all_gather_object(gathered, (layouts, mr_descs))
     return gathered  # type: ignore[return-value]

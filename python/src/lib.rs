@@ -149,16 +149,21 @@ fn pd_imm(req_id: &str) -> u32 {
 #[derive(Clone)]
 struct PdLocalLayer {
     base_addr: u64,
-    block_bytes: u64,
     mr: MemoryRegionHandle,
     mr_desc: MemoryRegionDescriptor,
 }
 
 #[derive(Clone)]
+struct PdRemoteRegion {
+    base_addr: u64,
+    block_len: u64,
+}
+
+#[derive(Clone)]
 struct PdRemoteLayer {
     mr_desc: MemoryRegionDescriptor,
-    k_by_block: HashMap<u64, u64>,
-    v_by_block: HashMap<u64, u64>,
+    allowed_block_ids: HashSet<u64>,
+    regions: Vec<PdRemoteRegion>,
 }
 
 struct PdRemoteRequest {
@@ -368,21 +373,57 @@ impl PdRdmaEngine {
         for layer in layers {
             let layer = layer.bind(py);
             let layer_idx: u64 = py_get(layer, "layer_idx")?;
-            let base_addr: u64 = py_get(layer, "base_addr")?;
-            let block_bytes: u64 = py_get(layer, "block_bytes")?;
-            let k_block_addrs: Vec<u64> = py_get(layer, "k_block_addrs")?;
-            let v_block_addrs: Vec<u64> = py_get(layer, "v_block_addrs")?;
-            let max_addr = k_block_addrs
+            let block_ids: Vec<u64> = py_get(layer, "block_ids")?;
+            if block_ids.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "local layer {layer_idx} has no block_ids"
+                )));
+            }
+            let max_block_id = block_ids
                 .iter()
-                .chain(v_block_addrs.iter())
                 .copied()
                 .max()
-                .ok_or_else(|| PyValueError::new_err("layer has no block addresses"))?;
+                .ok_or_else(|| PyValueError::new_err("local layer has no block_ids"))?;
+            let regions_any = layer
+                .get_item("regions")?
+                .ok_or_else(|| PyValueError::new_err("local layer missing regions"))?;
+            let mut min_addr = u64::MAX;
+            let mut max_addr = 0_u64;
+            let mut region_count = 0_usize;
+            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
+                let region = region_any?.cast_into::<PyDict>()?;
+                let region_idx: usize = py_get(&region, "region_idx")?;
+                if region_idx != expected_region_idx {
+                    return Err(PyValueError::new_err(format!(
+                        "local layer {layer_idx} regions must be ordered by region_idx"
+                    )));
+                }
+                let base_addr: u64 = py_get(&region, "base_addr")?;
+                let block_len: u64 = py_get(&region, "block_len")?;
+                if base_addr == 0 || block_len == 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "local layer {layer_idx} region {region_idx} has invalid address range"
+                    )));
+                }
+                let end = max_block_id
+                    .checked_add(1)
+                    .and_then(|block_count| block_count.checked_mul(block_len))
+                    .and_then(|byte_len| base_addr.checked_add(byte_len))
+                    .ok_or_else(|| PyValueError::new_err("local layer address range overflow"))?;
+                min_addr = min_addr.min(base_addr);
+                max_addr = max_addr.max(end);
+                region_count += 1;
+            }
+            if region_count == 0 {
+                return Err(PyValueError::new_err(format!(
+                    "local layer {layer_idx} has no regions"
+                )));
+            }
             let len = max_addr
-                .checked_add(block_bytes)
-                .and_then(|end| end.checked_sub(base_addr))
+                .checked_sub(min_addr)
+                .filter(|len| *len > 0)
                 .ok_or_else(|| PyValueError::new_err("invalid layer address range"))?;
-            let ptr = nonnull_from_u64(base_addr, "base_addr")?;
+            let ptr = nonnull_from_u64(min_addr, "base_addr")?;
             let (mr, mr_desc) = self
                 .engine
                 .register_memory_allow_remote(ptr, u64_to_usize(len, "layer length")?, self.device)
@@ -390,8 +431,7 @@ impl PdRdmaEngine {
             local_layers.insert(
                 layer_idx,
                 PdLocalLayer {
-                    base_addr,
-                    block_bytes,
+                    base_addr: min_addr,
                     mr,
                     mr_desc: mr_desc.clone(),
                 },
@@ -437,33 +477,56 @@ impl PdRdmaEngine {
             let layer = layer_any?.cast_into::<PyDict>()?;
             let layer_idx: u64 = py_get(&layer, "layer_idx")?;
             let block_ids: Vec<u64> = py_get(&layer, "block_ids")?;
-            let k_block_addrs: Vec<u64> = py_get(&layer, "k_block_addrs")?;
-            let v_block_addrs: Vec<u64> = py_get(&layer, "v_block_addrs")?;
-            if block_ids.len() != k_block_addrs.len() || block_ids.len() != v_block_addrs.len() {
+            if block_ids.is_empty() {
                 return Err(PyValueError::new_err(format!(
-                    "remote layer {layer_idx} block_ids and addresses length mismatch"
+                    "remote layer {layer_idx} has no block_ids"
+                )));
+            }
+            let allowed_block_ids = block_ids.iter().copied().collect::<HashSet<_>>();
+            if allowed_block_ids.len() != block_ids.len() {
+                return Err(PyValueError::new_err(format!(
+                    "remote layer {layer_idx} has duplicate block_ids"
+                )));
+            }
+            let regions_any = layer
+                .get_item("regions")?
+                .ok_or_else(|| PyValueError::new_err("remote layer missing regions"))?;
+            let mut regions = Vec::new();
+            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
+                let region = region_any?.cast_into::<PyDict>()?;
+                let region_idx: usize = py_get(&region, "region_idx")?;
+                if region_idx != expected_region_idx {
+                    return Err(PyValueError::new_err(format!(
+                        "remote layer {layer_idx} regions must be ordered by region_idx"
+                    )));
+                }
+                let base_addr: u64 = py_get(&region, "base_addr")?;
+                let block_len: u64 = py_get(&region, "block_len")?;
+                if base_addr == 0 || block_len == 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "remote layer {layer_idx} region {region_idx} has invalid address range"
+                    )));
+                }
+                regions.push(PdRemoteRegion {
+                    base_addr,
+                    block_len,
+                });
+            }
+            if regions.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "remote layer {layer_idx} has no regions"
                 )));
             }
             let mr_desc_any = layer
                 .get_item("mr_desc")?
                 .ok_or_else(|| PyValueError::new_err("remote layer missing mr_desc"))?;
             let mr_desc = mr_desc_from_py(&mr_desc_any.cast_into::<PyDict>()?)?;
-            let k_by_block = block_ids
-                .iter()
-                .copied()
-                .zip(k_block_addrs.iter().copied())
-                .collect::<HashMap<_, _>>();
-            let v_by_block = block_ids
-                .iter()
-                .copied()
-                .zip(v_block_addrs.iter().copied())
-                .collect::<HashMap<_, _>>();
             layers.insert(
                 layer_idx,
                 PdRemoteLayer {
                     mr_desc,
-                    k_by_block,
-                    v_by_block,
+                    allowed_block_ids,
+                    regions,
                 },
             );
         }
@@ -505,19 +568,24 @@ impl PdRdmaEngine {
                     "remote layer {layer_idx} for req {req_id} is not registered"
                 ))
             })?;
-        let mut dsts = Vec::with_capacity(blocks.len() * 2);
+        let mut dsts = Vec::with_capacity(blocks.len() * remote.regions.len());
         for block in blocks {
             let block = block.bind(py);
-            let k = block
-                .get_item("k")?
-                .ok_or_else(|| PyValueError::new_err("block missing k"))?
-                .cast_into::<PyDict>()?;
-            let v = block
-                .get_item("v")?
-                .ok_or_else(|| PyValueError::new_err("block missing v"))?
-                .cast_into::<PyDict>()?;
-            dsts.push(self.block_slice_to_scatter_target(&local, &remote, &k, true)?);
-            dsts.push(self.block_slice_to_scatter_target(&local, &remote, &v, false)?);
+            let regions_any = block
+                .get_item("regions")?
+                .ok_or_else(|| PyValueError::new_err("block missing regions"))?;
+            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
+                let region = region_any?.cast_into::<PyDict>()?;
+                let region_idx: usize = py_get(&region, "region_idx")?;
+                if region_idx != expected_region_idx {
+                    return Err(PyValueError::new_err(
+                        "block regions must be ordered by region_idx",
+                    ));
+                }
+                dsts.push(
+                    self.block_slice_to_scatter_target(&local, &remote, &region, region_idx)?,
+                );
+            }
         }
         if dsts.is_empty() {
             return Ok(());
@@ -775,26 +843,38 @@ impl PdRdmaEngine {
         local: &PdLocalLayer,
         remote: &PdRemoteLayer,
         block: &Bound<'_, PyDict>,
-        is_k: bool,
+        region_idx: usize,
     ) -> PyResult<ScatterTarget> {
         let block_id: u64 = py_get(block, "block_id")?;
         let src_offset: u64 = py_get(block, "src_offset_bytes")?;
         let bytes: u64 = py_get(block, "bytes")?;
-        if bytes == 0 || !bytes.is_multiple_of(local.block_bytes) {
+        if bytes == 0 {
+            return Err(PyValueError::new_err("block slice bytes must be positive"));
+        }
+        let region = remote.regions.get(region_idx).ok_or_else(|| {
+            PyValueError::new_err(format!("remote region {region_idx} is not registered"))
+        })?;
+        if !bytes.is_multiple_of(region.block_len) {
             return Err(PyValueError::new_err(format!(
-                "block slice bytes {bytes} must be a positive multiple of layer block_bytes {}",
-                local.block_bytes
+                "block slice bytes {bytes} must be a positive multiple of remote region block_len {}",
+                region.block_len
             )));
         }
-        let remote_addr = if is_k {
-            remote.k_by_block.get(&block_id)
-        } else {
-            remote.v_by_block.get(&block_id)
+        let block_count = bytes / region.block_len;
+        for offset in 0..block_count {
+            let remote_block_id = block_id
+                .checked_add(offset)
+                .ok_or_else(|| PyValueError::new_err("remote block id overflow"))?;
+            if !remote.allowed_block_ids.contains(&remote_block_id) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "remote block {remote_block_id} is not registered"
+                )));
+            }
         }
-        .copied()
-        .ok_or_else(|| {
-            PyRuntimeError::new_err(format!("remote block {block_id} is not registered"))
-        })?;
+        let remote_addr = block_id
+            .checked_mul(region.block_len)
+            .and_then(|offset| region.base_addr.checked_add(offset))
+            .ok_or_else(|| PyValueError::new_err("remote block address overflow"))?;
         let dst_offset = remote_addr
             .checked_sub(remote.mr_desc.ptr)
             .ok_or_else(|| PyRuntimeError::new_err("remote block address is below MR base"))?;

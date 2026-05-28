@@ -11,7 +11,6 @@ from typing import Any
 
 from pegaflow.pd_connector.metadata import (
     PdHandshake,
-    handshake_from_dict,
     handshake_to_dict,
     handshakes_from_dicts,
 )
@@ -72,9 +71,6 @@ def parse_producer(params: dict[str, Any]) -> ProducerKvParams | None:
     if not params.get("do_remote_prefill_sender"):
         return None
     handshakes = handshakes_from_dicts(params.get("pd_handshakes"))
-    if not handshakes:
-        single = handshake_from_dict(params.get("pd_handshake"))
-        handshakes = (single,) if single is not None else ()
     return ProducerKvParams(
         target_engine_id=str(params.get("target_engine_id") or ""),
         target_request_id=str(params.get("target_request_id") or ""),

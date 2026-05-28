@@ -11,10 +11,10 @@ from typing import TYPE_CHECKING, Any
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.chunk_tracker import ChunkTracker
 from pegaflow.pd_connector.layout import (
-    FlashAttnHndLayout,
     LayerBlockSlices,
     block_ranges_for_remote_write,
     block_slices_bytes,
+    layout_from_tensor,
     unique_blocks_from_slot_mapping,
 )
 from pegaflow.pd_connector.metadata import (
@@ -44,13 +44,26 @@ class PrefillHandler:
         self._remote_block_offsets: dict[str, int] = {}
         self._push_traces: dict[str, _PushTrace] = {}
         self._slot_mapping_cache: tuple[int, set[int]] | None = None
+        self._skipped_pushes = 0
         self._push_sender = _AsyncLayerPushSender()
         self._push_finalizer = _AsyncPushFinalizer(self._push_sender)
 
     def process_push_reqs(self, reqs_to_push: dict[str, PushReqMeta]) -> None:
         for req_id, req in reqs_to_push.items():
             self._tracker.add_request(req_id)
-            handshake = self._select_push_handshake(req)
+            try:
+                handshake = self._select_push_handshake(req)
+            except _SkipPushRank:
+                self._skipped_pushes += 1
+                self._completed_pushes.add(req_id)
+                logger.info(
+                    "[PdConnector] P skipped MLA push req=%s target_req=%s rank=%d skipped_total=%d",
+                    req_id,
+                    req.target_request_id,
+                    self._w.tp_rank,
+                    self._skipped_pushes,
+                )
+                continue
             self._push_reqs[req_id] = req
             self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
             self._pending_push_chunks.add(req_id)
@@ -84,7 +97,17 @@ class PrefillHandler:
         )
         # Re-assert the runtime tensor. CUDA graph or backend changes must not
         # silently swap in a different layout.
-        runtime_layout = FlashAttnHndLayout.from_tensor(layer_name, kv_layer)
+        runtime_layout = layout_from_tensor(
+            layer_name,
+            kv_layer,
+            layer_spec=self._w._layer_spec(layer_name),
+            logical_block_size=self._w.logical_block_size,
+            expected_num_blocks=layout.num_blocks,
+        )
+        assert type(runtime_layout) is type(layout), (
+            f"PdConnector KV layout type changed for {layer_name}: "
+            f"registered={type(layout).__name__} runtime={type(runtime_layout).__name__}"
+        )
         assert runtime_layout.shape == layout.shape, (
             f"PdConnector KV shape changed for {layer_name}: "
             f"registered={layout.shape} runtime={runtime_layout.shape}"
@@ -273,6 +296,34 @@ class PrefillHandler:
         assert req.handshakes, (
             f"PdConnector push request has no handshakes; target_req={req.target_request_id}"
         )
+        _assert_handshake_tp_consistency(req.handshakes)
+        decode_tp_size = req.handshakes[0].tp_size
+        if self._w.use_mla:
+            assert self._w.tp_size >= decode_tp_size, (
+                "PdConnector MLA heterogeneous TP requires prefill TP >= decode TP; "
+                f"prefill_tp={self._w.tp_size} decode_tp={decode_tp_size}"
+            )
+            assert self._w.tp_size % decode_tp_size == 0, (
+                "PdConnector MLA heterogeneous TP requires prefill TP to be a "
+                f"multiple of decode TP; prefill_tp={self._w.tp_size} decode_tp={decode_tp_size}"
+            )
+            ratio = self._w.tp_size // decode_tp_size
+            if self._w.tp_rank % ratio != 0:
+                raise _SkipPushRank
+            target_rank = self._w.tp_rank // ratio
+            for handshake in req.handshakes:
+                if handshake.tp_rank == target_rank:
+                    return handshake
+            raise AssertionError(
+                f"PdConnector missing MLA target handshake for prefill_tp_rank={self._w.tp_rank} "
+                f"decode_tp_rank={target_rank}; "
+                f"available={[handshake.tp_rank for handshake in req.handshakes]}"
+            )
+
+        assert self._w.tp_size == decode_tp_size, (
+            "PdConnector non-MLA requires equal P/D TP sizes; "
+            f"prefill_tp={self._w.tp_size} decode_tp={decode_tp_size}"
+        )
         for handshake in req.handshakes:
             if handshake.tp_rank == self._w.tp_rank:
                 return handshake
@@ -330,6 +381,18 @@ def _gbps(bytes_total: int, start_ts_ns: int | None, end_ts_ns: int | None) -> f
     if bytes_total <= 0 or start_ts_ns is None or end_ts_ns is None or end_ts_ns <= start_ts_ns:
         return 0.0
     return bytes_total * 8 / ((end_ts_ns - start_ts_ns) / 1_000_000_000) / 1e9
+
+
+def _assert_handshake_tp_consistency(handshakes: tuple[PdHandshake, ...]) -> None:
+    tp_size = handshakes[0].tp_size
+    assert all(handshake.tp_size == tp_size for handshake in handshakes), (
+        f"PdConnector handshakes disagree on decode TP size: "
+        f"{[handshake.tp_size for handshake in handshakes]}"
+    )
+
+
+class _SkipPushRank(Exception):
+    pass
 
 
 # ---------------------------------------------------------------------------

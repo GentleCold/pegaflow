@@ -58,26 +58,51 @@ class PushReqMeta:
 
 
 @dataclass(frozen=True)
-class LinearBlockAddrLayout:
-    block_id_start: int
-    block_id_stride: int
-    num_blocks: int
-    k_addr_start: int
-    v_addr_start: int
-    addr_stride: int
+class TransferRegionLayout:
+    region_idx: int
+    base_addr: int
+    block_len: int
+
+    def __post_init__(self) -> None:
+        assert self.region_idx >= 0
+        assert self.base_addr > 0
+        assert self.block_len > 0
 
 
 @dataclass(frozen=True)
 class LayerRemoteLayout:
     layer_name: str
     layer_idx: int
-    base_addr: int
-    block_bytes: int
     block_ids: tuple[int, ...]
-    k_block_addrs: tuple[int, ...]
-    v_block_addrs: tuple[int, ...]
+    regions: tuple[TransferRegionLayout, ...]
     mr_desc: Any | None = None
-    linear: LinearBlockAddrLayout | None = None
+
+    def __post_init__(self) -> None:
+        assert self.layer_name
+        assert self.layer_idx >= 0
+        assert self.block_ids
+        assert self.block_ids == tuple(sorted(self.block_ids))
+        assert self.regions
+        assert all(block_id >= 0 for block_id in self.block_ids)
+        assert tuple(region.region_idx for region in self.regions) == tuple(
+            range(len(self.regions))
+        )
+
+    @property
+    def base_addr(self) -> int:
+        return min(region.base_addr for region in self.regions)
+
+    @property
+    def byte_len(self) -> int:
+        max_end = max(
+            region.base_addr + (self.block_ids[-1] + 1) * region.block_len
+            for region in self.regions
+        )
+        return max_end - self.base_addr
+
+    def region_block_addrs(self, region_idx: int) -> tuple[int, ...]:
+        region = self.regions[region_idx]
+        return tuple(region.base_addr + block_id * region.block_len for block_id in self.block_ids)
 
 
 @dataclass(frozen=True)
@@ -92,41 +117,20 @@ class PdHandshake:
 
 
 def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
-    if data.get("block_addr_format") == "linear":
-        num_blocks = int(data["num_blocks"])
-        block_id_start = int(data["block_id_start"])
-        block_id_stride = int(data.get("block_id_stride", 1))
-        addr_stride = int(data["addr_stride"])
-        linear = LinearBlockAddrLayout(
-            block_id_start=block_id_start,
-            block_id_stride=block_id_stride,
-            num_blocks=num_blocks,
-            k_addr_start=int(data["k_addr_start"]),
-            v_addr_start=int(data["v_addr_start"]),
-            addr_stride=addr_stride,
-        )
-        block_ids = tuple(block_id_start + idx * block_id_stride for idx in range(num_blocks))
-        k_block_addrs = tuple(
-            int(data["k_addr_start"]) + idx * addr_stride for idx in range(num_blocks)
-        )
-        v_block_addrs = tuple(
-            int(data["v_addr_start"]) + idx * addr_stride for idx in range(num_blocks)
-        )
-    else:
-        linear = None
-        block_ids = tuple(int(block_id) for block_id in data["block_ids"])
-        k_block_addrs = tuple(int(addr) for addr in data["k_block_addrs"])
-        v_block_addrs = tuple(int(addr) for addr in data["v_block_addrs"])
+    assert "regions" in data
     return LayerRemoteLayout(
         layer_name=str(data["layer_name"]),
         layer_idx=int(data["layer_idx"]),
-        base_addr=int(data["base_addr"]),
-        block_bytes=int(data["block_bytes"]),
-        block_ids=block_ids,
-        k_block_addrs=k_block_addrs,
-        v_block_addrs=v_block_addrs,
+        block_ids=tuple(int(block_id) for block_id in data["block_ids"]),
+        regions=tuple(
+            TransferRegionLayout(
+                region_idx=int(region["region_idx"]),
+                base_addr=int(region["base_addr"]),
+                block_len=int(region["block_len"]),
+            )
+            for region in data["regions"]
+        ),
         mr_desc=data.get("mr_desc"),
-        linear=linear,
     )
 
 
@@ -154,64 +158,20 @@ def handshakes_from_dicts(data: Any) -> tuple[PdHandshake, ...]:
 
 
 def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
-    common = {
+    return {
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
-        "base_addr": layer.base_addr,
-        "block_bytes": layer.block_bytes,
+        "block_ids": list(layer.block_ids),
+        "regions": [
+            {
+                "region_idx": region.region_idx,
+                "base_addr": region.base_addr,
+                "block_len": region.block_len,
+            }
+            for region in layer.regions
+        ],
         "mr_desc": layer.mr_desc,
     }
-    compact = _linear_layer_layout_to_dict(layer)
-    if compact is not None:
-        return {**common, **compact}
-    return {
-        **common,
-        "block_ids": list(layer.block_ids),
-        "k_block_addrs": list(layer.k_block_addrs),
-        "v_block_addrs": list(layer.v_block_addrs),
-    }
-
-
-def _linear_layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any] | None:
-    if layer.linear is not None:
-        return {
-            "block_addr_format": "linear",
-            "block_id_start": layer.linear.block_id_start,
-            "block_id_stride": layer.linear.block_id_stride,
-            "num_blocks": layer.linear.num_blocks,
-            "k_addr_start": layer.linear.k_addr_start,
-            "v_addr_start": layer.linear.v_addr_start,
-            "addr_stride": layer.linear.addr_stride,
-        }
-    num_blocks = len(layer.block_ids)
-    if num_blocks == 0:
-        return None
-    if not (num_blocks == len(layer.k_block_addrs) == len(layer.v_block_addrs)):
-        return None
-    block_id_stride = _constant_stride(layer.block_ids)
-    k_stride = _constant_stride(layer.k_block_addrs)
-    v_stride = _constant_stride(layer.v_block_addrs)
-    if block_id_stride is None or k_stride is None or v_stride is None or k_stride != v_stride:
-        return None
-    return {
-        "block_addr_format": "linear",
-        "block_id_start": layer.block_ids[0],
-        "block_id_stride": block_id_stride,
-        "num_blocks": num_blocks,
-        "k_addr_start": layer.k_block_addrs[0],
-        "v_addr_start": layer.v_block_addrs[0],
-        "addr_stride": k_stride,
-    }
-
-
-def _constant_stride(values: tuple[int, ...]) -> int | None:
-    if len(values) <= 1:
-        return 1
-    stride = values[1] - values[0]
-    for prev, current in zip(values[:-1], values[1:], strict=True):
-        if current - prev != stride:
-            return None
-    return stride
 
 
 def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:
