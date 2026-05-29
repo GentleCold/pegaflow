@@ -206,6 +206,31 @@ Artifacts:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
 
+## Rejected Early-Prefill Experiment
+
+An experimental proxy-side early-prefill path was tested on 2026-05-29 and then
+reverted. The design started P prefill from the proxy immediately, let D
+allocate KV blocks, and sent a small handshake update to P once D had the RDMA
+handshakes. It added a delayed-handshake state machine on P but did not improve
+the 16k/c1 acceptance result in a meaningful way.
+
+The first 16k run exposed a request-body bug: P-early was forced to
+`stream=false` while still receiving `stream_options`, so P returned HTTP 400
+and D RDMA waits timed out after 30s. After removing `stream_options` from the
+P-early body, the 16k/c1 run completed. Mean TTFT changed by only -1.09ms versus
+the stable waitmini run, while p99 was worse.
+
+| run | success | mean_TTFT_ms | p50_TTFT_ms | p99_TTFT_ms | req_s | avg_RDMA_Gbps_per_NIC | peak_RDMA_Gbps_per_NIC | verdict |
+|-----|---------|--------------|-------------|-------------|-------|------------------------|-------------------------|---------|
+| `kimi-proxy-fixed32k-waitmini` | 50/50 | 2429.02 | 2380.71 | 2809.90 | 0.41 | 6.71 | 12.14 | kept |
+| `kimi-proxy-fixed32k-earlyp2` | 50/50 | 2427.93 | 2374.32 | 3040.55 | 0.41 | 6.71 | 18.52 | reverted |
+
+Artifacts:
+
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-earlyp2-in16384-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-earlyp2-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-earlyp2-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
+
 ## RDMA-only Integration Test
 
 Before another connector change, the RDMA path was isolated with

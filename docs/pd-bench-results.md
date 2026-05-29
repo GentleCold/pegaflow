@@ -183,6 +183,14 @@ was 0.81/1.28ms from h20-99 to h20-100 and 1.05/1.84ms in reverse. The remaining
 16k/c1 delta is application-layer serialization before P starts, not raw TCP
 latency.
 
+Rejected optimization: a proxy-side early-prefill experiment started P prefill
+before D block allocation and later sent a small handshake update. After fixing a
+streaming-body issue in the experiment, the 16k/c1 result was 50/50 success,
+2427.93ms mean TTFT, 3040.55ms p99 TTFT, and 6.71Gbps average per NIC. This is
+only 1.09ms faster than `kimi-proxy-fixed32k-waitmini` on mean TTFT and worse on
+p99, so the experiment was reverted and the stable waitmini path remains the
+current result.
+
 ### NIC Counter Result
 
 Counters are from `port_xmit_data` / `port_rcv_data`, converted with 4 bytes per
