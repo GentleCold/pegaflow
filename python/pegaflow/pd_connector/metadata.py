@@ -95,22 +95,6 @@ class LayerRemoteLayout:
             range(len(self.regions))
         )
 
-    @property
-    def base_addr(self) -> int:
-        return min(region.base_addr for region in self.regions)
-
-    @property
-    def byte_len(self) -> int:
-        max_end = max(
-            region.base_addr + (self.block_ids[-1] + 1) * region.block_len
-            for region in self.regions
-        )
-        return max_end - self.base_addr
-
-    def region_block_addrs(self, region_idx: int) -> tuple[int, ...]:
-        region = self.regions[region_idx]
-        return tuple(region.base_addr + block_id * region.block_len for block_id in self.block_ids)
-
 
 @dataclass(frozen=True)
 class PdHandshake:

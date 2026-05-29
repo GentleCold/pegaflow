@@ -5,7 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
@@ -80,7 +80,6 @@ class PrefillHandler:
         self._pending_push_chunks.discard(req_id)
         self._push_chunk_maps.pop(req_id, None)
         self._push_traces.pop(req_id, None)
-        self._push_sender.discard_req_stats(req_id)
         self._tracker.remove(req_id)
 
     def save_kv_layer(
@@ -203,18 +202,12 @@ class PrefillHandler:
             )
             rdma_bytes = block_slices_bytes(block_slices)
             assert self._w.rdma is not None
-            chunk_idx = trace.chunk_count + 1
             self._push_sender.submit(
                 _LayerPushTask(
                     rdma=self._w.rdma,
                     req_id=req_id,
-                    target_request_id=req.target_request_id,
-                    chunk_idx=chunk_idx,
                     layer_idx=layer_idx,
-                    block_count=len(req_blocks),
-                    rdma_bytes=rdma_bytes,
                     block_slices=block_slices,
-                    enqueued_ts_ns=time.time_ns(),
                     event=event,
                 )
             )
@@ -363,12 +356,6 @@ def _gbps(bytes_total: int, start_ts_ns: int | None, end_ts_ns: int | None) -> f
     return bytes_total * 8 / ((end_ts_ns - start_ts_ns) / 1_000_000_000) / 1e9
 
 
-def _gbps_from_ms(bytes_total: int, elapsed_ms: float) -> float:
-    if bytes_total <= 0 or elapsed_ms <= 0:
-        return 0.0
-    return bytes_total * 8 / (elapsed_ms / 1000) / 1e9
-
-
 def _pct(value: float, total: float) -> float:
     if value <= 0 or total <= 0:
         return 0.0
@@ -406,13 +393,8 @@ class _SkipPushRank(Exception):
 class _LayerPushTask:
     rdma: RdmaPort
     req_id: str
-    target_request_id: str
-    chunk_idx: int
     layer_idx: int
-    block_count: int
-    rdma_bytes: int
     block_slices: list[LayerBlockSlices]
-    enqueued_ts_ns: int
     event: Any = None
 
 
@@ -448,8 +430,6 @@ class _AsyncLayerPushSender:
         self._condition = threading.Condition()
         self._inflight = 0
         self._inflight_by_req: dict[str, int] = {}
-        self._stats_by_req: dict[str, _ReqPushStats] = {}
-        self._discarded_stats_reqs: set[str] = set()
         self._error: BaseException | None = None
         self._thread = threading.Thread(
             target=self._run,
@@ -457,14 +437,6 @@ class _AsyncLayerPushSender:
             daemon=True,
         )
         self._thread.start()
-        logger.info(
-            "[PdConnector] P layer push sender started workers=%d",
-            self.worker_count,
-        )
-
-    @property
-    def worker_count(self) -> int:
-        return 1
 
     def submit(self, task: _LayerPushTask) -> None:
         with self._condition:
@@ -472,20 +444,6 @@ class _AsyncLayerPushSender:
                 raise self._error
             self._inflight += 1
             self._inflight_by_req[task.req_id] = self._inflight_by_req.get(task.req_id, 0) + 1
-            inflight = self._inflight
-            inflight_req = self._inflight_by_req[task.req_id]
-        logger.debug(
-            "[PdConnector] P layer push queued req=%s target_req=%s chunk=%d layer=%d blocks=%d bytes=%d inflight=%d inflight_req=%d queue_depth=%d",
-            task.req_id,
-            task.target_request_id,
-            task.chunk_idx,
-            task.layer_idx,
-            task.block_count,
-            task.rdma_bytes,
-            inflight,
-            inflight_req,
-            self._queue.qsize(),
-        )
         self._queue.put(task)
 
     def wait_all(self) -> None:
@@ -509,27 +467,13 @@ class _AsyncLayerPushSender:
     def close(self) -> None:
         self._queue.put(None)
 
-    def pop_req_stats(self, req_id: str) -> _ReqPushStats:
-        with self._condition:
-            self._discarded_stats_reqs.discard(req_id)
-            return self._stats_by_req.pop(req_id, _ReqPushStats())
-
-    def discard_req_stats(self, req_id: str) -> None:
-        with self._condition:
-            self._stats_by_req.pop(req_id, None)
-            if self._inflight_by_req.get(req_id, 0) > 0:
-                self._discarded_stats_reqs.add(req_id)
-
     def _run(self) -> None:
         while True:
             task = self._queue.get()
             try:
                 if task is None:
                     return
-                result = _run_layer_push(task)
-                with self._condition:
-                    if task.req_id not in self._discarded_stats_reqs:
-                        self._stats_by_req.setdefault(task.req_id, _ReqPushStats()).add(result)
+                _run_layer_push(task)
             except BaseException as exc:
                 with self._condition:
                     self._error = exc
@@ -543,173 +487,14 @@ class _AsyncLayerPushSender:
                             self._inflight_by_req[task.req_id] = remaining
                         else:
                             self._inflight_by_req.pop(task.req_id, None)
-                            if task.req_id in self._discarded_stats_reqs:
-                                self._discarded_stats_reqs.discard(task.req_id)
-                                self._stats_by_req.pop(task.req_id, None)
                         self._condition.notify_all()
                 self._queue.task_done()
 
 
-@dataclass(frozen=True)
-class _LayerPushResult:
-    bytes: int
-    queue_wait_ms: float
-    event_ms: float
-    native_ms: float
-    event_ready_ts_ns: int
-    native_start_ts_ns: int
-    native_done_ts_ns: int
-
-
-@dataclass
-class _ReqPushStats:
-    tasks: int = 0
-    bytes: int = 0
-    queue_wait_ms: float = 0.0
-    event_ms: float = 0.0
-    native_ms: float = 0.0
-    max_queue_wait_ms: float = 0.0
-    max_event_ms: float = 0.0
-    max_native_ms: float = 0.0
-    first_event_ready_ts_ns: int | None = None
-    last_event_ready_ts_ns: int | None = None
-    first_native_start_ts_ns: int | None = None
-    last_native_done_ts_ns: int | None = None
-    queue_wait_samples_ms: list[float] = field(default_factory=list)
-    event_samples_ms: list[float] = field(default_factory=list)
-    native_samples_ms: list[float] = field(default_factory=list)
-
-    def add(self, result: _LayerPushResult) -> None:
-        self.tasks += 1
-        self.bytes += result.bytes
-        self.queue_wait_ms += result.queue_wait_ms
-        self.event_ms += result.event_ms
-        self.native_ms += result.native_ms
-        self.max_queue_wait_ms = max(self.max_queue_wait_ms, result.queue_wait_ms)
-        self.max_event_ms = max(self.max_event_ms, result.event_ms)
-        self.max_native_ms = max(self.max_native_ms, result.native_ms)
-        self.first_event_ready_ts_ns = _min_ts(
-            self.first_event_ready_ts_ns,
-            result.event_ready_ts_ns,
-        )
-        self.last_event_ready_ts_ns = _max_ts(
-            self.last_event_ready_ts_ns,
-            result.event_ready_ts_ns,
-        )
-        self.first_native_start_ts_ns = _min_ts(
-            self.first_native_start_ts_ns,
-            result.native_start_ts_ns,
-        )
-        self.last_native_done_ts_ns = _max_ts(
-            self.last_native_done_ts_ns,
-            result.native_done_ts_ns,
-        )
-        self.queue_wait_samples_ms.append(result.queue_wait_ms)
-        self.event_samples_ms.append(result.event_ms)
-        self.native_samples_ms.append(result.native_ms)
-
-    def avg_queue_wait_ms(self) -> float:
-        return _avg_ms(self.queue_wait_samples_ms)
-
-    def p50_queue_wait_ms(self) -> float:
-        return _percentile_ms(self.queue_wait_samples_ms, 0.50)
-
-    def p95_queue_wait_ms(self) -> float:
-        return _percentile_ms(self.queue_wait_samples_ms, 0.95)
-
-    def avg_event_ms(self) -> float:
-        return _avg_ms(self.event_samples_ms)
-
-    def p50_event_ms(self) -> float:
-        return _percentile_ms(self.event_samples_ms, 0.50)
-
-    def p95_event_ms(self) -> float:
-        return _percentile_ms(self.event_samples_ms, 0.95)
-
-    def avg_native_ms(self) -> float:
-        return _avg_ms(self.native_samples_ms)
-
-    def p50_native_ms(self) -> float:
-        return _percentile_ms(self.native_samples_ms, 0.50)
-
-    def p95_native_ms(self) -> float:
-        return _percentile_ms(self.native_samples_ms, 0.95)
-
-    def event_ready_window_ms(self) -> float:
-        return _elapsed_ms(self.first_event_ready_ts_ns, self.last_event_ready_ts_ns)
-
-    def native_submit_window_ms(self) -> float:
-        return _elapsed_ms(self.first_native_start_ts_ns, self.last_native_done_ts_ns)
-
-
-def _min_ts(current: int | None, value: int) -> int:
-    if current is None:
-        return value
-    return min(current, value)
-
-
-def _max_ts(current: int | None, value: int) -> int:
-    if current is None:
-        return value
-    return max(current, value)
-
-
-def _avg_ms(samples: list[float]) -> float:
-    if not samples:
-        return 0.0
-    return sum(samples) / len(samples)
-
-
-def _percentile_ms(samples: list[float], percentile: float) -> float:
-    if not samples:
-        return 0.0
-    ordered = sorted(samples)
-    idx = round((len(ordered) - 1) * percentile)
-    return ordered[idx]
-
-
-def _run_layer_push(task: _LayerPushTask) -> _LayerPushResult:
-    start_ts_ns = time.time_ns()
-    event_done_ts_ns = start_ts_ns
-    native_done_ts_ns = start_ts_ns
-    failed = False
+def _run_layer_push(task: _LayerPushTask) -> None:
     if task.event is not None:
         task.event.synchronize()
-    event_done_ts_ns = time.time_ns()
-    try:
-        task.rdma.push_layer(task.req_id, task.layer_idx, task.block_slices)
-        native_done_ts_ns = time.time_ns()
-    except BaseException:
-        failed = True
-        native_done_ts_ns = time.time_ns()
-        raise
-    finally:
-        queue_wait_ms = (start_ts_ns - task.enqueued_ts_ns) / 1_000_000
-        event_ms = (event_done_ts_ns - start_ts_ns) / 1_000_000
-        native_ms = (native_done_ts_ns - event_done_ts_ns) / 1_000_000
-        logger.debug(
-            "[PdConnector] P layer push %s req=%s target_req=%s chunk=%d layer=%d blocks=%d bytes=%d queue_wait_ms=%.3f event_ms=%.3f native_ms=%.3f total_ms=%.3f",
-            "failed" if failed else "done",
-            task.req_id,
-            task.target_request_id,
-            task.chunk_idx,
-            task.layer_idx,
-            task.block_count,
-            task.rdma_bytes,
-            queue_wait_ms,
-            event_ms,
-            native_ms,
-            (native_done_ts_ns - task.enqueued_ts_ns) / 1_000_000,
-        )
-    return _LayerPushResult(
-        bytes=task.rdma_bytes,
-        queue_wait_ms=queue_wait_ms,
-        event_ms=event_ms,
-        native_ms=native_ms,
-        event_ready_ts_ns=event_done_ts_ns,
-        native_start_ts_ns=event_done_ts_ns,
-        native_done_ts_ns=native_done_ts_ns,
-    )
+    task.rdma.push_layer(task.req_id, task.layer_idx, task.block_slices)
 
 
 class _AsyncPushFinalizer:
@@ -733,17 +518,6 @@ class _AsyncPushFinalizer:
                 return
             self._submitted.add(task.req_id)
             self._inflight += 1
-            inflight = self._inflight
-        logger.info(
-            "[PdConnector] P finalize queued req=%s target_req=%s chunks=%d blocks=%d bytes=%d inflight=%d queue_depth=%d",
-            task.req_id,
-            task.target_request_id,
-            task.chunk_count,
-            task.num_blocks,
-            task.rdma_bytes,
-            inflight,
-            self._queue.qsize(),
-        )
         self._queue.put(task)
 
     def wait_all(self) -> None:
@@ -764,33 +538,16 @@ class _AsyncPushFinalizer:
             try:
                 if task is None:
                     return
-                start_ts_ns = time.time_ns()
                 self._push_sender.wait_req(task.req_id)
-                sender_done_ts_ns = time.time_ns()
-                push_stats = self._push_sender.pop_req_stats(task.req_id)
                 task.rdma.wait_for_pushes(task.req_id)
-                writes_done_ts_ns = time.time_ns()
                 task.rdma.push_done(task.req_id)
                 done_ts_ns = time.time_ns()
-                ready_window_gbps = _gbps(
-                    task.rdma_bytes,
-                    task.first_save_ts_ns,
-                    task.finalize_queued_ts_ns,
-                )
-                event_ready_gbps = _gbps(
-                    push_stats.bytes,
-                    push_stats.first_event_ready_ts_ns,
-                    push_stats.last_event_ready_ts_ns,
-                )
-                native_submit_gbps = _gbps(
-                    push_stats.bytes,
-                    push_stats.first_native_start_ts_ns,
-                    push_stats.last_native_done_ts_ns,
-                )
-                native_call_gbps = _gbps_from_ms(push_stats.bytes, push_stats.native_ms)
+                save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
                 link_gbps = _rdma_link_gbps(task.rdma)
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f ready_window_gbps=%.2f link_gbps=%.2f ready_link_util_pct=%.2f event_ready_window_ms=%.3f event_ready_gbps=%.2f event_ready_link_util_pct=%.2f native_submit_window_ms=%.3f native_submit_gbps=%.2f native_call_gbps=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_avg_ms=%.3f push_queue_p50_ms=%.3f push_queue_p95_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_avg_ms=%.3f push_event_p50_ms=%.3f push_event_p95_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_avg_ms=%.3f push_native_p50_ms=%.3f push_native_p95_ms=%.3f push_native_max_ms=%.3f ts_ns=%d",
+                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d "
+                    "rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f "
+                    "save_gbps=%.2f tail_gbps=%.2f link_gbps=%.2f link_util_pct=%.2f",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
@@ -798,43 +555,13 @@ class _AsyncPushFinalizer:
                     task.rdma_bytes,
                     _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
                     _elapsed_ms(task.finalize_queued_ts_ns, done_ts_ns),
-                    _elapsed_ms(start_ts_ns, sender_done_ts_ns),
-                    _elapsed_ms(sender_done_ts_ns, writes_done_ts_ns),
-                    _elapsed_ms(writes_done_ts_ns, done_ts_ns),
-                    _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns),
+                    save_gbps,
                     _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
-                    ready_window_gbps,
                     link_gbps,
-                    _pct(ready_window_gbps, link_gbps),
-                    push_stats.event_ready_window_ms(),
-                    event_ready_gbps,
-                    _pct(event_ready_gbps, link_gbps),
-                    push_stats.native_submit_window_ms(),
-                    native_submit_gbps,
-                    native_call_gbps,
-                    self._push_sender.worker_count,
-                    push_stats.tasks,
-                    push_stats.bytes,
-                    push_stats.queue_wait_ms,
-                    push_stats.avg_queue_wait_ms(),
-                    push_stats.p50_queue_wait_ms(),
-                    push_stats.p95_queue_wait_ms(),
-                    push_stats.max_queue_wait_ms,
-                    push_stats.event_ms,
-                    push_stats.avg_event_ms(),
-                    push_stats.p50_event_ms(),
-                    push_stats.p95_event_ms(),
-                    push_stats.max_event_ms,
-                    push_stats.native_ms,
-                    push_stats.avg_native_ms(),
-                    push_stats.p50_native_ms(),
-                    push_stats.p95_native_ms(),
-                    push_stats.max_native_ms,
-                    done_ts_ns,
+                    _pct(save_gbps, link_gbps),
                 )
             except BaseException as exc:
                 if task is not None:
-                    self._push_sender.discard_req_stats(task.req_id)
                     logger.exception(
                         "[PdConnector] P finalize failed req=%s target_req=%s chunks=%d blocks=%d bytes=%d",
                         task.req_id,

@@ -125,36 +125,20 @@ fn wait_atomic_count(counter: &AtomicI64, target: i64, timeout: Duration) -> boo
     true
 }
 
-fn reserve_write_window(
+fn wait_write_window(
     submitted: &AtomicI64,
     completed: &AtomicI64,
     limit: i64,
     timeout: Duration,
-) -> Option<i64> {
+) -> bool {
     let deadline = Instant::now() + timeout;
-    loop {
-        let submitted_now = submitted.load(Ordering::Acquire);
-        let completed_now = completed.load(Ordering::Acquire);
-        if submitted_now - completed_now < limit {
-            if submitted
-                .compare_exchange_weak(
-                    submitted_now,
-                    submitted_now + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Some(submitted_now + 1);
-            }
-            std::hint::spin_loop();
-            continue;
-        }
+    while submitted.load(Ordering::Acquire) - completed.load(Ordering::Acquire) >= limit {
         if Instant::now() >= deadline {
-            return None;
+            return false;
         }
         std::hint::spin_loop();
     }
+    true
 }
 
 fn pd_imm(req_id: &str) -> u32 {
@@ -244,44 +228,6 @@ impl PdRdmaTestBuffer {
             .copy_to_vec()
             .map_err(|err| pd_rdma_error("cuda test buffer copy_to_vec failed", err))?;
         Ok(PyBytes::new(py, &data))
-    }
-
-    fn to_bytes_range<'py>(
-        &self,
-        py: Python<'py>,
-        offset: usize,
-        len: usize,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| PyValueError::new_err("cuda test buffer range overflows usize"))?;
-        if end > self.mem.size() {
-            return Err(PyValueError::new_err(format!(
-                "cuda test buffer range [{offset}, {end}) exceeds size {}",
-                self.mem.size()
-            )));
-        }
-        let data = self
-            .mem
-            .copy_range_to_vec(offset, len)
-            .map_err(|err| pd_rdma_error("cuda test buffer copy_range_to_vec failed", err))?;
-        Ok(PyBytes::new(py, &data))
-    }
-
-    fn write_bytes(&self, offset: usize, data: Bound<'_, PyBytes>) -> PyResult<()> {
-        let bytes = data.as_bytes();
-        let end = offset
-            .checked_add(bytes.len())
-            .ok_or_else(|| PyValueError::new_err("cuda test buffer range overflows usize"))?;
-        if end > self.mem.size() {
-            return Err(PyValueError::new_err(format!(
-                "cuda test buffer range [{offset}, {end}) exceeds size {}",
-                self.mem.size()
-            )));
-        }
-        self.mem
-            .copy_range_from_slice(offset, bytes)
-            .map_err(|err| pd_rdma_error("cuda test buffer copy_range_from_slice failed", err))
     }
 }
 
@@ -689,31 +635,29 @@ impl PdRdmaEngine {
         }
         let convert_ms = duration_ms(total_start.elapsed());
         let window_start = Instant::now();
-        let submitted_after = match py.detach(|| {
-            reserve_write_window(
+        if !py.detach(|| {
+            wait_write_window(
                 &self.write_submitted,
                 &self.write_completed,
                 PD_RDMA_WRITE_WINDOW,
                 Duration::from_secs(30),
             )
         }) {
-            Some(submitted_after) => submitted_after,
-            None => {
-                log::error!(
-                    "[PdRdmaEngine] RDMA WRITE window timeout req={} layer={} submitted={} completed={} window_wait_ms={:.3}",
-                    req_id,
-                    layer_idx,
-                    self.write_submitted.load(Ordering::Acquire),
-                    self.write_completed.load(Ordering::Acquire),
-                    duration_ms(window_start.elapsed()),
-                );
-                return Err(PegaFlowError::new_err(format!(
-                    "RDMA WRITE window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
-                    self.write_submitted.load(Ordering::Acquire),
-                    self.write_completed.load(Ordering::Acquire)
-                )));
-            }
-        };
+            log::error!(
+                "[PdRdmaEngine] RDMA WRITE window timeout req={} layer={} submitted={} completed={} window_wait_ms={:.3}",
+                req_id,
+                layer_idx,
+                self.write_submitted.load(Ordering::Acquire),
+                self.write_completed.load(Ordering::Acquire),
+                duration_ms(window_start.elapsed()),
+            );
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA WRITE window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
+                self.write_submitted.load(Ordering::Acquire),
+                self.write_completed.load(Ordering::Acquire)
+            )));
+        }
+        self.write_submitted.fetch_add(1, Ordering::Release);
         let window_ms = duration_ms(window_start.elapsed());
         let (req_completed, req_errors) = {
             let mut pending = self.pending_writes.lock().unwrap();
@@ -800,7 +744,7 @@ impl PdRdmaEngine {
             convert_ms,
             window_ms,
             duration_ms(submit_start.elapsed()),
-            submitted_after,
+            self.write_submitted.load(Ordering::Acquire),
             self.write_completed.load(Ordering::Acquire),
         );
         Ok(())

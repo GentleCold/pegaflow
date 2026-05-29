@@ -80,7 +80,7 @@ template cache, and minimal D wait-handshake changes.
 
 ### Code Changes Tested
 
-- D-side prefill HTTP dispatch is parallelized with 8 sender threads.
+- D-side prefill HTTP dispatch uses the connector default single sender.
 - P-side RDMA layer push uses one FIFO sender thread per worker.
 - P-side layer push uses scheduler-provided block ids instead of reading
   `slot_mapping` back to CPU.
@@ -278,10 +278,9 @@ Decode node `h20-100` receive:
   `proxy_to_finished_ms`, `matched_to_finished_ms`, and `wait_to_finished_ms`.
   These can be compared with `D received RDMA done ... ts_ns` and proxy first
   stream chunk timestamps to isolate the post-RDMA D tail.
-- The D-side RDMA done waiter now uses 8 fixed workers. This keeps the P-side
-  layer FIFO unchanged while allowing independent D requests to wait for IMM in
-  parallel, targeting the c4 `queue_wait_ms` pathology where one long wait delayed
-  later already-completed requests.
+- The D-side RDMA done waiter uses the connector default single waiter. The c4
+  multi-waiter run is kept only as a discarded queueing diagnostic, not as the
+  merge target.
 - The next performance target should be the post-`finished_recving` path,
   including D-side last-token recompute, proxy response handling, and scheduler
   wakeup. Increasing NIC count alone will not raise bandwidth until the upper

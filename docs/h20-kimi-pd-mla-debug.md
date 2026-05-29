@@ -109,7 +109,7 @@ cd /root/develop/xingming/pegaflow
 
 ## Code Changes Tested
 
-- D-to-P prefill HTTP dispatch uses 8 `AsyncPrefillSender` workers.
+- D-to-P prefill HTTP dispatch uses the connector default single sender.
 - P-side RDMA layer push now uses one FIFO sender thread per worker. vLLM
   computes layers in order; extra Python senders only wait on later CUDA events
   and add queueing noise.
@@ -255,37 +255,11 @@ Artifacts:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-earlyp2-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-earlyp2-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
 
-## RDMA-only Integration Test
+## RDMA-only Reference Result
 
-Before another connector change, the RDMA path was isolated with
-`/data/pegadev/scripts/pd-mla-h20/pd_rdma_two_node_it.py`. The test uses the same 8-rank Kimi 16k shape
-as the P/D run: 61 layers, 1024 blocks, 18432 bytes per block, and the same
-rank-to-NIC map.
-
-The current IT command fails the run when aggregate bandwidth is below
-1000Gbps, when any active NIC direction is below 300Gbps, when any active NIC
-direction moves less than 0.98x of the expected bytes, or when D-side sampled
-payload bytes do not match the P-side rank/offset deterministic pattern. D
-resets sampled destination ranges before every iteration and verifies them
-immediately after that iteration completes, so a later skipped transfer cannot be
-hidden by a previous successful transfer.
-
-```bash
-python /data/pegadev/scripts/pd-mla-h20/pd_rdma_two_node_it.py decode \
-  --iterations 4 \
-  --min-bandwidth-gbps 1000 \
-  --min-nic-gbps 300 \
-  --min-nic-byte-ratio 0.98 \
-  --verify-sample-bytes 1048576
-
-python /data/pegadev/scripts/pd-mla-h20/pd_rdma_two_node_it.py prefill \
-  --decode-host 10.96.191.100 \
-  --iterations 4 \
-  --min-bandwidth-gbps 1000 \
-  --min-nic-gbps 300 \
-  --min-nic-byte-ratio 0.98 \
-  --verify-sample-bytes 1048576
-```
+Before another connector change, the RDMA path was isolated with the same 8-rank
+Kimi 16k shape as the P/D run: 61 layers, 1024 blocks, 18432 bytes per block,
+and the same rank-to-NIC map.
 
 Verified result on h20 on 2026-05-29:
 
@@ -420,9 +394,9 @@ D-side wait logs show large queueing under concurrency:
   scheduler `proxy_to_finished_ms`, `matched_to_finished_ms`, and
   `wait_to_finished_ms`, so the post-RDMA D tail can be aligned with proxy first
   chunk timing.
-- the D-side RDMA done waiter now uses 8 fixed workers, so independent D
-  requests can wait for IMM in parallel. P-side layer push remains one FIFO
-  sender.
+- the D-side RDMA done waiter uses the connector default single waiter. The c4
+  multi-waiter run is kept as a discarded queueing diagnostic, not as the merge
+  target.
 
 Use the log summarizer after each run to keep the latency decomposition
 reproducible:
