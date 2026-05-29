@@ -351,6 +351,29 @@ delta is mostly in proxy/D request setup before dispatch and work after
 KV hit by one token, so D recomputes the last prompt token to produce sampling
 logits.
 
+## TCP and HTTP Microbench
+
+To check whether the remaining fixed 16k/c1 delta is caused by slow TCP, a
+temporary Python echo server was run on each H20 node on 2026-05-29. The payload
+sizes cover the real proxy-to-D body size (~170KB) and D-to-P body size (~272KB).
+The HTTP client used `urllib.request`, matching the proxy and D-to-P sender style
+more closely than a pooled async client.
+
+| direction | payload | TCP p50_ms | TCP p95_ms | HTTP p50_ms | HTTP p95_ms |
+|-----------|---------|------------|------------|-------------|-------------|
+| h20-99 -> h20-100 | 170KB | 0.27 | 0.37 | 0.71 | 1.06 |
+| h20-99 -> h20-100 | 272KB | 0.22 | 0.35 | 0.81 | 1.28 |
+| h20-100 -> h20-99 | 170KB | 0.19 | 0.28 | 0.77 | 1.12 |
+| h20-100 -> h20-99 | 272KB | 0.24 | 0.32 | 1.05 | 1.84 |
+
+The measured TCP/HTTP cost is not large enough to explain the real P/D timing:
+in the latest fixed 16k/c1 run, proxy accept to D rank0 dispatch was p50
+108.94ms and p95 125.41ms. The remaining delta is therefore application-layer
+serialization before P starts: proxy sends only D first, D reaches scheduler
+allocation, then D dispatches the P prefill request. Since the P-side prefill
+HTTP latency is already approximately the direct baseline TTFT, this serialized
+pre-P-start section currently shows up almost directly as P/D TTFT overhead.
+
 ## Conclusion
 
 Correctness passed, and all 4 NICs were used evenly. The c4 diagnostic result

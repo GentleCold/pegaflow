@@ -165,6 +165,13 @@ Latest 16k/c1 log split:
 - P-side `wait_sender_ms`: p50 1036.67ms.
 - D RDMA done to first proxy chunk: p50 23.63ms, p95 36.30ms.
 
+TCP/HTTP microbench on h20 does not explain the fixed overhead: a temporary
+Python echo server measured 170KB HTTP POST p50/p95 at 0.71/1.06ms from h20-99
+to h20-100 and 0.77/1.12ms in the reverse direction. For 272KB, HTTP p50/p95
+was 0.81/1.28ms from h20-99 to h20-100 and 1.05/1.84ms in reverse. The remaining
+16k/c1 delta is application-layer serialization before P starts, not raw TCP
+latency.
+
 ### NIC Counter Result
 
 Counters are from `port_xmit_data` / `port_rcv_data`, converted with 4 bytes per
