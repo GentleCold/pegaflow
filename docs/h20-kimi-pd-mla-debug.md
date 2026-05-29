@@ -12,9 +12,10 @@ H20. The run passed request correctness but did not saturate RDMA bandwidth.
 - Prefill/proxy node: `h20-99`
 - Decode node: `h20-100`
 - Model: `/data/models/Kimi-K2.5`
-- Result: 50/50 requests completed, 7113.63 total tok/s
-- RDMA result: all 4 NICs were used evenly, but peak bandwidth was only about
-  20Gbps per NIC
+- Latest fixed 16k/c1 P/D result: 50/50 requests completed, 6744.16 total
+  tok/s, 2429.02ms mean TTFT
+- RDMA result: all 4 NICs were used evenly, but serving peak bandwidth was
+  only about 12-14Gbps per NIC
 - Benchmark discipline after this run: use `--max-concurrency 1` for acceptance
   pressure tests, and compare only runs started with the same non-connector vLLM
   flags. The c4 run below is kept only as a queueing diagnostic.
@@ -98,6 +99,8 @@ scripts/run_pd_h20_kimi.sh start-cluster
   `slot_mapping` back to CPU.
 - D-side rank0 prefill dispatch caches compact per-rank layer templates after
   peer layout gather and only fills shared `block_ids` per request.
+- D-side local RDMA wait registration now opens a minimal one-layer/one-block
+  request while still sending the full per-rank handshake set to P.
 - Native RDMA write window reservation was changed to reserve with CAS before
   submit, avoiding write-window overrun under concurrent Python push threads.
 - Hot per-layer RDMA write logs were moved to DEBUG.
@@ -177,7 +180,7 @@ cache changes. Other input lengths are still pending.
 | 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
 | 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
 | 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | 2440.53 | 105.76 | 4.53% | 2346.75 | 2845.69 | 50/50 | 50/50 | 0.43 | 0.41 | 6.68 | 12.14 | proxy label `kimi-proxy-fixed32k-trace` |
+| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 0.43 | 0.41 | 6.71 | 12.14 | proxy label `kimi-proxy-fixed32k-waitmini` |
 | 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 Artifacts:
@@ -199,6 +202,9 @@ Artifacts:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528.json`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
 
 ## RDMA-only Integration Test
 
@@ -273,6 +279,7 @@ direct baseline is restarted with the same fixed 32k vLLM serving flags.
 | `kimi-proxy-fixed32k-schedblocks-in16384-out1-c1-n50-seed20260528` | 50/50 | 124.32 | 0.402 | 6589.97 | 2485.86 | 2986.99 |
 | `kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528` | 50/50 | 122.47 | 0.408 | 6689.38 | 2448.93 | 2897.89 |
 | `kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528` | 50/50 | 122.05 | 0.410 | 6712.22 | 2440.53 | 2845.69 |
+| `kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528` | 50/50 | 121.48 | 0.412 | 6744.16 | 2429.02 | 2809.90 |
 | `proxy-16k-c4-prefill-parallel-batch32768-50` | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | `proxy-16k-c4-windowfix-batch32768` | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
@@ -285,7 +292,7 @@ The final experiment table should be keyed by input length:
 | 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
 | 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
 | 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | 2440.53 | 105.76 | 4.53% | 2346.75 | 2845.69 | 50/50 | 50/50 | 0.43 | 0.41 | 6.68 | 12.14 | scheduler trace instrumentation |
+| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 0.43 | 0.41 | 6.71 | 12.14 | minimal D wait handshake |
 | 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 ## NIC Counter Result
@@ -314,10 +321,10 @@ Decode node `h20-100` receive:
 | `mlx5_3` | 115.86GB | 5.16Gbps | 20.46Gbps |
 | `mlx5_4` | 115.86GB | 5.16Gbps | 20.46Gbps |
 
-Latest fixed 16k/c1 `trace` run: each P NIC transmitted 116.27GB over a
-139.3s monitor window, averaging 6.68Gbps per NIC with max 1s peak 12.14Gbps.
-Each D NIC received 116.76GB over a 140.2s window, averaging 6.66Gbps per NIC
-with max 1s peak 9.06Gbps.
+Latest fixed 16k/c1 `waitmini` run: each P NIC transmitted 116.76GB over a
+139.3s monitor window, averaging 6.71Gbps per NIC with max 1s peak 12.14Gbps.
+Each D NIC received 116.76GB over a 139.4s window, averaging 6.70Gbps per NIC
+with max 1s peak 13.62Gbps.
 
 ## Log Evidence
 
@@ -359,15 +366,27 @@ For the fixed 16k/c1 `trace` run:
 - `matched_to_dispatch_ms`: p50 9.16ms, p95 10.13ms.
 - D rank0 dispatch body itself remains small: p50 0.07ms, p95 0.12ms.
 
-After scheduler-block push and cached D handshake templates, D-side handshake
-construction is no longer material in the TTFT delta. The trace run shows that
-most fixed overhead is already present before D's scheduler-side
-`get_num_new_matched_tokens` callback runs. Scheduler wait construction is
-sub-ms, and scheduler-to-worker dispatch adds about 9ms, mostly RDMA
-`open_request`. The main remaining target is therefore D's vLLM HTTP/API to
-EngineCore ingress before scheduler matching; one known later component is that
-vLLM decrements a full external KV hit by one token, so D recomputes the last
-prompt token to produce sampling logits.
+For the fixed 16k/c1 `waitmini` run:
+
+- `proxy_to_matched_ms`: p50 94.86ms, p95 102.48ms.
+- `matched_to_wait_ms`: p50 0.29ms, p95 0.37ms.
+- Rank0 `open_request_ms`: p50 0.27ms, p95 0.42ms.
+- `proxy_to_dispatch_ms`: p50 96.83ms, p95 104.99ms.
+- `matched_to_dispatch_ms`: p50 1.99ms, p95 2.75ms.
+- Proxy stream header latency: p50 91.34ms, p95 98.55ms.
+- Proxy TTFT: p50 2409.07ms, p95 2444.66ms.
+- P-side `wait_sender_ms`: p50 1037.43ms.
+- P-side `wait_writes_ms`: p50 0.84ms.
+- P-side `push_native_avg_ms`: p50 0.03ms per layer push.
+
+After scheduler-block push, cached D handshake templates, and minimal D wait
+registration, D-side handshake/open registration is no longer material in the
+TTFT delta. The waitmini run shows that most fixed overhead is already present
+before D's scheduler-side `get_num_new_matched_tokens` callback runs. The main
+remaining target is therefore D's vLLM HTTP/API to EngineCore ingress before
+scheduler matching; one known later component is that vLLM decrements a full
+external KV hit by one token, so D recomputes the last prompt token to produce
+sampling logits.
 
 ## TCP and HTTP Microbench
 
@@ -385,12 +404,30 @@ more closely than a pooled async client.
 | h20-100 -> h20-99 | 272KB | 0.24 | 0.32 | 1.05 | 1.84 |
 
 The measured TCP/HTTP cost is not large enough to explain the real P/D timing:
-in the latest fixed 16k/c1 run, proxy accept to D rank0 dispatch was p50
-108.94ms and p95 125.41ms. The remaining delta is therefore application-layer
+in the latest fixed 16k/c1 run, proxy accept to D scheduler matching was p50
+94.86ms and p95 102.48ms. The remaining delta is therefore application-layer
 serialization before P starts: proxy sends only D first, D reaches scheduler
 allocation, then D dispatches the P prefill request. Since the P-side prefill
 HTTP latency is already approximately the direct baseline TTFT, this serialized
 pre-P-start section currently shows up almost directly as P/D TTFT overhead.
+
+## Local vLLM/Proxy Microbench
+
+Local checks on `/data/models/Kimi-K2.6` with the same random 16k benchmark
+shape show why D ingress is a plausible fixed-cost source:
+
+| local check | p50_ms | p95_ms | notes |
+|-------------|--------|--------|-------|
+| Kimi tokenizer encode 16k random prompt | 55.81 | 61.05 | `transformers.AutoTokenizer`, `add_special_tokens=True` |
+| proxy two-hop text prompt | 2.52 | 2.94 | fake D server, local loopback |
+| proxy two-hop token-list prompt before shallow-copy change | 11.36 | 11.97 | dominated by list `deepcopy` |
+| proxy two-hop token-list prompt after shallow-copy change | 5.64 | 6.30 | top-level request copy only |
+
+The benchmark client sends string prompts for the OpenAI completions path, so
+this proxy microbench does not by itself explain the H20 P/D overhead. It does
+confirm that tokenized request bodies avoid tokenizer work at the cost of JSON
+list parsing/copying, and that proxy forwarding is not a tens-of-ms component
+for string prompts.
 
 ## Conclusion
 
@@ -421,6 +458,9 @@ Remote result files:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528.json`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
 
 Service cleanup was verified after the experiment:
 

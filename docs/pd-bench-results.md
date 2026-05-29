@@ -60,8 +60,8 @@ Current fixed 32k/c1 sweep progress: the direct baseline leg was rerun on
 [h20-kimi-pd-mla-debug.md](h20-kimi-pd-mla-debug.md). It completed 50/50
 requests for input lengths 1024, 4096, 8192, 16384, and 30000. The matching P/D
 proxy leg has only been rerun for 16k after the single FIFO sender, compact
-handshake, compact JSON, scheduler-block push, and D handshake template cache
-changes.
+handshake, compact JSON, scheduler-block push, D handshake template cache, and
+minimal D wait-handshake changes.
 
 ### Setup
 
@@ -87,6 +87,8 @@ changes.
   `slot_mapping` back to CPU.
 - D-side rank0 prefill dispatch caches compact per-rank layer templates after
   peer layout gather and only fills shared `block_ids` per request.
+- D-side local RDMA wait registration opens a minimal one-layer/one-block
+  request while full per-rank handshakes are still sent to P.
 - Native RDMA write window reservation uses CAS before submit, so concurrent Python
   push threads cannot overrun the global write window.
 - Hot per-layer RDMA write logs are DEBUG; per-request summary logs remain INFO.
@@ -132,6 +134,7 @@ vLLM serving flags.
 | kimi-proxy-fixed32k-schedblocks-in16384-out1-c1-n50-seed20260528 | 50/50 | 124.32 | 0.402 | 6589.97 | 2485.86 | 2986.99 |
 | kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528 | 50/50 | 122.47 | 0.408 | 6689.38 | 2448.93 | 2897.89 |
 | kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528 | 50/50 | 122.05 | 0.410 | 6712.22 | 2440.53 | 2845.69 |
+| kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528 | 50/50 | 121.48 | 0.412 | 6744.16 | 2429.02 | 2809.90 |
 | proxy-16k-c4-prefill-parallel-batch32768-50 | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | proxy-16k-c4-windowfix-batch32768 | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
@@ -144,18 +147,18 @@ P/D except for the connector/proxy shape: `--load-format dummy`,
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|
-| 16384 | 2334.77 | 2440.53 | 105.76 | 4.53% | 2346.75 | 2845.69 | 50/50 | 50/50 | 0.43 | 0.41 |
+| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 0.43 | 0.41 |
 
-The latest 16k proxy run moved 116.27GB per P NIC over a 139.3s monitor window
-and 116.76GB per D NIC over a 140.2s monitor window: average 6.68Gbps per NIC
-on P transmit and 6.66Gbps per NIC on D receive. The
+The latest 16k proxy run moved 116.76GB per P NIC over a 139.3s monitor window
+and 116.76GB per D NIC over a 139.4s monitor window: average 6.71Gbps per NIC
+on P transmit and 6.70Gbps per NIC on D receive. The
 verified RDMA-only two-node integration test using the same 8-rank Kimi 16k
 shape moved 36.84GB in about 239ms, passed 100.66MB D-side deterministic
 payload sampling with per-iteration destination reset, and reached 1.23Tbps
 aggregate with 312-313Gbps per NIC. Therefore the vLLM pressure run is not
-limited by native RDMA bandwidth. In the latest 16k/c1 run, D rank0 handshake
-build fell from about 39.7ms to 0.04ms p50; the scheduler trace shows the
-remaining TTFT delta is mostly before D scheduler matching plus work after
+limited by native RDMA bandwidth. In the latest 16k/c1 run, D rank0
+`open_request_ms` fell from 7.34ms p50 to 0.27ms p50; the scheduler trace shows
+the remaining TTFT delta is mostly before D scheduler matching plus work after
 `finished_recving`. One known later component is D-side last-token recompute.
 
 Latest 16k/c1 log split:
@@ -165,6 +168,9 @@ Latest 16k/c1 log split:
 - Trace run `proxy_to_matched_ms`: p50 95.79ms, p95 104.66ms.
 - Trace run `matched_to_dispatch_ms`: p50 9.16ms, p95 10.13ms.
 - Trace run rank0 `open_request_ms`: p50 7.34ms, p95 8.35ms.
+- Waitmini run `proxy_to_matched_ms`: p50 94.86ms, p95 102.48ms.
+- Waitmini run `matched_to_dispatch_ms`: p50 1.99ms, p95 2.75ms.
+- Waitmini run rank0 `open_request_ms`: p50 0.27ms, p95 0.42ms.
 - P-side `wait_writes_ms`: p50 0.83ms, p95 0.89ms.
 - P-side `push_native_avg_ms`: p50 0.03ms, p95 0.04ms per layer push.
 - P-side `wait_sender_ms`: p50 1036.67ms.

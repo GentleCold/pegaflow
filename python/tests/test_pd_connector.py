@@ -922,12 +922,14 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
     )
     d_rdma = MockRdmaPort()
+    prefill_sender = FakePrefillSender()
     d_worker = PdWorkerConnector(
         SimpleNamespace(
             kv_transfer_config=SimpleNamespace(engine_id="decode"),
             parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
         ),
         rdma=d_rdma,
+        prefill_sender=prefill_sender,
     )
     d_worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
 
@@ -944,11 +946,21 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
     )
     d_worker.start_load_kv(wait_meta, None)
 
-    handshake = d_rdma.remote_handshakes.get("req-1")
+    wait_handshake = d_rdma.remote_handshakes.get("req-1")
+    assert wait_handshake is not None
+    assert wait_handshake.engine_id == "decode"
+    assert wait_handshake.block_size == 16
+    assert isinstance(wait_handshake.imm_id, int)
+    assert len(wait_handshake.layers) == 1
+    assert wait_handshake.layers[0].block_ids == (1,)
+
+    assert len(prefill_sender.tasks) == 1
+    task = prefill_sender.tasks[0]
+    handshake = handshake_from_dict(task.kv_transfer_params["pd_handshakes"][0])
     assert handshake is not None
     assert handshake.engine_id == "decode"
     assert handshake.block_size == 16
-    assert isinstance(handshake.imm_id, int)
+    assert handshake.imm_id == wait_handshake.imm_id
     assert handshake.layers[0].block_ids == (1, 2)
     assert handshake.layers[0].regions[0] == TransferRegionLayout(
         region_idx=0,

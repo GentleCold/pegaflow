@@ -10,7 +10,6 @@ notification from P.
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import logging
 import time
@@ -54,9 +53,10 @@ def build_pd_proxy_request(
     prefill_req_id = f"{req_id}-p"
     decode_req_id = f"{req_id}-d"
 
-    decode_body = copy.deepcopy(body)
-
-    decode_body["request_id"] = decode_req_id
+    decode_body = {
+        **body,
+        "request_id": decode_req_id,
+    }
     decode_body["kv_transfer_params"] = ConsumerKvParams(
         prefill_url=config.prefill_url,
         remote_request_id=prefill_req_id,

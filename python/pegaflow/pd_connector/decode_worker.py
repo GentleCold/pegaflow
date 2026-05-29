@@ -82,12 +82,15 @@ class DecodeHandler:
                 continue
             process_ts_ns = time.time_ns()
             self._wait_reqs[req_id] = req
-            handshake = self._build_handshake(
+            block_ids = flatten_block_ids(req.local_block_ids)
+            imm_id = self._alloc_imm_id()
+            wait_handshake = self._build_wait_handshake(
                 req.done_request_id,
-                flatten_block_ids(req.local_block_ids),
+                block_ids,
+                imm_id,
             )
-            self._w.rdma.open_request(req_id, handshake)
-            local_block_count = len(flatten_block_ids(req.local_block_ids))
+            self._w.rdma.open_request(req_id, wait_handshake)
+            local_block_count = len(block_ids)
             waiter_queued_ts_ns = time.time_ns()
             self._rdma_waiter.submit(
                 _RdmaWaitTask(
@@ -117,7 +120,7 @@ class DecodeHandler:
                 queued_ts_ns,
             )
             if req.prefill_url and self._w.tp_rank == 0:
-                self._dispatch_prefill(req, handshake.imm_id)
+                self._dispatch_prefill(req, block_ids, imm_id)
 
     def release(self, req_id: str) -> None:
         self._wait_reqs.pop(req_id, None)
@@ -139,25 +142,38 @@ class DecodeHandler:
     def wait_reqs(self) -> dict[str, WaitReqMeta]:
         return self._wait_reqs
 
-    def _build_handshake(self, req_id: str, block_ids: set[int]) -> PdHandshake:
-        imm_id = self._alloc_imm_id()
-        ordered_block_ids = tuple(sorted(block_ids))
+    def _build_wait_handshake(
+        self,
+        req_id: str,
+        block_ids: set[int],
+        imm_id: int,
+    ) -> PdHandshake:
+        assert block_ids, f"PdConnector D wait req={req_id} has no local KV blocks"
+        first_layer_name = self._w.layer_names[0]
+        first_block_id = min(block_ids)
         return PdHandshake(
             request_id=req_id,
             engine_id=self._w.engine_id,
             tp_rank=self._w.tp_rank,
             tp_size=self._w.tp_size,
             block_size=next(iter(self._w.layouts.values())).block_size,
-            layers=tuple(
-                self._remote_layout_with_mr_desc(layer_name, layer_idx, ordered_block_ids)
-                for layer_idx, layer_name in enumerate(self._w.layer_names)
+            layers=(
+                self._remote_layout_with_mr_desc(
+                    first_layer_name,
+                    0,
+                    (first_block_id,),
+                ),
             ),
             imm_id=imm_id,
         )
 
-    def _dispatch_prefill(self, req: WaitReqMeta, imm_id: int) -> None:
+    def _dispatch_prefill(
+        self,
+        req: WaitReqMeta,
+        block_ids: set[int],
+        imm_id: int,
+    ) -> None:
         started_ts_ns = time.time_ns()
-        block_ids = flatten_block_ids(req.local_block_ids)
         block_ids_ts_ns = time.time_ns()
         all_handshakes = self._build_all_rank_handshake_dicts(
             req.done_request_id,
