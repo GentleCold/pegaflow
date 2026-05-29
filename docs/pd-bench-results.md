@@ -177,6 +177,16 @@ teens Gbps per NIC.
 | 16384 | 7.71Gbps | 8.50Gbps | 12.14Gbps | 7.83Gbps | 14.27Gbps | 18.53Gbps |
 | 30000 | 7.04Gbps | 7.78Gbps | 10.00Gbps | 7.04Gbps | 7.79Gbps | 10.56Gbps |
 
+For 16k/c1, the observed active bandwidth is also the expected ceiling for the
+current layer-wise serving shape. Each rank pushes 1,151,336,448 bytes. At the
+verified RDMA-only rate of about 313Gbps/NIC, that payload would transfer in
+29.4ms if submitted as a ready batch. In serving, the same bytes become ready
+across the prefill layer window, about 1.18s, which gives 7.83Gbps/NIC. The gap
+is about 40x. Therefore c1 serving cannot saturate the NICs without either many
+more independent prefills in flight, deliberately batching ready KV and losing
+some overlap, or changing the P/D contract so the benchmark no longer waits for
+the current D-side completion path.
+
 Latest 16k/c1 log split:
 
 - D rank0 prefill dispatch: p50 0.07ms total, p95 0.14ms.

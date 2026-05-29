@@ -364,6 +364,15 @@ the low serving bandwidth is not just idle tail dilution:
 | 16384 | 7.71Gbps | 8.50Gbps | 12.14Gbps | 7.83Gbps | 14.27Gbps | 18.53Gbps |
 | 30000 | 7.04Gbps | 7.78Gbps | 10.00Gbps | 7.04Gbps | 7.79Gbps | 10.56Gbps |
 
+For 16k/c1, this is the expected ceiling of the current layer-wise serving
+shape. Each rank pushes 1,151,336,448 bytes. At the verified RDMA-only rate of
+about 313Gbps/NIC, that payload would take 29.4ms if submitted as a ready batch.
+In serving, the same bytes become ready over the prefill layer window, about
+1.18s, which gives 7.83Gbps/NIC. The gap is about 40x, so c1 serving cannot
+saturate the NICs unless the system has many more independent prefills in flight,
+deliberately batches ready KV at the cost of overlap, or changes the P/D contract
+around D-side completion.
+
 ## Log Evidence
 
 P-side final logs show about 1.1GB pushed per rank for a 16k request. However,
