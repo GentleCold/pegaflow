@@ -106,6 +106,28 @@ wait_stopped() {
   done
 }
 
+require_selected_gpus_idle() {
+  local name="$1"
+  local selected=",${CUDA_VISIBLE_DEVICES//[[:space:]]/},"
+  local busy=0
+  local idx used total
+  while IFS=, read -r idx used total; do
+    idx="${idx//[[:space:]]/}"
+    used="${used//[[:space:]]/}"
+    total="${total//[[:space:]]/}"
+    if [[ "$selected" != *",$idx,"* ]]; then
+      continue
+    fi
+    if (( used > 1024 )); then
+      echo "[$name] GPU $idx is busy: ${used}MiB/${total}MiB used; refusing to start Kimi TP$TP_SIZE" >&2
+      busy=1
+    fi
+  done < <(nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits)
+  if (( busy != 0 )); then
+    exit 1
+  fi
+}
+
 start_vllm() {
   local name="$1"
   local port="$2"
@@ -120,6 +142,7 @@ start_vllm() {
     return
   fi
 
+  require_selected_gpus_idle "$name"
   echo "[$name] starting on port $port, logs=$log_file"
   CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   PEGAFLOW_INSTANCE_ID="$engine_id" \
@@ -150,6 +173,7 @@ start_baseline() {
     return
   fi
 
+  require_selected_gpus_idle baseline
   echo "[baseline] starting on port $DECODE_PORT, logs=$log_file"
   CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   PYTHONHASHSEED=0 \
