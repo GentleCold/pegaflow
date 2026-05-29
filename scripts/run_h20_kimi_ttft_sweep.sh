@@ -68,8 +68,10 @@ monitor_local_nics() {
 
 monitor_remote_nics() {
   local out_file="$1"
+  local ssh_log="$out_file.ssh.log"
   ssh "$DECODE_SSH_HOST" \
-    "cd '$REMOTE_REPO_ROOT' && mkdir -p '$RESULT_DIR' && NICS='$NICS' NIC_SAMPLE_INTERVAL_S='$NIC_SAMPLE_INTERVAL_S' bash -lc 'while true; do ts=\$(date +%s.%N); for nic in \$NICS; do counters=/sys/class/infiniband/\$nic/ports/1/counters; printf \"%s,h20-100,%s,%s,%s\\n\" \"\$ts\" \"\$nic\" \"\$(cat \$counters/port_xmit_data)\" \"\$(cat \$counters/port_rcv_data)\"; done; sleep \"\$NIC_SAMPLE_INTERVAL_S\"; done' > '$out_file'" &
+    "cd '$REMOTE_REPO_ROOT' && mkdir -p '$RESULT_DIR' && NICS='$NICS' NIC_SAMPLE_INTERVAL_S='$NIC_SAMPLE_INTERVAL_S' bash -lc 'while true; do ts=\$(date +%s.%N); for nic in \$NICS; do counters=/sys/class/infiniband/\$nic/ports/1/counters; printf \"%s,h20-100,%s,%s,%s\\n\" \"\$ts\" \"\$nic\" \"\$(cat \$counters/port_xmit_data)\" \"\$(cat \$counters/port_rcv_data)\"; done; sleep \"\$NIC_SAMPLE_INTERVAL_S\"; done' > '$out_file'" \
+    </dev/null >"$ssh_log" 2>&1 &
   echo "$!"
 }
 
