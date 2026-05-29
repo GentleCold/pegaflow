@@ -415,6 +415,25 @@ scheduler matching; one known later component is that vLLM decrements a full
 external KV hit by one token, so D recomputes the last prompt token to produce
 sampling logits.
 
+The last-token recompute is a vLLM scheduler invariant, not a value that the
+PdConnector can change by reporting more matched tokens. In local vLLM
+`v1/core/sched/scheduler.py`, `_update_waiting_for_remote_kv()` caches the
+external blocks and then changes a full prompt hit from `num_tokens` to
+`num_tokens - 1` before the request is promoted back to `WAITING`. Removing that
+without a vLLM-side replacement path would leave the request with no token to
+schedule, so the connector-only options are exhausted here. Avoiding this cost
+requires changing the product contract: either D must receive logits/hidden
+state from P, or the proxy/API path must use P's first generated token and hand
+the continuation to D.
+
+The low serving RDMA average should also be read together with this overlap
+model. Native RDMA can move the same Kimi 16k shape at 1.23Tbps when the test
+submits a contiguous transfer. In the real serving path, layer-wise push sends
+KV as each CUDA layer event becomes ready, so the NICs are idle between layer
+readiness events. This is good for TTFT overlap but means the whole-request NIC
+average will not resemble the RDMA-only peak unless multiple independent
+prefills are in flight or the design intentionally batches the tail transfer.
+
 ## TCP and HTTP Microbench
 
 To check whether the remaining fixed 16k/c1 delta is caused by slow TCP, a

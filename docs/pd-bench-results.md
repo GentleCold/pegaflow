@@ -179,6 +179,14 @@ Latest 16k/c1 log split:
 - P-side `wait_sender_ms`: p50 1036.67ms.
 - D RDMA done to first proxy chunk: p50 23.63ms, p95 36.30ms.
 
+The post-RDMA D recompute is not removable from the connector alone. Local vLLM
+`v1/core/sched/scheduler.py` promotes a request after async KV receive by
+caching the external blocks and then changing a full prompt hit from
+`num_tokens` to `num_tokens - 1`; the scheduler needs one token to run so it can
+produce sampling logits. Avoiding that 20-40ms tail requires a vLLM/API-level
+contract change such as transferring logits/hidden state from P or using P's
+first generated token as the first output token.
+
 TCP/HTTP microbench on h20 does not explain the fixed overhead: a temporary
 Python echo server measured 170KB HTTP POST p50/p95 at 0.71/1.06ms from h20-99
 to h20-100 and 0.77/1.12ms in the reverse direction. For 272KB, HTTP p50/p95
