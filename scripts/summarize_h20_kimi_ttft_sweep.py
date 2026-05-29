@@ -26,6 +26,7 @@ class BenchResult:
     p99_ttft_ms: float
     completed: int
     failed: int
+    request_throughput: float
 
 
 @dataclass(frozen=True)
@@ -47,11 +48,13 @@ def main() -> None:
     print(
         "| input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | "
         "delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | "
+        "baseline_success | proxy_success | baseline_req_s | proxy_req_s | "
         "proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |"
     )
     print(
         "|-----------|-----------------------|-----------------------|----------|"
         "-----------|-----------------------|-------------------|"
+        "------------------|---------------|----------------|-------------|"
         "-----------------------------|------------------------------|-------|"
     )
     for input_len in sorted(set(baseline) | set(proxy)):
@@ -78,6 +81,10 @@ def main() -> None:
                     fmt(delta_pct(base, pd)),
                     fmt(base.p99_ttft_ms if base else None),
                     fmt(pd.p99_ttft_ms if pd else None),
+                    success(base),
+                    success(pd),
+                    fmt(base.request_throughput if base else None),
+                    fmt(pd.request_throughput if pd else None),
                     fmt(nic.avg_gbps_per_nic),
                     fmt(nic.peak_gbps_per_nic),
                     ", ".join(notes) if notes else "fixed 32k, c1",
@@ -101,6 +108,7 @@ def load_results(result_dir: Path, prefix: str) -> dict[int, BenchResult]:
             p99_ttft_ms=float(data["p99_ttft_ms"]),
             completed=int(data["completed"]),
             failed=int(data["failed"]),
+            request_throughput=float(data["request_throughput"]),
         )
     return results
 
@@ -153,6 +161,12 @@ def fmt(value: float | None) -> str:
     if value is None:
         return "TBD"
     return f"{value:.2f}"
+
+
+def success(result: BenchResult | None) -> str:
+    if result is None:
+        return "TBD"
+    return f"{result.completed}/{result.completed + result.failed}"
 
 
 if __name__ == "__main__":

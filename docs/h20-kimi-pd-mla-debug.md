@@ -171,13 +171,13 @@ direct baseline is restarted with the same fixed 32k vLLM serving flags.
 
 The final experiment table should be keyed by input length:
 
-| input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
-|-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|-----------------------------|------------------------------|-------|
-| 1024 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
-| 4096 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
-| 8192 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
-| 16384 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
-| 30000 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
+|-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|-----------------------------|------------------------------|-------|
+| 1024 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 4096 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 8192 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 16384 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 30000 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
 
 ## NIC Counter Result
 
