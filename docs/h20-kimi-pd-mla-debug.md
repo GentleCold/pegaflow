@@ -465,6 +465,37 @@ For the fixed 16k/c1 `waitmini` run:
 - P-side `wait_writes_ms`: p50 0.84ms.
 - P-side `push_native_avg_ms`: p50 0.03ms per layer push.
 
+For the 2026-05-29 16k/c1 `eventready-probe` run:
+
+- benchmark label:
+  `kimi-proxy-fixed32k-eventready-probe-in16384-out1-c1-n5-seed20260528`
+- success: 5/5; mean TTFT 2516.24ms, p50 2421.49ms, p95 2799.54ms,
+  p99 2873.39ms
+- P-side `forward_ms`: mean 1177.58ms, p95 1181.72ms
+- P-side `save_to_imm_ms`: mean 2235.75ms, p95 2277.94ms
+- P-side `wait_sender_ms`: mean 1041.55ms, p95 1065.96ms
+- P-side `wait_writes_ms`: mean 4.19ms, p50 0.91ms, p95 17.99ms
+- P-side `event_ready_window_ms`: mean 2223.15ms, p95 2255.71ms
+- P-side `event_ready_gbps`: mean 4.14Gbps per rank
+- P-side `native_call_gbps`: mean 3972.24Gbps per rank-equivalent call time
+- D-side `wait_ms`: mean 2341.15ms, p95 2543.05ms
+- D-side `queue_wait_ms`: mean 0.35ms, p95 0.62ms
+- D scheduler `proxy_to_finished_ms`: mean 2449.55ms, p95 2669.81ms
+- h20-99 transmit: every `mlx5_1..4` NIC moved 11.37GB, average 4.29Gbps,
+  peak 9.40Gbps
+- h20-100 receive: every `mlx5_1..4` NIC moved 11.60GB, average 4.38Gbps,
+  peak 11.23Gbps
+
+The byte count matches the expected 5 requests x 2 ranks per NIC x
+1,151,336,448 bytes per rank, about 11.51GB per NIC. This confirms the 4-NIC
+rank map is correct. The low per-NIC rate is not caused by native RDMA submit or
+completion: native calls are microsecond-scale and write completion is usually
+sub-ms. The serving path is limited by layer readiness cadence. Each NIC gets
+only two ranks' current-layer KV, about 38MB, then waits for the next CUDA layer
+event roughly 37ms later. That produces the observed 8-11Gbps active peaks for
+c1 serving even though the same payload saturates RDMA in the standalone
+ready-batch test.
+
 After scheduler-block push, cached D handshake templates, and minimal D wait
 registration, D-side handshake/open registration is no longer material in the
 TTFT delta. The waitmini run shows that most fixed overhead is already present
@@ -536,14 +567,14 @@ for string prompts.
 
 ## Conclusion
 
-Correctness passed, and all 4 NICs were used evenly. The c4 diagnostic result
-did not pass the bandwidth target: peak was only about 20Gbps per NIC, far below
-the expected H20 RDMA link capacity. The RDMA-only integration test reaches
-about 1.23Tbps aggregate, so native RDMA bandwidth is available when the upper
-pipeline feeds it continuously.
+Correctness passed, and all 4 NICs were used evenly. The serving runs do not
+fill the H20 RDMA links under c1 because the current layer-wise P/D contract
+feeds each NIC a small current-layer KV slice at layer cadence. The RDMA-only
+integration test reaches about 1.23Tbps aggregate, so native RDMA bandwidth is
+available when the upper pipeline feeds it continuously.
 
-The evidence points away from a single-NIC routing issue. The next performance
-work should focus on the remaining upper-layer latency:
+The evidence points away from a single-NIC routing issue or slow RDMA writes.
+The next performance work should focus on the remaining upper-layer latency:
 
 - decide whether TTFT should use P's first generated token or transfer
   logits/hidden state so D does not recompute the last prompt token;
