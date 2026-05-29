@@ -55,6 +55,12 @@ direct baseline vs P/D proxy with the same fixed non-connector vLLM serving flag
 Use `scripts/run_pd_h20_kimi.sh start-baseline` for the direct baseline and
 `scripts/run_h20_kimi_ttft_sweep.sh` for the paired c1 sweep.
 
+Current fixed 32k/c1 sweep progress: the direct baseline leg was rerun on
+2026-05-29 and recorded in
+[h20-kimi-pd-mla-debug.md](h20-kimi-pd-mla-debug.md). It completed 50/50
+requests for input lengths 1024, 4096, 8192, 16384, and 30000. The matching P/D
+proxy leg is still pending, so this is not yet the acceptance comparison table.
+
 ### Setup
 
 - Branch/commit: `docs/pd-mla-design`, `874e0c6 fix: improve pd rdma push throughput`

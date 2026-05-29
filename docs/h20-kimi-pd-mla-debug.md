@@ -150,6 +150,37 @@ uv run --no-project python scripts/summarize_h20_kimi_ttft_sweep.py \
   pd_h20_logs/bench/ttft-sweep
 ```
 
+## Fixed 32k C1 Sweep Progress
+
+The direct baseline leg was run on 2026-05-29 with the fixed serving contract:
+
+- baseline node: `h20-100`
+- benchmark client: `h20-99`
+- vLLM flags: `--load-format dummy`, `--max-num-batched-tokens 32768`,
+  no explicit `--block-size`, no explicit `--max-model-len`
+- vLLM resolved max model length: `262144`
+- benchmark: `--max-concurrency 1`, `--request-rate inf`,
+  `--random-range-ratio 0.0`, `--random-output-len 1`, `--num-prompts 50`
+
+The P/D proxy leg has not been rerun yet for this fixed table, so the rows below
+are not acceptance results.
+
+| input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
+|-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|-----------------------------|------------------------------|-------|
+| 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
+| 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
+| 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
+| 16384 | 2334.77 | TBD | TBD | TBD | 2346.75 | TBD | 50/50 | TBD | 0.43 | TBD | TBD | TBD | missing proxy |
+| 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
+
+Artifacts:
+
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-baseline-fixed32k-in1024-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-baseline-fixed32k-in4096-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-baseline-fixed32k-in8192-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-baseline-fixed32k-in16384-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-baseline-fixed32k-in30000-out1-c1-n50-seed20260528.json`
+
 ## Serving Result
 
 | run | success | duration_s | req/s | total_tok/s | mean_TTFT_ms | p99_TTFT_ms |
@@ -173,11 +204,11 @@ The final experiment table should be keyed by input length:
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|-----------------------------|------------------------------|-------|
-| 1024 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
-| 4096 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
-| 8192 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
-| 16384 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
-| 30000 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
+| 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
+| 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
+| 16384 | 2334.77 | TBD | TBD | TBD | 2346.75 | TBD | 50/50 | TBD | 0.43 | TBD | TBD | TBD | missing proxy |
+| 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 ## NIC Counter Result
 
