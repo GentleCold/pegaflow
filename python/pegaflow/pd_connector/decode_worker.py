@@ -9,13 +9,13 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pd_connector.kv_params import ProducerKvParams
 from pegaflow.pd_connector.layout import KvCacheLayout
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdHandshake,
     WaitReqMeta,
     flatten_block_ids,
+    layer_layout_to_compact_dict,
 )
 from pegaflow.pd_connector.prefill import AsyncPrefillSender, PrefillHttpTask
 from pegaflow.pd_connector.rdma import RdmaPort
@@ -38,6 +38,8 @@ class DecodeHandler:
         self._wait_reqs: dict[str, WaitReqMeta] = {}
         self._peer_layouts: dict[int, dict[str, KvCacheLayout]] = {}
         self._peer_mr_descs: dict[int, dict[str, Any]] = {}
+        self._peer_layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
+        self._peer_block_size: int | None = None
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
             _AsyncRdmaDoneWaiter(worker.rdma) if worker.rdma is not None else None
@@ -54,6 +56,7 @@ class DecodeHandler:
         if self._w.tp_size <= 1:
             self._peer_layouts = {0: self._w.layouts}
             self._peer_mr_descs = {0: mr_descs}
+            self._refresh_peer_layer_templates()
             return
         try:
             gathered = _all_gather_peer_info(self._w.layouts, mr_descs, self._w.tp_size)
@@ -63,10 +66,12 @@ class DecodeHandler:
             )
             self._peer_layouts = {self._w.tp_rank: self._w.layouts}
             self._peer_mr_descs = {self._w.tp_rank: mr_descs}
+            self._refresh_peer_layer_templates()
             return
         for rank, (layouts, descs) in enumerate(gathered):
             self._peer_layouts[rank] = layouts
             self._peer_mr_descs[rank] = descs
+        self._refresh_peer_layer_templates()
 
     def process_wait_reqs(self, reqs_to_wait: dict[str, WaitReqMeta]) -> None:
         assert self._w.rdma is not None, "PdConnector RDMA port is not initialized"
@@ -142,65 +147,82 @@ class DecodeHandler:
         )
 
     def _dispatch_prefill(self, req: WaitReqMeta, imm_id: int) -> None:
+        started_ts_ns = time.time_ns()
         block_ids = flatten_block_ids(req.local_block_ids)
-        all_handshakes = self._build_all_rank_handshakes(
+        block_ids_ts_ns = time.time_ns()
+        all_handshakes = self._build_all_rank_handshake_dicts(
             req.done_request_id,
             block_ids,
             imm_id,
         )
-        params = ProducerKvParams(
-            target_engine_id=self._w.engine_id,
-            target_request_id=req.done_request_id,
-            handshakes=all_handshakes,
-        )
+        handshakes_ts_ns = time.time_ns()
+        kv_transfer_params: dict[str, Any] = {
+            "do_remote_prefill_sender": True,
+            "target_engine_id": self._w.engine_id,
+            "target_request_id": req.done_request_id,
+            "pd_handshakes": all_handshakes,
+        }
         task = PrefillHttpTask(
             request_id=req.remote_request_id,
             prefill_url=req.prefill_url,
             model=req.model,
             prompt_token_ids=req.prompt_token_ids,
             max_tokens=req.prefill_max_tokens,
-            kv_transfer_params=params.to_dict(),
+            kv_transfer_params=kv_transfer_params,
         )
         self._prefill_sender.submit(task)
+        submitted_ts_ns = time.time_ns()
         logger.info(
-            "[PdConnector] D rank0 dispatched prefill req=%s remote_req=%s ranks=%d ts_ns=%d",
+            "[PdConnector] D rank0 dispatched prefill req=%s remote_req=%s ranks=%d blocks=%d block_ids_ms=%.3f handshakes_ms=%.3f params_ms=%.3f total_ms=%.3f ts_ns=%d",
             req.remote_request_id,
             req.done_request_id,
             len(all_handshakes),
-            time.time_ns(),
+            len(block_ids),
+            (block_ids_ts_ns - started_ts_ns) / 1_000_000,
+            (handshakes_ts_ns - block_ids_ts_ns) / 1_000_000,
+            (submitted_ts_ns - handshakes_ts_ns) / 1_000_000,
+            (submitted_ts_ns - started_ts_ns) / 1_000_000,
+            submitted_ts_ns,
         )
 
-    def _build_all_rank_handshakes(
+    def _build_all_rank_handshake_dicts(
         self,
         req_id: str,
         block_ids: set[int],
         imm_id: int,
-    ) -> tuple[PdHandshake, ...]:
+    ) -> list[dict[str, Any]]:
         result = []
-        block_size = next(iter(self._w.layouts.values())).block_size
-        ordered_block_ids = tuple(sorted(block_ids))
+        block_size = self._peer_block_size
+        assert block_size is not None, "peer layer templates are not initialized"
+        ordered_block_ids = sorted(block_ids)
         for rank in range(self._w.tp_size):
-            peer_layouts = self._peer_layouts[rank]
+            result.append(
+                {
+                    "request_id": req_id,
+                    "engine_id": self._w.engine_id,
+                    "tp_rank": rank,
+                    "tp_size": self._w.tp_size,
+                    "block_size": block_size,
+                    "block_ids": list(ordered_block_ids),
+                    "layers": list(self._peer_layer_templates[rank]),
+                    "imm_id": imm_id,
+                }
+            )
+        return result
+
+    def _refresh_peer_layer_templates(self) -> None:
+        self._peer_layer_templates = {}
+        self._peer_block_size = next(iter(self._w.layouts.values())).block_size
+        for rank, peer_layouts in self._peer_layouts.items():
             peer_mr_descs = self._peer_mr_descs[rank]
-            layers = tuple(
-                replace(
-                    peer_layouts[name].remote_layout(layer_idx, ordered_block_ids),
+            layers = []
+            for layer_idx, name in enumerate(self._w.layer_names):
+                layer = replace(
+                    peer_layouts[name].remote_layout(layer_idx, (0,)),
                     mr_desc=peer_mr_descs.get(name),
                 )
-                for layer_idx, name in enumerate(self._w.layer_names)
-            )
-            result.append(
-                PdHandshake(
-                    request_id=req_id,
-                    engine_id=self._w.engine_id,
-                    tp_rank=rank,
-                    tp_size=self._w.tp_size,
-                    block_size=block_size,
-                    layers=layers,
-                    imm_id=imm_id,
-                )
-            )
-        return tuple(result)
+                layers.append(layer_layout_to_compact_dict(layer))
+            self._peer_layer_templates[rank] = tuple(layers)
 
     def _alloc_imm_id(self) -> int:
         imm_id = self._next_imm_id

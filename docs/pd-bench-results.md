@@ -60,7 +60,8 @@ Current fixed 32k/c1 sweep progress: the direct baseline leg was rerun on
 [h20-kimi-pd-mla-debug.md](h20-kimi-pd-mla-debug.md). It completed 50/50
 requests for input lengths 1024, 4096, 8192, 16384, and 30000. The matching P/D
 proxy leg has only been rerun for 16k after the single FIFO sender, compact
-handshake, and compact JSON changes.
+handshake, compact JSON, scheduler-block push, and D handshake template cache
+changes.
 
 ### Setup
 
@@ -82,6 +83,10 @@ handshake, and compact JSON changes.
 
 - D-side prefill HTTP dispatch is parallelized with 8 sender threads.
 - P-side RDMA layer push uses one FIFO sender thread per worker.
+- P-side layer push uses scheduler-provided block ids instead of reading
+  `slot_mapping` back to CPU.
+- D-side rank0 prefill dispatch caches compact per-rank layer templates after
+  peer layout gather and only fills shared `block_ids` per request.
 - Native RDMA write window reservation uses CAS before submit, so concurrent Python
   push threads cannot overrun the global write window.
 - Hot per-layer RDMA write logs are DEBUG; per-request summary logs remain INFO.
@@ -124,6 +129,8 @@ vLLM serving flags.
 | proxy-16k-c1-prefill-parallel-batch32768 | 50/50 | 130.52 | 0.383 | 6225.64 | 2609.82 | 2883.63 |
 | kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528 | 50/50 | 126.48 | 0.395 | 6477.43 | 2529.09 | 2917.96 |
 | kimi-proxy-fixed32k-jsoncompact-singlefifo-in16384-out1-c1-n50-seed20260528 | 50/50 | 125.94 | 0.397 | 6505.33 | 2518.21 | 3016.47 |
+| kimi-proxy-fixed32k-schedblocks-in16384-out1-c1-n50-seed20260528 | 50/50 | 124.32 | 0.402 | 6589.97 | 2485.86 | 2986.99 |
+| kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528 | 50/50 | 122.47 | 0.408 | 6689.38 | 2448.93 | 2897.89 |
 | proxy-16k-c4-prefill-parallel-batch32768-50 | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | proxy-16k-c4-windowfix-batch32768 | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
@@ -136,18 +143,27 @@ P/D except for the connector/proxy shape: `--load-format dummy`,
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|
-| 16384 | 2334.77 | 2518.21 | 183.44 | 7.86% | 2346.75 | 3016.47 | 50/50 | 50/50 | 0.43 | 0.40 |
+| 16384 | 2334.77 | 2448.93 | 114.16 | 4.89% | 2346.75 | 2897.89 | 50/50 | 50/50 | 0.43 | 0.41 |
 
-The latest 16k proxy run moved about 116GB per NIC over a 143.4s monitor window:
-average 6.49Gbps per NIC on P transmit and 6.52Gbps per NIC on D receive. The
+The latest 16k proxy run moved 116.76GB per NIC over a 140.3s monitor window:
+average 6.66Gbps per NIC on P transmit and 6.66Gbps per NIC on D receive. The
 verified RDMA-only two-node integration test using the same 8-rank Kimi 16k
 shape moved 36.84GB in about 239ms, passed 100.66MB D-side deterministic
 payload sampling with per-iteration destination reset, and reached 1.23Tbps
 aggregate with 312-313Gbps per NIC. Therefore the vLLM pressure run is not
-limited by native RDMA bandwidth; after compact JSON
-the D-side RDMA wait median is aligned with the direct baseline median, and the
-remaining TTFT delta is currently attributed to work after `finished_recving`.
-One known component is D-side last-token recompute.
+limited by native RDMA bandwidth. In the latest 16k/c1 run, D rank0 handshake
+build fell from about 39.7ms to 0.04ms p50; the remaining TTFT delta is mostly
+proxy/D request setup before dispatch plus work after `finished_recving`. One
+known component is D-side last-token recompute.
+
+Latest 16k/c1 log split:
+
+- D rank0 prefill dispatch: p50 0.07ms total, p95 0.14ms.
+- Proxy accept to D rank0 dispatch: p50 108.94ms, p95 125.41ms.
+- P-side `wait_writes_ms`: p50 0.83ms, p95 0.89ms.
+- P-side `push_native_avg_ms`: p50 0.03ms, p95 0.04ms per layer push.
+- P-side `wait_sender_ms`: p50 1036.67ms.
+- D RDMA done to first proxy chunk: p50 23.63ms, p95 36.30ms.
 
 ### NIC Counter Result
 

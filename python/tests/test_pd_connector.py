@@ -850,7 +850,7 @@ def test_pd_worker_get_finished_does_not_poll_wait_reqs() -> None:
     assert worker.get_finished(set()) == (None, {"req-1"})
 
 
-def test_p_worker_extracts_slot_mapping_blocks_once_per_forward() -> None:
+def test_p_worker_uses_scheduler_blocks_without_slot_mapping_cpu_sync() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
@@ -872,16 +872,19 @@ def test_p_worker_extracts_slot_mapping_blocks_once_per_forward() -> None:
         None,
     )
 
-    slot_mapping = FakeSlotMapping([16, 17])
+    slot_mapping = FakeSlotMapping([999])
     attn_metadata = SimpleNamespace(slot_mapping=slot_mapping)
     worker.save_kv_layer("layer.0", tensor, attn_metadata)
     worker.save_kv_layer("layer.1", tensor, attn_metadata)
 
-    assert slot_mapping.cpu_calls == 1
+    assert slot_mapping.cpu_calls == 0
     worker.wait_for_save()
+    drain_pd_pushes(worker)
+    pushed_by_layer = pushed_layers_by_idx(worker.rdma, "req-1")
+    assert set(pushed_by_layer) == {0, 1}
 
 
-def test_p_worker_slot_mapping_cache_survives_wait_for_save_within_step() -> None:
+def test_p_worker_save_does_not_require_slot_mapping() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
@@ -903,13 +906,14 @@ def test_p_worker_slot_mapping_cache_survives_wait_for_save_within_step() -> Non
         None,
     )
 
-    slot_mapping = FakeSlotMapping([16, 17])
-    attn_metadata = SimpleNamespace(slot_mapping=slot_mapping)
+    attn_metadata = SimpleNamespace()
     worker.save_kv_layer("layer.0", tensor, attn_metadata)
     worker.wait_for_save()
     worker.save_kv_layer("layer.1", tensor, attn_metadata)
 
-    assert slot_mapping.cpu_calls == 1
+    drain_pd_pushes(worker)
+    pushed_by_layer = pushed_layers_by_idx(worker.rdma, "req-1")
+    assert set(pushed_by_layer) == {0, 1}
 
 
 def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -> None:
@@ -1255,6 +1259,9 @@ def test_d_worker_rank0_dispatches_prefill_on_wait() -> None:
     assert handshakes[0]["request_id"] == "external-d"
     assert handshakes[0]["block_ids"] == [1]
     assert "block_ids" not in handshakes[0]["layers"][0]
+    parsed = handshake_from_dict(handshakes[0])
+    assert parsed is not None
+    assert parsed.layers[0].block_ids == (1,)
 
 
 def test_async_prefill_sender_dispatches_requests_in_parallel(monkeypatch) -> None:

@@ -15,7 +15,6 @@ from pegaflow.pd_connector.layout import (
     block_ranges_for_remote_write,
     block_slices_bytes,
     layout_from_tensor,
-    unique_blocks_from_slot_mapping,
 )
 from pegaflow.pd_connector.metadata import (
     PdHandshake,
@@ -43,7 +42,6 @@ class PrefillHandler:
         self._producer_finished_req_ids: set[str] = set()
         self._remote_block_offsets: dict[str, int] = {}
         self._push_traces: dict[str, _PushTrace] = {}
-        self._slot_mapping_cache: tuple[int, set[int]] | None = None
         self._skipped_pushes = 0
         self._push_sender = _AsyncLayerPushSender()
         self._push_finalizer = _AsyncPushFinalizer(self._push_sender)
@@ -115,13 +113,6 @@ class PrefillHandler:
         )
         if not self._push_reqs:
             return
-        slot_mapping = attn_metadata.slot_mapping
-        touched_blocks = self._cached_unique_blocks_from_slot_mapping(
-            slot_mapping,
-            layout.block_size,
-        )
-        if not touched_blocks:
-            return
         import torch
 
         if torch.cuda.is_available():
@@ -129,7 +120,7 @@ class PrefillHandler:
             event.record(torch.cuda.current_stream())
         else:
             event = None
-        self._push_touched_blocks(layer_name, touched_blocks, event)
+        self._push_pending_blocks(layer_name, event)
 
     def wait_for_save(self) -> None:
         logger.debug(
@@ -163,7 +154,6 @@ class PrefillHandler:
         self._push_reqs.clear()
         self._pending_push_chunks.clear()
         self._push_chunk_maps.clear()
-        self._slot_mapping_cache = None
         self._completed_pushes.clear()
         self._producer_finished_req_ids.clear()
         self._remote_block_offsets.clear()
@@ -175,26 +165,7 @@ class PrefillHandler:
     def push_reqs(self) -> dict[str, PushReqMeta]:
         return self._push_reqs
 
-    def _cached_unique_blocks_from_slot_mapping(
-        self,
-        slot_mapping: Any,
-        block_size: int,
-    ) -> set[int]:
-        step_id = self._w._forward_step_id
-        if self._slot_mapping_cache is not None and self._slot_mapping_cache[0] == step_id:
-            return self._slot_mapping_cache[1]
-        start = time.perf_counter()
-        blocks = unique_blocks_from_slot_mapping(slot_mapping, block_size)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        self._slot_mapping_cache = (step_id, blocks)
-        logger.info(
-            "[PdConnector] P extracted slot_mapping blocks blocks=%d latency_ms=%.3f",
-            len(blocks),
-            elapsed_ms,
-        )
-        return blocks
-
-    def _push_touched_blocks(self, layer_name: str, touched_blocks: set[int], event: Any) -> None:
+    def _push_pending_blocks(self, layer_name: str, event: Any) -> None:
         layer_idx = self._w._layer_idx(layer_name)
         layout = self._w.layouts[layer_name]
         for req_id, req in list(self._push_reqs.items()):
@@ -205,9 +176,6 @@ class PrefillHandler:
                 continue
             req_blocks = flatten_block_ids(req.local_block_ids)
             if not req_blocks:
-                continue
-            selected_blocks = req_blocks & touched_blocks
-            if not selected_blocks:
                 continue
             trace = self._push_traces.setdefault(
                 req_id,
@@ -220,17 +188,17 @@ class PrefillHandler:
                 remote_block_ids, all_chunks_seen = self._remote_block_id_map(
                     req_id,
                     req,
-                    selected_blocks,
+                    req_blocks,
                 )
                 self._push_chunk_maps[req_id] = (remote_block_ids, all_chunks_seen)
-            assert selected_blocks.issubset(remote_block_ids), (
+            assert req_blocks.issubset(remote_block_ids), (
                 "PdConnector selected blocks must match the current registered push chunk; "
-                f"req={req_id} selected={sorted(selected_blocks)} "
+                f"req={req_id} selected={sorted(req_blocks)} "
                 f"mapped={sorted(remote_block_ids)}"
             )
             block_slices = block_ranges_for_remote_write(
                 layout,
-                selected_blocks,
+                req_blocks,
                 remote_block_ids,
             )
             rdma_bytes = block_slices_bytes(block_slices)
@@ -243,7 +211,7 @@ class PrefillHandler:
                     target_request_id=req.target_request_id,
                     chunk_idx=chunk_idx,
                     layer_idx=layer_idx,
-                    block_count=len(selected_blocks),
+                    block_count=len(req_blocks),
                     rdma_bytes=rdma_bytes,
                     block_slices=block_slices,
                     enqueued_ts_ns=time.time_ns(),
@@ -251,7 +219,7 @@ class PrefillHandler:
                 )
             )
             trace.rdma_bytes += rdma_bytes
-            self._tracker.mark_blocks_pushed(req_id, layer_idx, selected_blocks)
+            self._tracker.mark_blocks_pushed(req_id, layer_idx, req_blocks)
             if layer_idx != len(self._w.layer_names) - 1:
                 continue
             trace.chunk_count += 1
@@ -260,7 +228,7 @@ class PrefillHandler:
             self._push_chunk_maps.pop(req_id, None)
             chunk_complete = self._tracker.has_pushed_all_blocks(
                 req_id,
-                selected_blocks,
+                req_blocks,
                 num_layers=len(self._w.layer_names),
             )
             if not (chunk_complete and all_chunks_seen):
@@ -269,29 +237,30 @@ class PrefillHandler:
                     req_id,
                     req.target_request_id,
                     trace.chunk_count,
-                    len(selected_blocks),
+                    len(req_blocks),
                     _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
                 )
                 continue
             self._tracker.mark_done(req_id)
             finalize_ts_ns = time.time_ns()
             logger.info(
-                "[PdConnector] P all chunks done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f gbps=%.2f",
+                "[PdConnector] P all chunks done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f gbps=%.2f ts_ns=%d",
                 req_id,
                 req.target_request_id,
                 trace.chunk_count,
-                len(selected_blocks),
+                len(req_blocks),
                 trace.rdma_bytes,
                 (finalize_ts_ns - trace.queued_ts_ns) / 1_000_000,
                 _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
                 _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns),
+                finalize_ts_ns,
             )
             self._push_finalizer.submit(
                 _PushFinalizeTask(
                     rdma=self._w.rdma,
                     req_id=req_id,
                     target_request_id=req.target_request_id,
-                    num_blocks=len(selected_blocks),
+                    num_blocks=len(req_blocks),
                     chunk_count=trace.chunk_count,
                     first_save_ts_ns=trace.first_save_ts_ns,
                     finalize_queued_ts_ns=finalize_ts_ns,
@@ -734,7 +703,7 @@ class _AsyncPushFinalizer:
                 task.rdma.push_done(task.req_id)
                 done_ts_ns = time.time_ns()
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_avg_ms=%.3f push_queue_p50_ms=%.3f push_queue_p95_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_avg_ms=%.3f push_event_p50_ms=%.3f push_event_p95_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_avg_ms=%.3f push_native_p50_ms=%.3f push_native_p95_ms=%.3f push_native_max_ms=%.3f",
+                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_avg_ms=%.3f push_queue_p50_ms=%.3f push_queue_p95_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_avg_ms=%.3f push_event_p50_ms=%.3f push_event_p95_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_avg_ms=%.3f push_native_p50_ms=%.3f push_native_p95_ms=%.3f push_native_max_ms=%.3f ts_ns=%d",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
@@ -765,6 +734,7 @@ class _AsyncPushFinalizer:
                     push_stats.p50_native_ms(),
                     push_stats.p95_native_ms(),
                     push_stats.max_native_ms,
+                    done_ts_ns,
                 )
             except BaseException as exc:
                 if task is not None:
