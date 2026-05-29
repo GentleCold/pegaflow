@@ -59,8 +59,8 @@ Current fixed 32k/c1 sweep progress: the direct baseline leg was rerun on
 2026-05-29 and recorded in
 [h20-kimi-pd-mla-debug.md](h20-kimi-pd-mla-debug.md). It completed 50/50
 requests for input lengths 1024, 4096, 8192, 16384, and 30000. The matching P/D
-proxy leg has only been rerun for 16k after the single FIFO sender and compact
-handshake changes.
+proxy leg has only been rerun for 16k after the single FIFO sender, compact
+handshake, and compact JSON changes.
 
 ### Setup
 
@@ -123,6 +123,7 @@ vLLM serving flags.
 | d-baseline-16k | 50/50 | 135.45 | 0.369 | 5999.04 | 2701.34 | 3513.22 |
 | proxy-16k-c1-prefill-parallel-batch32768 | 50/50 | 130.52 | 0.383 | 6225.64 | 2609.82 | 2883.63 |
 | kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528 | 50/50 | 126.48 | 0.395 | 6477.43 | 2529.09 | 2917.96 |
+| kimi-proxy-fixed32k-jsoncompact-singlefifo-in16384-out1-c1-n50-seed20260528 | 50/50 | 125.94 | 0.397 | 6505.33 | 2518.21 | 3016.47 |
 | proxy-16k-c4-prefill-parallel-batch32768-50 | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | proxy-16k-c4-windowfix-batch32768 | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
@@ -135,13 +136,18 @@ P/D except for the connector/proxy shape: `--load-format dummy`,
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|
-| 16384 | 2334.77 | 2529.09 | 194.32 | 8.32% | 2346.75 | 2917.96 | 50/50 | 50/50 | 0.43 | 0.40 |
+| 16384 | 2334.77 | 2518.21 | 183.44 | 7.86% | 2346.75 | 3016.47 | 50/50 | 50/50 | 0.43 | 0.40 |
 
-The 16k proxy run moved about 116GB per NIC over a 143.3s monitor window:
-average 6.48Gbps per NIC on P transmit and 6.49Gbps per NIC on D receive. An
-RDMA-only two-node integration test using the same 8-rank Kimi 16k shape moved
-36.84GB in 202.8ms, about 1.45Tbps aggregate and about 365-369Gbps per NIC.
-Therefore the vLLM pressure run is not limited by native RDMA bandwidth.
+The latest 16k proxy run moved about 116GB per NIC over a 143.4s monitor window:
+average 6.49Gbps per NIC on P transmit and 6.52Gbps per NIC on D receive. The
+verified RDMA-only two-node integration test using the same 8-rank Kimi 16k
+shape moved 36.84GB in about 239ms, passed 100.66MB D-side deterministic
+payload sampling with per-iteration destination reset, and reached 1.23Tbps
+aggregate with 312-313Gbps per NIC. Therefore the vLLM pressure run is not
+limited by native RDMA bandwidth; after compact JSON
+the D-side RDMA wait median is aligned with the direct baseline median, and the
+remaining TTFT delta is currently attributed to work after `finished_recving`.
+One known component is D-side last-token recompute.
 
 ### NIC Counter Result
 
@@ -183,9 +189,10 @@ Decode node `h20-100` receive:
 - D logs show large `queue_wait_ms` for concurrent requests, often several
   seconds. Some requests later observe IMM almost immediately because the P-side
   push already completed before the D waiter reached them.
-- The next performance target should be reducing P-side layer scheduling/event
-  wait and D-side RDMA done waiter queueing. Increasing NIC count alone will not
-  raise bandwidth until the upper pipeline can feed RDMA continuously.
+- The next performance target should be the post-`finished_recving` path,
+  including D-side last-token recompute, proxy response handling, and scheduler
+  wakeup. Increasing NIC count alone will not raise bandwidth until the upper
+  pipeline can feed RDMA continuously.
 
 ### Cleanup
 
@@ -200,3 +207,5 @@ Logs/results remain on the machines:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/proxy-16k-c4-nicdelta-50.log`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/nic-proxy-c4-50-p.csv`
 - `h20-100:/root/develop/xingming/pegaflow/pd_h20_logs/bench/nic-proxy-c4-50-d.csv`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/rdma-it-kimi16k-itercheck-iters4-prefill.json`
+- `h20-100:/root/develop/xingming/pegaflow/pd_h20_logs/bench/rdma-it-kimi16k-itercheck-iters4-decode.json`

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import random
 import socket
 import sys
 import threading
@@ -335,6 +336,182 @@ def nic_delta(
     return out
 
 
+def expected_nic_bytes(
+    contexts: list[RankContext],
+    *,
+    iterations: int,
+    block_count: int,
+    block_bytes: int,
+) -> dict[str, int]:
+    bytes_per_rank = iterations * len(contexts[0].layers) * block_count * block_bytes
+    out = {ctx.nic: 0 for ctx in contexts}
+    for ctx in contexts:
+        out[ctx.nic] += bytes_per_rank
+    return out
+
+
+def buffer_sample_ranges(size: int, sample_bytes: int) -> tuple[tuple[int, int], ...]:
+    if sample_bytes <= 0:
+        return ()
+    length = min(size, sample_bytes)
+    return tuple(
+        (offset, length)
+        for offset in sorted({0, max(0, (size - length) // 2), size - length})
+    )
+
+
+def sample_pattern(rank: int, offset: int, length: int, seed: int) -> bytes:
+    rng_seed = ((seed & 0xFF) << 56) ^ ((rank & 0xFFFF) << 40) ^ offset
+    return random.Random(rng_seed).randbytes(length)
+
+
+def write_source_patterns(
+    contexts: list[RankContext], *, sample_bytes: int, seed: int
+) -> dict[str, list[tuple[int, int]]]:
+    written_ranges: dict[str, list[tuple[int, int]]] = {}
+    for ctx in contexts:
+        ranges = buffer_sample_ranges(ctx.buffer.size(), sample_bytes)
+        written_ranges[str(ctx.rank)] = list(ranges)
+        for offset, length in ranges:
+            ctx.buffer.write_bytes(
+                offset, sample_pattern(ctx.rank, offset, length, seed)
+            )
+    return written_ranges
+
+
+def reset_decode_sample_ranges(
+    contexts: list[RankContext], *, sample_bytes: int, value: int
+) -> None:
+    if sample_bytes <= 0:
+        return
+    for ctx in contexts:
+        for offset, length in buffer_sample_ranges(ctx.buffer.size(), sample_bytes):
+            ctx.buffer.write_bytes(offset, bytes([value]) * length)
+
+
+def verify_decode_buffers(
+    contexts: list[RankContext], *, seed: int, sample_bytes: int
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    sampled_bytes = 0
+    checked_ranges: dict[str, list[tuple[int, int]]] = {}
+    for ctx in contexts:
+        ranges = buffer_sample_ranges(ctx.buffer.size(), sample_bytes)
+        checked_ranges[str(ctx.rank)] = list(ranges)
+        for offset, length in ranges:
+            data = ctx.buffer.to_bytes_range(offset, length)
+            wanted = sample_pattern(ctx.rank, offset, length, seed)
+            if data != wanted:
+                mismatch = next(
+                    idx
+                    for idx, (actual, want) in enumerate(zip(data, wanted, strict=True))
+                    if actual != want
+                )
+                raise AssertionError(
+                    "RDMA payload mismatch "
+                    f"rank={ctx.rank} cuda={ctx.cuda_device} offset={offset + mismatch} "
+                    f"expected_seed=0x{seed:02x} actual=0x{data[mismatch]:02x}"
+                )
+            sampled_bytes += length
+    return {
+        "enabled": sample_bytes > 0,
+        "sample_bytes_per_range": sample_bytes,
+        "sampled_bytes": sampled_bytes,
+        "elapsed_ms": (time.perf_counter() - started) * 1000,
+        "ranges": checked_ranges,
+    }
+
+
+def summarize_verify_results(
+    verify_results: list[dict[str, Any]], *, sample_bytes: int
+) -> dict[str, Any]:
+    return {
+        "enabled": sample_bytes > 0,
+        "sample_bytes_per_range": sample_bytes,
+        "sampled_bytes": sum(int(result["sampled_bytes"]) for result in verify_results),
+        "elapsed_ms": sum(float(result["elapsed_ms"]) for result in verify_results),
+        "iterations": verify_results,
+    }
+
+
+def result_check_errors(
+    result: dict[str, Any],
+    *,
+    min_bandwidth_gbps: float,
+    min_nic_gbps: float,
+    min_nic_byte_ratio: float,
+) -> list[str]:
+    errors: list[str] = []
+    bandwidth = float(result["bandwidth_gbps"])
+    if min_bandwidth_gbps > 0 and bandwidth < min_bandwidth_gbps:
+        errors.append(
+            f"aggregate bandwidth {bandwidth:.2f}Gbps is below {min_bandwidth_gbps:.2f}Gbps"
+        )
+    if min_nic_gbps > 0:
+        direction = "xmit_gbps" if result["role"] == "prefill" else "rcv_gbps"
+        for nic, delta in sorted(result["nic_delta"].items()):
+            nic_gbps = float(delta[direction])
+            if nic_gbps < min_nic_gbps:
+                errors.append(
+                    f"{nic} {direction} {nic_gbps:.2f}Gbps is below {min_nic_gbps:.2f}Gbps"
+                )
+    if min_nic_byte_ratio > 0:
+        byte_direction = "xmit_GB" if result["role"] == "prefill" else "rcv_GB"
+        expected_by_nic = result["expected_nic_bytes"]
+        for nic, expected_bytes in sorted(expected_by_nic.items()):
+            actual_bytes = float(result["nic_delta"][nic][byte_direction]) * 1e9
+            min_bytes = int(expected_bytes) * min_nic_byte_ratio
+            if actual_bytes < min_bytes:
+                errors.append(
+                    f"{nic} {byte_direction} {actual_bytes / 1e9:.2f}GB is below "
+                    f"{min_nic_byte_ratio:.2f}x expected {int(expected_bytes) / 1e9:.2f}GB"
+                )
+    return errors
+
+
+def apply_result_checks(
+    result: dict[str, Any],
+    *,
+    min_bandwidth_gbps: float,
+    min_nic_gbps: float,
+    min_nic_byte_ratio: float,
+    extra_errors: list[str] | None = None,
+) -> list[str]:
+    errors = result_check_errors(
+        result,
+        min_bandwidth_gbps=min_bandwidth_gbps,
+        min_nic_gbps=min_nic_gbps,
+        min_nic_byte_ratio=min_nic_byte_ratio,
+    )
+    if extra_errors:
+        errors.extend(extra_errors)
+    if errors:
+        result["ok"] = False
+        result["error"] = "; ".join(errors)
+    return errors
+
+
+def finish_result(
+    result: dict[str, Any],
+    *,
+    json_out: str | None,
+    min_bandwidth_gbps: float,
+    min_nic_gbps: float,
+    min_nic_byte_ratio: float,
+    extra_errors: list[str] | None = None,
+) -> None:
+    errors = apply_result_checks(
+        result,
+        min_bandwidth_gbps=min_bandwidth_gbps,
+        min_nic_gbps=min_nic_gbps,
+        min_nic_byte_ratio=min_nic_byte_ratio,
+        extra_errors=extra_errors,
+    )
+    print_result(result, json_out)
+    if errors:
+        raise RuntimeError(result["error"])
+
+
 def run_rank_push(
     ctx: RankContext,
     *,
@@ -365,6 +542,9 @@ def run_prefill(args: argparse.Namespace) -> None:
         device=args.device,
         fill_byte=args.src_byte,
     )
+    source_patterns = write_source_patterns(
+        contexts, sample_bytes=args.verify_sample_bytes, seed=args.src_byte
+    )
     rank_by_id = {ctx.rank: ctx for ctx in contexts}
     nics = {ctx.nic for ctx in contexts}
 
@@ -381,40 +561,68 @@ def run_prefill(args: argparse.Namespace) -> None:
                 "blocks": args.blocks,
                 "block_bytes": args.block_bytes,
                 "iterations": args.iterations,
+                "src_byte": args.src_byte,
             },
         )
         setup = recv_json(sock_file)
         assert setup["event"] == "setup"
-        requests_by_rank: dict[int, list[dict[str, Any]]] = {rank: [] for rank in ranks}
+        requests_by_iteration_by_rank: dict[int, dict[int, dict[str, Any]]] = {
+            iteration: {} for iteration in range(args.iterations)
+        }
         for request in setup["requests"]:
             rank = int(request["rank"])
+            iteration = int(request["iteration"])
+            if iteration not in requests_by_iteration_by_rank:
+                raise ValueError(f"unexpected setup iteration {iteration}")
             ctx = rank_by_id[rank]
             register_remote(ctx.engine, request["prefill_req"], request["handshake"])
-            requests_by_rank[rank].append(request)
+            requests_by_iteration_by_rank[iteration][rank] = request
+        for iteration, requests_by_rank in requests_by_iteration_by_rank.items():
+            missing_ranks = sorted(set(ranks) - set(requests_by_rank))
+            if missing_ranks:
+                raise ValueError(
+                    f"setup missing ranks for iteration {iteration}: {missing_ranks}"
+                )
         send_json(sock_file, {"event": "registered"})
-        start = recv_json(sock_file)
-        assert start["event"] == "start"
 
         before = nic_counters(nics)
-        started = time.perf_counter()
-        threads = [
-            threading.Thread(
-                target=run_rank_push,
-                kwargs={
-                    "ctx": ctx,
-                    "requests": requests_by_rank[ctx.rank],
-                    "block_count": args.blocks,
-                    "block_bytes": args.block_bytes,
-                },
-                name=f"rdma-it-prefill-rank-{ctx.rank}",
-            )
-            for ctx in contexts
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        elapsed_s = time.perf_counter() - started
+        elapsed_s = 0.0
+
+        def run_checked(ctx: RankContext, request: dict[str, Any]) -> None:
+            try:
+                run_rank_push(
+                    ctx,
+                    requests=[request],
+                    block_count=args.blocks,
+                    block_bytes=args.block_bytes,
+                )
+            except BaseException as err:
+                thread_errors.append(err)
+
+        for iteration in range(args.iterations):
+            start = recv_json(sock_file)
+            assert start["event"] == "start"
+            assert int(start["iteration"]) == iteration
+            thread_errors: list[BaseException] = []
+            started = time.perf_counter()
+            requests_by_rank = requests_by_iteration_by_rank[iteration]
+            threads = [
+                threading.Thread(
+                    target=run_checked,
+                    args=(ctx, requests_by_rank[ctx.rank]),
+                    name=f"rdma-it-prefill-rank-{ctx.rank}-iter-{iteration}",
+                )
+                for ctx in contexts
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            elapsed_s += time.perf_counter() - started
+            if thread_errors:
+                raise RuntimeError(
+                    f"{len(thread_errors)} prefill push thread(s) failed"
+                ) from (thread_errors[0])
         after = nic_counters(nics)
 
         bytes_total = (
@@ -443,9 +651,24 @@ def run_prefill(args: argparse.Namespace) -> None:
                 for ctx in contexts
             },
             "nic_delta": nic_delta(before, after, elapsed_s),
+            "expected_nic_bytes": expected_nic_bytes(
+                contexts,
+                iterations=args.iterations,
+                block_count=args.blocks,
+                block_bytes=args.block_bytes,
+            ),
+            "source_patterns": source_patterns,
         }
+        errors = apply_result_checks(
+            result,
+            min_bandwidth_gbps=args.min_bandwidth_gbps,
+            min_nic_gbps=args.min_nic_gbps,
+            min_nic_byte_ratio=args.min_nic_byte_ratio,
+        )
         send_json(sock_file, {"event": "prefill_done", "result": result})
         print_result(result, args.json_out)
+        if errors:
+            raise RuntimeError(result["error"])
 
 
 def run_decode(args: argparse.Namespace) -> None:
@@ -480,8 +703,12 @@ def run_decode(args: argparse.Namespace) -> None:
             assert ready["blocks"] == args.blocks
             assert ready["block_bytes"] == args.block_bytes
             assert ready["iterations"] == args.iterations
+            src_byte = int(ready["src_byte"])
 
             requests: list[dict[str, Any]] = []
+            requests_by_iteration: dict[int, list[dict[str, Any]]] = {
+                iteration: [] for iteration in range(args.iterations)
+            }
             for iteration in range(args.iterations):
                 for rank in ranks:
                     ctx = rank_by_id[rank]
@@ -498,36 +725,63 @@ def run_decode(args: argparse.Namespace) -> None:
                         imm_id=imm_id,
                     )
                     register_remote(ctx.engine, decode_req, hs)
-                    requests.append(
-                        {
-                            "rank": rank,
-                            "iteration": iteration,
-                            "decode_req": decode_req,
-                            "prefill_req": prefill_req,
-                            "handshake": hs,
-                        }
-                    )
+                    request = {
+                        "rank": rank,
+                        "iteration": iteration,
+                        "decode_req": decode_req,
+                        "prefill_req": prefill_req,
+                        "handshake": hs,
+                    }
+                    requests.append(request)
+                    requests_by_iteration[iteration].append(request)
             send_json(sock_file, {"event": "setup", "requests": requests})
             registered = recv_json(sock_file)
             assert registered["event"] == "registered"
 
             before = nic_counters(nics)
-            started = time.perf_counter()
-            send_json(sock_file, {"event": "start"})
-            wait_threads = [
-                threading.Thread(
-                    target=ctx.engine.wait_done,
-                    args=(request["decode_req"],),
-                    name=f"rdma-it-decode-rank-{ctx.rank}-iter-{request['iteration']}",
+            elapsed_s = 0.0
+            verify_results: list[dict[str, Any]] = []
+
+            def wait_checked(ctx: RankContext, req_id: str) -> None:
+                try:
+                    ctx.engine.wait_done(req_id)
+                except BaseException as err:
+                    wait_errors.append(err)
+
+            for iteration in range(args.iterations):
+                reset_decode_sample_ranges(
+                    contexts,
+                    sample_bytes=args.verify_sample_bytes,
+                    value=args.dst_byte,
                 )
-                for request in requests
-                for ctx in (rank_by_id[int(request["rank"])],)
-            ]
-            for thread in wait_threads:
-                thread.start()
-            for thread in wait_threads:
-                thread.join()
-            elapsed_s = time.perf_counter() - started
+                send_json(sock_file, {"event": "start", "iteration": iteration})
+                wait_errors: list[BaseException] = []
+                started = time.perf_counter()
+                wait_threads = [
+                    threading.Thread(
+                        target=wait_checked,
+                        args=(ctx, request["decode_req"]),
+                        name=f"rdma-it-decode-rank-{ctx.rank}-iter-{iteration}",
+                    )
+                    for request in requests_by_iteration[iteration]
+                    for ctx in (rank_by_id[int(request["rank"])],)
+                ]
+                for thread in wait_threads:
+                    thread.start()
+                for thread in wait_threads:
+                    thread.join()
+                elapsed_s += time.perf_counter() - started
+                if wait_errors:
+                    raise RuntimeError(
+                        f"{len(wait_errors)} decode wait thread(s) failed"
+                    ) from (wait_errors[0])
+                verify_result = verify_decode_buffers(
+                    contexts,
+                    seed=src_byte,
+                    sample_bytes=args.verify_sample_bytes,
+                )
+                verify_result["iteration"] = iteration
+                verify_results.append(verify_result)
             after = nic_counters(nics)
             done = recv_json(sock_file)
             assert done["event"] == "prefill_done"
@@ -546,6 +800,9 @@ def run_decode(args: argparse.Namespace) -> None:
         "bytes": bytes_total,
         "elapsed_ms": elapsed_s * 1000,
         "bandwidth_gbps": bytes_total * 8 / elapsed_s / 1e9,
+        "verify": summarize_verify_results(
+            verify_results, sample_bytes=args.verify_sample_bytes
+        ),
         "prefill_result": done["result"],
         "rank_domains": {
             str(ctx.rank): {
@@ -559,8 +816,24 @@ def run_decode(args: argparse.Namespace) -> None:
             for ctx in contexts
         },
         "nic_delta": nic_delta(before, after, elapsed_s),
+        "expected_nic_bytes": expected_nic_bytes(
+            contexts,
+            iterations=args.iterations,
+            block_count=args.blocks,
+            block_bytes=args.block_bytes,
+        ),
     }
-    print_result(result, args.json_out)
+    extra_errors = []
+    if not result["prefill_result"].get("ok", False):
+        extra_errors.append(f"prefill failed: {result['prefill_result'].get('error')}")
+    finish_result(
+        result,
+        json_out=args.json_out,
+        min_bandwidth_gbps=args.min_bandwidth_gbps,
+        min_nic_gbps=args.min_nic_gbps,
+        min_nic_byte_ratio=args.min_nic_byte_ratio,
+        extra_errors=extra_errors,
+    )
 
 
 def print_result(result: dict[str, Any], json_out: str | None) -> None:
@@ -588,6 +861,10 @@ def main() -> None:
         subparser.add_argument("--iterations", type=int, default=1)
         subparser.add_argument("--device", choices=("cuda",), default="cuda")
         subparser.add_argument("--json-out")
+        subparser.add_argument("--min-bandwidth-gbps", type=float, default=0.0)
+        subparser.add_argument("--min-nic-gbps", type=float, default=0.0)
+        subparser.add_argument("--min-nic-byte-ratio", type=float, default=0.98)
+        subparser.add_argument("--verify-sample-bytes", type=int, default=1024 * 1024)
 
     decode = subparsers.add_parser("decode")
     add_common(decode)
@@ -615,6 +892,14 @@ def main() -> None:
         )
     if args.iterations <= 0:
         raise ValueError("iterations must be positive")
+    if (
+        args.min_bandwidth_gbps < 0
+        or args.min_nic_gbps < 0
+        or args.min_nic_byte_ratio < 0
+    ):
+        raise ValueError("bandwidth thresholds must be nonnegative")
+    if args.verify_sample_bytes < 0:
+        raise ValueError("verify-sample-bytes must be nonnegative")
     if args.role == "decode":
         run_decode(args)
     else:

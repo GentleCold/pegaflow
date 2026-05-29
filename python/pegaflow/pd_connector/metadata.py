@@ -39,6 +39,10 @@ def flatten_block_ids(block_ids: BlockIds) -> set[int]:
     return {block_id for group in block_ids for block_id in group}
 
 
+def _is_strictly_increasing(values: tuple[int, ...]) -> bool:
+    return all(prev < current for prev, current in zip(values, values[1:], strict=False))
+
+
 @dataclass(frozen=True)
 class WaitReqMeta:
     local_block_ids: BlockIds
@@ -81,9 +85,9 @@ class LayerRemoteLayout:
         assert self.layer_name
         assert self.layer_idx >= 0
         assert self.block_ids
-        assert self.block_ids == tuple(sorted(self.block_ids))
+        assert _is_strictly_increasing(self.block_ids)
         assert self.regions
-        assert all(block_id >= 0 for block_id in self.block_ids)
+        assert self.block_ids[0] >= 0
         assert tuple(region.region_idx for region in self.regions) == tuple(
             range(len(self.regions))
         )
@@ -126,11 +130,13 @@ def layer_layout_from_dict(
     if raw_block_ids is None:
         if block_ids is None:
             raise KeyError("block_ids")
-        raw_block_ids = block_ids
+        parsed_block_ids = block_ids
+    else:
+        parsed_block_ids = tuple(int(block_id) for block_id in raw_block_ids)
     return LayerRemoteLayout(
         layer_name=str(data["layer_name"]),
         layer_idx=int(data["layer_idx"]),
-        block_ids=tuple(int(block_id) for block_id in raw_block_ids),
+        block_ids=parsed_block_ids,
         regions=tuple(
             TransferRegionLayout(
                 region_idx=int(region["region_idx"]),

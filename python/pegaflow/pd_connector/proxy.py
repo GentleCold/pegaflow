@@ -60,6 +60,7 @@ def build_pd_proxy_request(
         prefill_url=config.prefill_url,
         remote_request_id=prefill_req_id,
         done_request_id=decode_req_id,
+        prefill_max_tokens=config.prefill_max_tokens,
     ).to_dict()
 
     return PdProxyRequest(
@@ -158,7 +159,7 @@ def _post_json(
     request_id: str,
     role: str,
 ) -> tuple[int, bytes, str]:
-    payload = json.dumps(body).encode()
+    payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
         "[PdProxy] request=%s -> %s url=%s body_bytes=%d kv=%s",
         request_id,
@@ -203,7 +204,7 @@ def _open_json(
     request_id: str,
     role: str,
 ):
-    payload = json.dumps(body).encode()
+    payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
         "[PdProxy] request=%s -> %s stream url=%s body_bytes=%d kv=%s",
         request_id,

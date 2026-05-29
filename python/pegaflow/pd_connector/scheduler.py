@@ -121,6 +121,7 @@ class PdSchedulerConnector:
                 prompt_token_ids=_prompt_token_ids(request),
                 prefill_url=consumer.prefill_url,
                 model=str(getattr(request, "model", "") or ""),
+                prefill_max_tokens=consumer.prefill_max_tokens,
             )
             self._active_waits[req_id] = wait_req
             self._reqs_to_wait[req_id] = wait_req

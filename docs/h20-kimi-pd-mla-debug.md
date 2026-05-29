@@ -164,15 +164,16 @@ The direct baseline leg was run on 2026-05-29 with the fixed serving contract:
 - benchmark: `--max-concurrency 1`, `--request-rate inf`,
   `--random-range-ratio 0.0`, `--random-output-len 1`, `--num-prompts 50`
 
-The P/D proxy leg has only been rerun for 16k after the single FIFO sender and
-compact handshake changes. Other input lengths are still pending.
+The P/D proxy leg has only been rerun for 16k after the single FIFO sender,
+compact handshake, and compact JSON changes. Other input lengths are still
+pending.
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|-----------------------------|------------------------------|-------|
 | 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
 | 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
 | 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | 2529.09 | 194.32 | 8.32% | 2346.75 | 2917.96 | 50/50 | 50/50 | 0.43 | 0.40 | 6.48 | 12.75 | proxy label `kimi-proxy-fixed32k-compacths2-singlefifo` |
+| 16384 | 2334.77 | 2518.21 | 183.44 | 7.86% | 2346.75 | 3016.47 | 50/50 | 50/50 | 0.43 | 0.40 | 6.49 | 10.63 | proxy label `kimi-proxy-fixed32k-jsoncompact-singlefifo` |
 | 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 Artifacts:
@@ -185,6 +186,9 @@ Artifacts:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528.json`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-jsoncompact-singlefifo-in16384-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-jsoncompact-singlefifo-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-jsoncompact-singlefifo-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
 
 ## RDMA-only Integration Test
 
@@ -193,12 +197,46 @@ Before another connector change, the RDMA path was isolated with
 as the P/D run: 61 layers, 1024 blocks, 18432 bytes per block, and the same
 rank-to-NIC map.
 
-Result on h20:
+The current IT command fails the run when aggregate bandwidth is below
+1000Gbps, when any active NIC direction is below 300Gbps, when any active NIC
+direction moves less than 0.98x of the expected bytes, or when D-side sampled
+payload bytes do not match the P-side rank/offset deterministic pattern. D
+resets sampled destination ranges before every iteration and verifies them
+immediately after that iteration completes, so a later skipped transfer cannot be
+hidden by a previous successful transfer.
+
+```bash
+python scripts/pd_rdma_two_node_it.py decode \
+  --iterations 4 \
+  --min-bandwidth-gbps 1000 \
+  --min-nic-gbps 300 \
+  --min-nic-byte-ratio 0.98 \
+  --verify-sample-bytes 1048576
+
+python scripts/pd_rdma_two_node_it.py prefill \
+  --decode-host 10.96.191.100 \
+  --iterations 4 \
+  --min-bandwidth-gbps 1000 \
+  --min-nic-gbps 300 \
+  --min-nic-byte-ratio 0.98 \
+  --verify-sample-bytes 1048576
+```
+
+Verified result on h20 on 2026-05-29:
 
 | side | bytes | elapsed_ms | aggregate_Gbps | per-NIC active direction |
 |------|-------|------------|----------------|--------------------------|
-| P push | 36.84GB | 202.79 | 1453.46 | ~368.5Gbps xmit on each of `mlx5_1..4` |
-| D receive | 36.84GB | 204.48 | 1441.46 | ~365.5Gbps recv on each of `mlx5_1..4` |
+| P push | 36.84GB | 238.63 | 1235.16 | 313.16Gbps xmit on each of `mlx5_1..4` |
+| D receive | 36.84GB | 239.19 | 1232.26 | 312.43Gbps recv on each of `mlx5_1..4` |
+
+Each NIC moved 9.34GB in the active direction versus 9.21GB expected. D sampled
+25.17MB per iteration, 100.66MB total across 4 iterations, and passed
+deterministic payload verification after every iteration.
+
+Artifacts:
+
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/rdma-it-kimi16k-itercheck-iters4-prefill.json`
+- `h20-100:/root/develop/xingming/pegaflow/pd_h20_logs/bench/rdma-it-kimi16k-itercheck-iters4-decode.json`
 
 This rules out RDMA engine bandwidth as the current bottleneck. The low NIC
 average seen in vLLM pressure runs is caused by upper-layer submission cadence
@@ -221,6 +259,7 @@ direct baseline is restarted with the same fixed 32k vLLM serving flags.
 | `kimi-proxy-fixed32k-singlefifo-in16384-out1-c1-n50-seed20260528` | 50/50 | 130.68 | 0.383 | 6269.62 | 2613.22 | 2772.61 |
 | `kimi-proxy-fixed32k-compacths-singlefifo-in16384-out1-c1-n50-seed20260528` | 50/50 | 127.20 | 0.393 | 6439.95 | 2543.45 | 3119.31 |
 | `kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528` | 50/50 | 126.48 | 0.395 | 6477.43 | 2529.09 | 2917.96 |
+| `kimi-proxy-fixed32k-jsoncompact-singlefifo-in16384-out1-c1-n50-seed20260528` | 50/50 | 125.94 | 0.397 | 6505.33 | 2518.21 | 3016.47 |
 | `proxy-16k-c4-prefill-parallel-batch32768-50` | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | `proxy-16k-c4-windowfix-batch32768` | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
@@ -233,7 +272,7 @@ The final experiment table should be keyed by input length:
 | 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
 | 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
 | 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | 2529.09 | 194.32 | 8.32% | 2346.75 | 2917.96 | 50/50 | 50/50 | 0.43 | 0.40 | 6.48 | 12.75 | compact handshake + single FIFO sender |
+| 16384 | 2334.77 | 2518.21 | 183.44 | 7.86% | 2346.75 | 3016.47 | 50/50 | 50/50 | 0.43 | 0.40 | 6.49 | 10.63 | compact handshake + compact JSON + single FIFO sender |
 | 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 ## NIC Counter Result
@@ -278,17 +317,23 @@ D-side wait logs show large queueing under concurrency:
 - Some requests later see near-zero `wait_ms`, because the P-side IMM already
   arrived before the D waiter reached that request.
 
-For the fixed 16k/c1 `compacths2-singlefifo` run:
+For the fixed 16k/c1 `jsoncompact-singlefifo` run:
 
-- P-side `wait_writes_ms`: p50 0.83ms, p95 1.12ms.
-- P-side `push_native_avg_ms`: p50 0.035ms per layer push.
-- P-side `wait_sender_ms`: p50 1036.12ms. This is dominated by waiting for
+- P-side `wait_writes_ms`: p50 0.83ms, p95 1.02ms.
+- P-side `push_native_avg_ms`: p50 0.033ms per layer push.
+- P-side `wait_sender_ms`: p50 1036.87ms. This is dominated by waiting for
   CUDA layer events and the prefill tail, not RDMA completion.
-- D-side `RDMA open_request native_ms`: p50 2.20ms, p95 2.95ms.
-- D-side `RDMA wait_ms`: p50 2379.03ms, p95 2404.30ms, max 2777.53ms.
-- D rank0 queue-to-prefill dispatch: p50 29.99ms, p95 31.26ms.
-- D-to-P HTTP payload after compact handshake: p50 313KB, p95 328KB. Before the
-  compact handshake this was about 3.76MB.
+- D-side `RDMA open_request native_ms`: p50 2.29ms, p95 3.00ms.
+- D-side `RDMA wait_ms`: p50 2333.32ms, p95 2355.39ms, max 2988.30ms.
+- D rank0 queue-to-prefill dispatch: p50 39.84ms, p95 42.79ms.
+- D-to-P HTTP payload after compact handshake and compact JSON: p50 280KB,
+  p95 295KB. Before the compact handshake this was about 3.76MB.
+
+After compact JSON and shared block-id parsing, D-side RDMA wait median is
+aligned with the direct baseline median. The remaining median TTFT delta is
+currently attributed to work after `finished_recving`; one known component is
+that vLLM decrements a full external KV hit by one token, so D recomputes the
+last prompt token to produce sampling logits.
 
 ## Conclusion
 
@@ -301,8 +346,9 @@ pipeline feeds it continuously.
 The evidence points away from a single-NIC routing issue. The next performance
 work should focus on the remaining upper-layer latency:
 
+- decide whether TTFT should use P's first generated token or transfer
+  logits/hidden state so D does not recompute the last prompt token;
 - reduce the D rank0 queue-to-prefill dispatch and HTTP serialization path;
-- reduce the post-RDMA D decode/proxy response overhead;
 - keep P-side layer-wise push as one FIFO sender unless a future design can
   prove readiness-aware scheduling without waiting on later CUDA events.
 

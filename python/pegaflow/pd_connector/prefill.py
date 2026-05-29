@@ -73,7 +73,7 @@ def post_prefill_request(task: PrefillHttpTask) -> None:
         "request_id": task.request_id,
         "kv_transfer_params": task.kv_transfer_params,
     }
-    payload = json.dumps(body).encode()
+    payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
         "[PdConnector] D -> P prefill request req=%s url=%s tokens=%d payload_bytes=%d target_req=%s ts_ns=%d",
         task.request_id,

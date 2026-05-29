@@ -245,6 +245,44 @@ impl PdRdmaTestBuffer {
             .map_err(|err| pd_rdma_error("cuda test buffer copy_to_vec failed", err))?;
         Ok(PyBytes::new(py, &data))
     }
+
+    fn to_bytes_range<'py>(
+        &self,
+        py: Python<'py>,
+        offset: usize,
+        len: usize,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| PyValueError::new_err("cuda test buffer range overflows usize"))?;
+        if end > self.mem.size() {
+            return Err(PyValueError::new_err(format!(
+                "cuda test buffer range [{offset}, {end}) exceeds size {}",
+                self.mem.size()
+            )));
+        }
+        let data = self
+            .mem
+            .copy_range_to_vec(offset, len)
+            .map_err(|err| pd_rdma_error("cuda test buffer copy_range_to_vec failed", err))?;
+        Ok(PyBytes::new(py, &data))
+    }
+
+    fn write_bytes(&self, offset: usize, data: Bound<'_, PyBytes>) -> PyResult<()> {
+        let bytes = data.as_bytes();
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| PyValueError::new_err("cuda test buffer range overflows usize"))?;
+        if end > self.mem.size() {
+            return Err(PyValueError::new_err(format!(
+                "cuda test buffer range [{offset}, {end}) exceeds size {}",
+                self.mem.size()
+            )));
+        }
+        self.mem
+            .copy_range_from_slice(offset, bytes)
+            .map_err(|err| pd_rdma_error("cuda test buffer copy_range_from_slice failed", err))
+    }
 }
 
 #[pyclass]

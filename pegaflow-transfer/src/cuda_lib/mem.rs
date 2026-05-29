@@ -97,6 +97,47 @@ impl CudaDeviceMemory {
         }
     }
 
+    pub fn copy_range_to_vec(&self, offset: usize, len: usize) -> Result<Vec<u8>, CudartError> {
+        if offset > self.size || len > self.size - offset {
+            return Err(CudartError::new(1, "cudaMemcpyDeviceToHost range"));
+        }
+        let mut data = vec![0; len];
+        let src = unsafe { (self.ptr.as_ptr() as *const u8).add(offset) as *const c_void };
+        let ret = unsafe {
+            cudart_sys::cudaMemcpy(
+                data.as_mut_ptr() as *mut c_void,
+                src,
+                len,
+                cudart_sys::cudaMemcpyDeviceToHost,
+            )
+        };
+        if ret == cudart_sys::cudaError::cudaSuccess {
+            Ok(data)
+        } else {
+            Err(CudartError::new(ret as u32, "cudaMemcpyDeviceToHost"))
+        }
+    }
+
+    pub fn copy_range_from_slice(&self, offset: usize, data: &[u8]) -> Result<(), CudartError> {
+        if offset > self.size || data.len() > self.size - offset {
+            return Err(CudartError::new(1, "cudaMemcpyHostToDevice range"));
+        }
+        let dst = unsafe { (self.ptr.as_ptr() as *mut u8).add(offset) as *mut c_void };
+        let ret = unsafe {
+            cudart_sys::cudaMemcpy(
+                dst,
+                data.as_ptr() as *const c_void,
+                data.len(),
+                cudart_sys::cudaMemcpyHostToDevice,
+            )
+        };
+        if ret == cudart_sys::cudaError::cudaSuccess {
+            Ok(())
+        } else {
+            Err(CudartError::new(ret as u32, "cudaMemcpyHostToDevice"))
+        }
+    }
+
     pub fn get_ptr<T>(&self) -> *const T {
         self.ptr.as_ptr() as *const T
     }

@@ -31,6 +31,7 @@ import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
 import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
 import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
 from pegaflow.pd_connector import PdConnector  # noqa: E402
+from pegaflow.pd_connector.kv_params import parse_consumer  # noqa: E402
 from pegaflow.pd_connector.layout import (  # noqa: E402
     BlockRegionSlice,
     FlashAttnHndLayout,
@@ -1088,6 +1089,37 @@ def test_scheduler_carries_prompt_tokens_for_d_to_p_oob() -> None:
     assert meta.reqs_to_wait["req-1"].prompt_token_ids == (11, 12, 13)
 
 
+def test_scheduler_carries_prefill_max_tokens_for_d_to_p_oob() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="d"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "prefill_url": "http://p:8001",
+            "prefill_max_tokens": 3,
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    meta = scheduler.build_connector_meta(SimpleNamespace())
+
+    assert meta.reqs_to_wait["req-1"].prefill_max_tokens == 3
+
+
+def test_consumer_params_reject_invalid_prefill_max_tokens() -> None:
+    with pytest.raises(ValueError, match="prefill_max_tokens must be positive"):
+        parse_consumer(
+            {
+                "do_remote_prefill": True,
+                "prefill_url": "http://p:8001",
+                "prefill_max_tokens": 0,
+            }
+        )
+
+
 def test_scheduler_carries_cross_process_rdma_handshake() -> None:
     handshake = {
         "request_id": "decode-1",
@@ -1662,6 +1694,7 @@ def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
         "prefill_url": "http://127.0.0.1:8001",
         "remote_request_id": "pd-test-p",
         "done_request_id": "pd-test-d",
+        "prefill_max_tokens": 1,
     }
 
 
