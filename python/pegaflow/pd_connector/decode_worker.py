@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from pegaflow.pd_connector.worker import PdWorkerConnector
 
 logger = get_connector_logger()
+RDMA_DONE_WAITER_WORKERS = 8
 
 
 class DecodeHandler:
@@ -286,40 +287,59 @@ class _RdmaWaitTask:
 
 
 class _AsyncRdmaDoneWaiter:
-    def __init__(self, rdma: RdmaPort) -> None:
+    def __init__(
+        self,
+        rdma: RdmaPort,
+        worker_count: int = RDMA_DONE_WAITER_WORKERS,
+    ) -> None:
+        assert worker_count > 0, "RDMA done waiter worker_count must be positive"
         self.rdma = rdma
         self._queue: queue.Queue[_RdmaWaitTask | None] = queue.Queue()
         self._submitted: set[str] = set()
-        self._thread = threading.Thread(target=self._run, name="pd-rdma-done-waiter", daemon=True)
-        self._thread.start()
+        self._lock = threading.Lock()
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"pd-rdma-done-waiter-{idx}",
+                daemon=True,
+            )
+            for idx in range(worker_count)
+        ]
+        for thread in self._threads:
+            thread.start()
+        logger.info("[PdConnector] D RDMA done waiter started workers=%d", worker_count)
 
     def submit(self, task: _RdmaWaitTask) -> None:
-        if task.req_id in self._submitted:
-            return
-        self._submitted.add(task.req_id)
+        with self._lock:
+            if task.req_id in self._submitted:
+                return
+            self._submitted.add(task.req_id)
+            queue_depth = self._queue.qsize()
         logger.info(
-            "[PdConnector] D RDMA wait queued req=%s remote_req=%s done_req=%s rank=%d blocks=%d prefill_url=%s queue_depth=%d",
+            "[PdConnector] D RDMA wait queued req=%s remote_req=%s done_req=%s rank=%d blocks=%d prefill_url=%s queue_depth=%d workers=%d",
             task.req_id,
             task.remote_request_id,
             task.done_request_id,
             task.rank,
             task.block_count,
             task.prefill_url or "<oob>",
-            self._queue.qsize(),
+            queue_depth,
+            len(self._threads),
         )
         self._queue.put(task)
 
     def close(self) -> None:
-        self._queue.put(None)
+        for _ in self._threads:
+            self._queue.put(None)
 
     def _run(self) -> None:
         while True:
             item = self._queue.get()
-            if item is None:
-                return
-            task = item
-            start_ts_ns = time.time_ns()
             try:
+                if item is None:
+                    return
+                task = item
+                start_ts_ns = time.time_ns()
                 self.rdma.wait_done(task.req_id)
                 done_ts_ns = time.time_ns()
                 logger.info(
@@ -345,6 +365,11 @@ class _AsyncRdmaDoneWaiter:
                     (start_ts_ns - task.queued_ts_ns) / 1_000_000,
                     (failed_ts_ns - start_ts_ns) / 1_000_000,
                 )
+            finally:
+                if item is not None:
+                    with self._lock:
+                        self._submitted.discard(item.req_id)
+                self._queue.task_done()
 
 
 def _all_gather_peer_info(

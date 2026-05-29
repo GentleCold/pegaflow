@@ -272,6 +272,10 @@ Decode node `h20-100` receive:
   `proxy_to_finished_ms`, `matched_to_finished_ms`, and `wait_to_finished_ms`.
   These can be compared with `D received RDMA done ... ts_ns` and proxy first
   stream chunk timestamps to isolate the post-RDMA D tail.
+- The D-side RDMA done waiter now uses 8 fixed workers. This keeps the P-side
+  layer FIFO unchanged while allowing independent D requests to wait for IMM in
+  parallel, targeting the c4 `queue_wait_ms` pathology where one long wait delayed
+  later already-completed requests.
 - The next performance target should be the post-`finished_recving` path,
   including D-side last-token recompute, proxy response handling, and scheduler
   wakeup. Increasing NIC count alone will not raise bandwidth until the upper

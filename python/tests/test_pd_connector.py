@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -27,6 +28,7 @@ native.QueryReady = object
 native.__version__ = "test"
 sys.modules["pegaflow.pegaflow"] = native
 
+import pegaflow.pd_connector.decode_worker as decode_worker_mod  # noqa: E402
 import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
 import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
 import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
@@ -1304,6 +1306,61 @@ def test_async_prefill_sender_dispatches_requests_in_parallel(monkeypatch) -> No
     finally:
         release_first.set()
         sender.close()
+
+
+def test_rdma_done_waiter_dispatches_requests_in_parallel() -> None:
+    class BlockingRdma:
+        def __init__(self) -> None:
+            self.second_started = threading.Event()
+            self.release_first = threading.Event()
+            self.started: queue.Queue[str] = queue.Queue()
+            self.finished: queue.Queue[str] = queue.Queue()
+
+        def wait_done(self, req_id: str) -> None:
+            self.started.put(req_id)
+            if req_id == "first":
+                assert self.second_started.wait(timeout=2)
+                assert self.release_first.wait(timeout=2)
+            else:
+                self.second_started.set()
+            self.finished.put(req_id)
+
+    rdma = BlockingRdma()
+    waiter = decode_worker_mod._AsyncRdmaDoneWaiter(rdma, worker_count=2)
+    try:
+        waiter.submit(
+            decode_worker_mod._RdmaWaitTask(
+                req_id="first",
+                remote_request_id="first-p",
+                done_request_id="first-d",
+                prefill_url="http://p:8001",
+                rank=0,
+                block_count=1,
+                queued_ts_ns=time.time_ns(),
+            )
+        )
+        assert rdma.started.get(timeout=2) == "first"
+        waiter.submit(
+            decode_worker_mod._RdmaWaitTask(
+                req_id="second",
+                remote_request_id="second-p",
+                done_request_id="second-d",
+                prefill_url="http://p:8001",
+                rank=0,
+                block_count=1,
+                queued_ts_ns=time.time_ns(),
+            )
+        )
+
+        assert rdma.second_started.wait(timeout=2)
+        rdma.release_first.set()
+        assert {rdma.finished.get(timeout=2), rdma.finished.get(timeout=2)} == {
+            "first",
+            "second",
+        }
+    finally:
+        rdma.release_first.set()
+        waiter.close()
 
 
 def test_layer_push_sender_does_not_recreate_discarded_stats() -> None:

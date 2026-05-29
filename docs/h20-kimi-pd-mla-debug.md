@@ -395,6 +395,9 @@ D-side wait logs show large queueing under concurrency:
   scheduler `proxy_to_finished_ms`, `matched_to_finished_ms`, and
   `wait_to_finished_ms`, so the post-RDMA D tail can be aligned with proxy first
   chunk timing.
+- the D-side RDMA done waiter now uses 8 fixed workers, so independent D
+  requests can wait for IMM in parallel. P-side layer push remains one FIFO
+  sender.
 
 For the fixed 16k/c1 `handshakecache` run:
 
