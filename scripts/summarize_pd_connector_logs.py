@@ -75,6 +75,12 @@ EVENTS = (
             "ready_window_gbps",
             "link_gbps",
             "ready_link_util_pct",
+            "event_ready_window_ms",
+            "event_ready_gbps",
+            "event_ready_link_util_pct",
+            "native_submit_window_ms",
+            "native_submit_gbps",
+            "native_call_gbps",
             "push_queue_p95_ms",
             "push_event_p95_ms",
             "push_native_avg_ms",
@@ -116,6 +122,16 @@ TIMELINE_METRICS = (
     MetricSpec("p_wait_writes_ms", "p_rdma_done", "wait_writes_ms", max),
     MetricSpec("p_ready_window_gbps", "p_rdma_done", "ready_window_gbps", mean),
     MetricSpec("p_ready_link_util_pct", "p_rdma_done", "ready_link_util_pct", mean),
+    MetricSpec("p_event_ready_window_ms", "p_rdma_done", "event_ready_window_ms", max),
+    MetricSpec("p_event_ready_gbps", "p_rdma_done", "event_ready_gbps", mean),
+    MetricSpec(
+        "p_event_ready_link_util_pct",
+        "p_rdma_done",
+        "event_ready_link_util_pct",
+        mean,
+    ),
+    MetricSpec("p_native_submit_gbps", "p_rdma_done", "native_submit_gbps", mean),
+    MetricSpec("p_native_call_gbps", "p_rdma_done", "native_call_gbps", mean),
     MetricSpec("d_queue_wait_ms", "d_rdma_done", "queue_wait_ms", max),
     MetricSpec("d_wait_ms", "d_rdma_done", "wait_ms", max),
     MetricSpec(
@@ -308,13 +324,17 @@ def print_request_timeline(records: list[Record], limit: int) -> None:
     print(
         "| request | proxy_ttft_ms | p_forward_ms | p_save_to_imm_ms | "
         "p_wait_sender_ms | p_wait_writes_ms | p_ready_window_gbps | "
-        "p_ready_link_util_pct | d_queue_wait_ms | d_wait_ms | "
+        "p_ready_link_util_pct | p_event_ready_window_ms | p_event_ready_gbps | "
+        "p_event_ready_link_util_pct | p_native_submit_gbps | "
+        "p_native_call_gbps | d_queue_wait_ms | d_wait_ms | "
         "sched_proxy_to_finished_ms | sched_wait_to_finished_ms |"
     )
     print(
         "|---------|--------------:|-------------:|-----------------:|"
         "-----------------:|----------------:|--------------------:|"
-        "----------------------:|----------------:|----------:|"
+        "----------------------:|------------------------:|"
+        "-------------------:|----------------------------:|"
+        "---------------------:|-------------------:|----------------:|----------:|"
         "---------------------------:|--------------------------:|"
     )
     for row in rows:
@@ -330,6 +350,11 @@ def print_request_timeline(records: list[Record], limit: int) -> None:
                     fmt(row.get("p_wait_writes_ms")),
                     fmt(row.get("p_ready_window_gbps")),
                     fmt(row.get("p_ready_link_util_pct")),
+                    fmt(row.get("p_event_ready_window_ms")),
+                    fmt(row.get("p_event_ready_gbps")),
+                    fmt(row.get("p_event_ready_link_util_pct")),
+                    fmt(row.get("p_native_submit_gbps")),
+                    fmt(row.get("p_native_call_gbps")),
                     fmt(row.get("d_queue_wait_ms")),
                     fmt(row.get("d_wait_ms")),
                     fmt(row.get("sched_proxy_to_finished_ms")),

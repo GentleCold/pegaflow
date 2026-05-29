@@ -363,6 +363,12 @@ def _gbps(bytes_total: int, start_ts_ns: int | None, end_ts_ns: int | None) -> f
     return bytes_total * 8 / ((end_ts_ns - start_ts_ns) / 1_000_000_000) / 1e9
 
 
+def _gbps_from_ms(bytes_total: int, elapsed_ms: float) -> float:
+    if bytes_total <= 0 or elapsed_ms <= 0:
+        return 0.0
+    return bytes_total * 8 / (elapsed_ms / 1000) / 1e9
+
+
 def _pct(value: float, total: float) -> float:
     if value <= 0 or total <= 0:
         return 0.0
@@ -550,6 +556,9 @@ class _LayerPushResult:
     queue_wait_ms: float
     event_ms: float
     native_ms: float
+    event_ready_ts_ns: int
+    native_start_ts_ns: int
+    native_done_ts_ns: int
 
 
 @dataclass
@@ -562,6 +571,10 @@ class _ReqPushStats:
     max_queue_wait_ms: float = 0.0
     max_event_ms: float = 0.0
     max_native_ms: float = 0.0
+    first_event_ready_ts_ns: int | None = None
+    last_event_ready_ts_ns: int | None = None
+    first_native_start_ts_ns: int | None = None
+    last_native_done_ts_ns: int | None = None
     queue_wait_samples_ms: list[float] = field(default_factory=list)
     event_samples_ms: list[float] = field(default_factory=list)
     native_samples_ms: list[float] = field(default_factory=list)
@@ -575,6 +588,22 @@ class _ReqPushStats:
         self.max_queue_wait_ms = max(self.max_queue_wait_ms, result.queue_wait_ms)
         self.max_event_ms = max(self.max_event_ms, result.event_ms)
         self.max_native_ms = max(self.max_native_ms, result.native_ms)
+        self.first_event_ready_ts_ns = _min_ts(
+            self.first_event_ready_ts_ns,
+            result.event_ready_ts_ns,
+        )
+        self.last_event_ready_ts_ns = _max_ts(
+            self.last_event_ready_ts_ns,
+            result.event_ready_ts_ns,
+        )
+        self.first_native_start_ts_ns = _min_ts(
+            self.first_native_start_ts_ns,
+            result.native_start_ts_ns,
+        )
+        self.last_native_done_ts_ns = _max_ts(
+            self.last_native_done_ts_ns,
+            result.native_done_ts_ns,
+        )
         self.queue_wait_samples_ms.append(result.queue_wait_ms)
         self.event_samples_ms.append(result.event_ms)
         self.native_samples_ms.append(result.native_ms)
@@ -605,6 +634,24 @@ class _ReqPushStats:
 
     def p95_native_ms(self) -> float:
         return _percentile_ms(self.native_samples_ms, 0.95)
+
+    def event_ready_window_ms(self) -> float:
+        return _elapsed_ms(self.first_event_ready_ts_ns, self.last_event_ready_ts_ns)
+
+    def native_submit_window_ms(self) -> float:
+        return _elapsed_ms(self.first_native_start_ts_ns, self.last_native_done_ts_ns)
+
+
+def _min_ts(current: int | None, value: int) -> int:
+    if current is None:
+        return value
+    return min(current, value)
+
+
+def _max_ts(current: int | None, value: int) -> int:
+    if current is None:
+        return value
+    return max(current, value)
 
 
 def _avg_ms(samples: list[float]) -> float:
@@ -659,6 +706,9 @@ def _run_layer_push(task: _LayerPushTask) -> _LayerPushResult:
         queue_wait_ms=queue_wait_ms,
         event_ms=event_ms,
         native_ms=native_ms,
+        event_ready_ts_ns=event_done_ts_ns,
+        native_start_ts_ns=event_done_ts_ns,
+        native_done_ts_ns=native_done_ts_ns,
     )
 
 
@@ -727,9 +777,20 @@ class _AsyncPushFinalizer:
                     task.first_save_ts_ns,
                     task.finalize_queued_ts_ns,
                 )
+                event_ready_gbps = _gbps(
+                    push_stats.bytes,
+                    push_stats.first_event_ready_ts_ns,
+                    push_stats.last_event_ready_ts_ns,
+                )
+                native_submit_gbps = _gbps(
+                    push_stats.bytes,
+                    push_stats.first_native_start_ts_ns,
+                    push_stats.last_native_done_ts_ns,
+                )
+                native_call_gbps = _gbps_from_ms(push_stats.bytes, push_stats.native_ms)
                 link_gbps = _rdma_link_gbps(task.rdma)
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f ready_window_gbps=%.2f link_gbps=%.2f ready_link_util_pct=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_avg_ms=%.3f push_queue_p50_ms=%.3f push_queue_p95_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_avg_ms=%.3f push_event_p50_ms=%.3f push_event_p95_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_avg_ms=%.3f push_native_p50_ms=%.3f push_native_p95_ms=%.3f push_native_max_ms=%.3f ts_ns=%d",
+                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f ready_window_gbps=%.2f link_gbps=%.2f ready_link_util_pct=%.2f event_ready_window_ms=%.3f event_ready_gbps=%.2f event_ready_link_util_pct=%.2f native_submit_window_ms=%.3f native_submit_gbps=%.2f native_call_gbps=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_avg_ms=%.3f push_queue_p50_ms=%.3f push_queue_p95_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_avg_ms=%.3f push_event_p50_ms=%.3f push_event_p95_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_avg_ms=%.3f push_native_p50_ms=%.3f push_native_p95_ms=%.3f push_native_max_ms=%.3f ts_ns=%d",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
@@ -745,6 +806,12 @@ class _AsyncPushFinalizer:
                     ready_window_gbps,
                     link_gbps,
                     _pct(ready_window_gbps, link_gbps),
+                    push_stats.event_ready_window_ms(),
+                    event_ready_gbps,
+                    _pct(event_ready_gbps, link_gbps),
+                    push_stats.native_submit_window_ms(),
+                    native_submit_gbps,
+                    native_call_gbps,
                     self._push_sender.worker_count,
                     push_stats.tasks,
                     push_stats.bytes,

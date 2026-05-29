@@ -265,6 +265,12 @@ Decode node `h20-100` receive:
 - P-side logs now also emit `ready_window_gbps`, `link_gbps`, and
   `ready_link_util_pct` so future runs can directly distinguish layer-ready
   cadence from RDMA transfer bandwidth.
+- P-side finalizer logs now also emit CUDA-event-based
+  `event_ready_window_ms`, `event_ready_gbps`, and
+  `event_ready_link_util_pct`. These use actual layer event completion
+  timestamps rather than only Python hook timestamps, so the next run can
+  separate GPU layer cadence from native RDMA submit speed. The same log line
+  includes `native_call_gbps`, computed from summed `push_layer` call time.
 - D logs show large `queue_wait_ms` for concurrent requests, often several
   seconds. Some requests later observe IMM almost immediately because the P-side
   push already completed before the D waiter reached them.

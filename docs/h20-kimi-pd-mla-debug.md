@@ -385,6 +385,11 @@ native write completion is not the long section:
 - current P-side logs include `ready_window_gbps`, `link_gbps`, and
   `ready_link_util_pct` to show how much of the selected NIC link is fed by
   layer-ready KV
+- current P-side logs also include `event_ready_window_ms`,
+  `event_ready_gbps`, and `event_ready_link_util_pct`, computed from per-layer
+  CUDA event completion timestamps. This is the direct signal for whether the
+  NIC is starved by layer cadence or by native RDMA writes. `native_call_gbps`
+  is computed from summed `push_layer` call time to isolate native submit speed.
 
 D-side wait logs show large queueing under concurrency:
 

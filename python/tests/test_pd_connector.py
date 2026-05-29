@@ -1479,10 +1479,10 @@ def test_layer_push_sender_keeps_fifo_order() -> None:
 
 def test_req_push_stats_records_latency_distribution() -> None:
     stats = prefill_worker_mod._ReqPushStats()
-    for queue_ms, event_ms, native_ms in (
-        (1.0, 10.0, 100.0),
-        (2.0, 20.0, 200.0),
-        (3.0, 30.0, 300.0),
+    for queue_ms, event_ms, native_ms, event_ready_ts_ns, native_done_ts_ns in (
+        (1.0, 10.0, 100.0, 1_000_000_000, 1_100_000_000),
+        (2.0, 20.0, 200.0, 2_000_000_000, 2_200_000_000),
+        (3.0, 30.0, 300.0, 3_000_000_000, 3_300_000_000),
     ):
         stats.add(
             prefill_worker_mod._LayerPushResult(
@@ -1490,6 +1490,9 @@ def test_req_push_stats_records_latency_distribution() -> None:
                 queue_wait_ms=queue_ms,
                 event_ms=event_ms,
                 native_ms=native_ms,
+                event_ready_ts_ns=event_ready_ts_ns,
+                native_start_ts_ns=event_ready_ts_ns,
+                native_done_ts_ns=native_done_ts_ns,
             )
         )
 
@@ -1504,6 +1507,8 @@ def test_req_push_stats_records_latency_distribution() -> None:
     assert stats.avg_native_ms() == 200.0
     assert stats.p50_native_ms() == 200.0
     assert stats.p95_native_ms() == 300.0
+    assert stats.event_ready_window_ms() == 2000.0
+    assert stats.native_submit_window_ms() == 2300.0
 
 
 def _prefill_http_task(request_id: str) -> PrefillHttpTask:
