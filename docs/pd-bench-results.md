@@ -46,6 +46,11 @@ D→P setup (37.9ms) further breaks down to:
 
 ## H20 Kimi K2.5 Two-Node MLA Debug Run (2026-05-28)
 
+Standalone experiment note: [h20-kimi-pd-mla-debug.md](h20-kimi-pd-mla-debug.md).
+
+Note: this c4 run is a diagnostic queueing run. H20 PD MLA acceptance pressure
+tests should use `--max-concurrency 1`.
+
 ### Setup
 
 - Branch/commit: `docs/pd-mla-design`, `874e0c6 fix: improve pd rdma push throughput`
