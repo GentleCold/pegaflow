@@ -305,7 +305,7 @@ class WorkerConnector:
         )
 
         if not ok:
-            raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+            raise RuntimeError(f"Register context failed: {message}")
 
         if split_layer_count:
             logger.info(
