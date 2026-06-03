@@ -293,6 +293,28 @@ def test_register_version_mismatch_raises_startup_error(monkeypatch):
     worker.shutdown()
 
 
+def test_register_non_version_failure_reports_batch_layers(monkeypatch):
+    worker, client, _ = _make_worker()
+    client.register_response = (False, "invalid tensor metadata")
+
+    monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)
+
+    with pytest.raises(RuntimeError, match="invalid tensor metadata") as exc_info:
+        worker.register_kv_caches(
+            {
+                "layer.0": FakeTensor(),
+                "layer.1": FakeTensor(),
+            }
+        )
+
+    message = str(exc_info.value)
+    assert "Register context batch failed for layers ['layer.0', 'layer.1']" in message
+    assert "for layer.1" not in message
+    assert len(client.register_calls) == 1
+
+    worker.shutdown()
+
+
 def test_register_version_mismatch_rpc_error_stops_startup(monkeypatch):
     worker, client, _ = _make_worker()
     client.register_exception = RuntimeError(
