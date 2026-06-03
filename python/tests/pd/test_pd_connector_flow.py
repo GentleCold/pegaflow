@@ -6,8 +6,8 @@ from .pd_connector_test_utils import *
 
 def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
     tensor = FakeTensor(
-        shape=(2, 8, 16, 4, 32),
-        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+        shape=(2, 8, 16, 8, 32),
+        stride=(8 * 8 * 16 * 32, 8 * 16 * 32, 32, 16 * 32, 1),
     )
     native_engine = FakeNativeRdmaEngine()
     worker = PdWorkerConnector(
@@ -39,6 +39,45 @@ def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
         "addr_rkey_list": [("10.0.0.1:1", 17)],
     }
     assert layer["block_ids"] == [1]
+    assert handshake["expected_imm_count"] == 1
+
+
+def test_d_worker_waits_for_all_prefill_ranks_when_prefill_tp_is_larger() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 8, 32),
+        stride=(8 * 8 * 16 * 32, 8 * 16 * 32, 32, 16 * 32, 1),
+    )
+    native_engine = FakeNativeRdmaEngine()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                engine_id="decode",
+                extra_config={"pegaflow.pd.prefill_tp_size": 2},
+            ),
+            model_config=SimpleNamespace(get_total_num_kv_heads=lambda: 8),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=RealRdmaPort(native_engine),
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                "req-1": WaitReqMeta(
+                    local_block_ids=([1],),
+                    remote_request_id="req-1-p",
+                    done_request_id="req-1-d",
+                    prompt_token_ids=(11, 12, 13),
+                    prefill_url="http://p:8001",
+                )
+            }
+        ),
+        None,
+    )
+
+    _, handshake = native_engine.remote_regs[-1]
+    assert handshake["expected_imm_count"] == 2
 
 
 def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:

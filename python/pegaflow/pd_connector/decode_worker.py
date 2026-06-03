@@ -17,11 +17,16 @@ from pegaflow.pd_connector.metadata import (
     flatten_block_ids,
     layer_layout_to_compact_dict,
 )
+from pegaflow.pd_connector.layout_mapping import (
+    decode_rank_source_counts,
+)
 from pegaflow.pd_connector.prefill import AsyncPrefillSender, PrefillHttpTask
 from pegaflow.pd_connector.rdma import RdmaPort
 
 if TYPE_CHECKING:
     from pegaflow.pd_connector.worker import PdWorkerConnector
+
+from pegaflow.pd_connector.config import extra_config_value
 
 logger = get_connector_logger()
 
@@ -171,6 +176,7 @@ class DecodeHandler:
                 ),
             ),
             imm_id=imm_id,
+            expected_imm_count=self._expected_imm_count_for_local_rank(),
         )
 
     def _dispatch_prefill(
@@ -237,9 +243,41 @@ class DecodeHandler:
                     "block_ids": list(ordered_block_ids),
                     "layers": list(self._peer_layer_templates[rank]),
                     "imm_id": imm_id,
+                    "expected_imm_count": self._expected_imm_count_for_rank(rank),
                 }
             )
         return result
+
+    def _expected_imm_count_for_local_rank(self) -> int:
+        return self._expected_imm_count_for_rank(self._w.tp_rank)
+
+    def _expected_imm_count_for_rank(self, rank: int) -> int:
+        if self._w.use_mla:
+            return 1
+        local_layout = self._peer_layouts.get(rank, self._w.layouts)
+        first_layout = next(iter(local_layout.values()))
+        remote_heads = int(getattr(first_layout, "num_kv_heads", 1))
+        prefill_tp_size = int(
+            extra_config_value(
+                self._w.vllm_config,
+                "pegaflow.pd.prefill_tp_size",
+                self._w.tp_size,
+            )
+            or self._w.tp_size
+        )
+        total_heads = _total_num_kv_heads_from_config(self._w.vllm_config)
+        if total_heads is None:
+            total_heads = remote_heads * self._w.tp_size
+        local_heads = _ceil_div(total_heads, prefill_tp_size)
+        source_counts = decode_rank_source_counts(
+            prefill_tp_size=prefill_tp_size,
+            decode_tp_size=self._w.tp_size,
+            local_num_kv_heads=local_heads,
+            remote_num_kv_heads=remote_heads,
+            total_num_kv_heads=total_heads,
+            use_mla=self._w.use_mla,
+        )
+        return source_counts.get(rank, 1)
 
     def _refresh_peer_layer_templates(self) -> None:
         self._peer_layer_templates = {}
@@ -420,3 +458,23 @@ def _elapsed_ms(start_ts_ns: int, end_ts_ns: int) -> float:
     if start_ts_ns <= 0 or end_ts_ns <= 0 or end_ts_ns < start_ts_ns:
         return -1.0
     return (end_ts_ns - start_ts_ns) / 1_000_000
+
+
+def _total_num_kv_heads_from_config(vllm_config: Any) -> int | None:
+    model_config = getattr(vllm_config, "model_config", None)
+    getter = getattr(model_config, "get_total_num_kv_heads", None)
+    if getter is not None:
+        value = getter()
+        return int(value) if value is not None else None
+    hf_config = getattr(model_config, "hf_text_config", None)
+    for config in (model_config, hf_config):
+        value = getattr(config, "num_key_value_heads", None)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    assert value > 0
+    assert divisor > 0
+    return (value + divisor - 1) // divisor

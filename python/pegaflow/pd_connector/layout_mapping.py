@@ -137,6 +137,42 @@ def build_push_layout_plan(
     return PushLayoutPlan(targets=targets)
 
 
+def decode_rank_source_counts(
+    *,
+    prefill_tp_size: int,
+    decode_tp_size: int,
+    local_num_kv_heads: int,
+    remote_num_kv_heads: int,
+    total_num_kv_heads: int,
+    use_mla: bool,
+) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for prefill_tp_rank in range(prefill_tp_size):
+        placeholder_handshakes = tuple(
+            PdHandshake(
+                request_id=f"rank-{rank}",
+                engine_id="",
+                tp_rank=rank,
+                tp_size=decode_tp_size,
+                block_size=1,
+                layers=(),
+            )
+            for rank in range(decode_tp_size)
+        )
+        plan = build_push_layout_plan(
+            prefill_tp_rank=prefill_tp_rank,
+            prefill_tp_size=prefill_tp_size,
+            decode_handshakes=placeholder_handshakes,
+            local_num_kv_heads=local_num_kv_heads,
+            remote_num_kv_heads=remote_num_kv_heads,
+            total_num_kv_heads=total_num_kv_heads,
+            use_mla=use_mla,
+        )
+        for target in plan.targets:
+            counts[target.handshake.tp_rank] = counts.get(target.handshake.tp_rank, 0) + 1
+    return counts
+
+
 def _build_mla_plan(
     *,
     prefill_tp_rank: int,
@@ -158,7 +194,19 @@ def _build_mla_plan(
             "PdConnector MLA heterogeneous TP requires divisible TP sizes; "
             f"prefill_tp={prefill_tp_size} decode_tp={decode_tp_size}"
         )
-        decode_rank = prefill_tp_rank * (decode_tp_size // prefill_tp_size)
+        ratio = decode_tp_size // prefill_tp_size
+        decode_ranks = tuple(
+            range(prefill_tp_rank * ratio, (prefill_tp_rank + 1) * ratio)
+        )
+        return PushLayoutPlan(
+            targets=tuple(
+                PushTargetPlan(
+                    handshake=handshakes_by_rank[decode_rank],
+                    head_slices=(),
+                )
+                for decode_rank in decode_ranks
+            )
+        )
     return PushLayoutPlan(
         targets=(
             PushTargetPlan(
