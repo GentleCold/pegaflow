@@ -2,7 +2,11 @@ from __future__ import annotations
 
 # ruff: noqa: F403,F405,I001
 from .pd_connector_test_utils import *
-from pegaflow.pd_connector.layout_mapping import HeadSlice, build_push_layout_plan
+from pegaflow.pd_connector.layout_mapping import (
+    HeadSlice,
+    build_push_layout_plan,
+    decode_rank_source_counts,
+)
 
 
 def test_flash_attn_hnd_layout_offsets() -> None:
@@ -293,6 +297,128 @@ def test_layout_mapping_prefill_tp_greater_than_decode_tp_offsets_remote_heads()
     ]
 
 
+def test_p_worker_prefill_tp_greater_than_decode_tp_registers_remote_head_slices() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+        ptr=0x1000,
+    )
+    decode_tensor = FakeTensor(
+        shape=(2, 8, 16, 8, 32),
+        stride=(8 * 8 * 16 * 32, 8 * 16 * 32, 32, 16 * 32, 1),
+        ptr=0x2000,
+    )
+    kv_cache_config = fake_kv_cache_config(
+        num_blocks=8,
+        specs={
+            "layer.0": SimpleNamespace(block_size=16, page_size_bytes=2 * 16 * 4 * 32 * 2),
+        },
+    )
+    decode_layer = FlashAttnHndLayout.from_tensor("layer.0", decode_tensor).remote_layout(
+        0,
+        (1, 2),
+    )
+    decode_handshake = PdHandshake(
+        request_id="decode",
+        engine_id="decode",
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        layers=(decode_layer,),
+    )
+
+    def build_worker(rank: int) -> PdWorkerConnector:
+        worker = PdWorkerConnector(
+            SimpleNamespace(
+                kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+                model_config=SimpleNamespace(
+                    use_mla=False,
+                    get_total_num_kv_heads=lambda: 8,
+                ),
+                cache_config=SimpleNamespace(block_size=16),
+                parallel_config=SimpleNamespace(
+                    tensor_parallel_rank=rank,
+                    tensor_parallel_size=2,
+                    decode_context_parallel_size=1,
+                    prefill_context_parallel_size=1,
+                ),
+            ),
+            kv_cache_config=kv_cache_config,
+            rdma=MockRdmaPort(),
+        )
+        worker.register_kv_caches({"layer.0": tensor})
+        return worker
+
+    rank0 = build_worker(0)
+    rank1 = build_worker(1)
+
+    for worker in (rank0, rank1):
+        worker.start_load_kv(
+            PdConnectorMetadata(
+                reqs_to_push={
+                    f"prefill-r{worker.tp_rank}": PushReqMeta(
+                        local_block_ids=([1, 2],),
+                        target_request_id="decode",
+                        handshakes=(decode_handshake,),
+                    )
+                }
+            ),
+            None,
+        )
+
+    rank0_remote = rank0.rdma.remote_handshakes["prefill-r0"].layers[0]
+    rank1_remote = rank1.rdma.remote_handshakes["prefill-r1"].layers[0]
+
+    assert rank0_remote.regions == (
+        TransferRegionLayout(
+            region_idx=0,
+            base_addr=0x2000,
+            block_len=4 * 16 * 32 * 2,
+            block_stride=8 * 16 * 32 * 2,
+        ),
+        TransferRegionLayout(
+            region_idx=1,
+            base_addr=0x2000 + 8 * 8 * 16 * 32 * 2,
+            block_len=4 * 16 * 32 * 2,
+            block_stride=8 * 16 * 32 * 2,
+        ),
+    )
+    assert rank1_remote.regions == (
+        TransferRegionLayout(
+            region_idx=0,
+            base_addr=0x2000 + 4 * 16 * 32 * 2,
+            block_len=4 * 16 * 32 * 2,
+            block_stride=8 * 16 * 32 * 2,
+        ),
+        TransferRegionLayout(
+            region_idx=1,
+            base_addr=0x2000 + 8 * 8 * 16 * 32 * 2 + 4 * 16 * 32 * 2,
+            block_len=4 * 16 * 32 * 2,
+            block_stride=8 * 16 * 32 * 2,
+        ),
+    )
+
+
+def test_layout_mapping_counts_prefill_sources_per_decode_rank() -> None:
+    assert decode_rank_source_counts(
+        prefill_tp_size=2,
+        decode_tp_size=1,
+        local_num_kv_heads=2,
+        remote_num_kv_heads=4,
+        total_num_kv_heads=4,
+        use_mla=False,
+    ) == {0: 2}
+
+    assert decode_rank_source_counts(
+        prefill_tp_size=1,
+        decode_tp_size=2,
+        local_num_kv_heads=4,
+        remote_num_kv_heads=2,
+        total_num_kv_heads=4,
+        use_mla=False,
+    ) == {0: 1, 1: 1}
+
+
 def test_layout_mapping_mla_uses_one_remote_rank_and_skips_duplicates() -> None:
     handshakes = decode_handshakes(tp_size=4)
 
@@ -319,6 +445,46 @@ def test_layout_mapping_mla_uses_one_remote_rank_and_skips_duplicates() -> None:
         (1, ())
     ]
     assert skipped.targets == ()
+
+
+def test_layout_mapping_mla_prefill_tp_less_than_decode_tp_fans_out() -> None:
+    handshakes = decode_handshakes(tp_size=4)
+
+    rank0 = build_push_layout_plan(
+        prefill_tp_rank=0,
+        prefill_tp_size=2,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=1,
+        remote_num_kv_heads=1,
+        total_num_kv_heads=1,
+        use_mla=True,
+    )
+    rank1 = build_push_layout_plan(
+        prefill_tp_rank=1,
+        prefill_tp_size=2,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=1,
+        remote_num_kv_heads=1,
+        total_num_kv_heads=1,
+        use_mla=True,
+    )
+
+    assert [(target.handshake.tp_rank, target.head_slices) for target in rank0.targets] == [
+        (0, ()),
+        (1, ()),
+    ]
+    assert [(target.handshake.tp_rank, target.head_slices) for target in rank1.targets] == [
+        (2, ()),
+        (3, ()),
+    ]
+    assert decode_rank_source_counts(
+        prefill_tp_size=2,
+        decode_tp_size=4,
+        local_num_kv_heads=1,
+        remote_num_kv_heads=1,
+        total_num_kv_heads=1,
+        use_mla=True,
+    ) == {0: 1, 1: 1, 2: 1, 3: 1}
 
 
 def test_layout_mapping_gqa_dedup_skips_redundant_prefill_rank() -> None:

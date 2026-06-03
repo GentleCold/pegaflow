@@ -134,6 +134,7 @@ struct PdRemoteLayer {
 struct PdRemoteRequest {
     remote_request_id: String,
     imm_data: u32,
+    expected_imm_count: u32,
     layers: HashMap<u64, PdRemoteLayer>,
 }
 
@@ -437,6 +438,13 @@ impl PdRdmaEngine {
             Some(value) if !value.is_none() => value.extract()?,
             _ => pd_imm(&remote_request_id),
         };
+        let expected_imm_count = match handshake.get_item("expected_imm_count")? {
+            Some(value) if !value.is_none() => value.extract::<u32>()?,
+            _ => 1,
+        };
+        if expected_imm_count == 0 {
+            return Err(PyValueError::new_err("expected_imm_count must be positive"));
+        }
         self.imm_to_req.lock().unwrap().insert(imm, req_id.clone());
         self.imm_counters
             .lock()
@@ -534,6 +542,7 @@ impl PdRdmaEngine {
             PdRemoteRequest {
                 remote_request_id,
                 imm_data: imm,
+                expected_imm_count,
                 layers,
             },
         );
@@ -584,14 +593,16 @@ impl PdRdmaEngine {
                         "block regions must be ordered by region_idx",
                     ));
                 }
-                let target =
-                    self.block_slice_to_scatter_target(&local, &remote, &region, region_idx)?;
-                dst_bytes = dst_bytes.checked_add(target.length).ok_or_else(|| {
-                    PyValueError::new_err(format!(
-                        "RDMA scatter byte count overflow for req={req_id} layer={layer_idx}"
-                    ))
-                })?;
-                dsts.push(target);
+                let targets =
+                    self.block_slice_to_scatter_targets(&local, &remote, &region, region_idx)?;
+                for target in targets {
+                    dst_bytes = dst_bytes.checked_add(target.length).ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "RDMA scatter byte count overflow for req={req_id} layer={layer_idx}"
+                        ))
+                    })?;
+                    dsts.push(target);
+                }
             }
         }
         if dsts.is_empty() {
@@ -808,23 +819,30 @@ impl PdRdmaEngine {
     }
 
     fn wait_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
-        let (remote_request_id, imm_data) = self
+        let (remote_request_id, imm_data, expected_imm_count) = self
             .remote_requests
             .lock()
             .unwrap()
             .get(&req_id)
-            .map(|request| (request.remote_request_id.clone(), request.imm_data))
+            .map(|request| {
+                (
+                    request.remote_request_id.clone(),
+                    request.imm_data,
+                    request.expected_imm_count,
+                )
+            })
             .unwrap_or_else(|| {
                 let fallback = pd_imm(&req_id);
-                (req_id.clone(), fallback)
+                (req_id.clone(), fallback, 1)
             });
         if self.finished_recving.lock().unwrap().remove(&req_id) {
             self.finished_recving.lock().unwrap().insert(req_id.clone());
             log::info!(
-                "[PdRdmaEngine] RDMA IMM wait already done req={} remote_req={} imm={}",
+                "[PdRdmaEngine] RDMA IMM wait already done req={} remote_req={} imm={} expected={}",
                 req_id,
                 remote_request_id,
                 imm_data,
+                expected_imm_count,
             );
             return Ok(());
         }
@@ -837,18 +855,20 @@ impl PdRdmaEngine {
             .clone();
         let start = Instant::now();
         log::info!(
-            "[PdRdmaEngine] RDMA IMM wait start req={} remote_req={} imm={}",
+            "[PdRdmaEngine] RDMA IMM wait start req={} remote_req={} imm={} expected={}",
             req_id,
             remote_request_id,
             imm_data,
+            expected_imm_count,
         );
-        let done = py.detach(|| counter.wait_timeout(1, Duration::from_secs(30)));
+        let done = py.detach(|| counter.wait_timeout(expected_imm_count, Duration::from_secs(30)));
         if !done {
             log::error!(
-                "[PdRdmaEngine] RDMA IMM wait timed out req={} remote_req={} imm={} wait_ms={:.3}",
+                "[PdRdmaEngine] RDMA IMM wait timed out req={} remote_req={} imm={} expected={} wait_ms={:.3}",
                 req_id,
                 remote_request_id,
                 imm_data,
+                expected_imm_count,
                 duration_ms(start.elapsed()),
             );
             return Err(PegaFlowError::new_err(format!(
@@ -856,10 +876,11 @@ impl PdRdmaEngine {
             )));
         }
         log::info!(
-            "[PdRdmaEngine] RDMA IMM wait done req={} remote_req={} imm={} wait_ms={:.3}",
+            "[PdRdmaEngine] RDMA IMM wait done req={} remote_req={} imm={} expected={} wait_ms={:.3}",
             req_id,
             remote_request_id,
             imm_data,
+            expected_imm_count,
             duration_ms(start.elapsed()),
         );
         self.finished_recving.lock().unwrap().insert(req_id);
@@ -995,13 +1016,13 @@ impl PdRdmaEngine {
         Ok(())
     }
 
-    fn block_slice_to_scatter_target(
+    fn block_slice_to_scatter_targets(
         &self,
         local: &PdLocalLayer,
         remote: &PdRemoteLayer,
         block: &Bound<'_, PyDict>,
         region_idx: usize,
-    ) -> PyResult<ScatterTarget> {
+    ) -> PyResult<Vec<ScatterTarget>> {
         let block_id: u64 = py_get(block, "block_id")?;
         let src_offset: u64 = py_get(block, "src_offset_bytes")?;
         let bytes: u64 = py_get(block, "bytes")?;
@@ -1028,6 +1049,45 @@ impl PdRdmaEngine {
                 )));
             }
         }
+        if block_count == 1 || region.block_stride == region.block_len {
+            return Ok(vec![self.make_scatter_target(
+                local, remote, block_id, src_offset, bytes, region,
+            )?]);
+        }
+
+        let mut targets = Vec::with_capacity(u64_to_usize(block_count, "block_count")?);
+        for offset in 0..block_count {
+            let remote_block_id = block_id
+                .checked_add(offset)
+                .ok_or_else(|| PyValueError::new_err("remote block id overflow"))?;
+            let source_offset = src_offset
+                .checked_add(
+                    offset
+                        .checked_mul(region.block_len)
+                        .ok_or_else(|| PyValueError::new_err("source offset overflow"))?,
+                )
+                .ok_or_else(|| PyValueError::new_err("source offset overflow"))?;
+            targets.push(self.make_scatter_target(
+                local,
+                remote,
+                remote_block_id,
+                source_offset,
+                region.block_len,
+                region,
+            )?);
+        }
+        Ok(targets)
+    }
+
+    fn make_scatter_target(
+        &self,
+        local: &PdLocalLayer,
+        remote: &PdRemoteLayer,
+        block_id: u64,
+        src_offset: u64,
+        bytes: u64,
+        region: &PdRemoteRegion,
+    ) -> PyResult<ScatterTarget> {
         let remote_addr = block_id
             .checked_mul(region.block_stride)
             .and_then(|offset| region.base_addr.checked_add(offset))
