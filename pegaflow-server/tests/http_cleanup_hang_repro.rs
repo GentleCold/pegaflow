@@ -235,6 +235,7 @@ fn wedge_register_request(i: usize) -> RegisterContextRequest {
     RegisterContextRequest {
         instance_id: format!("wedge-{i}"),
         namespace: "wedge".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
         tp_rank: 0,
         tp_size: 1,
         world_size: 1,
