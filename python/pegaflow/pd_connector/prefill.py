@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-import queue
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+import httpx
 
 from pegaflow.logging_utils import get_connector_logger
 
@@ -28,41 +28,61 @@ class PrefillHttpTask:
 
 class AsyncPrefillSender:
     def __init__(self, worker_count: int = 16) -> None:
-        self._queue: queue.Queue[PrefillHttpTask | None] = queue.Queue()
         self._worker_count = max(1, int(worker_count))
-        self._threads = [
-            threading.Thread(
-                target=self._run,
-                name=f"pd-prefill-sender-{idx}",
-                daemon=True,
-            )
-            for idx in range(self._worker_count)
-        ]
-        for thread in self._threads:
-            thread.start()
+        self._closed = False
+        self._loop_ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="pd-prefill-sender",
+            daemon=True,
+        )
+        self._thread.start()
+        self._loop_ready.wait()
 
     def submit(self, task: PrefillHttpTask) -> None:
-        self._queue.put(task)
+        if self._closed:
+            return
+        asyncio.run_coroutine_threadsafe(self._submit(task), self._loop)
 
     def close(self) -> None:
-        for _ in self._threads:
-            self._queue.put(None)
+        if self._closed:
+            return
+        self._closed = True
+        future = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+        future.result(timeout=30)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=30)
 
-    def _run(self) -> None:
-        while True:
-            task = self._queue.get()
-            try:
-                if task is None:
-                    return
-                post_prefill_request(task)
-            finally:
-                self._queue.task_done()
+    def _run_loop(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0),
+            limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+        )
+        self._semaphore = asyncio.Semaphore(self._worker_count)
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._loop_ready.set()
+        self._loop.run_forever()
+        self._loop.run_until_complete(self._client.aclose())
+        self._loop.close()
+
+    async def _submit(self, task: PrefillHttpTask) -> None:
+        async_task = asyncio.create_task(self._run_task(task))
+        self._tasks.add(async_task)
+        async_task.add_done_callback(self._tasks.discard)
+
+    async def _shutdown(self) -> None:
+        if self._tasks:
+            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+
+    async def _run_task(self, task: PrefillHttpTask) -> None:
+        async with self._semaphore:
+            await post_prefill_request_async(task, self._client)
 
 
-def post_prefill_request(task: PrefillHttpTask) -> None:
-    url = task.prefill_url.rstrip("/") + "/v1/completions"
-    start_ts_ns = time.time_ns()
-    body = {
+def _prefill_request_body(task: PrefillHttpTask) -> dict[str, Any]:
+    return {
         "model": task.model,
         "prompt": list(task.prompt_token_ids),
         "max_tokens": task.max_tokens,
@@ -71,6 +91,15 @@ def post_prefill_request(task: PrefillHttpTask) -> None:
         "request_id": task.request_id,
         "kv_transfer_params": task.kv_transfer_params,
     }
+
+
+async def post_prefill_request_async(
+    task: PrefillHttpTask,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    url = task.prefill_url.rstrip("/") + "/v1/completions"
+    start_ts_ns = time.time_ns()
+    body = _prefill_request_body(task)
     payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
         "[PdConnector] D -> P prefill request req=%s url=%s tokens=%d payload_bytes=%d target_req=%s ts_ns=%d",
@@ -81,35 +110,43 @@ def post_prefill_request(task: PrefillHttpTask) -> None:
         task.kv_transfer_params.get("target_request_id"),
         start_ts_ns,
     )
-    request = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
     try:
-        with urlopen(request, timeout=600) as response:
-            response_body = response.read()
-            end_ts_ns = time.time_ns()
-            logger.info(
-                "[PdConnector] D -> P prefill completed req=%s status=%s bytes=%d latency_ms=%.3f ts_ns=%d",
-                task.request_id,
-                response.status,
-                len(response_body),
-                (end_ts_ns - start_ts_ns) / 1_000_000,
-                end_ts_ns,
-            )
-    except HTTPError as exc:
-        response_body = exc.read()
-        logger.error(
-            "[PdConnector] D -> P prefill failed req=%s status=%s body=%s",
-            task.request_id,
-            exc.code,
-            response_body[:512],
+        response = await client.post(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/json"},
         )
-    except URLError:
+        response_body = response.content
+        end_ts_ns = time.time_ns()
+        if response.status_code >= 400:
+            logger.error(
+                "[PdConnector] D -> P prefill failed req=%s status=%s body=%s",
+                task.request_id,
+                response.status_code,
+                response_body[:512],
+            )
+            return
+        logger.info(
+            "[PdConnector] D -> P prefill completed req=%s status=%s bytes=%d latency_ms=%.3f ts_ns=%d",
+            task.request_id,
+            response.status_code,
+            len(response_body),
+            (end_ts_ns - start_ts_ns) / 1_000_000,
+            end_ts_ns,
+        )
+    except httpx.RequestError:
         logger.exception(
             "[PdConnector] D -> P prefill connection failed req=%s url=%s",
             task.request_id,
             url,
         )
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
+def post_prefill_request(task: PrefillHttpTask) -> None:
+    asyncio.run(post_prefill_request_async(task))
