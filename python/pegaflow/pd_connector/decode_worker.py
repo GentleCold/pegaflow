@@ -44,6 +44,7 @@ class DecodeHandler:
         self._peer_layouts: dict[int, dict[str, KvCacheLayout]] = {}
         self._peer_mr_descs: dict[int, dict[str, Any]] = {}
         self._peer_layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
+        self._expected_imm_counts: dict[int, int] = {}
         self._peer_block_size: int | None = None
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
@@ -252,9 +253,31 @@ class DecodeHandler:
         return self._expected_imm_count_for_rank(self._w.tp_rank)
 
     def _expected_imm_count_for_rank(self, rank: int) -> int:
+        if not self._expected_imm_counts:
+            self._refresh_expected_imm_counts()
+        return self._expected_imm_counts.get(rank, 1)
+
+    def _refresh_peer_layer_templates(self) -> None:
+        self._peer_layer_templates = {}
+        self._peer_block_size = next(iter(self._w.layouts.values())).block_size
+        for rank, peer_layouts in self._peer_layouts.items():
+            peer_mr_descs = self._peer_mr_descs[rank]
+            layers = []
+            for layer_idx, name in enumerate(self._w.layer_names):
+                layer = replace(
+                    peer_layouts[name].remote_layout(layer_idx, (0,)),
+                    mr_desc=peer_mr_descs.get(name),
+                )
+                layers.append(layer_layout_to_compact_dict(layer))
+            self._peer_layer_templates[rank] = tuple(layers)
+        self._refresh_expected_imm_counts()
+
+    def _refresh_expected_imm_counts(self) -> None:
         if self._w.use_mla:
-            return 1
-        local_layout = self._peer_layouts.get(rank, self._w.layouts)
+            self._expected_imm_counts = {rank: 1 for rank in range(self._w.tp_size)}
+            return
+
+        local_layout = self._peer_layouts.get(self._w.tp_rank, self._w.layouts)
         first_layout = next(iter(local_layout.values()))
         remote_heads = int(getattr(first_layout, "num_kv_heads", 1))
         prefill_tp_size = int(
@@ -275,23 +298,11 @@ class DecodeHandler:
             local_num_kv_heads=local_heads,
             remote_num_kv_heads=remote_heads,
             total_num_kv_heads=total_heads,
-            use_mla=self._w.use_mla,
+            use_mla=False,
         )
-        return source_counts.get(rank, 1)
-
-    def _refresh_peer_layer_templates(self) -> None:
-        self._peer_layer_templates = {}
-        self._peer_block_size = next(iter(self._w.layouts.values())).block_size
-        for rank, peer_layouts in self._peer_layouts.items():
-            peer_mr_descs = self._peer_mr_descs[rank]
-            layers = []
-            for layer_idx, name in enumerate(self._w.layer_names):
-                layer = replace(
-                    peer_layouts[name].remote_layout(layer_idx, (0,)),
-                    mr_desc=peer_mr_descs.get(name),
-                )
-                layers.append(layer_layout_to_compact_dict(layer))
-            self._peer_layer_templates[rank] = tuple(layers)
+        self._expected_imm_counts = {
+            rank: source_counts.get(rank, 1) for rank in range(self._w.tp_size)
+        }
 
     def _alloc_imm_id(self) -> int:
         imm_id = self._next_imm_id

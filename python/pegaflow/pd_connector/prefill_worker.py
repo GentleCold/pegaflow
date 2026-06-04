@@ -413,39 +413,6 @@ class PrefillHandler:
             f"available={[handshake.tp_rank for handshake in req.handshakes]}"
         )
 
-    def _remote_block_id_map(
-        self,
-        req_id: str,
-        req: PushReqMeta,
-        local_block_ids: set[int],
-    ) -> tuple[dict[int, int], bool]:
-        handshake = self._select_push_handshake(req)
-        if not handshake.layers:
-            return {block_id: block_id for block_id in local_block_ids}, True
-        remote_block_ids = handshake.layers[0].block_ids
-        for layer in handshake.layers[1:]:
-            assert layer.block_ids == remote_block_ids, (
-                "PdConnector expects one decode block-id layout shared by all layers; "
-                f"layer=0 blocks={list(remote_block_ids)} layer={layer.layer_idx} "
-                f"blocks={list(layer.block_ids)}"
-            )
-        ordered_local = sorted(local_block_ids)
-        if len(ordered_local) == len(remote_block_ids):
-            self._remote_block_offsets[req_id] = len(remote_block_ids)
-            return dict(zip(ordered_local, remote_block_ids, strict=True)), True
-
-        offset = self._remote_block_offsets.get(req_id, 0)
-        next_offset = offset + len(ordered_local)
-        assert next_offset <= len(remote_block_ids), (
-            "PdConnector P/D block count mismatch "
-            f"offset={offset} local_blocks={ordered_local} remote_blocks={list(remote_block_ids)}"
-        )
-        remote_chunk = remote_block_ids[offset:next_offset]
-        self._remote_block_offsets[req_id] = next_offset
-        return dict(zip(ordered_local, remote_chunk, strict=True)), next_offset == len(
-            remote_block_ids
-        )
-
     def _remote_block_id_maps(
         self,
         req_id: str,

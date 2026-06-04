@@ -80,6 +80,62 @@ def test_d_worker_waits_for_all_prefill_ranks_when_prefill_tp_is_larger() -> Non
     assert handshake["expected_imm_count"] == 2
 
 
+def test_d_worker_caches_expected_imm_counts(monkeypatch) -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 8, 32),
+        stride=(8 * 8 * 16 * 32, 8 * 16 * 32, 32, 16 * 32, 1),
+    )
+    native_engine = FakeNativeRdmaEngine()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                engine_id="decode",
+                extra_config={"pegaflow.pd.prefill_tp_size": 2},
+            ),
+            model_config=SimpleNamespace(get_total_num_kv_heads=lambda: 8),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=RealRdmaPort(native_engine),
+    )
+    calls = 0
+    original = decode_worker_mod.decode_rank_source_counts
+
+    def tracking_decode_rank_source_counts(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        decode_worker_mod,
+        "decode_rank_source_counts",
+        tracking_decode_rank_source_counts,
+    )
+
+    worker.register_kv_caches({"layer.0": tensor})
+    assert calls == 1
+    for req_id in ("req-1", "req-2"):
+        worker.start_load_kv(
+            PdConnectorMetadata(
+                reqs_to_wait={
+                    req_id: WaitReqMeta(
+                        local_block_ids=([1],),
+                        remote_request_id=f"{req_id}-p",
+                        done_request_id=f"{req_id}-d",
+                        prompt_token_ids=(11, 12, 13),
+                        prefill_url="http://p:8001",
+                    )
+                }
+            ),
+            None,
+        )
+
+    assert calls == 1
+    assert [handshake["expected_imm_count"] for _, handshake in native_engine.remote_regs] == [
+        2,
+        2,
+    ]
+
+
 def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),

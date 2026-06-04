@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -286,16 +287,17 @@ class RealRdmaPort:
         start = time.perf_counter()
         self.engine.push_layer(req_id, layer_idx, native_blocks)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.debug(
-            "[PdConnector] RDMA push_layer req=%s layer=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
-            req_id,
-            layer_idx,
-            len(blocks),
-            len(native_blocks),
-            sum(len(block["regions"]) for block in native_blocks),
-            block_slices_bytes(blocks),
-            elapsed_ms,
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[PdConnector] RDMA push_layer req=%s layer=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
+                req_id,
+                layer_idx,
+                len(blocks),
+                len(native_blocks),
+                sum(len(block["regions"]) for block in native_blocks),
+                block_slices_bytes(blocks),
+                elapsed_ms,
+            )
 
     def wait_for_pushes(self, req_id: str) -> None:
         wait_for_pushes = getattr(self.engine, "wait_for_pushes", None)

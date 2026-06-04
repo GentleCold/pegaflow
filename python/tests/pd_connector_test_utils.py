@@ -30,6 +30,7 @@ sys.modules["pegaflow.pegaflow"] = native
 
 import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
 import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
+import pegaflow.pd_connector.decode_worker as decode_worker_mod  # noqa: E402
 import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
 from pegaflow.pd_connector import PdConnector  # noqa: E402
 from pegaflow.pd_connector.kv_params import parse_consumer  # noqa: E402
