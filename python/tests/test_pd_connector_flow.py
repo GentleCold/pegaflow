@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 # ruff: noqa: F403,F405,I001
 from .pd_connector_test_utils import *
 
@@ -906,11 +908,15 @@ def test_async_prefill_sender_runs_requests_concurrently(monkeypatch) -> None:
     entered: queue.Queue[str] = queue.Queue()
     release = threading.Event()
 
-    def fake_post_prefill_request(task: PrefillHttpTask) -> None:
+    async def fake_post_prefill_request(task: PrefillHttpTask, _client=None) -> None:
         entered.put(task.request_id)
-        assert release.wait(timeout=2)
+        assert await asyncio.to_thread(release.wait, 2)
 
-    monkeypatch.setattr(prefill_mod, "post_prefill_request", fake_post_prefill_request)
+    monkeypatch.setattr(
+        prefill_mod,
+        "post_prefill_request_async",
+        fake_post_prefill_request,
+    )
     sender = AsyncPrefillSender(worker_count=2)
     try:
         sender.submit(_prefill_http_task("req-1"))
