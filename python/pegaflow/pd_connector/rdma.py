@@ -42,6 +42,8 @@ class RdmaPort(Protocol):
 
     def push_done(self, req_id: str) -> None: ...
 
+    def fail_request(self, req_id: str) -> None: ...
+
     def aggregated_link_speed(self) -> int: ...
 
     def wait_done(self, req_id: str) -> None: ...
@@ -92,6 +94,9 @@ class MockRdmaPort:
 
     def push_done(self, req_id: str) -> None:
         self._finished_sending.add(req_id)
+
+    def fail_request(self, req_id: str) -> None:
+        return None
 
     def aggregated_link_speed(self) -> int:
         return 400_000_000_000
@@ -320,6 +325,20 @@ class RealRdmaPort:
         finally:
             logger.info(
                 "[PdConnector] RDMA push_done req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
+
+    def fail_request(self, req_id: str) -> None:
+        fail_request = getattr(self.engine, "fail_request", None)
+        if fail_request is None:
+            return None
+        start = time.perf_counter()
+        try:
+            return fail_request(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA fail_request req=%s native_ms=%.3f",
                 req_id,
                 (time.perf_counter() - start) * 1000,
             )

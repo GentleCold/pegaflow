@@ -258,6 +258,7 @@ class DecodeHandler:
                 ),
             ),
             imm_id=imm_id,
+            fail_imm_id=_fail_imm_id(imm_id),
             expected_imm_count=self._expected_imm_count_for_local_rank(),
         )
 
@@ -325,6 +326,7 @@ class DecodeHandler:
                     "block_ids": list(ordered_block_ids),
                     "layers": list(self._peer_layer_templates[rank]),
                     "imm_id": imm_id,
+                    "fail_imm_id": _fail_imm_id(imm_id),
                     "expected_imm_count": self._expected_imm_count_for_rank(rank),
                 }
             )
@@ -573,3 +575,7 @@ def _ceil_div(value: int, divisor: int) -> int:
     assert value > 0
     assert divisor > 0
     return (value + divisor - 1) // divisor
+
+
+def _fail_imm_id(imm_id: int) -> int:
+    return imm_id ^ 0x8000_0000
