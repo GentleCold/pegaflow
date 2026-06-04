@@ -43,6 +43,7 @@ def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
     }
     assert layer["block_ids"] == [1]
     assert handshake["expected_imm_count"] == 1
+    assert handshake["fail_imm_id"] == (handshake["imm_id"] ^ 0x8000_0000)
 
 
 def test_d_worker_waits_for_all_prefill_ranks_when_prefill_tp_is_larger() -> None:
@@ -493,6 +494,10 @@ def test_p_worker_release_closes_all_physical_decode_targets() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.closed_reqs: list[str] = []
+            self.failed_reqs: list[str] = []
+
+        def fail_request(self, req_id: str) -> None:
+            self.failed_reqs.append(req_id)
 
         def close_request(self, req_id: str) -> None:
             self.closed_reqs.append(req_id)
@@ -545,6 +550,7 @@ def test_p_worker_release_closes_all_physical_decode_targets() -> None:
 
     worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"prefill-r1"}), None)
 
+    assert sorted(rdma.failed_reqs) == ["prefill-r1#d2", "prefill-r1#d3"]
     assert sorted(rdma.closed_reqs) == ["prefill-r1#d2", "prefill-r1#d3"]
     assert rdma.registered == set()
 
@@ -554,6 +560,10 @@ def test_p_worker_preemption_cancels_push_without_waiting_for_done() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.closed_reqs: list[str] = []
+            self.failed_reqs: list[str] = []
+
+        def fail_request(self, req_id: str) -> None:
+            self.failed_reqs.append(req_id)
 
         def close_request(self, req_id: str) -> None:
             self.closed_reqs.append(req_id)
@@ -585,6 +595,7 @@ def test_p_worker_preemption_cancels_push_without_waiting_for_done() -> None:
 
     worker.start_load_kv(PdConnectorMetadata(preempted_req_ids={"prefill-1"}), None)
 
+    assert rdma.failed_reqs == ["prefill-1"]
     assert rdma.closed_reqs == ["prefill-1"]
     assert rdma.registered == set()
     assert worker.get_finished({"prefill-1"}) == (None, None)

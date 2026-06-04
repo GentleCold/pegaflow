@@ -107,6 +107,7 @@ class PdHandshake:
     block_size: int
     layers: tuple[LayerRemoteLayout, ...]
     imm_id: int | None = None
+    fail_imm_id: int | None = None
     expected_imm_count: int = 1
 
 
@@ -159,6 +160,7 @@ def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
             layer_layout_from_dict(layer, block_ids=shared_block_ids) for layer in data["layers"]
         ),
         imm_id=int(data["imm_id"]) if data.get("imm_id") is not None else None,
+        fail_imm_id=int(data["fail_imm_id"]) if data.get("fail_imm_id") is not None else None,
         expected_imm_count=int(data.get("expected_imm_count") or 1),
     )
 
@@ -211,6 +213,7 @@ def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:
         "block_size": handshake.block_size,
         "layers": [layer_layout_to_dict(layer) for layer in handshake.layers],
         "imm_id": handshake.imm_id,
+        "fail_imm_id": handshake.fail_imm_id,
         "expected_imm_count": handshake.expected_imm_count,
     }
 
@@ -230,6 +233,7 @@ def handshake_to_compact_dict(handshake: PdHandshake) -> dict[str, Any]:
         "block_ids": list(block_ids),
         "layers": [layer_layout_to_compact_dict(layer) for layer in handshake.layers],
         "imm_id": handshake.imm_id,
+        "fail_imm_id": handshake.fail_imm_id,
         "expected_imm_count": handshake.expected_imm_count,
     }
 

@@ -147,6 +147,7 @@ class FakeNativeRdmaEngine:
         assert handshake is not None
         assert handshake["request_id"]
         assert handshake.get("imm_id") is None or isinstance(handshake["imm_id"], int)
+        assert handshake.get("fail_imm_id") is None or isinstance(handshake["fail_imm_id"], int)
         for layer in handshake["layers"]:
             assert layer["mr_desc"]["addr_rkey_list"]
             assert isinstance(layer["mr_desc"]["addr_rkey_list"][0], tuple)
@@ -169,6 +170,9 @@ class FakeNativeRdmaEngine:
 
     def push_done(self, req_id):
         self.done_reqs.append(req_id)
+
+    def fail_request(self, req_id):
+        return None
 
     def wait_done(self, req_id):
         self.waited_reqs.append(req_id)

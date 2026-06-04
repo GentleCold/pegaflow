@@ -109,12 +109,26 @@ class PrefillHandler:
         if physical_req_ids:
             self._push_sender.cancel_many(physical_req_ids)
             self._push_finalizer.cancel_many(physical_req_ids)
+            self._fail_physical_requests(physical_req_ids)
         for physical_req_id in physical_req_ids:
             self._physical_to_logical.pop(physical_req_id, None)
             self._completed_physical_pushes.discard(physical_req_id)
         self._push_traces.pop(req_id, None)
         self._tracker.remove(req_id)
         return physical_req_ids
+
+    def _fail_physical_requests(self, physical_req_ids: tuple[str, ...]) -> None:
+        fail_request = getattr(self._w.rdma, "fail_request", None)
+        if fail_request is None:
+            return
+        for physical_req_id in physical_req_ids:
+            try:
+                fail_request(physical_req_id)
+            except Exception:
+                logger.exception(
+                    "[PdConnector] P failed to notify decode abort req=%s",
+                    physical_req_id,
+                )
 
     def save_kv_layer(
         self,
