@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -30,16 +31,59 @@ SUPPORTED_PATHS = {"/v1/completions", "/v1/chat/completions"}
 
 
 @dataclass(frozen=True)
+class PdEndpoint:
+    url: str
+    instance_id: str = ""
+
+
+@dataclass(frozen=True)
+class PdRoute:
+    prefill: PdEndpoint
+    decode: PdEndpoint
+
+    def as_tuple(self) -> tuple[str, str]:
+        return (self.prefill.url, self.decode.url)
+
+
+class RoundRobinPairRouter:
+    def __init__(
+        self,
+        *,
+        prefill_endpoints: tuple[PdEndpoint, ...],
+        decode_endpoints: tuple[PdEndpoint, ...],
+    ) -> None:
+        if not prefill_endpoints:
+            raise ValueError("PdProxy requires at least one prefill endpoint")
+        if not decode_endpoints:
+            raise ValueError("PdProxy requires at least one decode endpoint")
+        self._prefill_endpoints = tuple(prefill_endpoints)
+        self._decode_endpoints = tuple(decode_endpoints)
+        self._next_index = 0
+        self._lock = threading.Lock()
+
+    def select(self) -> PdRoute:
+        with self._lock:
+            index = self._next_index
+            self._next_index += 1
+        return PdRoute(
+            prefill=self._prefill_endpoints[index % len(self._prefill_endpoints)],
+            decode=self._decode_endpoints[index % len(self._decode_endpoints)],
+        )
+
+
+@dataclass(frozen=True)
 class ProxyConfig:
     prefill_url: str
     decode_url: str
     timeout_s: float
     prefill_max_tokens: int
+    router: RoundRobinPairRouter | None = None
 
 
 @dataclass(frozen=True)
 class PdProxyRequest:
     request_id: str
+    decode_url: str
     decode_body: dict[str, Any]
 
 
@@ -52,13 +96,16 @@ def build_pd_proxy_request(
     req_id = request_id or str(body.get("request_id") or f"pd-{uuid.uuid4().hex}")
     prefill_req_id = f"{req_id}-p"
     decode_req_id = f"{req_id}-d"
+    route = config.router.select() if config.router is not None else None
+    prefill_url = route.prefill.url if route is not None else config.prefill_url
+    decode_url = route.decode.url if route is not None else config.decode_url
 
     decode_body = {
         **body,
         "request_id": decode_req_id,
     }
     decode_body["kv_transfer_params"] = ConsumerKvParams(
-        prefill_url=config.prefill_url,
+        prefill_url=prefill_url,
         remote_request_id=prefill_req_id,
         done_request_id=decode_req_id,
         prefill_max_tokens=config.prefill_max_tokens,
@@ -67,6 +114,7 @@ def build_pd_proxy_request(
 
     return PdProxyRequest(
         request_id=req_id,
+        decode_url=decode_url,
         decode_body=decode_body,
     )
 
@@ -90,7 +138,7 @@ class PdProxy:
         )
 
         decode_status, decode_body, decode_content_type = _post_json(
-            self.config.decode_url + path,
+            req.decode_url + path,
             req.decode_body,
             self.config.timeout_s,
             req.request_id,
@@ -128,7 +176,7 @@ class PdProxy:
             start_ts_ns,
         )
         response = _open_json(
-            self.config.decode_url + path,
+            req.decode_url + path,
             req.decode_body,
             self.config.timeout_s,
             req.request_id,
@@ -320,12 +368,42 @@ class _PdHttpServer(ThreadingHTTPServer):
         self.proxy = proxy
 
 
+def parse_endpoint_urls(raw: str) -> tuple[str, ...]:
+    urls = tuple(url.strip().rstrip("/") for url in raw.split(",") if url.strip())
+    if not urls:
+        raise argparse.ArgumentTypeError("expected at least one endpoint URL")
+    return urls
+
+
+def build_router(
+    *,
+    prefill_urls: tuple[str, ...],
+    decode_urls: tuple[str, ...],
+    routing_policy: str,
+) -> RoundRobinPairRouter:
+    if routing_policy != "round_robin":
+        raise ValueError(f"unsupported routing policy {routing_policy!r}")
+    return RoundRobinPairRouter(
+        prefill_endpoints=tuple(
+            PdEndpoint(url=url, instance_id=f"p{index}")
+            for index, url in enumerate(prefill_urls)
+        ),
+        decode_endpoints=tuple(
+            PdEndpoint(url=url, instance_id=f"d{index}")
+            for index, url in enumerate(decode_urls)
+        ),
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="PegaFlow P/D local proxy")
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=8100)
     parser.add_argument("--prefill-url", default="http://127.0.0.1:8001")
     parser.add_argument("--decode-url", default="http://127.0.0.1:8002")
+    parser.add_argument("--prefill-urls", type=parse_endpoint_urls)
+    parser.add_argument("--decode-urls", type=parse_endpoint_urls)
+    parser.add_argument("--routing-policy", choices=["round_robin"], default="round_robin")
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument("--prefill-max-tokens", type=int, default=1)
     parser.add_argument("--log-file")
@@ -340,20 +418,29 @@ def main(argv: list[str] | None = None) -> None:
         handlers=handlers,
     )
 
+    prefill_urls = args.prefill_urls or (args.prefill_url.rstrip("/"),)
+    decode_urls = args.decode_urls or (args.decode_url.rstrip("/"),)
+    router = build_router(
+        prefill_urls=prefill_urls,
+        decode_urls=decode_urls,
+        routing_policy=args.routing_policy,
+    )
     config = ProxyConfig(
-        prefill_url=args.prefill_url.rstrip("/"),
-        decode_url=args.decode_url.rstrip("/"),
+        prefill_url=prefill_urls[0],
+        decode_url=decode_urls[0],
         timeout_s=args.timeout_s,
         prefill_max_tokens=args.prefill_max_tokens,
+        router=router,
     )
     proxy = PdProxy(config)
     server = _PdHttpServer((args.listen_host, args.listen_port), proxy)
     logger.info(
-        "[PdProxy] listening http://%s:%d prefill=%s decode=%s",
+        "[PdProxy] listening http://%s:%d policy=%s prefill=%s decode=%s",
         args.listen_host,
         args.listen_port,
-        config.prefill_url,
-        config.decode_url,
+        args.routing_policy,
+        list(prefill_urls),
+        list(decode_urls),
     )
     try:
         server.serve_forever()

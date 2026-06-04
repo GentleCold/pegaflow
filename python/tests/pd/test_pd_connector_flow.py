@@ -1938,6 +1938,62 @@ def test_pd_proxy_preserves_streaming_decode_request() -> None:
     assert req.decode_body["stream"] is True
 
 
+def test_pd_proxy_round_robins_prefill_decode_pairs() -> None:
+    router = RoundRobinPairRouter(
+        prefill_endpoints=(
+            PdEndpoint(url="http://127.0.0.1:8101", instance_id="p0"),
+            PdEndpoint(url="http://127.0.0.1:8102", instance_id="p1"),
+        ),
+        decode_endpoints=(
+            PdEndpoint(url="http://127.0.0.1:8201", instance_id="d0"),
+            PdEndpoint(url="http://127.0.0.1:8202", instance_id="d1"),
+        ),
+    )
+    config = ProxyConfig(
+        prefill_url="http://unused-prefill",
+        decode_url="http://unused-decode",
+        timeout_s=30,
+        prefill_max_tokens=1,
+        router=router,
+    )
+
+    first = build_pd_proxy_request({"model": "m", "prompt": "a"}, config, request_id="r0")
+    second = build_pd_proxy_request({"model": "m", "prompt": "b"}, config, request_id="r1")
+    third = build_pd_proxy_request({"model": "m", "prompt": "c"}, config, request_id="r2")
+
+    assert first.decode_url == "http://127.0.0.1:8201"
+    assert first.decode_body["kv_transfer_params"]["prefill_url"] == "http://127.0.0.1:8101"
+    assert second.decode_url == "http://127.0.0.1:8202"
+    assert second.decode_body["kv_transfer_params"]["prefill_url"] == "http://127.0.0.1:8102"
+    assert third.decode_url == "http://127.0.0.1:8201"
+    assert third.decode_body["kv_transfer_params"]["prefill_url"] == "http://127.0.0.1:8101"
+
+
+def test_pd_proxy_round_robin_pairs_all_prefill_decode_combinations() -> None:
+    router = RoundRobinPairRouter(
+        prefill_endpoints=(
+            PdEndpoint(url="http://p0", instance_id="p0"),
+            PdEndpoint(url="http://p1", instance_id="p1"),
+        ),
+        decode_endpoints=(
+            PdEndpoint(url="http://d0", instance_id="d0"),
+            PdEndpoint(url="http://d1", instance_id="d1"),
+            PdEndpoint(url="http://d2", instance_id="d2"),
+        ),
+    )
+    selected = [router.select().as_tuple() for _ in range(7)]
+
+    assert selected == [
+        ("http://p0", "http://d0"),
+        ("http://p1", "http://d1"),
+        ("http://p0", "http://d2"),
+        ("http://p1", "http://d0"),
+        ("http://p0", "http://d1"),
+        ("http://p1", "http://d2"),
+        ("http://p0", "http://d0"),
+    ]
+
+
 def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
     class SlowSseBody:
         def __init__(self) -> None:
