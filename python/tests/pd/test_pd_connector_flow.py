@@ -1424,6 +1424,55 @@ def test_layer_push_sender_cancel_skips_queued_req() -> None:
         sender.close()
 
 
+def test_push_finalizer_runs_requests_concurrently() -> None:
+    class Sender:
+        def wait_req(self, req_id: str) -> None:
+            return None
+
+    class BlockingRdma:
+        def __init__(self) -> None:
+            self.entered: queue.Queue[str] = queue.Queue()
+            self.release = threading.Event()
+            self.done: list[str] = []
+
+        def wait_for_pushes(self, req_id: str) -> None:
+            self.entered.put(req_id)
+            assert self.release.wait(timeout=2)
+
+        def push_done(self, req_id: str) -> None:
+            self.done.append(req_id)
+
+        def aggregated_link_speed(self) -> int:
+            return 400_000_000_000
+
+    rdma = BlockingRdma()
+    finalizer = prefill_worker_mod._AsyncPushFinalizer(Sender())
+    try:
+        for req_id in ("req-1", "req-2"):
+            finalizer.submit(
+                prefill_worker_mod._PushFinalizeTask(
+                    rdma=rdma,
+                    req_ids=(req_id,),
+                    target_request_id=req_id,
+                    num_blocks=1,
+                    chunk_count=1,
+                    first_save_ts_ns=time.time_ns(),
+                    finalize_queued_ts_ns=time.time_ns(),
+                    rdma_bytes=1,
+                )
+            )
+
+        entered = {rdma.entered.get(timeout=2), rdma.entered.get(timeout=2)}
+        assert entered == {"req-1", "req-2"}
+
+        rdma.release.set()
+        finalizer.wait_all()
+        assert sorted(rdma.done) == ["req-1", "req-2"]
+    finally:
+        rdma.release.set()
+        finalizer.close()
+
+
 def _prefill_http_task(request_id: str) -> PrefillHttpTask:
     return PrefillHttpTask(
         request_id=request_id,

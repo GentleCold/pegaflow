@@ -810,28 +810,35 @@ def _run_layer_push(task: _LayerPushTask) -> None:
 
 
 class _AsyncPushFinalizer:
-    def __init__(self, push_sender: _AsyncLayerPushSender) -> None:
+    def __init__(self, push_sender: _AsyncLayerPushSender, max_workers: int = 16) -> None:
         self._push_sender = push_sender
-        self._queue: queue.Queue[_PushFinalizeTask | None] = queue.Queue()
         self._condition = threading.Condition()
         self._submitted: set[tuple[str, ...]] = set()
         self._cancelled: set[str] = set()
         self._inflight = 0
         self._error: BaseException | None = None
-        self._thread = threading.Thread(
-            target=self._run, name="pd-rdma-push-finalizer", daemon=True
+        self._closed = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix="pd-rdma-finalize",
         )
-        self._thread.start()
 
     def submit(self, task: _PushFinalizeTask) -> None:
         with self._condition:
+            if self._closed:
+                raise RuntimeError("PdConnector RDMA push finalizer is closed")
             if self._error is not None:
                 raise self._error
             if task.req_ids in self._submitted:
                 return
             self._submitted.add(task.req_ids)
             self._inflight += 1
-        self._queue.put(task)
+        try:
+            self._executor.submit(self._run_task, task)
+        except BaseException:
+            with self._condition:
+                self._finish_task(task)
+            raise
 
     def cancel_many(self, req_ids: tuple[str, ...]) -> None:
         with self._condition:
@@ -855,66 +862,69 @@ class _AsyncPushFinalizer:
                 raise error
 
     def close(self) -> None:
-        self._queue.put(None)
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def is_idle(self) -> bool:
         with self._condition:
             return self._inflight == 0 and self._error is None
 
-    def _run(self) -> None:
-        while True:
-            task = self._queue.get()
-            try:
-                if task is None:
-                    return
-                for req_id in task.req_ids:
-                    if req_id in self._cancelled:
-                        continue
-                    self._push_sender.wait_req(req_id)
-                    if req_id in self._cancelled:
-                        continue
-                    task.rdma.wait_for_pushes(req_id)
-                    if req_id in self._cancelled:
-                        continue
-                    task.rdma.push_done(req_id)
-                done_ts_ns = time.time_ns()
-                save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
-                link_gbps = _rdma_link_gbps(task.rdma)
-                logger.info(
-                    "[PdConnector] P RDMA done reqs=%s target_req=%s chunks=%d blocks=%d "
-                    "rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f "
-                    "save_gbps=%.2f tail_gbps=%.2f link_gbps=%.2f link_util_pct=%.2f",
-                    list(task.req_ids),
-                    task.target_request_id,
-                    task.chunk_count,
-                    task.num_blocks,
-                    task.rdma_bytes,
-                    _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
-                    _elapsed_ms(task.finalize_queued_ts_ns, done_ts_ns),
-                    save_gbps,
-                    _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
-                    link_gbps,
-                    _pct(save_gbps, link_gbps),
-                )
-            except BaseException as exc:
-                if task is not None:
-                    logger.exception(
-                        "[PdConnector] P finalize failed reqs=%s target_req=%s chunks=%d blocks=%d bytes=%d",
-                        list(task.req_ids),
-                        task.target_request_id,
-                        task.chunk_count,
-                        task.num_blocks,
-                        task.rdma_bytes,
-                    )
-                with self._condition:
-                    self._error = exc
-                    self._condition.notify_all()
-            finally:
-                if task is not None:
-                    with self._condition:
-                        self._submitted.discard(task.req_ids)
-                        for req_id in task.req_ids:
-                            self._cancelled.discard(req_id)
-                        self._inflight -= 1
-                        self._condition.notify_all()
-                self._queue.task_done()
+    def _run_task(self, task: _PushFinalizeTask) -> None:
+        try:
+            for req_id in task.req_ids:
+                if self._is_cancelled(req_id):
+                    continue
+                self._push_sender.wait_req(req_id)
+                if self._is_cancelled(req_id):
+                    continue
+                task.rdma.wait_for_pushes(req_id)
+                if self._is_cancelled(req_id):
+                    continue
+                task.rdma.push_done(req_id)
+            done_ts_ns = time.time_ns()
+            save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
+            link_gbps = _rdma_link_gbps(task.rdma)
+            logger.info(
+                "[PdConnector] P RDMA done reqs=%s target_req=%s chunks=%d blocks=%d "
+                "rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f "
+                "save_gbps=%.2f tail_gbps=%.2f link_gbps=%.2f link_util_pct=%.2f",
+                list(task.req_ids),
+                task.target_request_id,
+                task.chunk_count,
+                task.num_blocks,
+                task.rdma_bytes,
+                _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
+                _elapsed_ms(task.finalize_queued_ts_ns, done_ts_ns),
+                save_gbps,
+                _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
+                link_gbps,
+                _pct(save_gbps, link_gbps),
+            )
+        except BaseException as exc:
+            logger.exception(
+                "[PdConnector] P finalize failed reqs=%s target_req=%s chunks=%d blocks=%d bytes=%d",
+                list(task.req_ids),
+                task.target_request_id,
+                task.chunk_count,
+                task.num_blocks,
+                task.rdma_bytes,
+            )
+            with self._condition:
+                self._error = exc
+                self._condition.notify_all()
+        finally:
+            with self._condition:
+                self._finish_task(task)
+
+    def _is_cancelled(self, req_id: str) -> bool:
+        with self._condition:
+            return req_id in self._cancelled
+
+    def _finish_task(self, task: _PushFinalizeTask) -> None:
+        self._submitted.discard(task.req_ids)
+        for req_id in task.req_ids:
+            self._cancelled.discard(req_id)
+        self._inflight -= 1
+        self._condition.notify_all()
