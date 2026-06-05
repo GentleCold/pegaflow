@@ -319,7 +319,7 @@ def test_register_version_mismatch_rpc_error_stops_startup(monkeypatch):
     worker, client, _ = _make_worker()
     client.register_exception = RuntimeError(
         "register_context_batch RPC failed: status: FailedPrecondition, "
-        "message: \"PegaFlow version mismatch: client=0.22.4 server=0.22.5\""
+        'message: "PegaFlow version mismatch: client=0.22.4 server=0.22.5"'
     )
 
     monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)

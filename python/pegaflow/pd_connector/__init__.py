@@ -13,7 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 
 from pegaflow.pd_connector.metadata import PdConnectorMetadata
 from pegaflow.pd_connector.scheduler import PdSchedulerConnector
-from pegaflow.pd_connector.worker import PdWorkerConnector
+from pegaflow.pd_connector.worker import PdWorkerConnector, model_uses_mla
 
 
 class PdConnector(KVConnectorBase_V1, SupportsHMA):
@@ -21,17 +21,20 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
 
     def __init__(self, vllm_config: Any, role: KVConnectorRole, kv_cache_config: Any = None):
         super().__init__(vllm_config, role, kv_cache_config)
+        _assert_supported_config(vllm_config)
         self._scheduler: PdSchedulerConnector | None = None
         self._worker: PdWorkerConnector | None = None
         if role == KVConnectorRole.SCHEDULER:
             self._scheduler = PdSchedulerConnector(vllm_config)
         elif role == KVConnectorRole.WORKER:
-            self._worker = PdWorkerConnector(vllm_config)
+            self._worker = PdWorkerConnector(vllm_config, kv_cache_config=kv_cache_config)
         else:
             raise ValueError(f"unsupported KV connector role: {role}")
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: Any) -> str | None:
+        if model_uses_mla(vllm_config):
+            return None
         return "HND"
 
     @classmethod
@@ -131,3 +134,17 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
 
 
 __all__ = ["PdConnector"]
+
+
+def _assert_supported_config(vllm_config: Any) -> None:
+    if not model_uses_mla(vllm_config):
+        return
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    dcp_world_size = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+    pcp_world_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    assert dcp_world_size == 1, (
+        "PdConnector MLA first version requires decode_context_parallel_size == 1"
+    )
+    assert pcp_world_size == 1, (
+        "PdConnector MLA first version requires prefill_context_parallel_size == 1"
+    )

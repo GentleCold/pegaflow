@@ -29,6 +29,10 @@ fn pd_rdma_error(context: &str, err: impl std::fmt::Display) -> PyErr {
     PegaFlowError::new_err(format!("{context}: {err}"))
 }
 
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
 fn nonnull_from_u64(ptr: u64, field: &str) -> PyResult<NonNull<c_void>> {
     NonNull::new(ptr as *mut c_void)
         .ok_or_else(|| PyValueError::new_err(format!("{field} must be non-zero")))
@@ -96,16 +100,21 @@ fn pd_imm(req_id: &str) -> u32 {
 #[derive(Clone)]
 struct PdLocalLayer {
     base_addr: u64,
-    block_bytes: u64,
     mr: MemoryRegionHandle,
     mr_desc: MemoryRegionDescriptor,
 }
 
 #[derive(Clone)]
+struct PdRemoteRegion {
+    base_addr: u64,
+    block_len: u64,
+}
+
+#[derive(Clone)]
 struct PdRemoteLayer {
     mr_desc: MemoryRegionDescriptor,
-    k_by_block: HashMap<u64, u64>,
-    v_by_block: HashMap<u64, u64>,
+    allowed_block_ids: HashSet<u64>,
+    regions: Vec<PdRemoteRegion>,
 }
 
 struct PdRemoteRequest {
@@ -315,21 +324,57 @@ impl PdRdmaEngine {
         for layer in layers {
             let layer = layer.bind(py);
             let layer_idx: u64 = py_get(layer, "layer_idx")?;
-            let base_addr: u64 = py_get(layer, "base_addr")?;
-            let block_bytes: u64 = py_get(layer, "block_bytes")?;
-            let k_block_addrs: Vec<u64> = py_get(layer, "k_block_addrs")?;
-            let v_block_addrs: Vec<u64> = py_get(layer, "v_block_addrs")?;
-            let max_addr = k_block_addrs
+            let block_ids: Vec<u64> = py_get(layer, "block_ids")?;
+            if block_ids.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "local layer {layer_idx} has no block_ids"
+                )));
+            }
+            let max_block_id = block_ids
                 .iter()
-                .chain(v_block_addrs.iter())
                 .copied()
                 .max()
-                .ok_or_else(|| PyValueError::new_err("layer has no block addresses"))?;
+                .ok_or_else(|| PyValueError::new_err("local layer has no block_ids"))?;
+            let regions_any = layer
+                .get_item("regions")?
+                .ok_or_else(|| PyValueError::new_err("local layer missing regions"))?;
+            let mut min_addr = u64::MAX;
+            let mut max_addr = 0_u64;
+            let mut region_count = 0_usize;
+            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
+                let region = region_any?.cast_into::<PyDict>()?;
+                let region_idx: usize = py_get(&region, "region_idx")?;
+                if region_idx != expected_region_idx {
+                    return Err(PyValueError::new_err(format!(
+                        "local layer {layer_idx} regions must be ordered by region_idx"
+                    )));
+                }
+                let base_addr: u64 = py_get(&region, "base_addr")?;
+                let block_len: u64 = py_get(&region, "block_len")?;
+                if base_addr == 0 || block_len == 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "local layer {layer_idx} region {region_idx} has invalid address range"
+                    )));
+                }
+                let end = max_block_id
+                    .checked_add(1)
+                    .and_then(|block_count| block_count.checked_mul(block_len))
+                    .and_then(|byte_len| base_addr.checked_add(byte_len))
+                    .ok_or_else(|| PyValueError::new_err("local layer address range overflow"))?;
+                min_addr = min_addr.min(base_addr);
+                max_addr = max_addr.max(end);
+                region_count += 1;
+            }
+            if region_count == 0 {
+                return Err(PyValueError::new_err(format!(
+                    "local layer {layer_idx} has no regions"
+                )));
+            }
             let len = max_addr
-                .checked_add(block_bytes)
-                .and_then(|end| end.checked_sub(base_addr))
+                .checked_sub(min_addr)
+                .filter(|len| *len > 0)
                 .ok_or_else(|| PyValueError::new_err("invalid layer address range"))?;
-            let ptr = nonnull_from_u64(base_addr, "base_addr")?;
+            let ptr = nonnull_from_u64(min_addr, "base_addr")?;
             let (mr, mr_desc) = self
                 .engine
                 .register_memory_allow_remote(ptr, u64_to_usize(len, "layer length")?, self.device)
@@ -337,11 +382,20 @@ impl PdRdmaEngine {
             local_layers.insert(
                 layer_idx,
                 PdLocalLayer {
-                    base_addr,
-                    block_bytes,
+                    base_addr: min_addr,
                     mr,
                     mr_desc: mr_desc.clone(),
                 },
+            );
+            log::info!(
+                "[PdRdmaEngine] register local layer layer={} blocks={} regions={} base=0x{:x} len={} domains={} link_speed={}",
+                layer_idx,
+                block_ids.len(),
+                region_count,
+                min_addr,
+                len,
+                self.engine.num_domains(),
+                self.engine.aggregated_link_speed(),
             );
 
             let out = PyDict::new(py);
@@ -384,36 +438,80 @@ impl PdRdmaEngine {
             let layer = layer_any?.cast_into::<PyDict>()?;
             let layer_idx: u64 = py_get(&layer, "layer_idx")?;
             let block_ids: Vec<u64> = py_get(&layer, "block_ids")?;
-            let k_block_addrs: Vec<u64> = py_get(&layer, "k_block_addrs")?;
-            let v_block_addrs: Vec<u64> = py_get(&layer, "v_block_addrs")?;
-            if block_ids.len() != k_block_addrs.len() || block_ids.len() != v_block_addrs.len() {
+            if block_ids.is_empty() {
                 return Err(PyValueError::new_err(format!(
-                    "remote layer {layer_idx} block_ids and addresses length mismatch"
+                    "remote layer {layer_idx} has no block_ids"
+                )));
+            }
+            let allowed_block_ids = block_ids.iter().copied().collect::<HashSet<_>>();
+            if allowed_block_ids.len() != block_ids.len() {
+                return Err(PyValueError::new_err(format!(
+                    "remote layer {layer_idx} has duplicate block_ids"
+                )));
+            }
+            let regions_any = layer
+                .get_item("regions")?
+                .ok_or_else(|| PyValueError::new_err("remote layer missing regions"))?;
+            let mut regions = Vec::new();
+            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
+                let region = region_any?.cast_into::<PyDict>()?;
+                let region_idx: usize = py_get(&region, "region_idx")?;
+                if region_idx != expected_region_idx {
+                    return Err(PyValueError::new_err(format!(
+                        "remote layer {layer_idx} regions must be ordered by region_idx"
+                    )));
+                }
+                let base_addr: u64 = py_get(&region, "base_addr")?;
+                let block_len: u64 = py_get(&region, "block_len")?;
+                if base_addr == 0 || block_len == 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "remote layer {layer_idx} region {region_idx} has invalid address range"
+                    )));
+                }
+                regions.push(PdRemoteRegion {
+                    base_addr,
+                    block_len,
+                });
+            }
+            if regions.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "remote layer {layer_idx} has no regions"
                 )));
             }
             let mr_desc_any = layer
                 .get_item("mr_desc")?
                 .ok_or_else(|| PyValueError::new_err("remote layer missing mr_desc"))?;
             let mr_desc = mr_desc_from_py(&mr_desc_any.cast_into::<PyDict>()?)?;
-            let k_by_block = block_ids
-                .iter()
-                .copied()
-                .zip(k_block_addrs.iter().copied())
-                .collect::<HashMap<_, _>>();
-            let v_by_block = block_ids
-                .iter()
-                .copied()
-                .zip(v_block_addrs.iter().copied())
-                .collect::<HashMap<_, _>>();
             layers.insert(
                 layer_idx,
                 PdRemoteLayer {
                     mr_desc,
-                    k_by_block,
-                    v_by_block,
+                    allowed_block_ids,
+                    regions,
                 },
             );
         }
+        let layer_count = layers.len();
+        let blocks_per_layer = layers
+            .values()
+            .next()
+            .map(|layer| layer.allowed_block_ids.len())
+            .unwrap_or(0);
+        let regions_per_layer = layers
+            .values()
+            .next()
+            .map(|layer| layer.regions.len())
+            .unwrap_or(0);
+        log::info!(
+            "[PdRdmaEngine] register remote req={} remote_req={} imm={} layers={} blocks_per_layer={} regions_per_layer={} domains={}",
+            req_id,
+            remote_request_id,
+            imm,
+            layer_count,
+            blocks_per_layer,
+            regions_per_layer,
+            self.engine.num_domains(),
+        );
         self.remote_requests.lock().unwrap().insert(
             req_id,
             PdRemoteRequest {
@@ -432,6 +530,8 @@ impl PdRdmaEngine {
         layer_idx: u64,
         blocks: Vec<Py<PyDict>>,
     ) -> PyResult<()> {
+        let total_start = Instant::now();
+        let input_blocks = blocks.len();
         let local = self
             .local_layers
             .lock()
@@ -452,23 +552,36 @@ impl PdRdmaEngine {
                     "remote layer {layer_idx} for req {req_id} is not registered"
                 ))
             })?;
-        let mut dsts = Vec::with_capacity(blocks.len() * 2);
+        let mut dsts = Vec::with_capacity(blocks.len() * remote.regions.len());
+        let mut dst_bytes = 0_u64;
         for block in blocks {
             let block = block.bind(py);
-            let k = block
-                .get_item("k")?
-                .ok_or_else(|| PyValueError::new_err("block missing k"))?
-                .cast_into::<PyDict>()?;
-            let v = block
-                .get_item("v")?
-                .ok_or_else(|| PyValueError::new_err("block missing v"))?
-                .cast_into::<PyDict>()?;
-            dsts.push(self.block_slice_to_scatter_target(&local, &remote, &k, true)?);
-            dsts.push(self.block_slice_to_scatter_target(&local, &remote, &v, false)?);
+            let regions_any = block
+                .get_item("regions")?
+                .ok_or_else(|| PyValueError::new_err("block missing regions"))?;
+            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
+                let region = region_any?.cast_into::<PyDict>()?;
+                let region_idx: usize = py_get(&region, "region_idx")?;
+                if region_idx != expected_region_idx {
+                    return Err(PyValueError::new_err(
+                        "block regions must be ordered by region_idx",
+                    ));
+                }
+                let target =
+                    self.block_slice_to_scatter_target(&local, &remote, &region, region_idx)?;
+                dst_bytes = dst_bytes.checked_add(target.length).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "RDMA scatter byte count overflow for req={req_id} layer={layer_idx}"
+                    ))
+                })?;
+                dsts.push(target);
+            }
         }
         if dsts.is_empty() {
             return Ok(());
         }
+        let convert_ms = duration_ms(total_start.elapsed());
+        let window_start = Instant::now();
         if !py.detach(|| {
             wait_write_window(
                 &self.write_submitted,
@@ -477,12 +590,22 @@ impl PdRdmaEngine {
                 Duration::from_secs(30),
             )
         }) {
+            log::error!(
+                "[PdRdmaEngine] RDMA WRITE window timeout req={} layer={} submitted={} completed={} window_wait_ms={:.3}",
+                req_id,
+                layer_idx,
+                self.write_submitted.load(Ordering::Acquire),
+                self.write_completed.load(Ordering::Acquire),
+                duration_ms(window_start.elapsed()),
+            );
             return Err(PegaFlowError::new_err(format!(
                 "RDMA WRITE window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
                 self.write_submitted.load(Ordering::Acquire),
                 self.write_completed.load(Ordering::Acquire)
             )));
         }
+        self.write_submitted.fetch_add(1, Ordering::Release);
+        let window_ms = duration_ms(window_start.elapsed());
         let (req_completed, req_errors) = {
             let mut pending = self.pending_writes.lock().unwrap();
             let state = pending
@@ -491,12 +614,20 @@ impl PdRdmaEngine {
             state.submitted += 1;
             (Arc::clone(&state.completed), Arc::clone(&state.errors))
         };
-        self.write_submitted.fetch_add(1, Ordering::Release);
+        let scatter_targets = dsts.len();
         let global_completed = Arc::clone(&self.write_completed);
         let done_completed = Arc::clone(&req_completed);
         let error_completed = Arc::clone(&req_completed);
         let error_counter = Arc::clone(&req_errors);
         let error_global_completed = Arc::clone(&global_completed);
+        let submit_start = Instant::now();
+        let callback_start = Instant::now();
+        let done_req_id = req_id.clone();
+        let error_req_id = req_id.clone();
+        let done_bytes = dst_bytes;
+        let error_bytes = dst_bytes;
+        let done_layer_idx = layer_idx;
+        let error_layer_idx = layer_idx;
         self.engine
             .submit_transfer(
                 TransferRequest::Scatter(ScatterTransferRequest {
@@ -510,13 +641,26 @@ impl PdRdmaEngine {
                     on_done: Box::new(move || {
                         done_completed.fetch_add(1, Ordering::Release);
                         global_completed.fetch_add(1, Ordering::Release);
+                        log::debug!(
+                            "[PdRdmaEngine] RDMA WRITE completed req={} layer={} bytes={} latency_ms={:.3}",
+                            done_req_id,
+                            done_layer_idx,
+                            done_bytes,
+                            duration_ms(callback_start.elapsed()),
+                        );
                         Ok(())
                     }),
                     on_error: Box::new(move |err: FabricLibError| {
                         error_counter.fetch_add(1, Ordering::Release);
                         error_completed.fetch_add(1, Ordering::Release);
                         error_global_completed.fetch_add(1, Ordering::Release);
-                        log::error!("[PdRdmaEngine] RDMA WRITE completion error: {err}");
+                        log::error!(
+                            "[PdRdmaEngine] RDMA WRITE completion error req={} layer={} bytes={} latency_ms={:.3} err={err}",
+                            error_req_id,
+                            error_layer_idx,
+                            error_bytes,
+                            duration_ms(callback_start.elapsed()),
+                        );
                         Ok(())
                     }),
                 },
@@ -525,8 +669,31 @@ impl PdRdmaEngine {
                 req_errors.fetch_add(1, Ordering::Release);
                 req_completed.fetch_add(1, Ordering::Release);
                 self.write_completed.fetch_add(1, Ordering::Release);
+                log::error!(
+                    "[PdRdmaEngine] RDMA WRITE submit failed req={} layer={} input_blocks={} scatter_targets={} bytes={} domains={} err={err}",
+                    req_id,
+                    layer_idx,
+                    input_blocks,
+                    scatter_targets,
+                    dst_bytes,
+                    self.engine.num_domains(),
+                );
                 pd_rdma_error("submit RDMA WRITE failed", err)
             })?;
+        log::debug!(
+            "[PdRdmaEngine] RDMA WRITE submitted req={} layer={} input_blocks={} scatter_targets={} bytes={} domains={} convert_ms={:.3} window_wait_ms={:.3} submit_ms={:.3} submitted={} completed={}",
+            req_id,
+            layer_idx,
+            input_blocks,
+            scatter_targets,
+            dst_bytes,
+            self.engine.num_domains(),
+            convert_ms,
+            window_ms,
+            duration_ms(submit_start.elapsed()),
+            self.write_submitted.load(Ordering::Acquire),
+            self.write_completed.load(Ordering::Acquire),
+        );
         Ok(())
     }
 
@@ -536,6 +703,7 @@ impl PdRdmaEngine {
 
     fn push_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
         self.wait_for_request_writes(py, &req_id, Duration::from_secs(30))?;
+        let start = Instant::now();
         let remote = self
             .remote_requests
             .lock()
@@ -560,6 +728,12 @@ impl PdRdmaEngine {
             })?;
         let tx_counter = Arc::new(AtomicI64::new(0));
         let err_counter = Arc::new(AtomicI64::new(0));
+        log::info!(
+            "[PdRdmaEngine] RDMA IMM submit start req={} imm={} domains={}",
+            req_id,
+            imm_data,
+            self.engine.num_domains(),
+        );
         self.engine
             .submit_transfer_atomic(
                 TransferRequest::Imm(ImmTransferRequest {
@@ -570,8 +744,23 @@ impl PdRdmaEngine {
                 Arc::clone(&tx_counter),
                 Arc::clone(&err_counter),
             )
-            .map_err(|err| pd_rdma_error("submit IMM failed", err))?;
+            .map_err(|err| {
+                log::error!(
+                    "[PdRdmaEngine] RDMA IMM submit failed req={} imm={} err={err}",
+                    req_id,
+                    imm_data,
+                );
+                pd_rdma_error("submit IMM failed", err)
+            })?;
         if !py.detach(|| wait_atomic_count(&tx_counter, 1, Duration::from_secs(30))) {
+            log::error!(
+                "[PdRdmaEngine] RDMA IMM timed out req={} imm={} completed={} errors={} wait_ms={:.3}",
+                req_id,
+                imm_data,
+                tx_counter.load(Ordering::Acquire),
+                err_counter.load(Ordering::Acquire),
+                duration_ms(start.elapsed()),
+            );
             return Err(PegaFlowError::new_err(format!(
                 "RDMA IMM timed out for req={req_id} completed={}",
                 tx_counter.load(Ordering::Acquire)
@@ -579,10 +768,24 @@ impl PdRdmaEngine {
         }
         let errors = err_counter.load(Ordering::Acquire);
         if errors != 0 {
+            log::error!(
+                "[PdRdmaEngine] RDMA IMM failed req={} imm={} completed={} errors={} wait_ms={:.3}",
+                req_id,
+                imm_data,
+                tx_counter.load(Ordering::Acquire),
+                errors,
+                duration_ms(start.elapsed()),
+            );
             return Err(PegaFlowError::new_err(format!(
                 "RDMA IMM failed for req={req_id} errors={errors}"
             )));
         }
+        log::info!(
+            "[PdRdmaEngine] RDMA IMM done req={} imm={} wait_ms={:.3}",
+            req_id,
+            imm_data,
+            duration_ms(start.elapsed()),
+        );
         self.finished_sending.lock().unwrap().insert(req_id);
         Ok(())
     }
@@ -599,6 +802,12 @@ impl PdRdmaEngine {
                 (req_id.clone(), fallback)
             });
         if self.finished_recving.lock().unwrap().contains(&req_id) {
+            log::info!(
+                "[PdRdmaEngine] RDMA IMM wait already done req={} remote_req={} imm={}",
+                req_id,
+                remote_request_id,
+                imm_data,
+            );
             return Ok(());
         }
         let counter = self
@@ -608,12 +817,33 @@ impl PdRdmaEngine {
             .entry(req_id.clone())
             .or_insert_with(|| self.engine.get_imm_counter(imm_data))
             .clone();
+        let start = Instant::now();
+        log::info!(
+            "[PdRdmaEngine] RDMA IMM wait start req={} remote_req={} imm={}",
+            req_id,
+            remote_request_id,
+            imm_data,
+        );
         let done = py.detach(|| counter.wait_timeout(1, Duration::from_secs(30)));
         if !done {
+            log::error!(
+                "[PdRdmaEngine] RDMA IMM wait timed out req={} remote_req={} imm={} wait_ms={:.3}",
+                req_id,
+                remote_request_id,
+                imm_data,
+                duration_ms(start.elapsed()),
+            );
             return Err(PegaFlowError::new_err(format!(
                 "RDMA IMM wait timed out for req={req_id} remote_request_id={remote_request_id}"
             )));
         }
+        log::info!(
+            "[PdRdmaEngine] RDMA IMM wait done req={} remote_req={} imm={} wait_ms={:.3}",
+            req_id,
+            remote_request_id,
+            imm_data,
+            duration_ms(start.elapsed()),
+        );
         self.finished_recving.lock().unwrap().insert(req_id);
         Ok(())
     }
@@ -701,7 +931,23 @@ impl PdRdmaEngine {
         if submitted == 0 {
             return Ok(());
         }
+        let start = Instant::now();
+        log::info!(
+            "[PdRdmaEngine] RDMA WRITE wait start req={} submitted={} completed={} errors={}",
+            req_id,
+            submitted,
+            state.completed.load(Ordering::Acquire),
+            state.errors.load(Ordering::Acquire),
+        );
         if !py.detach(|| wait_atomic_count(&state.completed, submitted, timeout)) {
+            log::error!(
+                "[PdRdmaEngine] RDMA WRITE wait timeout req={} submitted={} completed={} errors={} wait_ms={:.3}",
+                req_id,
+                submitted,
+                state.completed.load(Ordering::Acquire),
+                state.errors.load(Ordering::Acquire),
+                duration_ms(start.elapsed()),
+            );
             return Err(PegaFlowError::new_err(format!(
                 "RDMA WRITE timed out for req={req_id} submitted={submitted} completed={}",
                 state.completed.load(Ordering::Acquire)
@@ -709,10 +955,25 @@ impl PdRdmaEngine {
         }
         let errors = state.errors.load(Ordering::Acquire);
         if errors != 0 {
+            log::error!(
+                "[PdRdmaEngine] RDMA WRITE wait failed req={} submitted={} completed={} errors={} wait_ms={:.3}",
+                req_id,
+                submitted,
+                state.completed.load(Ordering::Acquire),
+                errors,
+                duration_ms(start.elapsed()),
+            );
             return Err(PegaFlowError::new_err(format!(
                 "RDMA WRITE failed for req={req_id} errors={errors}"
             )));
         }
+        log::info!(
+            "[PdRdmaEngine] RDMA WRITE wait done req={} submitted={} completed={} wait_ms={:.3}",
+            req_id,
+            submitted,
+            state.completed.load(Ordering::Acquire),
+            duration_ms(start.elapsed()),
+        );
         Ok(())
     }
 
@@ -721,26 +982,38 @@ impl PdRdmaEngine {
         local: &PdLocalLayer,
         remote: &PdRemoteLayer,
         block: &Bound<'_, PyDict>,
-        is_k: bool,
+        region_idx: usize,
     ) -> PyResult<ScatterTarget> {
         let block_id: u64 = py_get(block, "block_id")?;
         let src_offset: u64 = py_get(block, "src_offset_bytes")?;
         let bytes: u64 = py_get(block, "bytes")?;
-        if bytes == 0 || !bytes.is_multiple_of(local.block_bytes) {
+        if bytes == 0 {
+            return Err(PyValueError::new_err("block slice bytes must be positive"));
+        }
+        let region = remote.regions.get(region_idx).ok_or_else(|| {
+            PyValueError::new_err(format!("remote region {region_idx} is not registered"))
+        })?;
+        if !bytes.is_multiple_of(region.block_len) {
             return Err(PyValueError::new_err(format!(
-                "block slice bytes {bytes} must be a positive multiple of layer block_bytes {}",
-                local.block_bytes
+                "block slice bytes {bytes} must be a positive multiple of remote region block_len {}",
+                region.block_len
             )));
         }
-        let remote_addr = if is_k {
-            remote.k_by_block.get(&block_id)
-        } else {
-            remote.v_by_block.get(&block_id)
+        let block_count = bytes / region.block_len;
+        for offset in 0..block_count {
+            let remote_block_id = block_id
+                .checked_add(offset)
+                .ok_or_else(|| PyValueError::new_err("remote block id overflow"))?;
+            if !remote.allowed_block_ids.contains(&remote_block_id) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "remote block {remote_block_id} is not registered"
+                )));
+            }
         }
-        .copied()
-        .ok_or_else(|| {
-            PyRuntimeError::new_err(format!("remote block {block_id} is not registered"))
-        })?;
+        let remote_addr = block_id
+            .checked_mul(region.block_len)
+            .and_then(|offset| region.base_addr.checked_add(offset))
+            .ok_or_else(|| PyValueError::new_err("remote block address overflow"))?;
         let dst_offset = remote_addr
             .checked_sub(remote.mr_desc.ptr)
             .ok_or_else(|| PyRuntimeError::new_err("remote block address is below MR base"))?;

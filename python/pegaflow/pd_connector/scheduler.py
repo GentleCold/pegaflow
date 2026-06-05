@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -51,6 +52,7 @@ class PdSchedulerConnector:
         # D-side cross-step state
         self._active_waits: dict[str, WaitReqMeta] = {}
         self._completed_waits: set[str] = set()
+        self._matched_ts_ns: dict[str, int] = {}
 
         # P-side cross-step state
         self._active_pushes: dict[str, PushReqMeta] = {}
@@ -65,9 +67,11 @@ class PdSchedulerConnector:
 
         consumer = parse_consumer(params)
         if consumer is not None:
+            matched_ts_ns = time.time_ns()
+            self._matched_ts_ns[req_id] = matched_ts_ns
             count = _num_prompt_tokens(request) - num_computed_tokens
             logger.info(
-                "[PdConnector] D matched_tokens req=%s prompt=%d computed=%d count=%d prefill_url=%s remote_req=%s done_req=%s",
+                "[PdConnector] D matched_tokens req=%s prompt=%d computed=%d count=%d prefill_url=%s remote_req=%s done_req=%s proxy_to_matched_ms=%.3f ts_ns=%d",
                 req_id,
                 _num_prompt_tokens(request),
                 num_computed_tokens,
@@ -75,6 +79,8 @@ class PdSchedulerConnector:
                 consumer.prefill_url,
                 consumer.remote_request_id or req_id,
                 consumer.done_request_id or req_id,
+                _elapsed_ms(consumer.proxy_start_ts_ns, matched_ts_ns),
+                matched_ts_ns,
             )
             return (count, True) if count > 0 else (0, False)
 
@@ -109,11 +115,13 @@ class PdSchedulerConnector:
 
         consumer = parse_consumer(params)
         if consumer is not None:
+            scheduler_wait_ts_ns = time.time_ns()
             assert req_id not in self._active_waits, (
                 f"update_state_after_alloc called while req={req_id} is still waiting for RDMA transfer"
             )
             if req_id in self._completed_waits:
                 return
+            matched_ts_ns = self._matched_ts_ns.get(req_id, 0)
             wait_req = WaitReqMeta(
                 local_block_ids=local_block_ids,
                 remote_request_id=consumer.remote_request_id or req_id,
@@ -121,14 +129,21 @@ class PdSchedulerConnector:
                 prompt_token_ids=_prompt_token_ids(request),
                 prefill_url=consumer.prefill_url,
                 model=str(getattr(request, "model", "") or ""),
+                prefill_max_tokens=consumer.prefill_max_tokens,
+                proxy_start_ts_ns=consumer.proxy_start_ts_ns,
+                matched_ts_ns=matched_ts_ns,
+                scheduler_wait_ts_ns=scheduler_wait_ts_ns,
             )
             self._active_waits[req_id] = wait_req
             self._reqs_to_wait[req_id] = wait_req
             logger.info(
-                "[PdConnector] scheduler wait req=%s blocks=%d prefill_url=%s",
+                "[PdConnector] scheduler wait req=%s blocks=%d prefill_url=%s proxy_to_wait_ms=%.3f matched_to_wait_ms=%.3f ts_ns=%d",
                 req_id,
                 _count(local_block_ids),
                 wait_req.prefill_url,
+                _elapsed_ms(consumer.proxy_start_ts_ns, scheduler_wait_ts_ns),
+                _elapsed_ms(matched_ts_ns, scheduler_wait_ts_ns),
+                scheduler_wait_ts_ns,
             )
             return
 
@@ -164,12 +179,23 @@ class PdSchedulerConnector:
     def update_connector_output(self, connector_output: Any) -> None:
         for req_id in connector_output.finished_sending or ():
             self._active_pushes.pop(req_id, None)
+            self._reqs_to_release.add(req_id)
             logger.info("[PdConnector] scheduler finished sending req=%s", req_id)
 
         for req_id in connector_output.finished_recving or ():
+            finished_ts_ns = time.time_ns()
+            wait_req = self._active_waits.get(req_id)
             self._active_waits.pop(req_id, None)
             self._completed_waits.add(req_id)
-            logger.info("[PdConnector] scheduler finished recving req=%s", req_id)
+            matched_ts_ns = self._matched_ts_ns.pop(req_id, None)
+            logger.info(
+                "[PdConnector] scheduler finished recving req=%s proxy_to_finished_ms=%.3f matched_to_finished_ms=%.3f wait_to_finished_ms=%.3f ts_ns=%d",
+                req_id,
+                _elapsed_ms(wait_req.proxy_start_ts_ns, finished_ts_ns) if wait_req else -1.0,
+                _elapsed_ms(matched_ts_ns or 0, finished_ts_ns),
+                _elapsed_ms(wait_req.scheduler_wait_ts_ns, finished_ts_ns) if wait_req else -1.0,
+                finished_ts_ns,
+            )
 
     def request_finished(
         self,
@@ -180,10 +206,11 @@ class PdSchedulerConnector:
         params = _kv_params(request)
         is_prod = is_producer(params)
 
-        if is_consumer(params) or is_prod:
+        if is_consumer(params):
             self._reqs_to_release.add(req_id)
             self._active_waits.pop(req_id, None)
             self._completed_waits.discard(req_id)
+            self._matched_ts_ns.pop(req_id, None)
 
         if is_prod and _has_blocks(block_ids):
             self._active_pushes.setdefault(
@@ -194,6 +221,9 @@ class PdSchedulerConnector:
                 ),
             )
             return True, None
+        if is_prod:
+            self._reqs_to_release.add(req_id)
+            self._active_pushes.pop(req_id, None)
         return False, None
 
     def _add_cached_producer_chunks(self, scheduler_output: Any) -> None:
@@ -223,3 +253,9 @@ def _count(block_ids: tuple[list[int], ...]) -> int:
 
 def _has_blocks(block_ids: Any) -> bool:
     return any(len(group) > 0 for group in normalize_block_ids(block_ids))
+
+
+def _elapsed_ms(start_ts_ns: int, end_ts_ns: int) -> float:
+    if start_ts_ns <= 0 or end_ts_ns <= 0 or end_ts_ns < start_ts_ns:
+        return -1.0
+    return (end_ts_ns - start_ts_ns) / 1_000_000

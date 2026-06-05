@@ -1,479 +1,7 @@
 from __future__ import annotations
 
-import sys
-import types
-from types import SimpleNamespace
-from unittest.mock import MagicMock
-
-import pytest
-
-from .unit_stubs import install_connector_unit_stubs
-
-install_connector_unit_stubs()
-
-native = types.ModuleType("pegaflow.pegaflow")
-native.EngineRpcClient = MagicMock
-native.PegaFlowError = type("PegaFlowError", (Exception,), {})
-native.PegaflowInternal = type("PegaflowInternal", (Exception,), {})
-native.PyLoadState = object
-native.QueryLoading = object
-native.QueryReady = object
-native.__version__ = "test"
-sys.modules["pegaflow.pegaflow"] = native
-
-import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
-from pegaflow.pd_connector import PdConnector  # noqa: E402
-from pegaflow.pd_connector.layout import (  # noqa: E402
-    BlockSlice,
-    FlashAttnHndLayout,
-    LayerBlockSlices,
-    unique_blocks_from_slot_mapping,
-)
-from pegaflow.pd_connector.metadata import (  # noqa: E402
-    LayerRemoteLayout,
-    LinearBlockAddrLayout,
-    PdConnectorMetadata,
-    PdHandshake,
-    PushReqMeta,
-    WaitReqMeta,
-    handshake_from_dict,
-    handshake_to_dict,
-)
-from pegaflow.pd_connector.proxy import (  # noqa: E402
-    ProxyConfig,
-    build_pd_proxy_request,
-)
-from pegaflow.pd_connector.rdma import (  # noqa: E402
-    MockRdmaPort,
-    RealRdmaPort,
-    _layer_blocks_to_native,
-)
-from pegaflow.pd_connector.scheduler import PdSchedulerConnector  # noqa: E402
-from pegaflow.pd_connector.worker import PdWorkerConnector  # noqa: E402
-
-
-def teardown_module() -> None:
-    sys.modules.pop("pegaflow.pegaflow", None)
-
-
-class FakeTensor:
-    def __init__(
-        self,
-        shape: tuple[int, ...],
-        stride: tuple[int, ...],
-        ptr: int = 0x1000,
-        element_size: int = 2,
-        device_index: int | None = None,
-    ) -> None:
-        self.shape = shape
-        self._stride = stride
-        self._ptr = ptr
-        self._element_size = element_size
-        self.device = SimpleNamespace(index=device_index) if device_index is not None else None
-
-    def stride(self) -> tuple[int, ...]:
-        return self._stride
-
-    def data_ptr(self) -> int:
-        return self._ptr
-
-    def element_size(self) -> int:
-        return self._element_size
-
-
-class FakeSlotMapping(list[int]):
-    def __init__(self, values: list[int]) -> None:
-        super().__init__(values)
-        self.cpu_calls = 0
-
-    def detach(self):
-        return self
-
-    def cpu(self):
-        self.cpu_calls += 1
-        return self
-
-    def tolist(self):
-        return list(self)
-
-
-class FakePrefillSender:
-    def __init__(self) -> None:
-        self.tasks = []
-
-    def submit(self, task) -> None:
-        self.tasks.append(task)
-
-
-class FakeNativeRdmaEngine:
-    def __init__(self) -> None:
-        self.local_layers = []
-        self.remote_regs = []
-        self.pushed_layers = []
-        self.done_reqs = []
-        self.waited_reqs = []
-        self.polled_reqs = []
-        self.marked_reqs = []
-        self.finished_sending = ["sent-1"]
-        self.finished_recving = ["recv-1"]
-
-    def register_local_layers(self, layers):
-        self.local_layers.append(layers)
-        registered = []
-        for layer in layers:
-            registered.append(
-                {
-                    **layer,
-                    "mr_desc": {
-                        "ptr": layer["base_addr"],
-                        "addr_rkey_list": [["10.0.0.1:1", 17]],
-                    },
-                }
-            )
-        return registered
-
-    def register_remote(self, req_id, handshake):
-        assert handshake is not None
-        assert handshake["request_id"]
-        assert handshake.get("imm_id") is None or isinstance(handshake["imm_id"], int)
-        for layer in handshake["layers"]:
-            assert layer["mr_desc"]["addr_rkey_list"]
-            assert isinstance(layer["mr_desc"]["addr_rkey_list"][0], tuple)
-            assert (
-                len(layer["block_ids"])
-                == len(layer["k_block_addrs"])
-                == len(layer["v_block_addrs"])
-            )
-        self.remote_regs.append((req_id, handshake))
-
-    def push_layer(self, req_id, layer_idx, blocks):
-        for block in blocks:
-            assert set(block) == {"k", "v"}
-            assert block["k"]["block_id"] == block["v"]["block_id"]
-            assert block["k"]["bytes"] == block["v"]["bytes"]
-        self.pushed_layers.append((req_id, layer_idx, blocks))
-
-    def push_done(self, req_id):
-        self.done_reqs.append(req_id)
-
-    def wait_done(self, req_id):
-        self.waited_reqs.append(req_id)
-
-    def poll_done(self, req_id):
-        self.polled_reqs.append(req_id)
-        return req_id in self.finished_recving
-
-    def mark_done(self, req_id):
-        self.marked_reqs.append(req_id)
-
-    def pop_finished_sending(self):
-        finished = self.finished_sending
-        self.finished_sending = []
-        return finished
-
-    def pop_finished_recving(self):
-        finished = self.finished_recving
-        self.finished_recving = []
-        return finished
-
-
-class FakeNativeRdmaEngineCtor(FakeNativeRdmaEngine):
-    last_kwargs = None
-
-    def __init__(self, **kwargs) -> None:
-        super().__init__()
-        type(self).last_kwargs = kwargs
-
-    def num_domains(self):
-        return 1
-
-    def num_groups(self):
-        return 1
-
-    def aggregated_link_speed(self):
-        return 400_000_000_000
-
-
-def drain_pd_pushes(worker: PdWorkerConnector) -> None:
-    worker._push_sender.wait_all()
-    worker._push_finalizer.wait_all()
-
-
-DUMMY_HANDSHAKE = PdHandshake(
-    request_id="",
-    engine_id="",
-    tp_rank=0,
-    tp_size=1,
-    block_size=16,
-    layers=(),
-)
-
-
-def test_flash_attn_hnd_layout_offsets() -> None:
-    # Logical shape [2, num_blocks, block_size, num_kv_heads, head_size].
-    # HND physical order [2, num_blocks, num_kv_heads, block_size, head_size].
-    tensor = FakeTensor(
-        shape=(2, 8, 16, 4, 32),
-        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
-    )
-
-    layout = FlashAttnHndLayout.from_tensor("layer.0", tensor)
-
-    assert layout.block_bytes == 16 * 4 * 32 * 2
-    assert layout.block_offset_bytes(0, 3) == 3 * 4 * 16 * 32 * 2
-    assert layout.block_offset_bytes(1, 3) == (8 * 4 * 16 * 32 + 3 * 4 * 16 * 32) * 2
-
-
-def test_real_rdma_port_preserves_native_contract_for_pd_push() -> None:
-    native_engine = FakeNativeRdmaEngine()
-    rdma = RealRdmaPort(native_engine)
-    layer = LayerRemoteLayout(
-        layer_name="layer.0",
-        layer_idx=0,
-        base_addr=0x1000,
-        block_bytes=1024,
-        block_ids=(0, 1),
-        k_block_addrs=(0x1000, 0x1400),
-        v_block_addrs=(0x1800, 0x1C00),
-        linear=LinearBlockAddrLayout(
-            block_id_start=0,
-            block_id_stride=1,
-            num_blocks=2,
-            k_addr_start=0x1000,
-            v_addr_start=0x1800,
-            addr_stride=0x400,
-        ),
-    )
-
-    registered = rdma.register_local_layers((layer,))
-
-    assert registered[0].mr_desc == {
-        "ptr": 0x1000,
-        "addr_rkey_list": [["10.0.0.1:1", 17]],
-    }
-    assert registered[0].block_ids == (0, 1)
-    assert registered[0].k_block_addrs == (0x1000, 0x1400)
-    assert registered[0].v_block_addrs == (0x1800, 0x1C00)
-    assert registered[0].linear == layer.linear
-
-    handshake = PdHandshake(
-        request_id="req-1",
-        engine_id="decode",
-        tp_rank=0,
-        tp_size=1,
-        block_size=16,
-        layers=registered,
-    )
-    rdma.open_request("req-1", handshake)
-
-    assert native_engine.remote_regs[0][0] == "req-1"
-    assert native_engine.remote_regs[0][1]["layers"][0]["mr_desc"]["ptr"] == 0x1000
-    assert native_engine.remote_regs[0][1]["layers"][0]["block_ids"] == [0, 1]
-
-    rdma.push_layer(
-        "req-1",
-        0,
-        [
-            FlashAttnHndLayout(
-                "layer.0", (2, 8, 16, 4, 32), (16384, 2048, 32, 512, 1), 2, 0x1000
-            ).block_slices(1)
-        ],
-    )
-    rdma.push_done("req-1")
-    rdma.wait_done("req-1")
-    rdma.mark_done("req-1")
-
-    _, _, pushed_blocks = native_engine.pushed_layers[0]
-    assert pushed_blocks == [
-        {
-            "k": {"block_id": 1, "src_offset_bytes": 2048 * 2, "bytes": 4096},
-            "v": {
-                "block_id": 1,
-                "src_offset_bytes": (16384 + 2048) * 2,
-                "bytes": 4096,
-            },
-        }
-    ]
-    assert native_engine.done_reqs == ["req-1"]
-    assert native_engine.waited_reqs == ["req-1"]
-    assert native_engine.marked_reqs == ["req-1"]
-    assert rdma.pop_finished_sending() == {"sent-1"}
-    assert rdma.pop_finished_sending() == set()
-    assert rdma.pop_finished_recving() == {"recv-1"}
-    assert rdma.pop_finished_recving() == set()
-
-
-def test_real_rdma_port_rejects_native_layout_without_block_mapping() -> None:
-    native_engine = FakeNativeRdmaEngine()
-
-    def broken_register_local_layers(layers):
-        registered = [{**layers[0], "mr_desc": {"ptr": 0x1000, "addr_rkey_list": []}}]
-        registered[0].pop("block_ids")
-        return registered
-
-    native_engine.register_local_layers = broken_register_local_layers
-    rdma = RealRdmaPort(native_engine)
-    layer = LayerRemoteLayout(
-        layer_name="layer.0",
-        layer_idx=0,
-        base_addr=0x1000,
-        block_bytes=1024,
-        block_ids=(0,),
-        k_block_addrs=(0x1000,),
-        v_block_addrs=(0x1400,),
-    )
-
-    with pytest.raises(KeyError, match="block_ids"):
-        rdma.register_local_layers((layer,))
-
-
-def test_pd_handshake_serializes_linear_block_layout_compactly() -> None:
-    layer = LayerRemoteLayout(
-        layer_name="layer.0",
-        layer_idx=0,
-        base_addr=0x1000,
-        block_bytes=1024,
-        block_ids=(8, 9, 10),
-        k_block_addrs=(0x1000, 0x1400, 0x1800),
-        v_block_addrs=(0x2000, 0x2400, 0x2800),
-    )
-    handshake = PdHandshake(
-        request_id="req-1",
-        engine_id="decode",
-        tp_rank=0,
-        tp_size=1,
-        block_size=16,
-        layers=(layer,),
-    )
-
-    data = handshake_to_dict(handshake)
-    assert data is not None
-    layer_data = data["layers"][0]
-    assert layer_data["block_addr_format"] == "linear"
-    assert layer_data["block_id_start"] == 8
-    assert layer_data["num_blocks"] == 3
-    assert layer_data["addr_stride"] == 0x400
-    assert "block_ids" not in layer_data
-    assert "k_block_addrs" not in layer_data
-    assert "v_block_addrs" not in layer_data
-
-    restored = handshake_from_dict(data)
-    assert restored is not None
-    assert restored.layers[0].block_ids == layer.block_ids
-    assert restored.layers[0].k_block_addrs == layer.k_block_addrs
-    assert restored.layers[0].v_block_addrs == layer.v_block_addrs
-
-
-def test_pd_worker_builds_native_rdma_by_default_when_extension_exists(monkeypatch) -> None:
-    monkeypatch.setattr(native, "PdRdmaEngine", FakeNativeRdmaEngineCtor, raising=False)
-    tensor = FakeTensor(
-        shape=(2, 8, 16, 4, 32),
-        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
-        device_index=2,
-    )
-    config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(
-            engine_id="decode",
-            get_from_extra_config=lambda key, default: {
-                "pegaflow.pd.rdma.rank_map": {"0": {"nic": "mlx5_2", "worker_cpu": 64}},
-            }.get(key, default),
-        ),
-        parallel_config=SimpleNamespace(tensor_parallel_rank=0),
-    )
-
-    worker = PdWorkerConnector(config)
-    worker.register_kv_caches({"layer.0": tensor})
-
-    assert isinstance(worker.rdma, RealRdmaPort)
-    assert FakeNativeRdmaEngineCtor.last_kwargs == {
-        "cuda_device": 2,
-        "numa_node": None,
-        "domains": ["mlx5_2"],
-        "device": "cuda",
-        "pin_worker_cpu": 64,
-    }
-
-
-def test_pd_worker_uses_runtime_tp_rank_for_rdma_rank_map(monkeypatch) -> None:
-    monkeypatch.setattr(native, "PdRdmaEngine", FakeNativeRdmaEngineCtor, raising=False)
-    monkeypatch.setattr(worker_mod, "get_tensor_model_parallel_rank", lambda: 2)
-    monkeypatch.setattr(worker_mod, "get_tensor_model_parallel_world_size", lambda: 8)
-    tensor = FakeTensor(
-        shape=(2, 8, 16, 4, 32),
-        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
-        device_index=2,
-    )
-    config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(
-            engine_id="decode",
-            get_from_extra_config=lambda key, default: {
-                "pegaflow.pd.rdma.rank_map": {
-                    "0": {"nic": "mlx5_1", "worker_cpu": 16},
-                    "2": {"nic": "mlx5_2", "worker_cpu": 60},
-                },
-            }.get(key, default),
-        ),
-        parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=8),
-    )
-
-    worker = PdWorkerConnector(config)
-    worker.register_kv_caches({"layer.0": tensor})
-
-    assert FakeNativeRdmaEngineCtor.last_kwargs["domains"] == ["mlx5_2"]
-    assert FakeNativeRdmaEngineCtor.last_kwargs["pin_worker_cpu"] == 60
-
-
-def test_pd_worker_rejects_legacy_global_rdma_config(monkeypatch) -> None:
-    monkeypatch.setattr(native, "PdRdmaEngine", FakeNativeRdmaEngineCtor, raising=False)
-    tensor = FakeTensor(
-        shape=(2, 8, 16, 4, 32),
-        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
-        device_index=2,
-    )
-    config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(
-            engine_id="decode",
-            get_from_extra_config=lambda key, default: {
-                "pegaflow.pd.rdma.domains": ["mlx5_2"],
-                "pegaflow.pd.rdma.rank_map": {"0": {"nic": "mlx5_2", "worker_cpu": 64}},
-            }.get(key, default),
-        ),
-        parallel_config=SimpleNamespace(tensor_parallel_rank=0),
-    )
-
-    worker = PdWorkerConnector(config)
-    with pytest.raises(RuntimeError, match="legacy keys"):
-        worker.register_kv_caches({"layer.0": tensor})
-
-
-def test_rdma_native_blocks_coalesce_contiguous_ranges() -> None:
-    blocks = [
-        LayerBlockSlices(
-            k=BlockSlice(block_id=10, src_offset_bytes=0x1000, bytes=0x400),
-            v=BlockSlice(block_id=10, src_offset_bytes=0x9000, bytes=0x400),
-        ),
-        LayerBlockSlices(
-            k=BlockSlice(block_id=11, src_offset_bytes=0x1400, bytes=0x400),
-            v=BlockSlice(block_id=11, src_offset_bytes=0x9400, bytes=0x400),
-        ),
-        LayerBlockSlices(
-            k=BlockSlice(block_id=13, src_offset_bytes=0x2000, bytes=0x400),
-            v=BlockSlice(block_id=13, src_offset_bytes=0xA000, bytes=0x400),
-        ),
-    ]
-
-    native_blocks = _layer_blocks_to_native(blocks)
-
-    assert native_blocks == [
-        {
-            "k": {"block_id": 10, "src_offset_bytes": 0x1000, "bytes": 0x800},
-            "v": {"block_id": 10, "src_offset_bytes": 0x9000, "bytes": 0x800},
-        },
-        {
-            "k": {"block_id": 13, "src_offset_bytes": 0x2000, "bytes": 0x400},
-            "v": {"block_id": 13, "src_offset_bytes": 0xA000, "bytes": 0x400},
-        },
-    ]
+# ruff: noqa: F403,F405,I001
+from .pd_connector_test_utils import *
 
 
 def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
@@ -549,15 +77,16 @@ def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:
     assert unique_blocks_from_slot_mapping(attn_metadata.slot_mapping, 16) == {1, 2}
     worker.wait_for_save()
     drain_pd_pushes(worker)
-    assert worker.rdma.pushed_layers["req-1"][0][0] == 0
-    first_layer_blocks = worker.rdma.pushed_layers["req-1"][0][1]
+    pushed_by_layer = pushed_layers_by_idx(worker.rdma, "req-1")
+    assert set(pushed_by_layer) == {0, 1}
+    first_layer_blocks = pushed_by_layer[0]
     assert len(first_layer_blocks) == 1
-    assert first_layer_blocks[0].k.block_id == 1
-    assert first_layer_blocks[0].k.bytes == tensor.element_size() * 16 * 4 * 32 * 2
-    assert worker.rdma.pushed_layers["req-1"][1][0] == 1
+    assert first_layer_blocks[0].regions[0].block_id == 1
+    assert first_layer_blocks[0].regions[0].bytes == tensor.element_size() * 16 * 4 * 32 * 2
     finished_sending, finished_recving = worker.get_finished({"req-1"})
     assert finished_sending == {"req-1"}
     assert finished_recving is None
+    assert "req-1" not in worker.rdma.registered
 
 
 def test_pd_worker_get_finished_does_not_poll_wait_reqs() -> None:
@@ -582,7 +111,7 @@ def test_pd_worker_get_finished_does_not_poll_wait_reqs() -> None:
     assert worker.get_finished(set()) == (None, {"req-1"})
 
 
-def test_p_worker_extracts_slot_mapping_blocks_once_per_forward() -> None:
+def test_p_worker_uses_scheduler_blocks_without_slot_mapping_cpu_sync() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
@@ -604,16 +133,19 @@ def test_p_worker_extracts_slot_mapping_blocks_once_per_forward() -> None:
         None,
     )
 
-    slot_mapping = FakeSlotMapping([16, 17])
+    slot_mapping = FakeSlotMapping([999])
     attn_metadata = SimpleNamespace(slot_mapping=slot_mapping)
     worker.save_kv_layer("layer.0", tensor, attn_metadata)
     worker.save_kv_layer("layer.1", tensor, attn_metadata)
 
-    assert slot_mapping.cpu_calls == 1
+    assert slot_mapping.cpu_calls == 0
     worker.wait_for_save()
+    drain_pd_pushes(worker)
+    pushed_by_layer = pushed_layers_by_idx(worker.rdma, "req-1")
+    assert set(pushed_by_layer) == {0, 1}
 
 
-def test_p_worker_slot_mapping_cache_survives_wait_for_save_within_step() -> None:
+def test_p_worker_save_does_not_require_slot_mapping() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
@@ -635,13 +167,14 @@ def test_p_worker_slot_mapping_cache_survives_wait_for_save_within_step() -> Non
         None,
     )
 
-    slot_mapping = FakeSlotMapping([16, 17])
-    attn_metadata = SimpleNamespace(slot_mapping=slot_mapping)
+    attn_metadata = SimpleNamespace()
     worker.save_kv_layer("layer.0", tensor, attn_metadata)
     worker.wait_for_save()
     worker.save_kv_layer("layer.1", tensor, attn_metadata)
 
-    assert slot_mapping.cpu_calls == 1
+    drain_pd_pushes(worker)
+    pushed_by_layer = pushed_layers_by_idx(worker.rdma, "req-1")
+    assert set(pushed_by_layer) == {0, 1}
 
 
 def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -> None:
@@ -650,12 +183,14 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
     )
     d_rdma = MockRdmaPort()
+    prefill_sender = FakePrefillSender()
     d_worker = PdWorkerConnector(
         SimpleNamespace(
             kv_transfer_config=SimpleNamespace(engine_id="decode"),
             parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
         ),
         rdma=d_rdma,
+        prefill_sender=prefill_sender,
     )
     d_worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
 
@@ -672,17 +207,27 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
     )
     d_worker.start_load_kv(wait_meta, None)
 
-    handshake = d_rdma.remote_handshakes.get("req-1")
+    wait_handshake = d_rdma.remote_handshakes.get("req-1")
+    assert wait_handshake is not None
+    assert wait_handshake.engine_id == "decode"
+    assert wait_handshake.block_size == 16
+    assert isinstance(wait_handshake.imm_id, int)
+    assert len(wait_handshake.layers) == 1
+    assert wait_handshake.layers[0].block_ids == (1,)
+
+    assert len(prefill_sender.tasks) == 1
+    task = prefill_sender.tasks[0]
+    handshake = handshake_from_dict(task.kv_transfer_params["pd_handshakes"][0])
     assert handshake is not None
     assert handshake.engine_id == "decode"
     assert handshake.block_size == 16
-    assert handshake.layers[0].k_block_addrs == ()
-    assert isinstance(handshake.imm_id, int)
-    linear = handshake.layers[0].linear
-    assert linear is not None
-    assert linear.block_id_start == 1
-    assert linear.num_blocks == 2
-    assert linear.k_addr_start == tensor.data_ptr() + 1 * 4 * 16 * 32 * 2
+    assert handshake.imm_id == wait_handshake.imm_id
+    assert handshake.layers[0].block_ids == (1, 2)
+    assert handshake.layers[0].regions[0] == TransferRegionLayout(
+        region_idx=0,
+        base_addr=tensor.data_ptr(),
+        block_len=4 * 16 * 32 * 2,
+    )
 
     push_worker = PdWorkerConnector(
         SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="")), rdma=MockRdmaPort()
@@ -766,6 +311,9 @@ def test_scheduler_delays_producer_block_free_until_send_finishes() -> None:
     assert delay_free is True
     assert params is None
 
+    early_release_meta = scheduler.build_connector_meta(SimpleNamespace())
+    assert early_release_meta.reqs_to_release == set()
+
     scheduler.update_connector_output(
         SimpleNamespace(finished_sending={"req-1"}, finished_recving=None)
     )
@@ -817,6 +365,37 @@ def test_scheduler_carries_prompt_tokens_for_d_to_p_oob() -> None:
     assert meta.reqs_to_wait["req-1"].prompt_token_ids == (11, 12, 13)
 
 
+def test_scheduler_carries_prefill_max_tokens_for_d_to_p_oob() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="d"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "prefill_url": "http://p:8001",
+            "prefill_max_tokens": 3,
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    meta = scheduler.build_connector_meta(SimpleNamespace())
+
+    assert meta.reqs_to_wait["req-1"].prefill_max_tokens == 3
+
+
+def test_consumer_params_reject_invalid_prefill_max_tokens() -> None:
+    with pytest.raises(ValueError, match="prefill_max_tokens must be positive"):
+        parse_consumer(
+            {
+                "do_remote_prefill": True,
+                "prefill_url": "http://p:8001",
+                "prefill_max_tokens": 0,
+            }
+        )
+
+
 def test_scheduler_carries_cross_process_rdma_handshake() -> None:
     handshake = {
         "request_id": "decode-1",
@@ -828,11 +407,11 @@ def test_scheduler_carries_cross_process_rdma_handshake() -> None:
             {
                 "layer_name": "layer.0",
                 "layer_idx": 0,
-                "base_addr": 0x1000,
-                "block_bytes": 1024,
                 "block_ids": [1],
-                "k_block_addrs": [0x1000],
-                "v_block_addrs": [0x1400],
+                "regions": [
+                    {"region_idx": 0, "base_addr": 0x1000, "block_len": 1024},
+                    {"region_idx": 1, "base_addr": 0x1400, "block_len": 1024},
+                ],
                 "mr_desc": {"addr_rkey_list": [["10.0.0.1:1", 17]]},
             }
         ],
@@ -846,7 +425,7 @@ def test_scheduler_carries_cross_process_rdma_handshake() -> None:
             "do_remote_prefill_sender": True,
             "target_engine_id": "decode",
             "target_request_id": "decode-1",
-            "pd_handshake": handshake,
+            "pd_handshakes": [handshake],
         },
     )
 
@@ -950,7 +529,74 @@ def test_d_worker_rank0_dispatches_prefill_on_wait() -> None:
     handshakes = task.kv_transfer_params["pd_handshakes"]
     assert len(handshakes) == 1
     assert handshakes[0]["request_id"] == "external-d"
-    assert handshakes[0]["layers"][0]["num_blocks"] == 1
+    assert handshakes[0]["block_ids"] == [1]
+    assert "block_ids" not in handshakes[0]["layers"][0]
+    parsed = handshake_from_dict(handshakes[0])
+    assert parsed is not None
+    assert parsed.layers[0].block_ids == (1,)
+
+
+def test_layer_push_sender_keeps_fifo_order() -> None:
+    class Event:
+        def __init__(self) -> None:
+            self.ready = threading.Event()
+
+        def synchronize(self) -> None:
+            assert self.ready.wait(timeout=2)
+
+    class RecordingRdma:
+        def __init__(self) -> None:
+            self.pushed: queue.Queue[int] = queue.Queue()
+
+        def push_layer(self, req_id, layer_idx, blocks) -> None:
+            self.pushed.put(layer_idx)
+
+    first_event = Event()
+    ready_event = Event()
+    ready_event.ready.set()
+    rdma = RecordingRdma()
+    sender = prefill_worker_mod._AsyncLayerPushSender()
+    try:
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="req",
+                layer_idx=0,
+                block_slices=[],
+                event=first_event,
+            )
+        )
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="req",
+                layer_idx=1,
+                block_slices=[],
+                event=ready_event,
+            )
+        )
+
+        with pytest.raises(queue.Empty):
+            rdma.pushed.get(timeout=0.1)
+        first_event.ready.set()
+        sender.wait_req("req")
+
+        assert rdma.pushed.get(timeout=2) == 0
+        assert rdma.pushed.get(timeout=2) == 1
+    finally:
+        first_event.ready.set()
+        sender.close()
+
+
+def _prefill_http_task(request_id: str) -> PrefillHttpTask:
+    return PrefillHttpTask(
+        request_id=request_id,
+        prefill_url="http://p:8001",
+        model="model",
+        prompt_token_ids=(1,),
+        max_tokens=1,
+        kv_transfer_params={"target_request_id": request_id},
+    )
 
 
 def test_p_worker_selects_matching_tp_rank_handshake() -> None:
@@ -1042,7 +688,7 @@ def test_p_worker_pushes_registered_blocks_from_save_kv_layer() -> None:
     worker.wait_for_save()
     drain_pd_pushes(worker)
 
-    assert [layer_idx for layer_idx, _ in rdma.pushed_layers["prefill-r0"]] == [0, 1]
+    assert {layer_idx for layer_idx, _ in rdma.pushed_layers["prefill-r0"]} == {0, 1}
     assert worker.get_finished({"prefill-r0"})[0] == {"prefill-r0"}
 
 
@@ -1074,14 +720,9 @@ def test_p_worker_maps_local_blocks_to_remote_blocks_by_position() -> None:
                             tp_size=1,
                             block_size=16,
                             layers=(
-                                LayerRemoteLayout(
-                                    layer_name="layer.0",
-                                    layer_idx=0,
-                                    base_addr=0x1000,
-                                    block_bytes=4096,
+                                hnd_remote_layer(
                                     block_ids=(68, 69),
-                                    k_block_addrs=(0x1000, 0x2000),
-                                    v_block_addrs=(0x3000, 0x4000),
+                                    block_len=4096,
                                 ),
                             ),
                         ),
@@ -1101,12 +742,12 @@ def test_p_worker_maps_local_blocks_to_remote_blocks_by_position() -> None:
     drain_pd_pushes(worker)
 
     _, pushed = rdma.pushed_layers["prefill-r0"][0]
-    assert [block.k.block_id for block in pushed] == [68]
+    assert [block.regions[0].block_id for block in pushed] == [68]
     assert len(rdma.pushed_layers["prefill-r0"]) == 1
-    assert [block.k.src_offset_bytes for block in pushed] == [
+    assert [block.regions[0].src_offset_bytes for block in pushed] == [
         tensor.stride()[1] * 3 * tensor.element_size()
     ]
-    assert pushed[0].k.bytes == tensor.stride()[1] * tensor.element_size() * 2
+    assert pushed[0].regions[0].bytes == tensor.stride()[1] * tensor.element_size() * 2
 
 
 def test_p_worker_advances_remote_blocks_across_chunk_prefill() -> None:
@@ -1130,14 +771,9 @@ def test_p_worker_advances_remote_blocks_across_chunk_prefill() -> None:
         tp_size=1,
         block_size=16,
         layers=(
-            LayerRemoteLayout(
-                layer_name="layer.0",
-                layer_idx=0,
-                base_addr=0x1000,
-                block_bytes=4096,
+            hnd_remote_layer(
                 block_ids=(68, 69, 70, 71),
-                k_block_addrs=(0x1000, 0x2000, 0x3000, 0x4000),
-                v_block_addrs=(0x5000, 0x6000, 0x7000, 0x8000),
+                block_len=4096,
             ),
         ),
     )
@@ -1163,7 +799,7 @@ def test_p_worker_advances_remote_blocks_across_chunk_prefill() -> None:
     drain_pd_pushes(worker)
 
     assert worker.get_finished(set())[0] is None
-    assert [block.k.block_id for block in rdma.pushed_layers["prefill-r0"][0][1]] == [68]
+    assert [block.regions[0].block_id for block in rdma.pushed_layers["prefill-r0"][0][1]] == [68]
     assert len(rdma.pushed_layers["prefill-r0"]) == 1
 
     worker.start_load_kv(
@@ -1186,7 +822,7 @@ def test_p_worker_advances_remote_blocks_across_chunk_prefill() -> None:
     worker.wait_for_save()
     drain_pd_pushes(worker)
 
-    assert [block.k.block_id for block in rdma.pushed_layers["prefill-r0"][1][1]] == [70]
+    assert [block.regions[0].block_id for block in rdma.pushed_layers["prefill-r0"][1][1]] == [70]
     assert worker.get_finished({"prefill-r0"})[0] == {"prefill-r0"}
 
 
@@ -1216,6 +852,7 @@ def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
         "prefill_url": "http://127.0.0.1:8001",
         "remote_request_id": "pd-test-p",
         "done_request_id": "pd-test-d",
+        "prefill_max_tokens": 1,
     }
 
 

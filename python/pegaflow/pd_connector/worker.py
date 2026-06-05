@@ -7,6 +7,7 @@ PdWorkerConnector is the public facade. It composes:
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from vllm.distributed.parallel_state import (
@@ -16,7 +17,7 @@ from vllm.distributed.parallel_state import (
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.decode_worker import DecodeHandler
-from pegaflow.pd_connector.layout import FlashAttnHndLayout
+from pegaflow.pd_connector.layout import KvCacheLayout, layout_from_tensor
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdConnectorMetadata,
@@ -32,10 +33,15 @@ class PdWorkerConnector:
     def __init__(
         self,
         vllm_config: Any,
+        kv_cache_config: Any = None,
         rdma: RdmaPort | None = None,
         prefill_sender: Any | None = None,
     ) -> None:
         self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
+        self.use_mla = model_uses_mla(vllm_config)
+        self.logical_block_size = _logical_block_size(vllm_config)
+        self._layer_specs = _layer_specs_from_config(kv_cache_config)
         self.rdma = rdma
         self._rdma_is_injected = rdma is not None
         self.engine_id = getattr(vllm_config.kv_transfer_config, "engine_id", None) or ""
@@ -46,7 +52,7 @@ class PdWorkerConnector:
             self.tp_rank,
             self.tp_size,
         )
-        self.layouts: dict[str, FlashAttnHndLayout] = {}
+        self.layouts: dict[str, KvCacheLayout] = {}
         self.layer_names: list[str] = []
         self._registered_layers: dict[str, LayerRemoteLayout] = {}
         self._forward_step_id = 0
@@ -83,10 +89,22 @@ class PdWorkerConnector:
     # ------------------------------------------------------------------
 
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+        expected_num_blocks = _expected_num_blocks(self.kv_cache_config)
         self.layouts = {
-            layer_name: FlashAttnHndLayout.from_tensor(layer_name, tensor)
+            layer_name: layout_from_tensor(
+                layer_name,
+                tensor,
+                layer_spec=self._layer_spec(layer_name),
+                logical_block_size=self.logical_block_size,
+                expected_num_blocks=expected_num_blocks,
+            )
             for layer_name, tensor in kv_caches.items()
         }
+        num_blocks_by_layer = {name: layout.num_blocks for name, layout in self.layouts.items()}
+        assert len(set(num_blocks_by_layer.values())) == 1, (
+            "PdConnector requires all KV cache tensors to share num_blocks; "
+            f"num_blocks_by_layer={num_blocks_by_layer}"
+        )
         self.layer_names = list(kv_caches.keys())
         if not self._rdma_is_injected:
             self.rdma = build_rdma_port(
@@ -105,10 +123,18 @@ class PdWorkerConnector:
         self._registered_layers = {layer.layer_name: layer for layer in registered_layers}
         self._decode.gather_peer_info()
         logger.info(
-            "[PdConnector] registered %d FlashAttention HND KV cache layers, gathered %d peer ranks",
+            "[PdConnector] registered %d KV cache layers, gathered %d peer ranks",
             len(self.layouts),
             len(self._decode._peer_layouts),
         )
+
+    def _layer_spec(self, layer_name: str) -> Any | None:
+        layer_spec = self._layer_specs.get(layer_name)
+        assert layer_spec is not None or not self.use_mla, (
+            f"PdConnector MLA requires KVCacheSpec for layer={layer_name}; "
+            "pass kv_cache_config into the connector"
+        )
+        return layer_spec
 
     def start_load_kv(
         self,
@@ -164,7 +190,18 @@ class PdWorkerConnector:
         )
 
         releasable_sending = self._prefill.get_finished_sending(finished_req_ids)
+        for req_id in releasable_sending:
+            self.rdma.close_request(req_id)
         finished_recving = self.rdma.pop_finished_recving()
+        if finished_recving:
+            report_ts_ns = time.time_ns()
+            logger.info(
+                "[PdConnector] D worker finished_recving reqs=%s count=%d remaining_wait_before=%d ts_ns=%d",
+                sorted(finished_recving),
+                len(finished_recving),
+                len(self._decode.wait_reqs),
+                report_ts_ns,
+            )
         self._decode.finish_recving(finished_recving)
 
         logger.debug(
@@ -219,3 +256,36 @@ def _tensor_parallel_identity(vllm_config: Any) -> tuple[int, int]:
             int(getattr(parallel_config, "tensor_parallel_rank", 0) or 0),
             int(getattr(parallel_config, "tensor_parallel_size", 1) or 1),
         )
+
+
+def model_uses_mla(vllm_config: Any) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    if bool(getattr(model_config, "use_mla", False)):
+        return True
+    hf_config = getattr(model_config, "hf_text_config", None)
+    return getattr(hf_config, "kv_lora_rank", None) is not None
+
+
+def _logical_block_size(vllm_config: Any) -> int:
+    cache_config = getattr(vllm_config, "cache_config", None)
+    block_size = int(getattr(cache_config, "block_size", 0) or 0)
+    if block_size > 0:
+        return block_size
+    return 16
+
+
+def _layer_specs_from_config(kv_cache_config: Any) -> dict[str, Any]:
+    if kv_cache_config is None:
+        return {}
+    return {
+        layer_name: group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+
+
+def _expected_num_blocks(kv_cache_config: Any) -> int | None:
+    if kv_cache_config is None:
+        return None
+    num_blocks = getattr(kv_cache_config, "num_blocks", None)
+    return int(num_blocks) if num_blocks is not None else None

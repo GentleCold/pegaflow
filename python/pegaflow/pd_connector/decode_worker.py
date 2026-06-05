@@ -5,17 +5,17 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pd_connector.kv_params import ProducerKvParams
-from pegaflow.pd_connector.layout import FlashAttnHndLayout
+from pegaflow.pd_connector.layout import KvCacheLayout
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdHandshake,
     WaitReqMeta,
     flatten_block_ids,
+    layer_layout_to_compact_dict,
 )
 from pegaflow.pd_connector.prefill import AsyncPrefillSender, PrefillHttpTask
 from pegaflow.pd_connector.rdma import RdmaPort
@@ -36,8 +36,10 @@ class DecodeHandler:
     ) -> None:
         self._w = worker
         self._wait_reqs: dict[str, WaitReqMeta] = {}
-        self._peer_layouts: dict[int, dict[str, FlashAttnHndLayout]] = {}
+        self._peer_layouts: dict[int, dict[str, KvCacheLayout]] = {}
         self._peer_mr_descs: dict[int, dict[str, Any]] = {}
+        self._peer_layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
+        self._peer_block_size: int | None = None
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
             _AsyncRdmaDoneWaiter(worker.rdma) if worker.rdma is not None else None
@@ -54,6 +56,7 @@ class DecodeHandler:
         if self._w.tp_size <= 1:
             self._peer_layouts = {0: self._w.layouts}
             self._peer_mr_descs = {0: mr_descs}
+            self._refresh_peer_layer_templates()
             return
         try:
             gathered = _all_gather_peer_info(self._w.layouts, mr_descs, self._w.tp_size)
@@ -63,10 +66,12 @@ class DecodeHandler:
             )
             self._peer_layouts = {self._w.tp_rank: self._w.layouts}
             self._peer_mr_descs = {self._w.tp_rank: mr_descs}
+            self._refresh_peer_layer_templates()
             return
         for rank, (layouts, descs) in enumerate(gathered):
             self._peer_layouts[rank] = layouts
             self._peer_mr_descs[rank] = descs
+        self._refresh_peer_layer_templates()
 
     def process_wait_reqs(self, reqs_to_wait: dict[str, WaitReqMeta]) -> None:
         assert self._w.rdma is not None, "PdConnector RDMA port is not initialized"
@@ -75,24 +80,47 @@ class DecodeHandler:
             if req_id in self._wait_reqs:
                 logger.info("[PdConnector] D wait req=%s already registered", req_id)
                 continue
+            process_ts_ns = time.time_ns()
             self._wait_reqs[req_id] = req
-            handshake = self._build_handshake(
+            block_ids = flatten_block_ids(req.local_block_ids)
+            imm_id = self._alloc_imm_id()
+            wait_handshake = self._build_wait_handshake(
                 req.done_request_id,
-                flatten_block_ids(req.local_block_ids),
+                block_ids,
+                imm_id,
             )
-            self._w.rdma.open_request(req_id, handshake)
-            self._rdma_waiter.submit(req_id)
+            self._w.rdma.open_request(req_id, wait_handshake)
+            local_block_count = len(block_ids)
+            waiter_queued_ts_ns = time.time_ns()
+            self._rdma_waiter.submit(
+                _RdmaWaitTask(
+                    req_id=req_id,
+                    remote_request_id=req.remote_request_id,
+                    done_request_id=req.done_request_id,
+                    prefill_url=req.prefill_url,
+                    rank=self._w.tp_rank,
+                    block_count=local_block_count,
+                    queued_ts_ns=waiter_queued_ts_ns,
+                )
+            )
+            queued_ts_ns = time.time_ns()
             logger.info(
-                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s rank=%d blocks=%d ts_ns=%d",
+                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s rank=%d blocks=%d "
+                "proxy_to_worker_ms=%.3f matched_to_worker_ms=%.3f scheduler_wait_to_worker_ms=%.3f "
+                "open_request_ms=%.3f ts_ns=%d",
                 req_id,
                 req.remote_request_id,
                 req.prefill_url or "<oob>",
                 self._w.tp_rank,
-                len(flatten_block_ids(req.local_block_ids)),
-                time.time_ns(),
+                local_block_count,
+                _elapsed_ms(req.proxy_start_ts_ns, queued_ts_ns),
+                _elapsed_ms(req.matched_ts_ns, queued_ts_ns),
+                _elapsed_ms(req.scheduler_wait_ts_ns, queued_ts_ns),
+                _elapsed_ms(process_ts_ns, queued_ts_ns),
+                queued_ts_ns,
             )
             if req.prefill_url and self._w.tp_rank == 0:
-                self._dispatch_prefill(req, handshake.imm_id)
+                self._dispatch_prefill(req, block_ids, imm_id)
 
     def release(self, req_id: str) -> None:
         self._wait_reqs.pop(req_id, None)
@@ -114,80 +142,112 @@ class DecodeHandler:
     def wait_reqs(self) -> dict[str, WaitReqMeta]:
         return self._wait_reqs
 
-    def _build_handshake(self, req_id: str, block_ids: set[int]) -> PdHandshake:
-        imm_id = self._alloc_imm_id()
+    def _build_wait_handshake(
+        self,
+        req_id: str,
+        block_ids: set[int],
+        imm_id: int,
+    ) -> PdHandshake:
+        assert block_ids, f"PdConnector D wait req={req_id} has no local KV blocks"
+        first_layer_name = self._w.layer_names[0]
+        first_block_id = min(block_ids)
         return PdHandshake(
             request_id=req_id,
             engine_id=self._w.engine_id,
             tp_rank=self._w.tp_rank,
             tp_size=self._w.tp_size,
             block_size=next(iter(self._w.layouts.values())).block_size,
-            layers=tuple(
-                self._remote_layout_with_mr_desc(layer_name, layer_idx, block_ids)
-                for layer_idx, layer_name in enumerate(self._w.layer_names)
+            layers=(
+                self._remote_layout_with_mr_desc(
+                    first_layer_name,
+                    0,
+                    (first_block_id,),
+                ),
             ),
             imm_id=imm_id,
         )
 
-    def _dispatch_prefill(self, req: WaitReqMeta, imm_id: int) -> None:
-        block_ids = flatten_block_ids(req.local_block_ids)
-        all_handshakes = self._build_all_rank_handshakes(
+    def _dispatch_prefill(
+        self,
+        req: WaitReqMeta,
+        block_ids: set[int],
+        imm_id: int,
+    ) -> None:
+        started_ts_ns = time.time_ns()
+        all_handshakes = self._build_all_rank_handshake_dicts(
             req.done_request_id,
             block_ids,
             imm_id,
         )
-        params = ProducerKvParams(
-            target_engine_id=self._w.engine_id,
-            target_request_id=req.done_request_id,
-            handshakes=all_handshakes,
-        )
+        kv_transfer_params: dict[str, Any] = {
+            "do_remote_prefill_sender": True,
+            "target_engine_id": self._w.engine_id,
+            "target_request_id": req.done_request_id,
+            "pd_handshakes": all_handshakes,
+        }
         task = PrefillHttpTask(
             request_id=req.remote_request_id,
             prefill_url=req.prefill_url,
             model=req.model,
             prompt_token_ids=req.prompt_token_ids,
             max_tokens=req.prefill_max_tokens,
-            kv_transfer_params=params.to_dict(),
+            kv_transfer_params=kv_transfer_params,
         )
         self._prefill_sender.submit(task)
+        submitted_ts_ns = time.time_ns()
         logger.info(
-            "[PdConnector] D rank0 dispatched prefill req=%s remote_req=%s ranks=%d ts_ns=%d",
+            "[PdConnector] D rank0 dispatched prefill req=%s remote_req=%s ranks=%d blocks=%d "
+            "build_ms=%.3f proxy_to_dispatch_ms=%.3f matched_to_dispatch_ms=%.3f "
+            "scheduler_wait_to_dispatch_ms=%.3f ts_ns=%d",
             req.remote_request_id,
             req.done_request_id,
             len(all_handshakes),
-            time.time_ns(),
+            len(block_ids),
+            (submitted_ts_ns - started_ts_ns) / 1_000_000,
+            _elapsed_ms(req.proxy_start_ts_ns, submitted_ts_ns),
+            _elapsed_ms(req.matched_ts_ns, submitted_ts_ns),
+            _elapsed_ms(req.scheduler_wait_ts_ns, submitted_ts_ns),
+            submitted_ts_ns,
         )
 
-    def _build_all_rank_handshakes(
+    def _build_all_rank_handshake_dicts(
         self,
         req_id: str,
         block_ids: set[int],
         imm_id: int,
-    ) -> tuple[PdHandshake, ...]:
+    ) -> list[dict[str, Any]]:
         result = []
-        block_size = next(iter(self._w.layouts.values())).block_size
+        block_size = self._peer_block_size
+        assert block_size is not None, "peer layer templates are not initialized"
+        ordered_block_ids = sorted(block_ids)
         for rank in range(self._w.tp_size):
-            peer_layouts = self._peer_layouts[rank]
+            result.append(
+                {
+                    "request_id": req_id,
+                    "engine_id": self._w.engine_id,
+                    "tp_rank": rank,
+                    "tp_size": self._w.tp_size,
+                    "block_size": block_size,
+                    "block_ids": list(ordered_block_ids),
+                    "layers": list(self._peer_layer_templates[rank]),
+                    "imm_id": imm_id,
+                }
+            )
+        return result
+
+    def _refresh_peer_layer_templates(self) -> None:
+        self._peer_layer_templates = {}
+        self._peer_block_size = next(iter(self._w.layouts.values())).block_size
+        for rank, peer_layouts in self._peer_layouts.items():
             peer_mr_descs = self._peer_mr_descs[rank]
-            layers = tuple(
-                replace(
-                    peer_layouts[name].remote_layout(layer_idx, block_ids),
+            layers = []
+            for layer_idx, name in enumerate(self._w.layer_names):
+                layer = replace(
+                    peer_layouts[name].remote_layout(layer_idx, (0,)),
                     mr_desc=peer_mr_descs.get(name),
                 )
-                for layer_idx, name in enumerate(self._w.layer_names)
-            )
-            result.append(
-                PdHandshake(
-                    request_id=req_id,
-                    engine_id=self._w.engine_id,
-                    tp_rank=rank,
-                    tp_size=self._w.tp_size,
-                    block_size=block_size,
-                    layers=layers,
-                    imm_id=imm_id,
-                )
-            )
-        return tuple(result)
+                layers.append(layer_layout_to_compact_dict(layer))
+            self._peer_layer_templates[rank] = tuple(layers)
 
     def _alloc_imm_id(self) -> int:
         imm_id = self._next_imm_id
@@ -200,7 +260,7 @@ class DecodeHandler:
         self,
         layer_name: str,
         layer_idx: int,
-        block_ids: set[int],
+        block_ids: tuple[int, ...],
     ) -> LayerRemoteLayout:
         layout = self._w.layouts[layer_name].remote_layout(layer_idx, block_ids)
         registered = self._w._registered_layers.get(layer_name)
@@ -209,49 +269,101 @@ class DecodeHandler:
         return replace(layout, mr_desc=registered.mr_desc)
 
 
+@dataclass(frozen=True)
+class _RdmaWaitTask:
+    req_id: str
+    remote_request_id: str
+    done_request_id: str
+    prefill_url: str | None
+    rank: int
+    block_count: int
+    queued_ts_ns: int
+
+
 class _AsyncRdmaDoneWaiter:
+    """One background thread blocking on each request's RDMA IMM completion.
+
+    submit() runs on the vLLM worker thread; _run() is the sole consumer.
+    _submitted is shared by those two threads, hence the lock. A request is
+    dropped from it once its wait resolves so the set tracks only in-flight waits.
+    """
+
     def __init__(self, rdma: RdmaPort) -> None:
         self.rdma = rdma
-        self._queue: queue.Queue[tuple[str, int] | None] = queue.Queue()
+        self._queue: queue.Queue[_RdmaWaitTask | None] = queue.Queue()
         self._submitted: set[str] = set()
+        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, name="pd-rdma-done-waiter", daemon=True)
         self._thread.start()
 
-    def submit(self, req_id: str) -> None:
-        if req_id in self._submitted:
-            return
-        self._submitted.add(req_id)
-        self._queue.put((req_id, time.time_ns()))
+    def submit(self, task: _RdmaWaitTask) -> None:
+        with self._lock:
+            if task.req_id in self._submitted:
+                return
+            self._submitted.add(task.req_id)
+        logger.info(
+            "[PdConnector] D RDMA wait queued req=%s remote_req=%s done_req=%s rank=%d blocks=%d prefill_url=%s queue_depth=%d",
+            task.req_id,
+            task.remote_request_id,
+            task.done_request_id,
+            task.rank,
+            task.block_count,
+            task.prefill_url or "<oob>",
+            self._queue.qsize(),
+        )
+        self._queue.put(task)
 
     def close(self) -> None:
         self._queue.put(None)
 
     def _run(self) -> None:
         while True:
-            item = self._queue.get()
-            if item is None:
+            task = self._queue.get()
+            if task is None:
                 return
-            req_id, submit_ts_ns = item
             try:
-                self.rdma.wait_done(req_id)
+                start_ts_ns = time.time_ns()
+                self.rdma.wait_done(task.req_id)
                 done_ts_ns = time.time_ns()
                 logger.info(
-                    "[PdConnector] D received RDMA done req=%s wait_ms=%.3f ts_ns=%d",
-                    req_id,
-                    (done_ts_ns - submit_ts_ns) / 1_000_000,
+                    "[PdConnector] D received RDMA done req=%s remote_req=%s done_req=%s rank=%d blocks=%d queue_wait_ms=%.3f wait_ms=%.3f ts_ns=%d",
+                    task.req_id,
+                    task.remote_request_id,
+                    task.done_request_id,
+                    task.rank,
+                    task.block_count,
+                    (start_ts_ns - task.queued_ts_ns) / 1_000_000,
+                    (done_ts_ns - start_ts_ns) / 1_000_000,
                     done_ts_ns,
                 )
             except Exception:
-                logger.exception("[PdConnector] D RDMA done wait failed req=%s", req_id)
+                logger.exception(
+                    "[PdConnector] D RDMA done wait failed req=%s remote_req=%s done_req=%s rank=%d blocks=%d",
+                    task.req_id,
+                    task.remote_request_id,
+                    task.done_request_id,
+                    task.rank,
+                    task.block_count,
+                )
+            finally:
+                with self._lock:
+                    self._submitted.discard(task.req_id)
+                self._queue.task_done()
 
 
 def _all_gather_peer_info(
-    layouts: dict[str, FlashAttnHndLayout],
+    layouts: dict[str, KvCacheLayout],
     mr_descs: dict[str, Any],
     tp_size: int,
-) -> list[tuple[dict[str, FlashAttnHndLayout], dict[str, Any]]]:
+) -> list[tuple[dict[str, KvCacheLayout], dict[str, Any]]]:
     import torch.distributed as dist
 
-    gathered: list[tuple[dict[str, FlashAttnHndLayout], dict[str, Any]] | None] = [None] * tp_size
+    gathered: list[tuple[dict[str, KvCacheLayout], dict[str, Any]] | None] = [None] * tp_size
     dist.all_gather_object(gathered, (layouts, mr_descs))
     return gathered  # type: ignore[return-value]
+
+
+def _elapsed_ms(start_ts_ns: int, end_ts_ns: int) -> float:
+    if start_ts_ns <= 0 or end_ts_ns <= 0 or end_ts_ns < start_ts_ns:
+        return -1.0
+    return (end_ts_ns - start_ts_ns) / 1_000_000

@@ -11,8 +11,7 @@ from typing import Any
 
 from pegaflow.pd_connector.metadata import (
     PdHandshake,
-    handshake_from_dict,
-    handshake_to_dict,
+    handshake_to_compact_dict,
     handshakes_from_dicts,
 )
 
@@ -24,6 +23,14 @@ class ConsumerKvParams:
     prefill_url: str
     remote_request_id: str = ""
     done_request_id: str = ""
+    prefill_max_tokens: int = 1
+    proxy_start_ts_ns: int = 0
+
+    def __post_init__(self) -> None:
+        if self.prefill_max_tokens <= 0:
+            raise ValueError("prefill_max_tokens must be positive")
+        if self.proxy_start_ts_ns < 0:
+            raise ValueError("proxy_start_ts_ns must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"do_remote_prefill": True, "prefill_url": self.prefill_url}
@@ -31,6 +38,9 @@ class ConsumerKvParams:
             d["remote_request_id"] = self.remote_request_id
         if self.done_request_id:
             d["done_request_id"] = self.done_request_id
+        d["prefill_max_tokens"] = self.prefill_max_tokens
+        if self.proxy_start_ts_ns:
+            d["proxy_start_ts_ns"] = self.proxy_start_ts_ns
         return d
 
 
@@ -50,7 +60,7 @@ class ProducerKvParams:
         }
         if self.handshakes:
             result["pd_handshakes"] = [
-                handshake_to_dict(handshake) for handshake in self.handshakes
+                handshake_to_compact_dict(handshake) for handshake in self.handshakes
             ]
         return result
 
@@ -61,10 +71,13 @@ def parse_consumer(params: dict[str, Any]) -> ConsumerKvParams | None:
     prefill_url = params.get("prefill_url")
     if not prefill_url:
         return None
+    raw_prefill_max_tokens = params.get("prefill_max_tokens", 1)
     return ConsumerKvParams(
         prefill_url=str(prefill_url),
         remote_request_id=str(params.get("remote_request_id") or ""),
         done_request_id=str(params.get("done_request_id") or ""),
+        prefill_max_tokens=int(raw_prefill_max_tokens),
+        proxy_start_ts_ns=int(params.get("proxy_start_ts_ns") or 0),
     )
 
 
@@ -72,9 +85,6 @@ def parse_producer(params: dict[str, Any]) -> ProducerKvParams | None:
     if not params.get("do_remote_prefill_sender"):
         return None
     handshakes = handshakes_from_dicts(params.get("pd_handshakes"))
-    if not handshakes:
-        single = handshake_from_dict(params.get("pd_handshake"))
-        handshakes = (single,) if single is not None else ()
     return ProducerKvParams(
         target_engine_id=str(params.get("target_engine_id") or ""),
         target_request_id=str(params.get("target_request_id") or ""),

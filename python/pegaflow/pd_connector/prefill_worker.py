@@ -11,11 +11,10 @@ from typing import TYPE_CHECKING, Any
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.chunk_tracker import ChunkTracker
 from pegaflow.pd_connector.layout import (
-    FlashAttnHndLayout,
     LayerBlockSlices,
     block_ranges_for_remote_write,
     block_slices_bytes,
-    unique_blocks_from_slot_mapping,
+    layout_from_tensor,
 )
 from pegaflow.pd_connector.metadata import (
     PdHandshake,
@@ -43,14 +42,26 @@ class PrefillHandler:
         self._producer_finished_req_ids: set[str] = set()
         self._remote_block_offsets: dict[str, int] = {}
         self._push_traces: dict[str, _PushTrace] = {}
-        self._slot_mapping_cache: tuple[int, set[int]] | None = None
+        self._skipped_pushes = 0
         self._push_sender = _AsyncLayerPushSender()
         self._push_finalizer = _AsyncPushFinalizer(self._push_sender)
 
     def process_push_reqs(self, reqs_to_push: dict[str, PushReqMeta]) -> None:
         for req_id, req in reqs_to_push.items():
             self._tracker.add_request(req_id)
-            handshake = self._select_push_handshake(req)
+            try:
+                handshake = self._select_push_handshake(req)
+            except _SkipPushRank:
+                self._skipped_pushes += 1
+                self._completed_pushes.add(req_id)
+                logger.info(
+                    "[PdConnector] P skipped MLA push req=%s target_req=%s rank=%d skipped_total=%d",
+                    req_id,
+                    req.target_request_id,
+                    self._w.tp_rank,
+                    self._skipped_pushes,
+                )
+                continue
             self._push_reqs[req_id] = req
             self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
             self._pending_push_chunks.add(req_id)
@@ -84,19 +95,22 @@ class PrefillHandler:
         )
         # Re-assert the runtime tensor. CUDA graph or backend changes must not
         # silently swap in a different layout.
-        runtime_layout = FlashAttnHndLayout.from_tensor(layer_name, kv_layer)
+        runtime_layout = layout_from_tensor(
+            layer_name,
+            kv_layer,
+            layer_spec=self._w._layer_spec(layer_name),
+            logical_block_size=self._w.logical_block_size,
+            expected_num_blocks=layout.num_blocks,
+        )
+        assert type(runtime_layout) is type(layout), (
+            f"PdConnector KV layout type changed for {layer_name}: "
+            f"registered={type(layout).__name__} runtime={type(runtime_layout).__name__}"
+        )
         assert runtime_layout.shape == layout.shape, (
             f"PdConnector KV shape changed for {layer_name}: "
             f"registered={layout.shape} runtime={runtime_layout.shape}"
         )
         if not self._push_reqs:
-            return
-        slot_mapping = attn_metadata.slot_mapping
-        touched_blocks = self._cached_unique_blocks_from_slot_mapping(
-            slot_mapping,
-            layout.block_size,
-        )
-        if not touched_blocks:
             return
         import torch
 
@@ -105,7 +119,7 @@ class PrefillHandler:
             event.record(torch.cuda.current_stream())
         else:
             event = None
-        self._push_touched_blocks(layer_name, touched_blocks, event)
+        self._push_pending_blocks(layer_name, event)
 
     def wait_for_save(self) -> None:
         logger.debug(
@@ -139,7 +153,6 @@ class PrefillHandler:
         self._push_reqs.clear()
         self._pending_push_chunks.clear()
         self._push_chunk_maps.clear()
-        self._slot_mapping_cache = None
         self._completed_pushes.clear()
         self._producer_finished_req_ids.clear()
         self._remote_block_offsets.clear()
@@ -151,26 +164,7 @@ class PrefillHandler:
     def push_reqs(self) -> dict[str, PushReqMeta]:
         return self._push_reqs
 
-    def _cached_unique_blocks_from_slot_mapping(
-        self,
-        slot_mapping: Any,
-        block_size: int,
-    ) -> set[int]:
-        step_id = self._w._forward_step_id
-        if self._slot_mapping_cache is not None and self._slot_mapping_cache[0] == step_id:
-            return self._slot_mapping_cache[1]
-        start = time.perf_counter()
-        blocks = unique_blocks_from_slot_mapping(slot_mapping, block_size)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        self._slot_mapping_cache = (step_id, blocks)
-        logger.info(
-            "[PdConnector] P extracted slot_mapping blocks blocks=%d latency_ms=%.3f",
-            len(blocks),
-            elapsed_ms,
-        )
-        return blocks
-
-    def _push_touched_blocks(self, layer_name: str, touched_blocks: set[int], event: Any) -> None:
+    def _push_pending_blocks(self, layer_name: str, event: Any) -> None:
         layer_idx = self._w._layer_idx(layer_name)
         layout = self._w.layouts[layer_name]
         for req_id, req in list(self._push_reqs.items()):
@@ -181,9 +175,6 @@ class PrefillHandler:
                 continue
             req_blocks = flatten_block_ids(req.local_block_ids)
             if not req_blocks:
-                continue
-            selected_blocks = req_blocks & touched_blocks
-            if not selected_blocks:
                 continue
             trace = self._push_traces.setdefault(
                 req_id,
@@ -196,17 +187,17 @@ class PrefillHandler:
                 remote_block_ids, all_chunks_seen = self._remote_block_id_map(
                     req_id,
                     req,
-                    selected_blocks,
+                    req_blocks,
                 )
                 self._push_chunk_maps[req_id] = (remote_block_ids, all_chunks_seen)
-            assert selected_blocks.issubset(remote_block_ids), (
+            assert req_blocks.issubset(remote_block_ids), (
                 "PdConnector selected blocks must match the current registered push chunk; "
-                f"req={req_id} selected={sorted(selected_blocks)} "
+                f"req={req_id} selected={sorted(req_blocks)} "
                 f"mapped={sorted(remote_block_ids)}"
             )
             block_slices = block_ranges_for_remote_write(
                 layout,
-                selected_blocks,
+                req_blocks,
                 remote_block_ids,
             )
             rdma_bytes = block_slices_bytes(block_slices)
@@ -221,7 +212,7 @@ class PrefillHandler:
                 )
             )
             trace.rdma_bytes += rdma_bytes
-            self._tracker.mark_blocks_pushed(req_id, layer_idx, selected_blocks)
+            self._tracker.mark_blocks_pushed(req_id, layer_idx, req_blocks)
             if layer_idx != len(self._w.layer_names) - 1:
                 continue
             trace.chunk_count += 1
@@ -230,7 +221,7 @@ class PrefillHandler:
             self._push_chunk_maps.pop(req_id, None)
             chunk_complete = self._tracker.has_pushed_all_blocks(
                 req_id,
-                selected_blocks,
+                req_blocks,
                 num_layers=len(self._w.layer_names),
             )
             if not (chunk_complete and all_chunks_seen):
@@ -239,29 +230,34 @@ class PrefillHandler:
                     req_id,
                     req.target_request_id,
                     trace.chunk_count,
-                    len(selected_blocks),
+                    len(req_blocks),
                     _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
                 )
                 continue
             self._tracker.mark_done(req_id)
             finalize_ts_ns = time.time_ns()
+            ready_gbps = _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns)
+            link_gbps = _rdma_link_gbps(self._w.rdma)
             logger.info(
-                "[PdConnector] P all chunks done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f gbps=%.2f",
+                "[PdConnector] P all chunks done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f gbps=%.2f link_gbps=%.2f ready_link_util_pct=%.2f ts_ns=%d",
                 req_id,
                 req.target_request_id,
                 trace.chunk_count,
-                len(selected_blocks),
+                len(req_blocks),
                 trace.rdma_bytes,
                 (finalize_ts_ns - trace.queued_ts_ns) / 1_000_000,
                 _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
-                _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns),
+                ready_gbps,
+                link_gbps,
+                _pct(ready_gbps, link_gbps),
+                finalize_ts_ns,
             )
             self._push_finalizer.submit(
                 _PushFinalizeTask(
                     rdma=self._w.rdma,
                     req_id=req_id,
                     target_request_id=req.target_request_id,
-                    num_blocks=len(selected_blocks),
+                    num_blocks=len(req_blocks),
                     chunk_count=trace.chunk_count,
                     first_save_ts_ns=trace.first_save_ts_ns,
                     finalize_queued_ts_ns=finalize_ts_ns,
@@ -272,6 +268,34 @@ class PrefillHandler:
     def _select_push_handshake(self, req: PushReqMeta) -> PdHandshake:
         assert req.handshakes, (
             f"PdConnector push request has no handshakes; target_req={req.target_request_id}"
+        )
+        _assert_handshake_tp_consistency(req.handshakes)
+        decode_tp_size = req.handshakes[0].tp_size
+        if self._w.use_mla:
+            assert self._w.tp_size >= decode_tp_size, (
+                "PdConnector MLA heterogeneous TP requires prefill TP >= decode TP; "
+                f"prefill_tp={self._w.tp_size} decode_tp={decode_tp_size}"
+            )
+            assert self._w.tp_size % decode_tp_size == 0, (
+                "PdConnector MLA heterogeneous TP requires prefill TP to be a "
+                f"multiple of decode TP; prefill_tp={self._w.tp_size} decode_tp={decode_tp_size}"
+            )
+            ratio = self._w.tp_size // decode_tp_size
+            if self._w.tp_rank % ratio != 0:
+                raise _SkipPushRank
+            target_rank = self._w.tp_rank // ratio
+            for handshake in req.handshakes:
+                if handshake.tp_rank == target_rank:
+                    return handshake
+            raise AssertionError(
+                f"PdConnector missing MLA target handshake for prefill_tp_rank={self._w.tp_rank} "
+                f"decode_tp_rank={target_rank}; "
+                f"available={[handshake.tp_rank for handshake in req.handshakes]}"
+            )
+
+        assert self._w.tp_size == decode_tp_size, (
+            "PdConnector non-MLA requires equal P/D TP sizes; "
+            f"prefill_tp={self._w.tp_size} decode_tp={decode_tp_size}"
         )
         for handshake in req.handshakes:
             if handshake.tp_rank == self._w.tp_rank:
@@ -332,6 +356,34 @@ def _gbps(bytes_total: int, start_ts_ns: int | None, end_ts_ns: int | None) -> f
     return bytes_total * 8 / ((end_ts_ns - start_ts_ns) / 1_000_000_000) / 1e9
 
 
+def _pct(value: float, total: float) -> float:
+    if value <= 0 or total <= 0:
+        return 0.0
+    return value / total * 100
+
+
+def _rdma_link_gbps(rdma: RdmaPort | None) -> float:
+    if rdma is None:
+        return 0.0
+    try:
+        return rdma.aggregated_link_speed() / 1e9
+    except Exception:
+        logger.exception("[PdConnector] failed to read RDMA link speed")
+        return 0.0
+
+
+def _assert_handshake_tp_consistency(handshakes: tuple[PdHandshake, ...]) -> None:
+    tp_size = handshakes[0].tp_size
+    assert all(handshake.tp_size == tp_size for handshake in handshakes), (
+        f"PdConnector handshakes disagree on decode TP size: "
+        f"{[handshake.tp_size for handshake in handshakes]}"
+    )
+
+
+class _SkipPushRank(Exception):
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -379,7 +431,11 @@ class _AsyncLayerPushSender:
         self._inflight = 0
         self._inflight_by_req: dict[str, int] = {}
         self._error: BaseException | None = None
-        self._thread = threading.Thread(target=self._run, name="pd-rdma-push-sender", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run,
+            name="pd-rdma-push-sender",
+            daemon=True,
+        )
         self._thread.start()
 
     def submit(self, task: _LayerPushTask) -> None:
@@ -486,8 +542,12 @@ class _AsyncPushFinalizer:
                 task.rdma.wait_for_pushes(task.req_id)
                 task.rdma.push_done(task.req_id)
                 done_ts_ns = time.time_ns()
+                save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
+                link_gbps = _rdma_link_gbps(task.rdma)
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f gbps=%.2f",
+                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d "
+                    "rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f "
+                    "save_gbps=%.2f tail_gbps=%.2f link_gbps=%.2f link_util_pct=%.2f",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
@@ -495,9 +555,21 @@ class _AsyncPushFinalizer:
                     task.rdma_bytes,
                     _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
                     _elapsed_ms(task.finalize_queued_ts_ns, done_ts_ns),
-                    _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns),
+                    save_gbps,
+                    _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
+                    link_gbps,
+                    _pct(save_gbps, link_gbps),
                 )
             except BaseException as exc:
+                if task is not None:
+                    logger.exception(
+                        "[PdConnector] P finalize failed req=%s target_req=%s chunks=%d blocks=%d bytes=%d",
+                        task.req_id,
+                        task.target_request_id,
+                        task.chunk_count,
+                        task.num_blocks,
+                        task.rdma_bytes,
+                    )
                 with self._condition:
                     self._error = exc
                     self._condition.notify_all()

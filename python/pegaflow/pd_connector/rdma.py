@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pd_connector.layout import BlockSlice, LayerBlockSlices
+from pegaflow.pd_connector.layout import (
+    BlockRegionSlice,
+    LayerBlockSlices,
+    block_slices_bytes,
+)
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
-    LinearBlockAddrLayout,
     PdHandshake,
     handshake_to_dict,
+    layer_layout_from_dict,
 )
 
 logger = get_connector_logger()
@@ -35,6 +40,8 @@ class RdmaPort(Protocol):
     def wait_for_pushes(self, req_id: str) -> None: ...
 
     def push_done(self, req_id: str) -> None: ...
+
+    def aggregated_link_speed(self) -> int: ...
 
     def wait_done(self, req_id: str) -> None: ...
 
@@ -85,6 +92,9 @@ class MockRdmaPort:
     def push_done(self, req_id: str) -> None:
         self._finished_sending.add(req_id)
 
+    def aggregated_link_speed(self) -> int:
+        return 400_000_000_000
+
     def wait_done(self, req_id: str) -> None:
         return None
 
@@ -112,7 +122,7 @@ class MockRdmaPort:
         self._finished_recving.discard(req_id)
 
 
-def _block_slice_to_native(block: BlockSlice) -> dict[str, int]:
+def _block_slice_to_native(block: BlockRegionSlice) -> dict[str, int]:
     return {
         "block_id": block.block_id,
         "src_offset_bytes": block.src_offset_bytes,
@@ -123,8 +133,10 @@ def _block_slice_to_native(block: BlockSlice) -> dict[str, int]:
 def _layer_blocks_to_native(blocks: list[LayerBlockSlices]) -> list[dict[str, Any]]:
     return [
         {
-            "k": _block_slice_to_native(block.k),
-            "v": _block_slice_to_native(block.v),
+            "regions": [
+                {"region_idx": region_idx, **_block_slice_to_native(region)}
+                for region_idx, region in enumerate(block.regions)
+            ],
         }
         for block in _coalesce_contiguous_blocks(blocks)
     ]
@@ -139,15 +151,17 @@ def _coalesce_contiguous_blocks(blocks: list[LayerBlockSlices]) -> list[LayerBlo
     for block in blocks[1:]:
         if _can_extend_block_range(current, block):
             current = LayerBlockSlices(
-                k=BlockSlice(
-                    block_id=current.k.block_id,
-                    src_offset_bytes=current.k.src_offset_bytes,
-                    bytes=current.k.bytes + block.k.bytes,
-                ),
-                v=BlockSlice(
-                    block_id=current.v.block_id,
-                    src_offset_bytes=current.v.src_offset_bytes,
-                    bytes=current.v.bytes + block.v.bytes,
+                regions=tuple(
+                    BlockRegionSlice(
+                        block_id=current_region.block_id,
+                        src_offset_bytes=current_region.src_offset_bytes,
+                        bytes=current_region.bytes + block_region.bytes,
+                    )
+                    for current_region, block_region in zip(
+                        current.regions,
+                        block.regions,
+                        strict=True,
+                    )
                 ),
             )
             continue
@@ -158,68 +172,40 @@ def _coalesce_contiguous_blocks(blocks: list[LayerBlockSlices]) -> list[LayerBlo
 
 
 def _can_extend_block_range(prev: LayerBlockSlices, nxt: LayerBlockSlices) -> bool:
-    return (
-        prev.k.block_id + (prev.k.bytes // nxt.k.bytes) == nxt.k.block_id
-        and prev.v.block_id + (prev.v.bytes // nxt.v.bytes) == nxt.v.block_id
-        and prev.k.src_offset_bytes + prev.k.bytes == nxt.k.src_offset_bytes
-        and prev.v.src_offset_bytes + prev.v.bytes == nxt.v.src_offset_bytes
-        and nxt.k.bytes == nxt.v.bytes
-        and prev.k.bytes % nxt.k.bytes == 0
-        and prev.v.bytes % nxt.v.bytes == 0
-    )
+    if len(prev.regions) != len(nxt.regions):
+        return False
+    for prev_region, next_region in zip(prev.regions, nxt.regions, strict=True):
+        if prev_region.bytes % next_region.bytes != 0:
+            return False
+        block_count = prev_region.bytes // next_region.bytes
+        if prev_region.block_id + block_count != next_region.block_id:
+            return False
+        if prev_region.src_offset_bytes + prev_region.bytes != next_region.src_offset_bytes:
+            return False
+    return True
 
 
 def _layer_to_native(layer: LayerRemoteLayout) -> dict[str, Any]:
-    block_ids, k_addrs, v_addrs = _expand_layer_addrs(layer)
     return {
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
-        "base_addr": layer.base_addr,
-        "block_bytes": layer.block_bytes,
-        "block_ids": block_ids,
-        "k_block_addrs": k_addrs,
-        "v_block_addrs": v_addrs,
+        "block_ids": list(layer.block_ids),
+        "regions": [
+            {
+                "region_idx": region.region_idx,
+                "base_addr": region.base_addr,
+                "block_len": region.block_len,
+            }
+            for region in layer.regions
+        ],
         "mr_desc": _mr_desc_to_native(layer.mr_desc),
     }
 
 
-def _expand_layer_addrs(
-    layer: LayerRemoteLayout,
-) -> tuple[list[int], list[int], list[int]]:
-    if layer.k_block_addrs:
-        return list(layer.block_ids), list(layer.k_block_addrs), list(layer.v_block_addrs)
-    lin = layer.linear
-    assert lin is not None, "LayerRemoteLayout has no addrs and no linear layout"
-    block_ids = [lin.block_id_start + i * lin.block_id_stride for i in range(lin.num_blocks)]
-    k_addrs = [lin.k_addr_start + i * lin.addr_stride for i in range(lin.num_blocks)]
-    v_addrs = [lin.v_addr_start + i * lin.addr_stride for i in range(lin.num_blocks)]
-    return block_ids, k_addrs, v_addrs
-
-
-def _layer_from_native(
-    layer: LayerRemoteLayout | dict[str, Any],
-    *,
-    linear: LinearBlockAddrLayout | None = None,
-) -> LayerRemoteLayout:
+def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemoteLayout:
     if isinstance(layer, LayerRemoteLayout):
         return layer
-    block_ids = tuple(int(block_id) for block_id in layer["block_ids"])
-    k_block_addrs = tuple(int(addr) for addr in layer["k_block_addrs"])
-    v_block_addrs = tuple(int(addr) for addr in layer["v_block_addrs"])
-    assert len(block_ids) == len(k_block_addrs) == len(v_block_addrs), (
-        "native RDMA layer must preserve a one-to-one block_id/K/V address mapping"
-    )
-    return LayerRemoteLayout(
-        layer_name=str(layer["layer_name"]),
-        layer_idx=int(layer["layer_idx"]),
-        base_addr=int(layer["base_addr"]),
-        block_bytes=int(layer["block_bytes"]),
-        block_ids=block_ids,
-        k_block_addrs=k_block_addrs,
-        v_block_addrs=v_block_addrs,
-        mr_desc=layer.get("mr_desc"),
-        linear=linear,
-    )
+    return layer_layout_from_dict(layer)
 
 
 def _handshake_to_native(handshake: PdHandshake) -> dict[str, Any]:
@@ -254,15 +240,37 @@ class RealRdmaPort:
     def register_local_layers(
         self, layers: tuple[LayerRemoteLayout, ...]
     ) -> tuple[LayerRemoteLayout, ...]:
+        start = time.perf_counter()
         native_layers = [_layer_to_native(layer) for layer in layers]
         registered = self.engine.register_local_layers(native_layers)
-        return tuple(
-            _layer_from_native(layer, linear=original.linear)
-            for original, layer in zip(layers, registered, strict=True)
+        assert len(registered) == len(layers)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "[PdConnector] RDMA register_local_layers layers=%d blocks_per_layer=%s regions_per_layer=%s native_ms=%.3f",
+            len(layers),
+            [len(layer.block_ids) for layer in layers],
+            [len(layer.regions) for layer in layers],
+            elapsed_ms,
         )
+        return tuple(_layer_from_native(layer) for layer in registered)
 
     def open_request(self, req_id: str, handshake: PdHandshake) -> None:
+        start = time.perf_counter()
         self.engine.register_remote(req_id, _handshake_to_native(handshake))
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        blocks_per_layer = len(handshake.layers[0].block_ids) if handshake.layers else 0
+        logger.info(
+            "[PdConnector] RDMA open_request req=%s remote_req=%s tp_rank=%d/%d imm_id=%s layers=%d blocks_per_layer=%d block_size=%d native_ms=%.3f",
+            req_id,
+            handshake.request_id,
+            handshake.tp_rank,
+            handshake.tp_size,
+            handshake.imm_id,
+            len(handshake.layers),
+            blocks_per_layer,
+            handshake.block_size,
+            elapsed_ms,
+        )
 
     def push_layer(
         self,
@@ -270,22 +278,62 @@ class RealRdmaPort:
         layer_idx: int,
         blocks: list[LayerBlockSlices],
     ) -> None:
-        self.engine.push_layer(req_id, layer_idx, _layer_blocks_to_native(blocks))
+        native_blocks = _layer_blocks_to_native(blocks)
+        start = time.perf_counter()
+        self.engine.push_layer(req_id, layer_idx, native_blocks)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.debug(
+            "[PdConnector] RDMA push_layer req=%s layer=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
+            req_id,
+            layer_idx,
+            len(blocks),
+            len(native_blocks),
+            sum(len(block["regions"]) for block in native_blocks),
+            block_slices_bytes(blocks),
+            elapsed_ms,
+        )
 
     def wait_for_pushes(self, req_id: str) -> None:
         wait_for_pushes = getattr(self.engine, "wait_for_pushes", None)
         if wait_for_pushes is None:
             return None
-        return wait_for_pushes(req_id)
+        start = time.perf_counter()
+        try:
+            return wait_for_pushes(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA wait_for_pushes req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
 
     def push_done(self, req_id: str) -> None:
-        self.engine.push_done(req_id)
+        start = time.perf_counter()
+        try:
+            return self.engine.push_done(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA push_done req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
+
+    def aggregated_link_speed(self) -> int:
+        return int(self.engine.aggregated_link_speed())
 
     def wait_done(self, req_id: str) -> None:
         wait_done = getattr(self.engine, "wait_done", None)
         if wait_done is None:
             return None
-        return wait_done(req_id)
+        start = time.perf_counter()
+        try:
+            return wait_done(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA wait_done req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
 
     def poll_done(self, req_id: str) -> bool:
         poll_done = getattr(self.engine, "poll_done", None)
