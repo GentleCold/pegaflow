@@ -37,18 +37,29 @@ class PrefillRequestError(RuntimeError):
 
 
 class AsyncPrefillSender:
-    def __init__(self, worker_count: int = 16, failure_callback: Any | None = None) -> None:
+    def __init__(
+        self,
+        worker_count: int = 16,
+        failure_callback: Any | None = None,
+        startup_timeout_s: float = 30.0,
+    ) -> None:
         self._worker_count = max(1, int(worker_count))
         self._failure_callback = failure_callback
         self._closed = False
         self._loop_ready = threading.Event()
+        self._loop_error: BaseException | None = None
         self._thread = threading.Thread(
             target=self._run_loop,
             name="pd-prefill-sender",
             daemon=True,
         )
         self._thread.start()
-        self._loop_ready.wait()
+        if not self._loop_ready.wait(timeout=startup_timeout_s):
+            self._closed = True
+            raise RuntimeError("PD prefill sender event loop failed to start before timeout")
+        if self._loop_error is not None:
+            self._closed = True
+            raise RuntimeError("PD prefill sender event loop failed to start") from self._loop_error
 
     def submit(self, task: PrefillHttpTask) -> None:
         if self._closed:
@@ -70,17 +81,21 @@ class AsyncPrefillSender:
         self._thread.join(timeout=30)
 
     def _run_loop(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._client = None
-        self._semaphore = asyncio.Semaphore(self._worker_count)
-        self._tasks: set[asyncio.Task[None]] = set()
-        self._tasks_by_req: dict[str, asyncio.Task[None]] = {}
-        self._loop_ready.set()
-        self._loop.run_forever()
-        if self._client is not None:
-            self._loop.run_until_complete(self._client.aclose())
-        self._loop.close()
+        try:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._client = None
+            self._semaphore = asyncio.Semaphore(self._worker_count)
+            self._tasks: set[asyncio.Task[None]] = set()
+            self._tasks_by_req: dict[str, asyncio.Task[None]] = {}
+            self._loop_ready.set()
+            self._loop.run_forever()
+            if self._client is not None:
+                self._loop.run_until_complete(self._client.aclose())
+            self._loop.close()
+        except BaseException as exc:
+            self._loop_error = exc
+            self._loop_ready.set()
 
     async def _submit(self, task: PrefillHttpTask) -> None:
         old_task = self._tasks_by_req.pop(task.request_id, None)

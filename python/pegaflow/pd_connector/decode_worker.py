@@ -163,9 +163,10 @@ class DecodeHandler:
         for req_id in finished_recving:
             with self._lock:
                 req = self._wait_reqs.pop(req_id, None)
+                was_aborted = req_id in self._aborted_waits
                 self._aborted_waits.discard(req_id)
                 self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
-            if req is not None:
+            if req is not None and not was_aborted:
                 self._w.metrics.record_decode_wait(
                     duration_s=_elapsed_seconds(req.scheduler_wait_ts_ns, time.time_ns()),
                     rdma_wait_s=None,

@@ -579,6 +579,50 @@ def test_d_worker_release_waits_for_abort_ack_before_finishing() -> None:
     assert rdma.closed_reqs == ["req-1"]
 
 
+def test_d_worker_release_ack_does_not_record_successful_load() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")), rdma=rdma
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                "req-1": WaitReqMeta(
+                    local_block_ids=([1],),
+                    remote_request_id="req-1-p",
+                    done_request_id="req-1-d",
+                    prompt_token_ids=(1,),
+                    prefill_url="",
+                )
+            }
+        ),
+        None,
+    )
+
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_release={"req-1"},
+            release_reasons={"req-1": RELEASE_CONSUMER_ABORT},
+        ),
+        None,
+    )
+    rdma.mark_done("req-1")
+    worker.get_finished(set())
+    stats = worker.get_stats()
+
+    assert stats.data["pd_decode_abort_count"] == 1
+    assert stats.data["pd_load_success_count"] == 0
+    assert stats.data["pd_load_failure_count"] == 0
+    assert stats.data["pd_load_blocks"] == []
+    assert stats.data["pd_decode_wait_duration"] == []
+    assert stats.data["pd_decode_active_waits"] == 0
+
+
 def test_d_worker_release_cancels_remote_prefill_request() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
@@ -1894,6 +1938,16 @@ def test_async_prefill_sender_cancel_cancels_running_request(monkeypatch) -> Non
         assert cancelled.get(timeout=2) == "req-1"
     finally:
         sender.close()
+
+
+def test_async_prefill_sender_reports_startup_failure(monkeypatch) -> None:
+    def fail_new_event_loop():
+        raise RuntimeError("loop init failed")
+
+    monkeypatch.setattr(prefill_mod.asyncio, "new_event_loop", fail_new_event_loop)
+
+    with pytest.raises(RuntimeError, match="failed to start"):
+        AsyncPrefillSender(startup_timeout_s=0.1)
 
 
 def test_p_worker_selects_matching_tp_rank_handshake() -> None:
