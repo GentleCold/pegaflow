@@ -32,6 +32,162 @@ from pegaflow.pd_connector.config import extra_config_value
 logger = get_connector_logger()
 
 
+class _DecodeWaitState:
+    """Thread-safe bookkeeping for in-flight decode receives.
+
+    Groups the seven request-tracking collections that the RDMA waiter and
+    prefill-sender callbacks mutate concurrently with the vLLM forward thread,
+    behind a single lock (the original ``DecodeHandler._lock``).
+
+    Failure marking writes the three failure channels together, but they are
+    drained by *different* vLLM callbacks (``get_finished`` /
+    ``build_connector_worker_meta`` / ``get_block_ids_with_load_errors``), so
+    they remain separate collections rather than one merged set.
+    """
+
+    def __init__(self, metrics: Any) -> None:
+        self._metrics = metrics
+        self._lock = threading.Lock()
+        self.wait_reqs: dict[str, WaitReqMeta] = {}
+        self.aborted_waits: set[str] = set()
+        self.failed_recving: set[str] = set()
+        self.failed_recving_for_meta: set[str] = set()
+        self.failed_block_ids: set[int] = set()
+        self.finished_aborted_recving: set[str] = set()
+        self.finished_rdma_waits: set[str] = set()
+
+    # -- registration / completion -----------------------------------------
+
+    def has_wait(self, req_id: str) -> bool:
+        return req_id in self.wait_reqs
+
+    def register_wait(self, req_id: str, req: WaitReqMeta) -> None:
+        with self._lock:
+            self.wait_reqs[req_id] = req
+            self._metrics.set_decode_active_waits(len(self.wait_reqs))
+
+    def mark_aborted(self, req_id: str) -> WaitReqMeta | None:
+        with self._lock:
+            req = self.wait_reqs.get(req_id)
+            if req is not None:
+                self.aborted_waits.add(req_id)
+                self._metrics.record_decode_abort()
+            return req
+
+    def finish_recving_one(self, req_id: str) -> tuple[WaitReqMeta | None, bool, bool]:
+        with self._lock:
+            req = self.wait_reqs.pop(req_id, None)
+            was_aborted = req_id in self.aborted_waits
+            self.aborted_waits.discard(req_id)
+            self._metrics.set_decode_active_waits(len(self.wait_reqs))
+            is_failed = req_id in self.failed_recving
+            return req, was_aborted, is_failed
+
+    def record_rdma_done(self, req_id: str) -> WaitReqMeta | None:
+        with self._lock:
+            if req_id not in self.wait_reqs:
+                return None
+            self.finished_rdma_waits.add(req_id)
+            return self.wait_reqs[req_id]
+
+    # -- failure paths ------------------------------------------------------
+
+    def _mark_failed_unlocked(self, req_id: str, req: WaitReqMeta) -> set[int]:
+        failed_blocks = flatten_block_ids(req.local_block_ids)
+        self.failed_recving.add(req_id)
+        self.failed_recving_for_meta.add(req_id)
+        self.failed_block_ids.update(failed_blocks)
+        self.aborted_waits.discard(req_id)
+        self.finished_rdma_waits.discard(req_id)
+        self.finished_aborted_recving.discard(req_id)
+        self.wait_reqs.pop(req_id, None)
+        self._metrics.set_decode_active_waits(len(self.wait_reqs))
+        return failed_blocks
+
+    def mark_prefill_failed(
+        self, remote_request_id: str
+    ) -> tuple[str, WaitReqMeta, set[int]] | None:
+        with self._lock:
+            for req_id, req in list(self.wait_reqs.items()):
+                if req.remote_request_id != remote_request_id:
+                    continue
+                failed_blocks = self._mark_failed_unlocked(req_id, req)
+                return req_id, req, failed_blocks
+        return None
+
+    def mark_wait_failed(
+        self, req_id: str
+    ) -> tuple[str, WaitReqMeta | None, set[int] | None]:
+        """Returns (kind, req, failed_blocks) where kind is one of
+        ``"unknown"`` / ``"aborted_finished"`` / ``"failed"``."""
+        with self._lock:
+            req = self.wait_reqs.get(req_id)
+            if req is None:
+                return "unknown", None, None
+            if req_id in self.aborted_waits:
+                self.wait_reqs.pop(req_id, None)
+                self.aborted_waits.discard(req_id)
+                self.finished_aborted_recving.add(req_id)
+                self._metrics.set_decode_active_waits(len(self.wait_reqs))
+                return "aborted_finished", req, None
+            failed_blocks = self._mark_failed_unlocked(req_id, req)
+            return "failed", req, failed_blocks
+
+    # -- drains (one per consuming vLLM callback) --------------------------
+
+    def drain_finished_aborted_recving(self) -> set[str]:
+        with self._lock:
+            finished = self.finished_aborted_recving
+            self.finished_aborted_recving = set()
+            return finished
+
+    def drain_finished_rdma_waits(self) -> set[str]:
+        with self._lock:
+            finished = self.finished_rdma_waits
+            self.finished_rdma_waits = set()
+            return finished
+
+    def drain_failed_recving(self) -> set[str]:
+        with self._lock:
+            failed = self.failed_recving
+            self.failed_recving = set()
+            return failed
+
+    def drain_failed_recving_for_meta(self) -> set[str]:
+        with self._lock:
+            failed = self.failed_recving_for_meta
+            self.failed_recving_for_meta = set()
+            return failed
+
+    def drain_failed_block_ids(self) -> set[int]:
+        with self._lock:
+            failed = self.failed_block_ids
+            self.failed_block_ids = set()
+            return failed
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def is_idle(self) -> bool:
+        with self._lock:
+            return (
+                not self.wait_reqs
+                and not self.failed_recving
+                and not self.failed_block_ids
+                and not self.finished_aborted_recving
+                and not self.finished_rdma_waits
+            )
+
+    def clear(self) -> None:
+        with self._lock:
+            self.wait_reqs.clear()
+            self.failed_recving.clear()
+            self.failed_recving_for_meta.clear()
+            self.failed_block_ids.clear()
+            self.aborted_waits.clear()
+            self.finished_aborted_recving.clear()
+            self.finished_rdma_waits.clear()
+
+
 class DecodeHandler:
     """Handles D-side (decode) requests: RDMA receive, handshake, prefill dispatch."""
 
@@ -41,19 +197,12 @@ class DecodeHandler:
         prefill_sender: Any | None = None,
     ) -> None:
         self._w = worker
-        self._lock = threading.Lock()
-        self._wait_reqs: dict[str, WaitReqMeta] = {}
+        self._state = _DecodeWaitState(worker.metrics)
         self._peer_layouts: dict[int, dict[str, KvCacheLayout]] = {}
         self._peer_mr_descs: dict[int, dict[str, Any]] = {}
         self._peer_layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
         self._expected_imm_counts: dict[int, int] = {}
         self._peer_block_size: int | None = None
-        self._failed_recving: set[str] = set()
-        self._failed_recving_for_meta: set[str] = set()
-        self._failed_block_ids: set[int] = set()
-        self._aborted_waits: set[str] = set()
-        self._finished_aborted_recving: set[str] = set()
-        self._finished_rdma_waits: set[str] = set()
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
             _AsyncRdmaDoneWaiter(
@@ -111,13 +260,11 @@ class DecodeHandler:
         assert self._w.rdma is not None, "PdConnector RDMA port is not initialized"
         assert self._rdma_waiter is not None, "PdConnector RDMA waiter is not initialized"
         for req_id, req in reqs_to_wait.items():
-            if req_id in self._wait_reqs:
+            if self._state.has_wait(req_id):
                 logger.info("[PdConnector] D wait req=%s already registered", req_id)
                 continue
             process_ts_ns = time.time_ns()
-            with self._lock:
-                self._wait_reqs[req_id] = req
-                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
+            self._state.register_wait(req_id, req)
             block_ids = flatten_block_ids(req.local_block_ids)
             imm_id = self._alloc_imm_id()
             wait_handshake = self._build_wait_handshake(
@@ -160,70 +307,40 @@ class DecodeHandler:
                 self._dispatch_prefill(req, req.local_block_ids, imm_id)
 
     def release(self, req_id: str) -> None:
-        with self._lock:
-            req = self._wait_reqs.get(req_id)
-            if req is not None:
-                self._aborted_waits.add(req_id)
-                self._w.metrics.record_decode_abort()
+        req = self._state.mark_aborted(req_id)
         cancel_prefill = getattr(self._prefill_sender, "cancel", None)
         if req is not None and cancel_prefill is not None:
             cancel_prefill(req.remote_request_id)
 
     def finish_recving(self, finished_recving: set[str]) -> None:
         for req_id in finished_recving:
-            with self._lock:
-                req = self._wait_reqs.pop(req_id, None)
-                was_aborted = req_id in self._aborted_waits
-                self._aborted_waits.discard(req_id)
-                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
+            req, was_aborted, is_failed = self._state.finish_recving_one(req_id)
             if req is not None and not was_aborted:
                 self._w.metrics.record_decode_wait(
                     duration_s=_elapsed_seconds(req.scheduler_wait_ts_ns, time.time_ns()),
                     rdma_wait_s=None,
                     blocks=len(flatten_block_ids(req.local_block_ids)),
-                    success=req_id not in self._failed_recving,
+                    success=not is_failed,
                 )
             self._w.rdma.close_request(req_id)
 
     def pop_finished_aborted_recving(self) -> set[str]:
-        with self._lock:
-            finished = self._finished_aborted_recving
-            self._finished_aborted_recving = set()
-            return finished
+        return self._state.drain_finished_aborted_recving()
 
     def pop_finished_rdma_waits(self) -> set[str]:
-        with self._lock:
-            finished = self._finished_rdma_waits
-            self._finished_rdma_waits = set()
-            return finished
+        return self._state.drain_finished_rdma_waits()
 
     def pop_failed_recving(self) -> set[str]:
-        with self._lock:
-            failed = self._failed_recving
-            self._failed_recving = set()
-            return failed
+        return self._state.drain_failed_recving()
 
     def pop_failed_recving_for_meta(self) -> set[str]:
-        with self._lock:
-            failed = self._failed_recving_for_meta
-            self._failed_recving_for_meta = set()
-            return failed
+        return self._state.drain_failed_recving_for_meta()
 
     def pop_failed_block_ids(self) -> set[int]:
-        with self._lock:
-            failed = self._failed_block_ids
-            self._failed_block_ids = set()
-            return failed
+        return self._state.drain_failed_block_ids()
 
     def shutdown(self) -> None:
-        with self._lock:
-            self._wait_reqs.clear()
-            self._failed_recving.clear()
-            self._failed_recving_for_meta.clear()
-            self._failed_block_ids.clear()
-            self._aborted_waits.clear()
-            self._finished_aborted_recving.clear()
-            self._finished_rdma_waits.clear()
+        self._state.clear()
         if self._rdma_waiter is not None:
             self._rdma_waiter.close()
         close = getattr(self._prefill_sender, "close", None)
@@ -232,62 +349,63 @@ class DecodeHandler:
 
     @property
     def wait_reqs(self) -> dict[str, WaitReqMeta]:
-        return self._wait_reqs
+        return self._state.wait_reqs
+
+    # Backward-compatible field access for tests / worker.py that reach into
+    # the decode handler's internal collections directly.
+    @property
+    def _wait_reqs(self) -> dict[str, WaitReqMeta]:
+        return self._state.wait_reqs
+
+    @_wait_reqs.setter
+    def _wait_reqs(self, value: dict[str, WaitReqMeta]) -> None:
+        self._state.wait_reqs = value
+
+    @property
+    def _finished_rdma_waits(self) -> set[str]:
+        return self._state.finished_rdma_waits
 
     def is_idle(self) -> bool:
-        with self._lock:
-            return (
-                not self._wait_reqs
-                and not self._failed_recving
-                and not self._failed_block_ids
-                and not self._finished_aborted_recving
-                and not self._finished_rdma_waits
-            )
+        return self._state.is_idle()
 
     def _mark_prefill_failed(self, remote_request_id: str, exc: BaseException) -> None:
-        with self._lock:
-            for req_id, req in list(self._wait_reqs.items()):
-                if req.remote_request_id != remote_request_id:
-                    continue
-                self._mark_failed_locked(req_id, req, exc)
-                return
-        logger.warning(
-            "[PdConnector] D prefill failed for unknown/finished remote_req=%s: %s",
-            remote_request_id,
-            exc,
-        )
+        result = self._state.mark_prefill_failed(remote_request_id)
+        if result is None:
+            logger.warning(
+                "[PdConnector] D prefill failed for unknown/finished remote_req=%s: %s",
+                remote_request_id,
+                exc,
+            )
+            return
+        req_id, req, failed_blocks = result
+        self._after_mark_failed(req_id, req, failed_blocks, exc)
 
     def _mark_wait_failed(self, req_id: str, exc: BaseException) -> None:
-        with self._lock:
-            req = self._wait_reqs.get(req_id)
-            if req is None:
-                logger.warning(
-                    "[PdConnector] D wait failed for unknown/finished req=%s: %s",
-                    req_id,
-                    exc,
-                )
-                return
-            if req_id in self._aborted_waits:
-                self._wait_reqs.pop(req_id, None)
-                self._aborted_waits.discard(req_id)
-                self._finished_aborted_recving.add(req_id)
-                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
-                logger.info(
-                    "[PdConnector] D treating aborted wait as finished req=%s remote_req=%s error=%s",
-                    req_id,
-                    req.remote_request_id,
-                    exc,
-                )
-                return
-            self._mark_failed_locked(req_id, req, exc)
+        kind, req, failed_blocks = self._state.mark_wait_failed(req_id)
+        if kind == "unknown":
+            logger.warning(
+                "[PdConnector] D wait failed for unknown/finished req=%s: %s",
+                req_id,
+                exc,
+            )
+            return
+        if kind == "aborted_finished":
+            assert req is not None
+            logger.info(
+                "[PdConnector] D treating aborted wait as finished req=%s remote_req=%s error=%s",
+                req_id,
+                req.remote_request_id,
+                exc,
+            )
+            return
+        assert req is not None and failed_blocks is not None
+        self._after_mark_failed(req_id, req, failed_blocks, exc)
 
     def _record_rdma_wait_done(self, req_id: str, wait_s: float) -> None:
         done_ts_ns = time.time_ns()
-        with self._lock:
-            if req_id not in self._wait_reqs:
-                return
-            req = self._wait_reqs[req_id]
-            self._finished_rdma_waits.add(req_id)
+        req = self._state.record_rdma_done(req_id)
+        if req is None:
+            return
         self._w.metrics.record_decode_rdma_wait(wait_s)
         logger.info(
             "[PdConnector] D RDMA wait done req=%s remote_req=%s wait_ms=%.3f proxy_to_rdma_done_ms=%.3f scheduler_wait_to_rdma_done_ms=%.3f ts_ns=%d",
@@ -299,16 +417,15 @@ class DecodeHandler:
             done_ts_ns,
         )
 
-    def _mark_failed_locked(self, req_id: str, req: WaitReqMeta, exc: BaseException) -> None:
-        failed_blocks = flatten_block_ids(req.local_block_ids)
-        self._failed_recving.add(req_id)
-        self._failed_recving_for_meta.add(req_id)
-        self._failed_block_ids.update(failed_blocks)
-        self._aborted_waits.discard(req_id)
-        self._finished_rdma_waits.discard(req_id)
-        self._finished_aborted_recving.discard(req_id)
-        self._wait_reqs.pop(req_id, None)
-        self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
+    def _after_mark_failed(
+        self,
+        req_id: str,
+        req: WaitReqMeta,
+        failed_blocks: set[int],
+        exc: BaseException,
+    ) -> None:
+        """Side effects after a failure is recorded in state: emit the wait
+        metric, log, and cancel the RDMA waiter."""
         self._w.metrics.record_decode_wait(
             duration_s=_elapsed_seconds(req.scheduler_wait_ts_ns, time.time_ns()),
             rdma_wait_s=None,
