@@ -59,7 +59,8 @@ class _DecodeWaitState:
     # -- registration / completion -----------------------------------------
 
     def has_wait(self, req_id: str) -> bool:
-        return req_id in self.wait_reqs
+        with self._lock:
+            return req_id in self.wait_reqs
 
     def register_wait(self, req_id: str, req: WaitReqMeta) -> None:
         with self._lock:
