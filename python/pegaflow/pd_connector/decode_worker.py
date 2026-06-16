@@ -188,6 +188,163 @@ class _DecodeWaitState:
             self.finished_rdma_waits.clear()
 
 
+class _DecodePeerState:
+    """Peer tensor-parallel topology and IMM-id allocation for the decode side.
+
+    After ``register_kv_caches`` the decode worker all-gathers every peer rank's
+    KV layouts and memory-region descriptors, then derives per-rank layer
+    templates and the expected IMM completion counts used to build wait
+    handshakes. This groups that topology state plus the monotonic IMM-id
+    allocator, which were previously flat fields on ``DecodeHandler``.
+
+    Single-threaded: populated during registration and read while building
+    handshakes on the forward thread; no locking needed.
+    """
+
+    def __init__(self, worker: PdWorkerBase) -> None:
+        self._w = worker
+        self.layouts: dict[int, dict[str, KvCacheLayout]] = {}
+        self.mr_descs: dict[int, dict[str, Any]] = {}
+        self.layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
+        self.expected_imm_counts: dict[int, int] = {}
+        self._next_imm_id = 1
+
+    @property
+    def block_size(self) -> int:
+        return next(iter(self._w.layouts.values())).block_size
+
+    def gather(self) -> None:
+        mr_descs = {name: layer.mr_desc for name, layer in self._w._registered_layers.items()}
+        if self._w.tp_size <= 1:
+            self.layouts = {0: self._w.layouts}
+            self.mr_descs = {0: mr_descs}
+            self._refresh_layer_templates()
+            return
+        try:
+            gathered = _all_gather_peer_info(self._w.layouts, mr_descs, self._w.tp_size)
+        except Exception:
+            logger.warning(
+                "[PdConnector] all_gather_object unavailable, rank 0 dispatch limited to local rank",
+            )
+            self.layouts = {self._w.tp_rank: self._w.layouts}
+            self.mr_descs = {self._w.tp_rank: mr_descs}
+            self._refresh_layer_templates()
+            return
+        for rank, (layouts, descs) in enumerate(gathered):
+            self.layouts[rank] = layouts
+            self.mr_descs[rank] = descs
+        self._refresh_layer_templates()
+
+    def alloc_imm_id(self) -> int:
+        imm_id = self._next_imm_id
+        self._next_imm_id += 1
+        # The wire contract (pegaflow-pd-wire) reserves the top two bits of
+        # imm_id for the fail/abort XOR flags, so wrap before reaching them.
+        if self._next_imm_id > 0x3FFF_FFFF:
+            self._next_imm_id = 1
+        return imm_id
+
+    def expected_imm_count(self, rank: int) -> int:
+        if not self.expected_imm_counts:
+            self._refresh_expected_imm_counts()
+        return self.expected_imm_counts.get(rank, 1)
+
+    def local_expected_imm_count(self) -> int:
+        return self.expected_imm_count(self._w.tp_rank)
+
+    def build_all_rank_handshake_dicts(
+        self,
+        req_id: str,
+        block_ids: BlockIds,
+        imm_id: int,
+    ) -> list[dict[str, Any]]:
+        result = []
+        block_size = self.block_size
+        for rank in range(self._w.tp_size):
+            layers = []
+            for layer in self.layer_templates[rank]:
+                layer_name = str(layer["layer_name"])
+                layer_block_ids = self._w.block_ids_for_layer(block_ids, layer_name)
+                if not layer_block_ids:
+                    continue
+                layer_dict = dict(layer)
+                layer_dict["block_ids"] = sorted(layer_block_ids)
+                layers.append(layer_dict)
+            assert layers, f"PdConnector D wait req={req_id} has no local KV blocks"
+            block_ids_by_layer = [tuple(layer["block_ids"]) for layer in layers]
+            shared_block_ids = block_ids_by_layer[0]
+            compact = all(ids == shared_block_ids for ids in block_ids_by_layer)
+            if compact:
+                payload_layers = [
+                    {key: value for key, value in layer.items() if key != "block_ids"}
+                    for layer in layers
+                ]
+            else:
+                payload_layers = layers
+            payload: dict[str, Any] = {
+                "request_id": req_id,
+                "engine_id": self._w.engine_id,
+                "tp_rank": rank,
+                "tp_size": self._w.tp_size,
+                "block_size": block_size,
+                "layers": payload_layers,
+                "imm_id": imm_id,
+                "fail_imm_id": _fail_imm_id(imm_id),
+                "abort_imm_id": _abort_imm_id(imm_id),
+                "expected_imm_count": self.expected_imm_count(rank),
+            }
+            if compact:
+                payload["block_ids"] = list(shared_block_ids)
+            result.append(payload)
+        return result
+
+    def _refresh_layer_templates(self) -> None:
+        self.layer_templates = {}
+        for rank, peer_layouts in self.layouts.items():
+            peer_mr_descs = self.mr_descs[rank]
+            layers = []
+            for layer_idx, name in enumerate(self._w.layer_names):
+                layer = replace(
+                    peer_layouts[name].remote_layout(layer_idx, (0,)),
+                    mr_desc=peer_mr_descs.get(name),
+                )
+                layers.append(layer_layout_to_compact_dict(layer))
+            self.layer_templates[rank] = tuple(layers)
+        self._refresh_expected_imm_counts()
+
+    def _refresh_expected_imm_counts(self) -> None:
+        if self._w.use_mla:
+            self.expected_imm_counts = dict.fromkeys(range(self._w.tp_size), 1)
+            return
+
+        local_layout = self.layouts.get(self._w.tp_rank, self._w.layouts)
+        first_layout = next(iter(local_layout.values()))
+        remote_heads = int(getattr(first_layout, "num_kv_heads", 1))
+        prefill_tp_size = int(
+            extra_config_value(
+                self._w.vllm_config,
+                "pegaflow.pd.prefill_tp_size",
+                self._w.tp_size,
+            )
+            or self._w.tp_size
+        )
+        total_heads = _total_num_kv_heads_from_config(self._w.vllm_config)
+        if total_heads is None:
+            total_heads = remote_heads * self._w.tp_size
+        local_heads = _ceil_div(total_heads, prefill_tp_size)
+        source_counts = decode_rank_source_counts(
+            prefill_tp_size=prefill_tp_size,
+            decode_tp_size=self._w.tp_size,
+            local_num_kv_heads=local_heads,
+            remote_num_kv_heads=remote_heads,
+            total_num_kv_heads=total_heads,
+            use_mla=False,
+        )
+        self.expected_imm_counts = {
+            rank: source_counts.get(rank, 1) for rank in range(self._w.tp_size)
+        }
+
+
 class DecodeHandler:
     """Handles D-side (decode) requests: RDMA receive, handshake, prefill dispatch."""
 
@@ -198,12 +355,7 @@ class DecodeHandler:
     ) -> None:
         self._w = worker
         self._state = _DecodeWaitState(worker.metrics)
-        self._peer_layouts: dict[int, dict[str, KvCacheLayout]] = {}
-        self._peer_mr_descs: dict[int, dict[str, Any]] = {}
-        self._peer_layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
-        self._expected_imm_counts: dict[int, int] = {}
-        self._peer_block_size: int | None = None
-        self._next_imm_id = 1
+        self._peers = _DecodePeerState(worker)
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
             _AsyncRdmaDoneWaiter(
                 worker.rdma,
@@ -235,26 +387,7 @@ class DecodeHandler:
             )
 
     def gather_peer_info(self) -> None:
-        mr_descs = {name: layer.mr_desc for name, layer in self._w._registered_layers.items()}
-        if self._w.tp_size <= 1:
-            self._peer_layouts = {0: self._w.layouts}
-            self._peer_mr_descs = {0: mr_descs}
-            self._refresh_peer_layer_templates()
-            return
-        try:
-            gathered = _all_gather_peer_info(self._w.layouts, mr_descs, self._w.tp_size)
-        except Exception:
-            logger.warning(
-                "[PdConnector] all_gather_object unavailable, rank 0 dispatch limited to local rank",
-            )
-            self._peer_layouts = {self._w.tp_rank: self._w.layouts}
-            self._peer_mr_descs = {self._w.tp_rank: mr_descs}
-            self._refresh_peer_layer_templates()
-            return
-        for rank, (layouts, descs) in enumerate(gathered):
-            self._peer_layouts[rank] = layouts
-            self._peer_mr_descs[rank] = descs
-        self._refresh_peer_layer_templates()
+        self._peers.gather()
 
     def process_wait_reqs(self, reqs_to_wait: dict[str, WaitReqMeta]) -> None:
         assert self._w.rdma is not None, "PdConnector RDMA port is not initialized"
@@ -266,7 +399,7 @@ class DecodeHandler:
             process_ts_ns = time.time_ns()
             self._state.register_wait(req_id, req)
             block_ids = flatten_block_ids(req.local_block_ids)
-            imm_id = self._alloc_imm_id()
+            imm_id = self._peers.alloc_imm_id()
             wait_handshake = self._build_wait_handshake(
                 req.done_request_id,
                 req.local_block_ids,
@@ -364,6 +497,10 @@ class DecodeHandler:
     @property
     def _finished_rdma_waits(self) -> set[str]:
         return self._state.finished_rdma_waits
+
+    @property
+    def _peer_layouts(self) -> dict[int, dict[str, KvCacheLayout]]:
+        return self._peers.layouts
 
     def is_idle(self) -> bool:
         return self._state.is_idle()
@@ -466,12 +603,12 @@ class DecodeHandler:
             engine_id=self._w.engine_id,
             tp_rank=self._w.tp_rank,
             tp_size=self._w.tp_size,
-            block_size=next(iter(self._w.layouts.values())).block_size,
+            block_size=self._peers.block_size,
             layers=tuple(layers),
             imm_id=imm_id,
             fail_imm_id=_fail_imm_id(imm_id),
             abort_imm_id=_abort_imm_id(imm_id),
-            expected_imm_count=self._expected_imm_count_for_local_rank(),
+            expected_imm_count=self._peers.local_expected_imm_count(),
         )
 
     def _dispatch_prefill(
@@ -481,7 +618,7 @@ class DecodeHandler:
         imm_id: int,
     ) -> None:
         started_ts_ns = time.time_ns()
-        all_handshakes = self._build_all_rank_handshake_dicts(
+        all_handshakes = self._peers.build_all_rank_handshake_dicts(
             req.done_request_id,
             block_ids,
             imm_id,
@@ -520,117 +657,6 @@ class DecodeHandler:
             _elapsed_ms(req.scheduler_wait_ts_ns, submitted_ts_ns),
             submitted_ts_ns,
         )
-
-    def _build_all_rank_handshake_dicts(
-        self,
-        req_id: str,
-        block_ids: BlockIds,
-        imm_id: int,
-    ) -> list[dict[str, Any]]:
-        result = []
-        block_size = self._peer_block_size
-        assert block_size is not None, "peer layer templates are not initialized"
-        for rank in range(self._w.tp_size):
-            layers = []
-            for layer in self._peer_layer_templates[rank]:
-                layer_name = str(layer["layer_name"])
-                layer_block_ids = self._w.block_ids_for_layer(block_ids, layer_name)
-                if not layer_block_ids:
-                    continue
-                layer_dict = dict(layer)
-                layer_dict["block_ids"] = sorted(layer_block_ids)
-                layers.append(layer_dict)
-            assert layers, f"PdConnector D wait req={req_id} has no local KV blocks"
-            block_ids_by_layer = [tuple(layer["block_ids"]) for layer in layers]
-            shared_block_ids = block_ids_by_layer[0]
-            compact = all(ids == shared_block_ids for ids in block_ids_by_layer)
-            if compact:
-                payload_layers = [
-                    {key: value for key, value in layer.items() if key != "block_ids"}
-                    for layer in layers
-                ]
-            else:
-                payload_layers = layers
-            payload: dict[str, Any] = {
-                "request_id": req_id,
-                "engine_id": self._w.engine_id,
-                "tp_rank": rank,
-                "tp_size": self._w.tp_size,
-                "block_size": block_size,
-                "layers": payload_layers,
-                "imm_id": imm_id,
-                "fail_imm_id": _fail_imm_id(imm_id),
-                "abort_imm_id": _abort_imm_id(imm_id),
-                "expected_imm_count": self._expected_imm_count_for_rank(rank),
-            }
-            if compact:
-                payload["block_ids"] = list(shared_block_ids)
-            result.append(payload)
-        return result
-
-    def _expected_imm_count_for_local_rank(self) -> int:
-        return self._expected_imm_count_for_rank(self._w.tp_rank)
-
-    def _expected_imm_count_for_rank(self, rank: int) -> int:
-        if not self._expected_imm_counts:
-            self._refresh_expected_imm_counts()
-        return self._expected_imm_counts.get(rank, 1)
-
-    def _refresh_peer_layer_templates(self) -> None:
-        self._peer_layer_templates = {}
-        self._peer_block_size = next(iter(self._w.layouts.values())).block_size
-        for rank, peer_layouts in self._peer_layouts.items():
-            peer_mr_descs = self._peer_mr_descs[rank]
-            layers = []
-            for layer_idx, name in enumerate(self._w.layer_names):
-                layer = replace(
-                    peer_layouts[name].remote_layout(layer_idx, (0,)),
-                    mr_desc=peer_mr_descs.get(name),
-                )
-                layers.append(layer_layout_to_compact_dict(layer))
-            self._peer_layer_templates[rank] = tuple(layers)
-        self._refresh_expected_imm_counts()
-
-    def _refresh_expected_imm_counts(self) -> None:
-        if self._w.use_mla:
-            self._expected_imm_counts = dict.fromkeys(range(self._w.tp_size), 1)
-            return
-
-        local_layout = self._peer_layouts.get(self._w.tp_rank, self._w.layouts)
-        first_layout = next(iter(local_layout.values()))
-        remote_heads = int(getattr(first_layout, "num_kv_heads", 1))
-        prefill_tp_size = int(
-            extra_config_value(
-                self._w.vllm_config,
-                "pegaflow.pd.prefill_tp_size",
-                self._w.tp_size,
-            )
-            or self._w.tp_size
-        )
-        total_heads = _total_num_kv_heads_from_config(self._w.vllm_config)
-        if total_heads is None:
-            total_heads = remote_heads * self._w.tp_size
-        local_heads = _ceil_div(total_heads, prefill_tp_size)
-        source_counts = decode_rank_source_counts(
-            prefill_tp_size=prefill_tp_size,
-            decode_tp_size=self._w.tp_size,
-            local_num_kv_heads=local_heads,
-            remote_num_kv_heads=remote_heads,
-            total_num_kv_heads=total_heads,
-            use_mla=False,
-        )
-        self._expected_imm_counts = {
-            rank: source_counts.get(rank, 1) for rank in range(self._w.tp_size)
-        }
-
-    def _alloc_imm_id(self) -> int:
-        imm_id = self._next_imm_id
-        self._next_imm_id += 1
-        # The wire contract (pegaflow-pd-wire) reserves the top two bits of
-        # imm_id for the fail/abort XOR flags, so wrap before reaching them.
-        if self._next_imm_id > 0x3FFF_FFFF:
-            self._next_imm_id = 1
-        return imm_id
 
     def _remote_layout_with_mr_desc(
         self,
