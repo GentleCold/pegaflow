@@ -1444,9 +1444,6 @@ impl PdRdmaEngine {
         let region = remote.regions.get(region_idx).ok_or_else(|| {
             PyValueError::new_err(format!("remote region {region_idx} is not registered"))
         })?;
-        let local_region = local.regions.get(region_idx).ok_or_else(|| {
-            PyValueError::new_err(format!("local region {region_idx} is not registered"))
-        })?;
         if !bytes.is_multiple_of(region.block_len) {
             return Err(PyValueError::new_err(format!(
                 "block slice bytes {bytes} must be a positive multiple of remote region block_len {}",
@@ -1509,6 +1506,9 @@ impl PdRdmaEngine {
         }
         let region = remote.regions.get(region_idx).ok_or_else(|| {
             PyValueError::new_err(format!("remote region {region_idx} is not registered"))
+        })?;
+        let local_region = local.regions.get(region_idx).ok_or_else(|| {
+            PyValueError::new_err(format!("local region {region_idx} is not registered"))
         })?;
         if !bytes.is_multiple_of(region.block_len) {
             return Err(PyValueError::new_err(format!(
