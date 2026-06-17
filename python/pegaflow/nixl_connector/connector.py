@@ -9,7 +9,7 @@ and worker classes; the connector classes here only forward calls.
 * :class:`NixlBaseConnector` – common logic shared by pull and push.
 * :class:`NixlPullConnector` – pull-based (READ) KV transfer.
 * :class:`NixlPushConnector` – push-based (WRITE) KV transfer.
-* :class:`PegaNixlConnector` – PegaFlow's WRITE-based P/D connector.
+* :class:`PegaNixlConnector` – PegaFlow's READ-based P/D connector.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -52,6 +52,9 @@ from pegaflow.nixl_connector.push_worker import (
 )
 from pegaflow.nixl_connector.pega_push_worker import (
     PegaNixlPushConnectorWorker,
+)
+from pegaflow.nixl_connector.pega_pull_worker import (
+    PegaNixlPullConnectorWorker,
 )
 from pegaflow.nixl_connector.stats import (
     NixlKVConnectorStats,
@@ -385,7 +388,7 @@ class NixlPushConnector(NixlBaseConnector):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
 
-class PegaNixlConnector(NixlPushConnector):
+class PegaNixlPushConnector(NixlPushConnector):
     """PegaFlow NIXL connector facade.
 
     This class intentionally starts from vLLM's WRITE-based NIXL connector
@@ -414,14 +417,42 @@ class PegaNixlConnector(NixlPushConnector):
             raise ValueError(f"Unsupported KVConnectorRole: {role}")
 
 
-# PegaFlow's packaged NIXL connector defaults to the WRITE-based P/D path.
-NixlConnector = PegaNixlConnector
+class PegaNixlPullConnector(NixlPullConnector):
+    """PegaFlow NIXL connector using pull-mode control flow and Pega RDMA READ."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        NixlBaseConnector.__init__(self, vllm_config, role, kv_cache_config)
+        self.connector_scheduler: NixlPullConnectorScheduler | None = None
+        self.connector_worker: PegaNixlPullConnectorWorker | None = None
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector_scheduler = NixlPullConnectorScheduler(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+        elif role == KVConnectorRole.WORKER:
+            self.connector_worker = PegaNixlPullConnectorWorker(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+        else:
+            raise ValueError(f"Unsupported KVConnectorRole: {role}")
+
+
+PegaNixlConnector = PegaNixlPullConnector
+
+# PegaFlow's packaged NIXL connector defaults to the READ-based P/D path.
+NixlConnector = PegaNixlPullConnector
 
 
 __all__ = [
     "NixlBaseConnector",
     "NixlConnector",
     "PegaNixlConnector",
+    "PegaNixlPullConnector",
+    "PegaNixlPushConnector",
     "NixlPullConnector",
     "NixlPushConnector",
 ]

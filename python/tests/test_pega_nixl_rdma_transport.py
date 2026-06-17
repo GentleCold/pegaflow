@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import queue
 from types import SimpleNamespace
 
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
+from pegaflow.nixl_connector.metadata import NixlHandshakePayload
+from pegaflow.nixl_connector.pega_pull_worker import (
+    PegaNixlPullConnectorWorker,
+    encode_pega_rdma_handshake_payload,
+)
 from pegaflow.nixl_connector.rdma_transport import PegaNixlRdmaTransport
 from pegaflow.pd_connector.metadata import LayerRemoteLayout
 from pegaflow.pd_connector.rdma import MockRdmaPort
@@ -149,3 +155,134 @@ def test_transport_pulls_remote_blocks_into_local_blocks() -> None:
         4 * kv_cache.stride()[1] * kv_cache.element_size(),
     ]
     assert "decode-req" in rdma.pop_finished_recving()
+
+
+class RecordingPegaRdma:
+    def __init__(self) -> None:
+        self.pull_calls: list[dict[str, object]] = []
+
+    def pull_blocks(self, **kwargs: object) -> None:
+        self.pull_calls.append(kwargs)
+
+    def pop_finished_recving(self) -> set[str]:
+        return {"decode-req"}
+
+    def pop_finished_sending(self) -> set[str]:
+        return set()
+
+    def close_request(self, request_id: str) -> None:
+        return None
+
+
+class ImmediateExecutor:
+    def submit(self, fn, *args, **kwargs):
+        class DoneFuture:
+            def __init__(self):
+                self._result = fn(*args, **kwargs)
+
+            def result(self):
+                return self._result
+
+            def add_done_callback(self, callback):
+                callback(self)
+
+        return DoneFuture()
+
+
+def test_pega_pull_worker_uses_rdma_pull_and_reports_completion() -> None:
+    worker = object.__new__(PegaNixlPullConnectorWorker)
+    rdma = RecordingPegaRdma()
+    worker.pega_rdma = rdma
+    worker._recving_metadata = {}
+    worker._recving_transfers = {}
+    worker._failed_recv_reqs = SimpleNamespace(empty=lambda: True)
+    worker._rdma_pull_executor = ImmediateExecutor()
+    worker._pending_rdma_recvs = {}
+    worker._completed_rdma_recvs = queue.Queue()
+    worker._reqs_to_process = set()
+    worker._reqs_to_send = {}
+    worker._ready_requests = SimpleNamespace(empty=lambda: True)
+    worker._engine_last_active = {}
+    worker._remote_agents = {"p0": {0: "pega-rdma:p0:0"}}
+    worker._remote_rdma_handshakes = {"p0": {0: _remote_handshake()}}
+    worker.transfer_topo = SimpleNamespace(
+        get_engine_info=lambda _engine_id: SimpleNamespace(
+            remote_block_size=2,
+            remote_tp_size=1,
+            remote_physical_blocks_per_logical=1,
+        ),
+        block_size_ratio=lambda _remote_block_size: 1,
+        tp_ratio=lambda _remote_tp_size: 1,
+    )
+    worker.block_size = 2
+    worker.use_mla = False
+    worker.world_size = 1
+    worker.tp_rank = 0
+    worker.tp_mappings = {
+        "p0": SimpleNamespace(
+            source_ranks_per_group=((0,),),
+            all_source_ranks=(0,),
+        )
+    }
+    worker._is_hma_required = False
+    worker.use_host_buffer = False
+    worker.enable_permute_local_kv = False
+    worker.enable_heterogeneous_attn_post_process = False
+    worker.xfer_stats = SimpleNamespace(record_kv_expired_req=lambda: None)
+    worker._logical_to_kernel_block_ids = lambda block_ids: block_ids
+    worker._logical_to_remote_kernel_block_ids = lambda block_ids, _ratio: block_ids
+    worker._send_heartbeats = lambda _metadata: None
+    worker._apply_prefix_caching = lambda local, remote, _physical: (local, remote)
+    worker._handle_failed_transfer = lambda _req_id, _handle: None
+
+    metadata = SimpleNamespace(
+        reqs_to_recv={
+            "decode-req": SimpleNamespace(
+                local_block_ids=([6, 7],),
+                local_physical_block_ids=(),
+                tp_size=1,
+                remote=SimpleNamespace(
+                    engine_id="p0",
+                    request_id="prefill-req",
+                    block_ids=([2, 4],),
+                    host="127.0.0.1",
+                    port=5555,
+                ),
+            )
+        },
+        reqs_in_batch=set(),
+        reqs_not_processed=set(),
+        reqs_to_send={},
+    )
+
+    worker.start_load_kv(metadata)
+    assert rdma.pull_calls == [
+        {
+            "request_id": "decode-req",
+            "remote_handshake": _remote_handshake(),
+            "local_block_ids": ([6, 7],),
+            "remote_block_ids": ([2, 4],),
+        }
+    ]
+
+    assert worker.get_finished() == (set(), {"decode-req"})
+
+
+def test_pega_pull_handshake_payload_round_trips() -> None:
+    payload = encode_pega_rdma_handshake_payload("compat", _remote_handshake())
+
+    assert isinstance(payload, NixlHandshakePayload)
+    assert payload.compatibility_hash == "compat"
+
+
+def _remote_handshake():
+    rdma = RegisteringRdmaPort()
+    transport = PegaNixlRdmaTransport(
+        vllm_config=_vllm_config(),
+        engine_id="p0",
+        tp_rank=0,
+        tp_size=1,
+        rdma=rdma,
+    )
+    transport.register_kv_caches({"layer.0": FakeTensor((2, 8, 2, 1, 8))})
+    return transport.build_local_handshake("prefill-req", [2, 4])
