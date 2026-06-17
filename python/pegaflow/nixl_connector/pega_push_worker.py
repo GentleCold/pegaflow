@@ -90,6 +90,18 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=b"pega-rdma",
         )
+        self._ensure_push_writer_started()
+
+    def _ensure_push_writer_started(self) -> None:
+        if self._push_writer_thread is not None:
+            return
+        self._push_writer_thread = threading.Thread(
+            target=self._push_writer_loop,
+            daemon=True,
+            name="pega-nixl-push-writer",
+        )
+        self._push_writer_thread.start()
+        logger.info("pega-nixl-push-writer thread started (rank=%d)", self.tp_rank)
 
     def shutdown(self):
         self._push_writer_stop.set()
