@@ -166,6 +166,35 @@ def test_transport_pulls_remote_blocks_into_local_blocks() -> None:
     assert "decode-req" in rdma.pop_finished_recving()
 
 
+def test_transport_pull_registers_only_requested_remote_blocks() -> None:
+    rdma = RegisteringRdmaPort()
+    transport = PegaNixlRdmaTransport(
+        vllm_config=_vllm_config(),
+        engine_id="d0",
+        tp_rank=0,
+        tp_size=1,
+        rdma=rdma,
+    )
+    kv_cache = FakeTensor((2, 8, 2, 1, 8))
+    transport.register_kv_caches({"layer.0": kv_cache})
+    remote_engine_handshake = transport.build_local_handshake(
+        "prefill-engine",
+        tuple(range(8)),
+    )
+
+    transport.pull_blocks(
+        request_id="decode-req",
+        remote_handshake=remote_engine_handshake,
+        local_block_ids=([6, 7],),
+        remote_block_ids=([2, 4],),
+    )
+
+    registered = rdma.remote_handshakes["decode-req"]
+    assert registered is not None
+    assert registered.request_id == "prefill-engine"
+    assert registered.layers[0].block_ids == (2, 4)
+
+
 def test_push_registration_key_preserves_decode_tp_rank() -> None:
     reg_rank0 = {
         "request_id": "decode-req",

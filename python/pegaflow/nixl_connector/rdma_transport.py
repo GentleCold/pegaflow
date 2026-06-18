@@ -168,8 +168,12 @@ class PegaNixlRdmaTransport:
         remote_block_ids: BlockIds,
     ) -> None:
         assert self.rdma is not None, "Pega NIXL RDMA transport is not initialized"
-        self.open_request(request_id, remote_handshake)
         remote_map = _remote_block_map(local_block_ids, remote_block_ids)
+        remote_handshake = _handshake_for_remote_blocks(
+            remote_handshake,
+            tuple(sorted(set(remote_map.values()))),
+        )
+        self.open_request(request_id, remote_handshake)
         if not remote_map:
             logger.warning("Pega NIXL RDMA pull has no mapped blocks req=%s", request_id)
             self.rdma.wait_for_pulls(request_id)
@@ -259,6 +263,35 @@ def _remote_block_map(local_block_ids: BlockIds, remote_block_ids: BlockIds) -> 
         for local_id, remote_id in zip(local_group, remote_group, strict=False):
             mapping[int(local_id)] = int(remote_id)
     return mapping
+
+
+def _handshake_for_remote_blocks(
+    handshake: PdHandshake,
+    block_ids: tuple[int, ...],
+) -> PdHandshake:
+    if not block_ids:
+        return handshake
+    return PdHandshake(
+        request_id=handshake.request_id,
+        engine_id=handshake.engine_id,
+        tp_rank=handshake.tp_rank,
+        tp_size=handshake.tp_size,
+        block_size=handshake.block_size,
+        layers=tuple(
+            LayerRemoteLayout(
+                layer_name=layer.layer_name,
+                layer_idx=layer.layer_idx,
+                block_ids=block_ids,
+                regions=layer.regions,
+                mr_desc=layer.mr_desc,
+            )
+            for layer in handshake.layers
+        ),
+        imm_id=handshake.imm_id,
+        fail_imm_id=handshake.fail_imm_id,
+        abort_imm_id=handshake.abort_imm_id,
+        expected_imm_count=handshake.expected_imm_count,
+    )
 
 
 def _block_ranges_for_remote_read(
