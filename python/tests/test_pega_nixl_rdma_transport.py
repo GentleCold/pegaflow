@@ -154,6 +154,9 @@ def test_transport_pulls_remote_blocks_into_local_blocks() -> None:
         remote_block_ids=([2, 4],),
     )
 
+    assert rdma.pull_layer_calls == []
+    assert len(rdma.pull_layers_calls) == 1
+    assert rdma.pull_layers_calls[0][0] == "decode-req"
     pulled = rdma.pulled_layers["decode-req"]
     assert len(pulled) == 1
     layer_idx, blocks = pulled[0]

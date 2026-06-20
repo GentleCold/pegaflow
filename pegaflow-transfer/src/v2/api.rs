@@ -160,6 +160,7 @@ pub struct ScatterTransferRequest {
     pub dsts: Arc<Vec<ScatterTarget>>,
     pub imm_data: Option<u32>,
     pub domain: GroupTransferRouting,
+    pub read: bool,
 }
 
 /// Use static dispatch for performance.

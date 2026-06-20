@@ -4,9 +4,8 @@ use pegaflow_pd_wire as pd_wire;
 use pegaflow_transfer::v2::{
     CudaDeviceId, Device, DomainAddress, DomainGroupRouting, FabricLibError, GroupTransferRouting,
     ImmCounter, ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle,
-    MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest,
-    SingleTransferRequest, SmallVec, TransferCallback, TransferEngine, TransferEngineBuilder,
-    TransferRequest, detect_topology,
+    MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest, SmallVec,
+    TransferCallback, TransferEngine, TransferEngineBuilder, TransferRequest, detect_topology,
 };
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -16,7 +15,6 @@ use pyo3::{
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
-    num::NonZeroU8,
     ptr::NonNull,
     sync::atomic::{AtomicI64, Ordering},
     sync::{Arc, Mutex},
@@ -174,13 +172,6 @@ struct PdRemoteRequest {
     abort_imm_data: u32,
     expected_imm_count: u32,
     layers: HashMap<u64, PdRemoteLayer>,
-}
-
-struct SingleReadTarget {
-    remote_mr: MemoryRegionDescriptor,
-    remote_offset: u64,
-    local_offset: u64,
-    length: u64,
 }
 
 #[derive(Clone)]
@@ -758,6 +749,7 @@ impl PdRdmaEngine {
                     dsts: Arc::new(dsts),
                     imm_data: None,
                     domain: GroupTransferRouting::AllDomainsShardBytes,
+                    read: false,
                 }),
                 TransferCallback {
                     on_done: Box::new(move || {
@@ -865,197 +857,55 @@ impl PdRdmaEngine {
     ) -> PyResult<()> {
         let total_start = Instant::now();
         let input_blocks = blocks.len();
-        let local = self
-            .local_layers
-            .lock()
-            .unwrap()
-            .get(&layer_idx)
-            .cloned()
-            .ok_or_else(|| {
-                PyRuntimeError::new_err(format!("local layer {layer_idx} is not registered"))
-            })?;
-        let remote = self
-            .remote_requests
-            .lock()
-            .unwrap()
-            .get(&req_id)
-            .and_then(|request| request.layers.get(&layer_idx).cloned())
-            .ok_or_else(|| {
-                PyRuntimeError::new_err(format!(
-                    "remote layer {layer_idx} for req {req_id} is not registered"
-                ))
-            })?;
-
-        let mut reads = Vec::with_capacity(blocks.len() * remote.regions.len());
-        let mut read_bytes = 0_u64;
-        for block in blocks {
-            let block = block.bind(py);
-            let regions_any = block
-                .get_item("regions")?
-                .ok_or_else(|| PyValueError::new_err("block missing regions"))?;
-            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
-                let region = region_any?.cast_into::<PyDict>()?;
-                let region_idx: usize = py_get(&region, "region_idx")?;
-                if region_idx != expected_region_idx {
-                    return Err(PyValueError::new_err(
-                        "block regions must be ordered by region_idx",
-                    ));
-                }
-                let targets =
-                    self.block_slice_to_read_targets(&local, &remote, &region, region_idx)?;
-                for target in targets {
-                    read_bytes = read_bytes.checked_add(target.length).ok_or_else(|| {
-                        PyValueError::new_err(format!(
-                            "RDMA read byte count overflow for req={req_id} layer={layer_idx}"
-                        ))
-                    })?;
-                    reads.push(target);
-                }
-            }
-        }
+        let (local, reads, read_bytes) =
+            self.collect_read_targets(py, &req_id, layer_idx, blocks)?;
         if reads.is_empty() {
             return Ok(());
         }
-
-        let convert_ms = duration_ms(total_start.elapsed());
-        let scatter_targets = reads.len();
-        let submit_start = Instant::now();
-        for target in reads {
-            let window_start = Instant::now();
-            if !py.detach(|| {
-                wait_write_window(
-                    &self.read_submitted,
-                    &self.read_completed,
-                    PD_RDMA_READ_WINDOW,
-                    Duration::from_secs(30),
-                )
-            }) {
-                log::error!(
-                    "[PdRdmaEngine] RDMA READ window timeout req={} layer={} submitted={} completed={} window_wait_ms={:.3}",
-                    req_id,
-                    layer_idx,
-                    self.read_submitted.load(Ordering::Acquire),
-                    self.read_completed.load(Ordering::Acquire),
-                    duration_ms(window_start.elapsed()),
-                );
-                return Err(PegaFlowError::new_err(format!(
-                    "RDMA READ window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
-                    self.read_submitted.load(Ordering::Acquire),
-                    self.read_completed.load(Ordering::Acquire)
-                )));
-            }
-            self.read_submitted.fetch_add(1, Ordering::Release);
-            let submit_at = Instant::now();
-            let (req_completed, req_errors, req_stats) = {
-                let mut pending = self.pending_reads.lock().unwrap();
-                let state = pending
-                    .entry(req_id.clone())
-                    .or_insert_with(PendingRdmaTransfers::new);
-                state.submitted += 1;
-                state
-                    .stats
-                    .lock()
-                    .unwrap()
-                    .record_submit(target.length, submit_at);
-                (
-                    Arc::clone(&state.completed),
-                    Arc::clone(&state.errors),
-                    Arc::clone(&state.stats),
-                )
-            };
-            let global_completed = Arc::clone(&self.read_completed);
-            let done_completed = Arc::clone(&req_completed);
-            let error_completed = Arc::clone(&req_completed);
-            let error_counter = Arc::clone(&req_errors);
-            let done_stats = Arc::clone(&req_stats);
-            let error_stats = Arc::clone(&req_stats);
-            let error_global_completed = Arc::clone(&global_completed);
-            let callback_start = Instant::now();
-            let done_req_id = req_id.clone();
-            let error_req_id = req_id.clone();
-            let done_layer_idx = layer_idx;
-            let error_layer_idx = layer_idx;
-            let bytes = target.length;
-            let local_offset = target.local_offset;
-            let remote_mr = target.remote_mr;
-            let remote_offset = target.remote_offset;
-            self.engine
-                .submit_transfer(
-                    TransferRequest::Single(SingleTransferRequest {
-                        src_mr: local.mr,
-                        src_offset: local_offset,
-                        length: bytes,
-                        imm_data: None,
-                        dst_mr: remote_mr,
-                        dst_offset: remote_offset,
-                        domain: DomainGroupRouting::RoundRobinSharded {
-                            num_shards: NonZeroU8::new(1).unwrap(),
-                        },
-                        read: true,
-                    }),
-                    TransferCallback {
-                        on_done: Box::new(move || {
-                            let latency_ms = duration_ms(callback_start.elapsed());
-                            done_stats
-                                .lock()
-                                .unwrap()
-                                .record_complete(Instant::now(), latency_ms);
-                            done_completed.fetch_add(1, Ordering::Release);
-                            global_completed.fetch_add(1, Ordering::Release);
-                            log::debug!(
-                                "[PdRdmaEngine] RDMA READ completed req={} layer={} bytes={} latency_ms={:.3}",
-                                done_req_id,
-                                done_layer_idx,
-                                bytes,
-                                latency_ms,
-                            );
-                            Ok(())
-                        }),
-                        on_error: Box::new(move |err: FabricLibError| {
-                            let latency_ms = duration_ms(callback_start.elapsed());
-                            error_stats
-                                .lock()
-                                .unwrap()
-                                .record_complete(Instant::now(), latency_ms);
-                            error_counter.fetch_add(1, Ordering::Release);
-                            error_completed.fetch_add(1, Ordering::Release);
-                            error_global_completed.fetch_add(1, Ordering::Release);
-                            log::error!(
-                                "[PdRdmaEngine] RDMA READ completion error req={} layer={} bytes={} latency_ms={:.3} err={err}",
-                                error_req_id,
-                                error_layer_idx,
-                                bytes,
-                                latency_ms,
-                            );
-                            Ok(())
-                        }),
-                    },
-                )
-                .map_err(|err| {
-                    req_errors.fetch_add(1, Ordering::Release);
-                    req_completed.fetch_add(1, Ordering::Release);
-                    self.read_completed.fetch_add(1, Ordering::Release);
-                    log::error!(
-                        "[PdRdmaEngine] RDMA READ submit failed req={} layer={} input_blocks={} bytes={} domains={} err={err}",
-                        req_id,
-                        layer_idx,
-                        input_blocks,
-                        bytes,
-                        self.engine.num_domains(),
-                    );
-                    pd_rdma_error("submit RDMA READ failed", err)
-                })?;
-        }
-        log::debug!(
-            "[PdRdmaEngine] RDMA READ submitted req={} layer={} input_blocks={} scatter_targets={} bytes={} domains={} convert_ms={:.3} submit_ms={:.3} submitted={} completed={}",
-            req_id,
+        self.submit_read_batch(
+            py,
+            &req_id,
             layer_idx,
             input_blocks,
-            scatter_targets,
+            reads,
             read_bytes,
-            self.engine.num_domains(),
-            convert_ms,
-            duration_ms(submit_start.elapsed()),
+            local.mr,
+            duration_ms(total_start.elapsed()),
+        )
+    }
+
+    fn pull_layers(
+        &self,
+        py: Python<'_>,
+        req_id: String,
+        layers: Vec<(u64, Vec<Py<PyDict>>)>,
+    ) -> PyResult<()> {
+        let total_start = Instant::now();
+        let mut submitted_layers = 0_usize;
+        for (layer_idx, blocks) in layers {
+            let input_blocks = blocks.len();
+            let (local, reads, read_bytes) =
+                self.collect_read_targets(py, &req_id, layer_idx, blocks)?;
+            if reads.is_empty() {
+                continue;
+            }
+            self.submit_read_batch(
+                py,
+                &req_id,
+                layer_idx,
+                input_blocks,
+                reads,
+                read_bytes,
+                local.mr,
+                duration_ms(total_start.elapsed()),
+            )?;
+            submitted_layers += 1;
+        }
+        log::debug!(
+            "[PdRdmaEngine] RDMA READ layers submitted req={} layers={} total_ms={:.3} submitted={} completed={}",
+            req_id,
+            submitted_layers,
+            duration_ms(total_start.elapsed()),
             self.read_submitted.load(Ordering::Acquire),
             self.read_completed.load(Ordering::Acquire),
         );
@@ -1405,6 +1255,214 @@ impl PdRdmaEngine {
         Ok(())
     }
 
+    fn collect_read_targets(
+        &self,
+        py: Python<'_>,
+        req_id: &str,
+        layer_idx: u64,
+        blocks: Vec<Py<PyDict>>,
+    ) -> PyResult<(PdLocalLayer, Vec<ScatterTarget>, u64)> {
+        let local = self
+            .local_layers
+            .lock()
+            .unwrap()
+            .get(&layer_idx)
+            .cloned()
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!("local layer {layer_idx} is not registered"))
+            })?;
+        let remote = self
+            .remote_requests
+            .lock()
+            .unwrap()
+            .get(req_id)
+            .and_then(|request| request.layers.get(&layer_idx).cloned())
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "remote layer {layer_idx} for req {req_id} is not registered"
+                ))
+            })?;
+
+        let mut reads = Vec::with_capacity(blocks.len() * remote.regions.len());
+        let mut read_bytes = 0_u64;
+        for block in blocks {
+            let block = block.bind(py);
+            let regions_any = block
+                .get_item("regions")?
+                .ok_or_else(|| PyValueError::new_err("block missing regions"))?;
+            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
+                let region = region_any?.cast_into::<PyDict>()?;
+                let region_idx: usize = py_get(&region, "region_idx")?;
+                if region_idx != expected_region_idx {
+                    return Err(PyValueError::new_err(
+                        "block regions must be ordered by region_idx",
+                    ));
+                }
+                let targets =
+                    self.block_slice_to_read_targets(&local, &remote, &region, region_idx)?;
+                for target in targets {
+                    read_bytes = read_bytes.checked_add(target.length).ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "RDMA read byte count overflow for req={req_id} layer={layer_idx}"
+                        ))
+                    })?;
+                    reads.push(target);
+                }
+            }
+        }
+        Ok((local, reads, read_bytes))
+    }
+
+    fn submit_read_batch(
+        &self,
+        py: Python<'_>,
+        req_id: &str,
+        layer_idx: u64,
+        input_blocks: usize,
+        reads: Vec<ScatterTarget>,
+        read_bytes: u64,
+        local_mr: MemoryRegionHandle,
+        convert_ms: f64,
+    ) -> PyResult<()> {
+        let scatter_targets = reads.len();
+        let window_start = Instant::now();
+        if !py.detach(|| {
+            wait_write_window(
+                &self.read_submitted,
+                &self.read_completed,
+                PD_RDMA_READ_WINDOW,
+                Duration::from_secs(30),
+            )
+        }) {
+            log::error!(
+                "[PdRdmaEngine] RDMA READ window timeout req={} layer={} submitted={} completed={} window_wait_ms={:.3}",
+                req_id,
+                layer_idx,
+                self.read_submitted.load(Ordering::Acquire),
+                self.read_completed.load(Ordering::Acquire),
+                duration_ms(window_start.elapsed()),
+            );
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA READ window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
+                self.read_submitted.load(Ordering::Acquire),
+                self.read_completed.load(Ordering::Acquire)
+            )));
+        }
+        self.read_submitted.fetch_add(1, Ordering::Release);
+        let window_ms = duration_ms(window_start.elapsed());
+        let submit_at = Instant::now();
+        let (req_completed, req_errors, req_stats) = {
+            let mut pending = self.pending_reads.lock().unwrap();
+            let state = pending
+                .entry(req_id.to_string())
+                .or_insert_with(PendingRdmaTransfers::new);
+            state.submitted += 1;
+            state
+                .stats
+                .lock()
+                .unwrap()
+                .record_submit(read_bytes, submit_at);
+            (
+                Arc::clone(&state.completed),
+                Arc::clone(&state.errors),
+                Arc::clone(&state.stats),
+            )
+        };
+        let global_completed = Arc::clone(&self.read_completed);
+        let done_completed = Arc::clone(&req_completed);
+        let error_completed = Arc::clone(&req_completed);
+        let error_counter = Arc::clone(&req_errors);
+        let done_stats = Arc::clone(&req_stats);
+        let error_stats = Arc::clone(&req_stats);
+        let error_global_completed = Arc::clone(&global_completed);
+        let callback_start = Instant::now();
+        let done_req_id = req_id.to_string();
+        let error_req_id = req_id.to_string();
+        let done_layer_idx = layer_idx;
+        let error_layer_idx = layer_idx;
+        let done_bytes = read_bytes;
+        let error_bytes = read_bytes;
+        let submit_start = Instant::now();
+        self.engine
+            .submit_transfer(
+                TransferRequest::Scatter(ScatterTransferRequest {
+                    src_mr: local_mr,
+                    dst_handle: None,
+                    dsts: Arc::new(reads),
+                    imm_data: None,
+                    domain: GroupTransferRouting::AllDomainsShardBytes,
+                    read: true,
+                }),
+                TransferCallback {
+                    on_done: Box::new(move || {
+                        let latency_ms = duration_ms(callback_start.elapsed());
+                        done_stats
+                            .lock()
+                            .unwrap()
+                            .record_complete(Instant::now(), latency_ms);
+                        done_completed.fetch_add(1, Ordering::Release);
+                        global_completed.fetch_add(1, Ordering::Release);
+                        log::debug!(
+                            "[PdRdmaEngine] RDMA READ completed req={} layer={} bytes={} latency_ms={:.3}",
+                            done_req_id,
+                            done_layer_idx,
+                            done_bytes,
+                            latency_ms,
+                        );
+                        Ok(())
+                    }),
+                    on_error: Box::new(move |err: FabricLibError| {
+                        let latency_ms = duration_ms(callback_start.elapsed());
+                        error_stats
+                            .lock()
+                            .unwrap()
+                            .record_complete(Instant::now(), latency_ms);
+                        error_counter.fetch_add(1, Ordering::Release);
+                        error_completed.fetch_add(1, Ordering::Release);
+                        error_global_completed.fetch_add(1, Ordering::Release);
+                        log::error!(
+                            "[PdRdmaEngine] RDMA READ completion error req={} layer={} bytes={} latency_ms={:.3} err={err}",
+                            error_req_id,
+                            error_layer_idx,
+                            error_bytes,
+                            latency_ms,
+                        );
+                        Ok(())
+                    }),
+                },
+            )
+            .map_err(|err| {
+                req_errors.fetch_add(1, Ordering::Release);
+                req_completed.fetch_add(1, Ordering::Release);
+                self.read_completed.fetch_add(1, Ordering::Release);
+                log::error!(
+                    "[PdRdmaEngine] RDMA READ submit failed req={} layer={} input_blocks={} scatter_targets={} bytes={} domains={} err={err}",
+                    req_id,
+                    layer_idx,
+                    input_blocks,
+                    scatter_targets,
+                    read_bytes,
+                    self.engine.num_domains(),
+                );
+                pd_rdma_error("submit RDMA READ failed", err)
+            })?;
+        log::debug!(
+            "[PdRdmaEngine] RDMA READ submitted req={} layer={} input_blocks={} scatter_targets={} bytes={} domains={} convert_ms={:.3} window_ms={:.3} submit_ms={:.3} submitted={} completed={}",
+            req_id,
+            layer_idx,
+            input_blocks,
+            scatter_targets,
+            read_bytes,
+            self.engine.num_domains(),
+            convert_ms,
+            window_ms,
+            duration_ms(submit_start.elapsed()),
+            self.read_submitted.load(Ordering::Acquire),
+            self.read_completed.load(Ordering::Acquire),
+        );
+        Ok(())
+    }
+
     fn transfer_stats<'py>(
         &self,
         py: Python<'py>,
@@ -1497,7 +1555,7 @@ impl PdRdmaEngine {
         remote: &PdRemoteLayer,
         block: &Bound<'_, PyDict>,
         region_idx: usize,
-    ) -> PyResult<Vec<SingleReadTarget>> {
+    ) -> PyResult<Vec<ScatterTarget>> {
         let local_block_id: u64 = py_get(block, "block_id")?;
         let remote_offset: u64 = py_get(block, "src_offset_bytes")?;
         let bytes: u64 = py_get(block, "bytes")?;
@@ -1518,7 +1576,7 @@ impl PdRdmaEngine {
         }
         let block_count = bytes / region.block_len;
         if block_count == 1 || region.block_stride == region.block_len {
-            return Ok(vec![self.make_single_read_target(
+            return Ok(vec![self.make_read_scatter_target(
                 local,
                 remote,
                 local_region,
@@ -1541,7 +1599,7 @@ impl PdRdmaEngine {
                         .ok_or_else(|| PyValueError::new_err("remote offset overflow"))?,
                 )
                 .ok_or_else(|| PyValueError::new_err("remote offset overflow"))?;
-            targets.push(self.make_single_read_target(
+            targets.push(self.make_read_scatter_target(
                 local,
                 remote,
                 local_region,
@@ -1588,7 +1646,7 @@ impl PdRdmaEngine {
         })
     }
 
-    fn make_single_read_target(
+    fn make_read_scatter_target(
         &self,
         local: &PdLocalLayer,
         remote: &PdRemoteLayer,
@@ -1597,7 +1655,7 @@ impl PdRdmaEngine {
         remote_offset: u64,
         bytes: u64,
         region: &PdRemoteRegion,
-    ) -> PyResult<SingleReadTarget> {
+    ) -> PyResult<ScatterTarget> {
         let remote_source_absolute = remote
             .mr_desc
             .ptr
@@ -1632,10 +1690,10 @@ impl PdRdmaEngine {
                 "local block address is below local MR base",
             ));
         }
-        Ok(SingleReadTarget {
-            remote_mr: remote.mr_desc.clone(),
-            remote_offset,
-            local_offset: local_addr - local.mr_desc.ptr,
+        Ok(ScatterTarget {
+            dst_mr: remote.mr_desc.clone(),
+            dst_offset: remote_offset,
+            src_offset: local_addr - local.mr_desc.ptr,
             length: bytes,
         })
     }

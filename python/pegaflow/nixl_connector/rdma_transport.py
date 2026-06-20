@@ -179,6 +179,7 @@ class PegaNixlRdmaTransport:
             self.rdma.wait_for_pulls(request_id)
             return
 
+        layers: list[tuple[int, list[LayerBlockSlices]]] = []
         for layer_idx, layer_name in enumerate(self.layer_names):
             group_idx = 0
             local_group = set(local_block_ids[group_idx]) if local_block_ids else set()
@@ -188,7 +189,9 @@ class PegaNixlRdmaTransport:
                 remote_map,
             )
             if blocks:
-                self.rdma.pull_layer(request_id, layer_idx, blocks)
+                layers.append((layer_idx, blocks))
+        if layers:
+            self.rdma.pull_layers(request_id, layers)
         self.rdma.wait_for_pulls(request_id)
 
     def pop_finished_sending(self) -> set[str]:

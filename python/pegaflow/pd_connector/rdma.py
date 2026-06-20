@@ -48,6 +48,12 @@ class RdmaPort(Protocol):
         blocks: list[LayerBlockSlices],
     ) -> None: ...
 
+    def pull_layers(
+        self,
+        req_id: str,
+        layers: list[tuple[int, list[LayerBlockSlices]]],
+    ) -> None: ...
+
     def wait_for_pulls(self, req_id: str) -> None: ...
 
     def push_done(self, req_id: str) -> None: ...
@@ -80,6 +86,10 @@ class MockRdmaPort:
         self.remote_handshakes: dict[str, PdHandshake | None] = {}
         self.pushed_layers: dict[str, list[tuple[int, list[LayerBlockSlices]]]] = {}
         self.pulled_layers: dict[str, list[tuple[int, list[LayerBlockSlices]]]] = {}
+        self.pull_layer_calls: list[tuple[str, int, list[LayerBlockSlices]]] = []
+        self.pull_layers_calls: list[
+            tuple[str, list[tuple[int, list[LayerBlockSlices]]]]
+        ] = []
         self._finished_sending: set[str] = set()
         self._finished_recving: set[str] = set()
 
@@ -111,8 +121,18 @@ class MockRdmaPort:
         layer_idx: int,
         blocks: list[LayerBlockSlices],
     ) -> None:
+        self.pull_layer_calls.append((req_id, layer_idx, blocks))
         self.pulled_layers.setdefault(req_id, [])
         self.pulled_layers[req_id].append((layer_idx, blocks))
+
+    def pull_layers(
+        self,
+        req_id: str,
+        layers: list[tuple[int, list[LayerBlockSlices]]],
+    ) -> None:
+        self.pull_layers_calls.append((req_id, layers))
+        self.pulled_layers.setdefault(req_id, [])
+        self.pulled_layers[req_id].extend(layers)
 
     def wait_for_pulls(self, req_id: str) -> None:
         self._finished_recving.add(req_id)
@@ -378,6 +398,33 @@ class RealRdmaPort:
                 len(native_blocks),
                 sum(len(block["regions"]) for block in native_blocks),
                 block_slices_bytes(blocks),
+                elapsed_ms,
+            )
+
+    def pull_layers(
+        self,
+        req_id: str,
+        layers: list[tuple[int, list[LayerBlockSlices]]],
+    ) -> None:
+        native_layers = [
+            (layer_idx, _layer_blocks_to_native(blocks))
+            for layer_idx, blocks in layers
+            if blocks
+        ]
+        if not native_layers:
+            return
+        start = time.perf_counter()
+        self.engine.pull_layers(req_id, native_layers)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[PdConnector] RDMA pull_layers req=%s layers=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
+                req_id,
+                len(native_layers),
+                sum(len(blocks) for _, blocks in layers),
+                sum(len(blocks) for _, blocks in native_layers),
+                sum(len(block["regions"]) for _, blocks in native_layers for block in blocks),
+                sum(block_slices_bytes(blocks) for _, blocks in layers),
                 elapsed_ms,
             )
 
