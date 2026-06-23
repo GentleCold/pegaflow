@@ -23,6 +23,7 @@ from vllm.utils.network_utils import make_zmq_path
 
 from pegaflow.nixl_connector.metadata import (
     GET_META_MSG,
+    HEARTBEAT_MSG,
     NixlConnectorMetadata,
     NixlHandshakePayload,
     ReqId,
@@ -71,6 +72,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             max_workers=16,
             thread_name_prefix="pega-nixl-rdma-pull",
         )
+
+    def _pega_zmq_ctx(self, path: str):
+        return zmq_ctx(zmq.REQ, path)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.transfer_topo = TransferTopology(
@@ -320,7 +324,29 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         return set()
 
     def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
-        return None
+        for engine_id, hb_info in metadata.heartbeat_by_engine.items():
+            if not hb_info.req_ids:
+                continue
+            path = make_zmq_path("tcp", hb_info.host, hb_info.port)
+            payload = ",".join(hb_info.req_ids)
+            try:
+                with self._pega_zmq_ctx(path) as sock:
+                    sock.setsockopt(zmq.RCVTIMEO, 1000)
+                    sock.setsockopt(zmq.SNDTIMEO, 1000)
+                    sock.send(msgspec.msgpack.encode((HEARTBEAT_MSG, payload)))
+                    reply = sock.recv()
+                    if reply != b"OK":
+                        logger.debug(
+                            "Pega NIXL heartbeat to engine %s returned %r",
+                            engine_id,
+                            reply,
+                        )
+            except Exception:
+                logger.debug(
+                    "Failed to send Pega NIXL heartbeat to engine %s",
+                    engine_id,
+                    exc_info=True,
+                )
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         while not self._completed_rdma_recvs.empty():

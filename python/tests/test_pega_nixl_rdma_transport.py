@@ -3,25 +3,36 @@ from __future__ import annotations
 # ruff: noqa: E402, I001
 
 import queue
+import threading
 from types import SimpleNamespace
 
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
+import msgspec
+import zmq
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from pegaflow.nixl_connector.base_scheduler import _push_registration_key
+from pegaflow.nixl_connector.base_scheduler import (
+    NixlBaseConnectorScheduler,
+    _push_registration_key,
+)
 from pegaflow.nixl_connector.base_worker import (
     NixlBaseConnectorWorker,
     _unregister_remote_engine_if_supported,
 )
-from pegaflow.nixl_connector.metadata import NixlConnectorMetadata, NixlHandshakePayload
+from pegaflow.nixl_connector.metadata import (
+    HeartbeatInfo,
+    NixlConnectorMetadata,
+    NixlHandshakePayload,
+)
 from pegaflow.nixl_connector.pega_pull_worker import (
     PegaNixlPullConnectorWorker,
     encode_pega_rdma_handshake_payload,
 )
 from pegaflow.nixl_connector.pega_push_worker import PegaNixlPushConnectorWorker
+from pegaflow.nixl_connector.pull_worker import NixlPullConnectorWorker
 from pegaflow.nixl_connector.rdma_transport import PegaNixlRdmaTransport, handshake_to_wire
 from pegaflow.pd_connector.metadata import LayerRemoteLayout
 from pegaflow.pd_connector.rdma import MockRdmaPort
@@ -374,6 +385,7 @@ def test_pega_pull_worker_uses_rdma_pull_and_reports_completion() -> None:
         reqs_in_batch=set(),
         reqs_not_processed=set(),
         reqs_to_send={},
+        incoming_heartbeats=set(),
     )
 
     worker.start_load_kv(metadata)
@@ -388,6 +400,125 @@ def test_pega_pull_worker_uses_rdma_pull_and_reports_completion() -> None:
     assert rdma.wait_pull_calls == ["decode-req"]
 
     assert worker.get_finished() == (set(), {"decode-req"})
+
+
+def test_pega_pull_worker_sends_heartbeats_over_side_channel() -> None:
+    worker = object.__new__(PegaNixlPullConnectorWorker)
+    worker._remote_agents = {"p0": {0: "pega-rdma:p0:0"}}
+    sent: list[tuple[int, bytes]] = []
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def setsockopt(self, _opt, _value):
+            return None
+
+        def send(self, payload: bytes) -> None:
+            sent.append(msgspec.msgpack.decode(payload))
+
+        def recv(self) -> bytes:
+            return b"OK"
+
+    worker._pega_zmq_ctx = lambda _path: FakeSocket()
+
+    metadata = NixlConnectorMetadata()
+    metadata.heartbeat_by_engine = {
+        "p0": HeartbeatInfo(
+            req_ids={"prefill-req-a", "prefill-req-b"},
+            host="127.0.0.1",
+            port=5555,
+            tp_size=1,
+        )
+    }
+
+    worker._send_heartbeats(metadata)
+
+    assert len(sent) == 1
+    msg, payload = sent[0]
+    assert msg == b"heartbeat_msg"
+    assert set(payload.split(",")) == {"prefill-req-a", "prefill-req-b"}
+
+
+def test_side_channel_listener_forwards_heartbeats_to_metadata(monkeypatch) -> None:
+    incoming: set[str] = set()
+    incoming_lock = threading.Lock()
+    ready_event = threading.Event()
+    stop_event = threading.Event()
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.replies: list[tuple[bytes, bytes, bytes]] = []
+            self._messages = [
+                (b"identity", b"", msgspec.msgpack.encode((b"heartbeat_msg", "prefill-req")))
+            ]
+
+        def setsockopt(self, _opt, _value):
+            return None
+
+        def recv_multipart(self):
+            if self._messages:
+                return self._messages.pop(0)
+            stop_event.set()
+            raise zmq.Again()
+
+        def send_multipart(self, payload):
+            self.replies.append(payload)
+
+    router = FakeRouter()
+
+    class FakeCtx:
+        def __enter__(self):
+            return router
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(
+        "pegaflow.nixl_connector.base_scheduler.zmq_ctx",
+        lambda _socket_type, _path: FakeCtx(),
+    )
+    NixlBaseConnectorScheduler._nixl_handshake_listener(
+        {0: b"unused"},
+        {},
+        threading.Lock(),
+        incoming,
+        incoming_lock,
+        ready_event,
+        stop_event,
+        "127.0.0.1",
+        5555,
+    )
+
+    assert incoming == {"prefill-req"}
+    assert router.replies == [(b"identity", b"", b"OK")]
+
+
+def test_pull_worker_applies_side_channel_heartbeats_to_send_leases() -> None:
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._recving_metadata = {}
+    worker._remote_agents = {}
+    worker._handshake_lock = SimpleNamespace(
+        __enter__=lambda _self: None,
+        __exit__=lambda _self, _exc_type, _exc, _tb: None,
+    )
+    worker._ready_requests = SimpleNamespace(empty=lambda: True)
+    worker._reqs_to_process = set()
+    worker._reqs_to_send = {}
+    worker._lease_extension = 30
+    worker._send_heartbeats = lambda _metadata: None
+
+    metadata = NixlConnectorMetadata()
+    metadata.reqs_in_batch = {"prefill-req"}
+    metadata.reqs_to_send = {"prefill-req": 1.0}
+    metadata.incoming_heartbeats = {"prefill-req"}
+
+    worker.start_load_kv(metadata)
+
+    assert worker._reqs_to_send["prefill-req"] > 1.0
 
 
 def test_pega_pull_handshake_payload_round_trips() -> None:

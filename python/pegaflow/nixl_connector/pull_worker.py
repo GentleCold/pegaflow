@@ -94,6 +94,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
 
+        if metadata.incoming_heartbeats:
+            self._handle_heartbeat(",".join(metadata.incoming_heartbeats))
+
         # Send heartbeats to P-side engines to keep KV blocks alive while
         # requests sit in the D scheduler WAITING queue.
         self._send_heartbeats(metadata)

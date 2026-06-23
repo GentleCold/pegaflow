@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
 
 from pegaflow.nixl_connector.metadata import (
     GET_META_MSG,
+    HEARTBEAT_MSG,
     PUSH_REG_NOTIF_PREFIX,
     HeartbeatInfo,
     NixlConnectorMetadata,
@@ -111,6 +112,8 @@ class NixlBaseConnectorScheduler:
         self._stop_event = threading.Event()
         self._incoming_push_registrations: dict[ReqId, dict[str, Any]] = {}
         self._incoming_push_registrations_lock = threading.Lock()
+        self._incoming_heartbeats: set[ReqId] = set()
+        self._incoming_heartbeats_lock = threading.Lock()
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -287,6 +290,8 @@ class NixlBaseConnectorScheduler:
                     encoded_data,
                     self._incoming_push_registrations,
                     self._incoming_push_registrations_lock,
+                    self._incoming_heartbeats,
+                    self._incoming_heartbeats_lock,
                     ready_event,
                     self._stop_event,
                     self.side_channel_host,
@@ -303,6 +308,8 @@ class NixlBaseConnectorScheduler:
         encoded_data: dict[int, Any],
         incoming_push_registrations: dict[ReqId, dict[str, Any]],
         incoming_push_registrations_lock: threading.Lock,
+        incoming_heartbeats: set[ReqId],
+        incoming_heartbeats_lock: threading.Lock,
         ready_event: threading.Event,
         stop_event: threading.Event,
         host: str,
@@ -335,6 +342,19 @@ class NixlBaseConnectorScheduler:
                 )
                 if msg == GET_META_MSG:
                     sock.send_multipart((identity, b"", encoded_data[payload]))
+                    continue
+                if msg == HEARTBEAT_MSG:
+                    try:
+                        with incoming_heartbeats_lock:
+                            incoming_heartbeats.update(
+                                req_id
+                                for req_id in str(payload).split(",")
+                                if req_id
+                            )
+                        sock.send_multipart((identity, b"", b"OK"))
+                    except Exception:
+                        logger.exception("Failed to receive Pega NIXL heartbeat")
+                        sock.send_multipart((identity, b"", b"ERR"))
                     continue
                 if msg == PUSH_REG_NOTIF_PREFIX:
                     try:
@@ -456,6 +476,11 @@ class NixlBaseConnectorScheduler:
                     self._incoming_push_registrations
                 )
                 self._incoming_push_registrations.clear()
+
+        with self._incoming_heartbeats_lock:
+            if self._incoming_heartbeats:
+                meta.incoming_heartbeats = set(self._incoming_heartbeats)
+                self._incoming_heartbeats.clear()
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()

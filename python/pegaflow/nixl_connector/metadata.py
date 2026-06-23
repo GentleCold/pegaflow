@@ -19,6 +19,7 @@ TransferHandle = int
 ReqId = str
 
 GET_META_MSG = b"get_meta_msg"
+HEARTBEAT_MSG = b"heartbeat_msg"
 
 # Push-mode (WRITE-based) registration notification.
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
@@ -178,6 +179,9 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_not_processed: set[ReqId] = set()
         # Heartbeat data grouped by remote engine, sent by D worker to P.
         self.heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
+        # P-side heartbeats received over the scheduler side channel and
+        # forwarded to the worker on the next engine step.
+        self.incoming_heartbeats: set[ReqId] = set()
         # Push mode (D side): registration data the D worker should send to
         # P workers via NIXL notification on this step.
         self.push_registrations: dict[ReqId, dict[str, Any]] = {}
