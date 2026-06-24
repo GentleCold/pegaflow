@@ -58,6 +58,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_rdma_reads: dict[TransferHandle, PegaRdmaV1Read] = {}
         self._pega_local_handshake: dict[str, bytes] = {}
         self._pega_pending_requests = defaultdict[str, list[tuple[str, str]]](list)
+        self._pega_pending_since: dict[str, float] = {}
         self._pega_expected_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_submitted_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_completed_peers: dict[str, set[str]] = defaultdict(set)
@@ -232,6 +233,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             return True
         if status.status == "connecting":
             self._add_pending_request(peer_key, request_id, dst_engine_id)
+            self._pega_pending_since.setdefault(peer_key, time.perf_counter())
             return False
         if status.metadata is None:
             raise RuntimeError(f"RDMA v1 get_or_prepare({peer_key}) returned no metadata")
@@ -244,6 +246,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             notif_msg=encode_handshake_request(peer_key, local_metadata),
         )
         self._add_pending_request(peer_key, request_id, dst_engine_id)
+        self._pega_pending_since.setdefault(peer_key, time.perf_counter())
         return False
 
     def _add_pending_request(self, peer_key: str, request_id: str, dst_engine_id: str) -> None:
@@ -254,6 +257,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
 
     def _get_new_notifs(self) -> set[str]:
         assert self.transfer_topo is not None
+        self._expire_pega_rdma_handshakes()
         notified_req_ids: set[str] = set()
         for source_agent, notifs in self.nixl_wrapper.get_new_notifs().items():
             for notif in notifs:
@@ -314,6 +318,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
 
         if kind == "response":
             local = self._pega_local_handshake.pop(peer_key, None)
+            self._pega_pending_since.pop(peer_key, None)
             if local is None:
                 local = self._prepare_or_get_local_metadata(peer_key)
             self._pega_rdma.complete_handshake(peer_key, local, metadata)
@@ -332,6 +337,44 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             return
 
         raise ValueError(f"unknown Pega RDMA v1 handshake kind {kind!r}")
+
+    def _expire_pega_rdma_handshakes(self) -> None:
+        now = time.perf_counter()
+        timeout_s = self._pega_rdma_config.handshake_timeout_s
+        expired_peers = [
+            peer_key
+            for peer_key, started_at in self._pega_pending_since.items()
+            if now - started_at >= timeout_s
+        ]
+        for peer_key in expired_peers:
+            self._pega_pending_since.pop(peer_key, None)
+            local = self._pega_local_handshake.pop(peer_key, None)
+            if local is not None:
+                try:
+                    self._pega_rdma.abort_handshake(peer_key, local)
+                except Exception:
+                    logger.debug(
+                        "Failed to abort expired Pega RDMA v1 handshake peer=%s",
+                        peer_key,
+                        exc_info=True,
+                    )
+
+            pending = self._pega_pending_requests.pop(peer_key, [])
+            for req_id, engine_id in pending:
+                if req_id not in self._recving_metadata:
+                    continue
+                self._log_failure(
+                    failure_type="pega_rdma_handshake_timeout",
+                    req_id=req_id,
+                    msg=(
+                        "Pega RDMA v1 handshake timed out before READ setup; "
+                        "marking blocks invalid"
+                    ),
+                    remote_engine_id=engine_id,
+                    peer_key=peer_key,
+                    timeout_s=timeout_s,
+                )
+                self._handle_failed_transfer(req_id, None)
 
     def _prepare_or_get_local_metadata(self, peer_key: str) -> bytes:
         local = self._pega_local_handshake.get(peer_key)
@@ -418,6 +461,8 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         for read in list(self._pega_rdma_reads.values()):
             self._pega_rdma.release_read(read.handle)
         self._pega_rdma_reads.clear()
+        self._pega_pending_since.clear()
+        self._pega_pending_requests.clear()
         self._recving_transfers.clear()
         try:
             self._pega_rdma.unregister_memory(

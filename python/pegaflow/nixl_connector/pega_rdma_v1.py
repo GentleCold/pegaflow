@@ -19,6 +19,7 @@ PEGA_RDMA_V1_HANDSHAKE_PREFIX = b"PEGA_RDMA_V1_HS:"
 class PegaRdmaV1Config:
     nics: list[str]
     qps_per_peer: int
+    handshake_timeout_s: float
 
     @classmethod
     def from_extra_config(cls, extra_config: dict[str, Any]) -> PegaRdmaV1Config:
@@ -40,7 +41,17 @@ class PegaRdmaV1Config:
         qps_per_peer = int(extra_config.get("pegaflow.nixl.rdma_v1.qps_per_peer", 4))
         if qps_per_peer <= 0:
             raise ValueError("pegaflow.nixl.rdma_v1.qps_per_peer must be positive")
-        return cls(nics=nics, qps_per_peer=qps_per_peer)
+
+        handshake_timeout_s = float(
+            extra_config.get("pegaflow.nixl.rdma_v1.handshake_timeout_s", 5.0)
+        )
+        if handshake_timeout_s <= 0:
+            raise ValueError("pegaflow.nixl.rdma_v1.handshake_timeout_s must be positive")
+        return cls(
+            nics=nics,
+            qps_per_peer=qps_per_peer,
+            handshake_timeout_s=handshake_timeout_s,
+        )
 
 
 @dataclass(frozen=True)
