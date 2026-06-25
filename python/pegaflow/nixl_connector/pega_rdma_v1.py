@@ -180,29 +180,6 @@ def build_memory_regions(blocks_data: list[tuple[int, int, int]]) -> list[dict[s
     return [{"addr": addr, "len": size} for addr, size in merged.items()]
 
 
-def build_read_descs(
-    local_blocks_data: list[tuple[int, int, int]],
-    remote_blocks_data: list[tuple[int, int, int]],
-    local_desc_ids,
-    remote_desc_ids,
-) -> list[dict[str, int]]:
-    descs: list[dict[str, int]] = []
-    for local_idx, remote_idx in zip(local_desc_ids, remote_desc_ids, strict=True):
-        local_addr, local_len, _local_dev = local_blocks_data[int(local_idx)]
-        remote_addr, remote_len, _remote_dev = remote_blocks_data[int(remote_idx)]
-        transfer_len = min(local_len, remote_len)
-        if transfer_len <= 0:
-            continue
-        descs.append(
-            {
-                "local_addr": int(local_addr),
-                "remote_addr": int(remote_addr),
-                "len": int(transfer_len),
-            }
-        )
-    return descs
-
-
 def encode_handshake_request(
     peer_key: str,
     metadata: bytes,

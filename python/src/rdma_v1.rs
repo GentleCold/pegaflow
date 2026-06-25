@@ -217,30 +217,6 @@ impl PegaRdmaV1Engine {
         Ok(())
     }
 
-    fn read_async(
-        &self,
-        py: Python<'_>,
-        remote_addr: String,
-        descs: Vec<Py<PyDict>>,
-    ) -> PyResult<u64> {
-        let mut native = Vec::with_capacity(descs.len());
-        for desc in descs {
-            let desc = desc.bind(py);
-            let local_addr: u64 = py_get(desc, "local_addr")?;
-            let remote_addr_value: u64 = py_get(desc, "remote_addr")?;
-            let len: u64 = py_get(desc, "len")?;
-            if len == 0 {
-                return Err(PyValueError::new_err("transfer desc len must be positive"));
-            }
-            native.push(TransferDesc {
-                local_ptr: nonnull_from_u64(local_addr, "local_addr")?,
-                remote_ptr: nonnull_from_u64(remote_addr_value, "remote_addr")?,
-                len: u64_to_usize(len, "transfer desc len")?,
-            });
-        }
-        self.submit_read_native(remote_addr, native)
-    }
-
     fn read_async_indices(
         &self,
         remote_addr: String,

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """NIXL KV-cache transfer connector (disaggregated prefill / decode)."""
 
 from pegaflow.nixl_connector.base_scheduler import (
