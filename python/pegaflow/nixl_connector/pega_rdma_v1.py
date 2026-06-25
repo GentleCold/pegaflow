@@ -5,6 +5,10 @@
 
 from __future__ import annotations
 
+import os
+import time
+from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +24,8 @@ class PegaRdmaV1Config:
     nics: list[str]
     qps_per_peer: int
     handshake_timeout_s: float
+    perf_enabled: bool
+    perf_log_every: int
 
     @classmethod
     def from_extra_config(cls, extra_config: dict[str, Any]) -> PegaRdmaV1Config:
@@ -47,10 +53,25 @@ class PegaRdmaV1Config:
         )
         if handshake_timeout_s <= 0:
             raise ValueError("pegaflow.nixl.rdma_v1.handshake_timeout_s must be positive")
+
+        perf_enabled = _config_bool(
+            extra_config.get("pegaflow.nixl.rdma_v1.perf"),
+            default=os.getenv("PEGA_NIXL_RDMA_V1_PERF", "").lower() in {"1", "true", "yes"},
+        )
+        perf_log_every = int(
+            extra_config.get(
+                "pegaflow.nixl.rdma_v1.perf_log_every",
+                os.getenv("PEGA_NIXL_RDMA_V1_PERF_LOG_EVERY", 64),
+            )
+        )
+        if perf_log_every <= 0:
+            raise ValueError("pegaflow.nixl.rdma_v1.perf_log_every must be positive")
         return cls(
             nics=nics,
             qps_per_peer=qps_per_peer,
             handshake_timeout_s=handshake_timeout_s,
+            perf_enabled=perf_enabled,
+            perf_log_every=perf_log_every,
         )
 
 
@@ -63,6 +84,72 @@ class PegaRdmaV1Read:
     submitted_at: float
     bytes_transferred: int
     num_descriptors: int
+
+
+class PegaRdmaV1Perf:
+    def __init__(self, *, enabled: bool, log_every: int, logger_name: str):
+        self.enabled = enabled
+        self.log_every = log_every
+        self.logger_name = logger_name
+        self._count_by_stage: dict[str, int] = defaultdict(int)
+        self._total_ns_by_stage: dict[str, int] = defaultdict(int)
+        self._max_ns_by_stage: dict[str, int] = defaultdict(int)
+        self._events = 0
+
+    @contextmanager
+    def measure(self, stage: str):
+        if not self.enabled:
+            yield
+            return
+        start_ns = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            self.record_ns(stage, time.perf_counter_ns() - start_ns)
+
+    def record_ns(self, stage: str, elapsed_ns: int) -> None:
+        if not self.enabled:
+            return
+        self._count_by_stage[stage] += 1
+        self._total_ns_by_stage[stage] += elapsed_ns
+        self._max_ns_by_stage[stage] = max(self._max_ns_by_stage[stage], elapsed_ns)
+        self._events += 1
+        if self._events % self.log_every == 0:
+            self.log_summary()
+
+    def log_summary(self) -> None:
+        if not self.enabled or not self._count_by_stage:
+            return
+        import logging
+
+        parts = []
+        for stage in sorted(self._count_by_stage):
+            count = self._count_by_stage[stage]
+            total_ms = self._total_ns_by_stage[stage] / 1_000_000
+            avg_ms = total_ms / count
+            max_ms = self._max_ns_by_stage[stage] / 1_000_000
+            parts.append(f"{stage}:n={count},avg={avg_ms:.3f}ms,max={max_ms:.3f}ms")
+        logging.getLogger(self.logger_name).warning(
+            "Pega RDMA v1 perf summary %s", "; ".join(parts)
+        )
+
+    def log_final_summary(self) -> None:
+        if not self.enabled:
+            return
+        import logging
+
+        logging.getLogger(self.logger_name).warning("Pega RDMA v1 perf final summary follows")
+        self.log_summary()
+
+
+def _config_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def make_peer_key(local_engine_id: str, local_tp_rank: int, remote_engine_id: str, remote_rank: int):

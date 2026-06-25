@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from pegaflow.nixl_connector.metadata import TransferHandle
 from pegaflow.nixl_connector.pega_rdma_v1 import (
     PegaRdmaV1Config,
+    PegaRdmaV1Perf,
     PegaRdmaV1Read,
     build_memory_regions,
     build_read_descs,
@@ -55,6 +56,16 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self._pega_rdma_config = PegaRdmaV1Config.from_extra_config(extra_config)
         self._pega_rdma = create_rdma_engine(self._pega_rdma_config)
+        self._pega_rdma_perf = PegaRdmaV1Perf(
+            enabled=self._pega_rdma_config.perf_enabled,
+            log_every=self._pega_rdma_config.perf_log_every,
+            logger_name=__name__,
+        )
+        if self._pega_rdma_config.perf_enabled:
+            logger.warning(
+                "Pega RDMA v1 perf probes enabled; log_every=%d",
+                self._pega_rdma_config.perf_log_every,
+            )
         self._pega_rdma_reads: dict[TransferHandle, PegaRdmaV1Read] = {}
         self._pega_local_handshake: dict[str, bytes] = {}
         self._pega_pending_requests = defaultdict[str, list[tuple[str, str]]](list)
@@ -172,13 +183,15 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 block_size=remote_info.remote_block_size,
             )
             remote_blocks_data = self.dst_blocks_data[dst_engine_id][remote_rank]
-            descs = build_read_descs(
-                local_blocks_data,
-                remote_blocks_data,
-                local_block_descs_ids,
-                remote_block_descs_ids,
-            )
-            handle = self._pega_rdma.read_async(peer_key, descs)
+            with self._pega_rdma_perf.measure("build_descs"):
+                descs = build_read_descs(
+                    local_blocks_data,
+                    remote_blocks_data,
+                    local_block_descs_ids,
+                    remote_block_descs_ids,
+                )
+            with self._pega_rdma_perf.measure("read_async_submit"):
+                handle = self._pega_rdma.read_async(peer_key, descs)
             self._pega_rdma_reads[handle] = PegaRdmaV1Read(
                 remote_addr=peer_key,
                 handle=handle,
@@ -231,8 +244,10 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
     ) -> bool:
         status = self._pega_rdma.get_or_prepare(peer_key)
         if status.status == "existing":
+            self._pega_rdma_perf.record_ns("ensure_existing", 0)
             return True
         if status.status == "connecting":
+            self._pega_rdma_perf.record_ns("ensure_connecting", 0)
             self._add_pending_request(peer_key, request_id, dst_engine_id)
             self._pega_pending_since.setdefault(peer_key, time.perf_counter())
             return False
@@ -242,14 +257,16 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         local_metadata = bytes(status.metadata)
         self._pega_local_handshake[peer_key] = local_metadata
         agent_name = self._remote_agents[dst_engine_id][remote_rank]
-        self.nixl_wrapper.send_notif(
-            agent_name,
-            notif_msg=encode_handshake_request(
-                peer_key,
-                local_metadata,
-                self.nixl_wrapper.get_agent_metadata(),
-            ),
-        )
+        with self._pega_rdma_perf.measure("send_hs_request"):
+            self.nixl_wrapper.send_notif(
+                agent_name,
+                notif_msg=encode_handshake_request(
+                    peer_key,
+                    local_metadata,
+                    self.nixl_wrapper.get_agent_metadata(),
+                ),
+            )
+        self._pega_rdma_perf.record_ns("ensure_prepared", 0)
         self._add_pending_request(peer_key, request_id, dst_engine_id)
         self._pega_pending_since.setdefault(peer_key, time.perf_counter())
         return False
@@ -311,38 +328,40 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             raise ValueError("invalid Pega RDMA v1 handshake notification")
 
         if kind == "request":
-            if not isinstance(response_agent_metadata, bytes):
-                raise ValueError(
-                    "Pega RDMA v1 handshake request missing response agent metadata"
+            with self._pega_rdma_perf.measure("handle_hs_request"):
+                if not isinstance(response_agent_metadata, bytes):
+                    raise ValueError(
+                        "Pega RDMA v1 handshake request missing response agent metadata"
+                    )
+                local_peer_key = reverse_peer_key(peer_key)
+                local = self._prepare_or_get_local_metadata(local_peer_key)
+                self._pega_rdma.complete_handshake(local_peer_key, local, metadata)
+                agent_name = self._get_pega_response_agent(peer_key, response_agent_metadata)
+                self.nixl_wrapper.send_notif(
+                    agent_name,
+                    notif_msg=encode_handshake_response(peer_key, local),
                 )
-            local_peer_key = reverse_peer_key(peer_key)
-            local = self._prepare_or_get_local_metadata(local_peer_key)
-            self._pega_rdma.complete_handshake(local_peer_key, local, metadata)
-            agent_name = self._get_pega_response_agent(peer_key, response_agent_metadata)
-            self.nixl_wrapper.send_notif(
-                agent_name,
-                notif_msg=encode_handshake_response(peer_key, local),
-            )
             logger.debug("Pega RDMA v1 handshake request accepted peer=%s", local_peer_key)
             return
 
         if kind == "response":
-            local = self._pega_local_handshake.pop(peer_key, None)
-            self._pega_pending_since.pop(peer_key, None)
-            if local is None:
-                local = self._prepare_or_get_local_metadata(peer_key)
-            self._pega_rdma.complete_handshake(peer_key, local, metadata)
-            pending = self._pega_pending_requests.pop(peer_key, [])
-            for req_id, engine_id in pending:
-                meta = self._recving_metadata.get(req_id)
-                if meta is not None:
-                    self._ready_requests.put((req_id, meta))
-                else:
-                    logger.debug(
-                        "Skipping stale request %s after RDMA handshake with %s",
-                        req_id,
-                        engine_id,
-                    )
+            with self._pega_rdma_perf.measure("handle_hs_response"):
+                local = self._pega_local_handshake.pop(peer_key, None)
+                self._pega_pending_since.pop(peer_key, None)
+                if local is None:
+                    local = self._prepare_or_get_local_metadata(peer_key)
+                self._pega_rdma.complete_handshake(peer_key, local, metadata)
+                pending = self._pega_pending_requests.pop(peer_key, [])
+                for req_id, engine_id in pending:
+                    meta = self._recving_metadata.get(req_id)
+                    if meta is not None:
+                        self._ready_requests.put((req_id, meta))
+                    else:
+                        logger.debug(
+                            "Skipping stale request %s after RDMA handshake with %s",
+                            req_id,
+                            engine_id,
+                        )
             logger.debug("Pega RDMA v1 handshake response completed peer=%s", peer_key)
             return
 
@@ -422,17 +441,19 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 if read is None:
                     continue
                 try:
-                    state = self._pega_rdma.check_read(handle)
+                    with self._pega_rdma_perf.measure("check_read_poll"):
+                        state = self._pega_rdma.check_read(handle)
                     if state == "done":
-                        self._pega_rdma_reads.pop(handle, None)
-                        self._pega_completed_peers[req_id].add(read.remote_addr)
-                        self.xfer_stats.record_transfer_values(
-                            transfer_duration=time.perf_counter() - read.submitted_at,
-                            post_duration=0.0,
-                            bytes_transferred=read.bytes_transferred,
-                            num_descriptors=read.num_descriptors,
-                        )
-                        self.nixl_wrapper.send_notif(read.notif_agent, notif_msg=read.notif_msg)
+                        with self._pega_rdma_perf.measure("read_complete_to_notif"):
+                            self._pega_rdma_reads.pop(handle, None)
+                            self._pega_completed_peers[req_id].add(read.remote_addr)
+                            self.xfer_stats.record_transfer_values(
+                                transfer_duration=time.perf_counter() - read.submitted_at,
+                                post_duration=0.0,
+                                bytes_transferred=read.bytes_transferred,
+                                num_descriptors=read.num_descriptors,
+                            )
+                            self.nixl_wrapper.send_notif(read.notif_agent, notif_msg=read.notif_msg)
                     elif state == "pending":
                         in_progress.append(handle)
                     else:
@@ -476,6 +497,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         super()._handle_failed_transfer(req_id, handle)
 
     def shutdown(self):
+        self._pega_rdma_perf.log_final_summary()
         for read in list(self._pega_rdma_reads.values()):
             self._pega_rdma.release_read(read.handle)
         self._pega_rdma_reads.clear()
