@@ -76,6 +76,7 @@ struct BlockEntry {
 #[pyclass]
 struct PegaRdmaV1Engine {
     engine: Arc<TransferEngine>,
+    pending_handshakes: Mutex<HashMap<String, HandshakeMetadata>>,
     pending_reads: Mutex<HashMap<u64, PendingRead>>,
     next_handle: Mutex<u64>,
     block_tables: Mutex<HashMap<u64, Vec<BlockEntry>>>,
@@ -96,6 +97,7 @@ impl PegaRdmaV1Engine {
             .map_err(|err| rdma_v1_error("v1 transfer engine init failed", err))?;
         Ok(Self {
             engine: Arc::new(engine),
+            pending_handshakes: Mutex::new(HashMap::new()),
             pending_reads: Mutex::new(HashMap::new()),
             next_handle: Mutex::new(1),
             block_tables: Mutex::new(HashMap::new()),
@@ -137,72 +139,45 @@ impl PegaRdmaV1Engine {
             .map_err(|err| rdma_v1_error("unregister_memory failed", err))
     }
 
-    fn get_or_prepare(&self, remote_addr: String) -> PyResult<PegaRdmaV1Handshake> {
-        // Expose TransferEngine's state machine without leaking Rust enums into
-        // Python.  "prepared" means the caller must send this side's RDMA v1
-        // handshake metadata to its peer; "connecting" means another request is
-        // already doing that for the same peer.
-        let status = self
-            .engine
-            .get_or_prepare(&remote_addr)
-            .map_err(|err| rdma_v1_error("get_or_prepare failed", err))?;
-        Ok(match status {
-            ConnectionStatus::Existing => PegaRdmaV1Handshake {
-                status: "existing".to_string(),
-                has_metadata: false,
-                metadata: None,
-            },
-            ConnectionStatus::Connecting => PegaRdmaV1Handshake {
-                status: "connecting".to_string(),
-                has_metadata: false,
-                metadata: None,
-            },
-            ConnectionStatus::Prepared(metadata) => PegaRdmaV1Handshake {
-                status: "prepared".to_string(),
-                has_metadata: true,
-                metadata: Some(metadata.to_bytes()),
-            },
-        })
+    fn prepare_handshake(&self, remote_addr: String) -> PyResult<PegaRdmaV1Handshake> {
+        // Expose TransferEngine's initiator state machine without leaking Rust
+        // enums into Python. "prepared" means Python must send this opaque RDMA
+        // metadata to its peer; "connecting" means another request is already
+        // doing that for the same peer.
+        self.prepare_handshake_inner(&remote_addr)
     }
 
-    fn local_meta_for<'py>(
+    fn accept_handshake<'py>(
         &self,
         py: Python<'py>,
         remote_addr: String,
-    ) -> Option<Bound<'py, pyo3::types::PyBytes>> {
-        // Return cached local handshake metadata for a peer that is already
-        // prepared or connected.  This is used when replying to a peer's
-        // handshake request after the local side was prepared earlier.
-        self.engine
-            .local_meta_for(&remote_addr)
-            .map(|metadata| pyo3::types::PyBytes::new(py, &metadata.to_bytes()))
-    }
-
-    fn complete_handshake(
-        &self,
-        remote_addr: String,
-        local_metadata: Vec<u8>,
         remote_metadata: Vec<u8>,
-    ) -> PyResult<()> {
-        // The local and remote byte blobs are PegaFlow RDMA v1 metadata, not
-        // NIXL agent metadata.  The Python connector transports these bytes over
-        // NIXL notifications but completes them against the Pega transfer
-        // engine here.
-        let local = HandshakeMetadata::from_bytes(&local_metadata)
-            .map_err(|err| rdma_v1_error("decode local handshake failed", err))?;
-        let remote = HandshakeMetadata::from_bytes(&remote_metadata)
-            .map_err(|err| rdma_v1_error("decode remote handshake failed", err))?;
-        self.engine
-            .complete_handshake(&remote_addr, &local, &remote)
-            .map_err(|err| rdma_v1_error("complete_handshake failed", err))
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        // Responder-side equivalent of PegaEngine::rdma_accept_handshake. The
+        // Python connector only transports opaque bytes; stale connection
+        // invalidation, local QP preparation, and completion stay in Rust.
+        let local = self.accept_handshake_inner(&remote_addr, &remote_metadata)?;
+        Ok(pyo3::types::PyBytes::new(py, &local))
     }
 
-    fn abort_handshake(&self, remote_addr: String, local_metadata: Vec<u8>) -> PyResult<()> {
-        // Abort a prepared-but-incomplete handshake after the Python connector's
-        // timeout expires, so the transfer engine can release pending state.
-        let local = HandshakeMetadata::from_bytes(&local_metadata)
-            .map_err(|err| rdma_v1_error("decode local handshake failed", err))?;
-        self.engine.abort_handshake(&remote_addr, &local);
+    fn finish_handshake(&self, remote_addr: String, remote_metadata: Vec<u8>) -> PyResult<()> {
+        // Initiator-side completion. The local metadata was cached by
+        // prepare_handshake, so Python does not need to keep or decode it.
+        self.finish_handshake_inner(&remote_addr, &remote_metadata)
+    }
+
+    fn abort_handshake(&self, remote_addr: String) -> PyResult<()> {
+        // Abort a prepared-but-incomplete initiator handshake after the Python
+        // connector's timeout expires. If there is no prepared local metadata
+        // left, the peer is already connected or gone, so abort is a no-op.
+        if let Some(local) = self
+            .pending_handshakes
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("pending_handshakes mutex poisoned"))?
+            .remove(&remote_addr)
+        {
+            self.engine.abort_handshake(&remote_addr, &local);
+        }
         Ok(())
     }
 
@@ -371,6 +346,89 @@ impl PegaRdmaV1Engine {
 }
 
 impl PegaRdmaV1Engine {
+    fn prepare_handshake_inner(&self, remote_addr: &str) -> PyResult<PegaRdmaV1Handshake> {
+        let status = self
+            .engine
+            .get_or_prepare(remote_addr)
+            .map_err(|err| rdma_v1_error("prepare_handshake failed", err))?;
+        Ok(match status {
+            ConnectionStatus::Existing => PegaRdmaV1Handshake {
+                status: "existing".to_string(),
+                has_metadata: false,
+                metadata: None,
+            },
+            ConnectionStatus::Connecting => PegaRdmaV1Handshake {
+                status: "connecting".to_string(),
+                has_metadata: false,
+                metadata: None,
+            },
+            ConnectionStatus::Prepared(metadata) => {
+                self.pending_handshakes
+                    .lock()
+                    .map_err(|_| PyRuntimeError::new_err("pending_handshakes mutex poisoned"))?
+                    .insert(remote_addr.to_string(), metadata.clone());
+                PegaRdmaV1Handshake {
+                    status: "prepared".to_string(),
+                    has_metadata: true,
+                    metadata: Some(metadata.to_bytes()),
+                }
+            }
+        })
+    }
+
+    fn accept_handshake_inner(
+        &self,
+        remote_addr: &str,
+        remote_metadata: &[u8],
+    ) -> PyResult<Vec<u8>> {
+        let remote = HandshakeMetadata::from_bytes(remote_metadata)
+            .map_err(|err| rdma_v1_error("decode remote handshake failed", err))?;
+
+        // Match the server-side PegaEngine RDMA handshake behavior: a peer
+        // that sends fresh metadata is asking for a fresh connection, so drop
+        // stale local state before preparing response QPs.
+        self.engine.invalidate_connection(remote_addr);
+
+        let local = match self
+            .engine
+            .get_or_prepare(remote_addr)
+            .map_err(|err| rdma_v1_error("accept_handshake prepare failed", err))?
+        {
+            ConnectionStatus::Prepared(metadata) => metadata,
+            ConnectionStatus::Existing => {
+                unreachable!("just invalidated connection for {remote_addr}")
+            }
+            ConnectionStatus::Connecting => {
+                return Err(PegaFlowError::new_err(format!(
+                    "handshake to {remote_addr} already in progress"
+                )));
+            }
+        };
+
+        self.engine
+            .complete_handshake(remote_addr, &local, &remote)
+            .map_err(|err| rdma_v1_error("accept_handshake complete failed", err))?;
+        Ok(local.to_bytes())
+    }
+
+    fn finish_handshake_inner(&self, remote_addr: &str, remote_metadata: &[u8]) -> PyResult<()> {
+        let remote = HandshakeMetadata::from_bytes(remote_metadata)
+            .map_err(|err| rdma_v1_error("decode remote handshake failed", err))?;
+        let local = self
+            .pending_handshakes
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("pending_handshakes mutex poisoned"))?
+            .remove(remote_addr)
+            .ok_or_else(|| {
+                PegaFlowError::new_err(format!(
+                    "finish_handshake called without prepared local metadata for {remote_addr}"
+                ))
+            })?;
+        self.engine
+            .complete_handshake(remote_addr, &local, &remote)
+            .map_err(|err| rdma_v1_error("finish_handshake complete failed", err))
+    }
+
     fn submit_read_native(&self, remote_addr: String, native: Vec<TransferDesc>) -> PyResult<u64> {
         // TransferEngine returns one completion receiver per descriptor.  Python
         // sees a single monotonically increasing handle so the worker can store

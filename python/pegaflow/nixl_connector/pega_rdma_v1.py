@@ -213,10 +213,11 @@ def encode_handshake_request(
 ) -> bytes:
     """Encode the D->P Pega RDMA handshake request.
 
-    The extra ``response_agent_metadata`` is the decode worker's NIXL agent
-    metadata.  The prefill worker cannot assume the decode agent is already in
-    its ``_remote_agents`` table while replying to this transport-level
-    handshake, so it registers a temporary response agent from this metadata.
+    The metadata is opaque PegaFlow RDMA v1 handshake data.  Python transports
+    it over NIXL notifications; the native transfer engine owns interpretation
+    and connection state.  The response agent metadata is still needed while
+    Pega RDMA uses a NIXL notification side channel: the P worker can receive
+    the transport handshake before its normal D-side agent table is populated.
     """
     return PEGA_RDMA_V1_HANDSHAKE_PREFIX + msgspec.msgpack.encode(
         {

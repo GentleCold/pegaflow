@@ -66,7 +66,6 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 self._pega_rdma_config.perf_log_every,
             )
         self._pega_rdma_reads: dict[TransferHandle, PegaRdmaV1Read] = {}
-        self._pega_local_handshake: dict[str, bytes] = {}
         self._pega_pending_requests = defaultdict[str, list[tuple[str, str]]](list)
         self._pega_pending_since: dict[str, float] = {}
         self._pega_response_agents: dict[str, str] = {}
@@ -289,7 +288,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         Returns ``True`` when the connection is ready.  Returns ``False`` when
         the request has been queued behind an in-flight transport handshake.
         """
-        status = self._pega_rdma.get_or_prepare(peer_key)
+        status = self._pega_rdma.prepare_handshake(peer_key)
         if status.status == "existing":
             self._pega_rdma_perf.record_ns("ensure_existing", 0)
             return True
@@ -299,15 +298,14 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             self._pega_pending_since.setdefault(peer_key, time.perf_counter())
             return False
         if status.metadata is None:
-            raise RuntimeError(f"RDMA v1 get_or_prepare({peer_key}) returned no metadata")
+            raise RuntimeError(f"RDMA v1 prepare_handshake({peer_key}) returned no metadata")
 
         local_metadata = bytes(status.metadata)
-        self._pega_local_handshake[peer_key] = local_metadata
         agent_name = self._remote_agents[dst_engine_id][remote_rank]
         # NIXL's own handshake does not expose PegaFlow RDMA v1 connection
         # metadata.  We reuse NIXL notifications as the control channel for the
-        # Pega transport handshake, then keep all later request lifecycle events
-        # on the original NIXL paths.
+        # Pega transport handshake.  The native engine owns prepare/finish/abort
+        # state; Python only transports opaque metadata bytes.
         with self._pega_rdma_perf.measure("send_hs_request"):
             self.nixl_wrapper.send_notif(
                 agent_name,
@@ -388,11 +386,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                         "Pega RDMA v1 handshake request missing response agent metadata"
                     )
                 local_peer_key = reverse_peer_key(peer_key)
-                local = self._prepare_or_get_local_metadata(local_peer_key)
-                self._pega_rdma.complete_handshake(local_peer_key, local, metadata)
-                # This response must not rely on _remote_agents[d0][rank]: the
-                # P worker can receive the Pega transport handshake before the
-                # decode-side agent table is fully populated for that rank.
+                local = self._pega_rdma.accept_handshake(local_peer_key, metadata)
                 agent_name = self._get_pega_response_agent(peer_key, response_agent_metadata)
                 self.nixl_wrapper.send_notif(
                     agent_name,
@@ -403,11 +397,8 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
 
         if kind == "response":
             with self._pega_rdma_perf.measure("handle_hs_response"):
-                local = self._pega_local_handshake.pop(peer_key, None)
                 self._pega_pending_since.pop(peer_key, None)
-                if local is None:
-                    local = self._prepare_or_get_local_metadata(peer_key)
-                self._pega_rdma.complete_handshake(peer_key, local, metadata)
+                self._pega_rdma.finish_handshake(peer_key, metadata)
                 pending = self._pega_pending_requests.pop(peer_key, [])
                 for req_id, engine_id in pending:
                     meta = self._recving_metadata.get(req_id)
@@ -447,16 +438,14 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         ]
         for peer_key in expired_peers:
             self._pega_pending_since.pop(peer_key, None)
-            local = self._pega_local_handshake.pop(peer_key, None)
-            if local is not None:
-                try:
-                    self._pega_rdma.abort_handshake(peer_key, local)
-                except Exception:
-                    logger.debug(
-                        "Failed to abort expired Pega RDMA v1 handshake peer=%s",
-                        peer_key,
-                        exc_info=True,
-                    )
+            try:
+                self._pega_rdma.abort_handshake(peer_key)
+            except Exception:
+                logger.debug(
+                    "Failed to abort expired Pega RDMA v1 handshake peer=%s",
+                    peer_key,
+                    exc_info=True,
+                )
 
             pending = self._pega_pending_requests.pop(peer_key, [])
             for req_id, engine_id in pending:
@@ -477,26 +466,6 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                     timeout_s=timeout_s,
                 )
                 self._handle_failed_transfer(req_id, None)
-
-    def _prepare_or_get_local_metadata(self, peer_key: str) -> bytes:
-        """Return local RDMA v1 metadata for replying to or completing a handshake."""
-        local = self._pega_local_handshake.get(peer_key)
-        if local is not None:
-            return local
-        status = self._pega_rdma.get_or_prepare(peer_key)
-        if status.status == "existing":
-            metadata = self._pega_rdma.local_meta_for(peer_key)
-            if metadata is None:
-                raise RuntimeError(f"RDMA v1 existing peer {peer_key} has no local metadata")
-            local = bytes(metadata)
-        elif status.status == "prepared":
-            if status.metadata is None:
-                raise RuntimeError(f"RDMA v1 prepared peer {peer_key} has no metadata")
-            local = bytes(status.metadata)
-        else:
-            raise RuntimeError(f"RDMA v1 peer {peer_key} is already connecting")
-        self._pega_local_handshake[peer_key] = local
-        return local
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
         """Poll Pega RDMA READs and emit normal NIXL completion notifications."""
