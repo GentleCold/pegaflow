@@ -5,8 +5,8 @@
 
 The vendored NIXL connector still owns scheduler metadata, TP/block mapping,
 heartbeats, and completion notifications.  This module only defines the small
-Pega RDMA v1 side channel used to exchange native RDMA handshake metadata and
-submit the KV READ data plane from the pull worker.
+Pega RDMA v1 adapter used to fold native RDMA handshake metadata into NIXL's
+handshake and submit the KV READ data plane from the pull worker.
 """
 
 from __future__ import annotations
@@ -19,13 +19,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import msgspec
+import zmq
 
+from pegaflow.nixl_connector.utils import zmq_ctx
 from pegaflow.pegaflow import PegaRdmaV1Engine
 
-# Pega RDMA v1 handshake messages share NIXL's notification channel, so they
-# need an explicit prefix to stay distinguishable from regular request/HB
-# notifications handled by the upstream NIXL worker.
-PEGA_RDMA_V1_HANDSHAKE_PREFIX = b"PEGA_RDMA_V1_HS:"
+PEGA_RDMA_V1_EXTENSION = "pegaflow_rdma_v1"
+PEGA_RDMA_V1_ACCEPT_ENDPOINT = "pegaflow_rdma_v1_accept_endpoint"
 
 
 @dataclass(frozen=True)
@@ -206,48 +206,64 @@ def build_memory_regions(blocks_data: list[tuple[int, int, int]]) -> list[dict[s
     return [{"addr": addr, "len": size} for addr, size in merged.items()]
 
 
-def encode_handshake_request(
+def build_handshake_request_extension(peer_key: str, metadata: bytes) -> dict[str, Any]:
+    """Build the D->P RDMA extension carried by a NIXL GET_META request."""
+    return {
+        PEGA_RDMA_V1_EXTENSION: {
+            "peer_key": peer_key,
+            "metadata": metadata,
+        }
+    }
+
+
+def parse_handshake_response_extension(
+    response_extensions: dict[str, Any] | None,
+) -> bytes | None:
+    """Return P-side RDMA metadata carried by a NIXL handshake response."""
+    if response_extensions is None:
+        return None
+    payload = response_extensions.get(PEGA_RDMA_V1_EXTENSION)
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("Pega RDMA v1 response extension must be a dict")
+    error = payload.get("error")
+    if error is not None:
+        raise RuntimeError(f"Pega RDMA v1 handshake failed: {error}")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, bytes):
+        raise ValueError("Pega RDMA v1 response extension missing metadata bytes")
+    return metadata
+
+
+def accept_handshake_via_zmq(
+    endpoint: str,
     peer_key: str,
     metadata: bytes,
-    response_agent_metadata: bytes,
+    timeout_ms: int,
 ) -> bytes:
-    """Encode the D->P Pega RDMA handshake request.
-
-    The metadata is opaque PegaFlow RDMA v1 handshake data.  Python transports
-    it over NIXL notifications; the native transfer engine owns interpretation
-    and connection state.  The response agent metadata is still needed while
-    Pega RDMA uses a NIXL notification side channel: the P worker can receive
-    the transport handshake before its normal D-side agent table is populated.
-    """
-    return PEGA_RDMA_V1_HANDSHAKE_PREFIX + msgspec.msgpack.encode(
+    """Ask the local P worker to accept one Pega RDMA v1 handshake."""
+    request = msgspec.msgpack.encode(
         {
-            "kind": "request",
-            "peer_key": peer_key,
-            "metadata": metadata,
-            "response_agent_metadata": response_agent_metadata,
-        }
-    )
-
-
-def encode_handshake_response(peer_key: str, metadata: bytes) -> bytes:
-    """Encode the P->D Pega RDMA metadata response."""
-    return PEGA_RDMA_V1_HANDSHAKE_PREFIX + msgspec.msgpack.encode(
-        {
-            "kind": "response",
+            "kind": "accept",
             "peer_key": peer_key,
             "metadata": metadata,
         }
     )
-
-
-def decode_handshake_notif(notif: bytes) -> dict[str, Any] | None:
-    """Return a Pega RDMA handshake payload, or ``None`` for normal NIXL notifs."""
-    if not notif.startswith(PEGA_RDMA_V1_HANDSHAKE_PREFIX):
-        return None
-    payload = msgspec.msgpack.decode(notif[len(PEGA_RDMA_V1_HANDSHAKE_PREFIX) :])
-    if not isinstance(payload, dict):
-        raise ValueError("Pega RDMA v1 handshake notification payload must be a dict")
-    return payload
+    with zmq_ctx(zmq.REQ, endpoint) as sock:
+        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        sock.send(request)
+        response = msgspec.msgpack.decode(sock.recv())
+    if not isinstance(response, dict):
+        raise ValueError("Pega RDMA v1 accept response must be a dict")
+    if not response.get("ok"):
+        error = response.get("error")
+        raise RuntimeError(f"Pega RDMA v1 accept failed: {error}")
+    response_metadata = response.get("metadata")
+    if not isinstance(response_metadata, bytes):
+        raise ValueError("Pega RDMA v1 accept response missing metadata bytes")
+    return response_metadata
 
 
 def create_rdma_engine(config: PegaRdmaV1Config) -> PegaRdmaV1Engine:

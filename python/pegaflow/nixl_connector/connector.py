@@ -46,6 +46,9 @@ from vllm.v1.outputs import KVConnectorOutput
 from pegaflow.nixl_connector.metadata import (
     NixlConnectorMetadata,
 )
+from pegaflow.nixl_connector.pega_pull_scheduler import (
+    PegaNixlPullConnectorScheduler,
+)
 from pegaflow.nixl_connector.pega_pull_worker import (
     PegaNixlPullConnectorWorker,
 )
@@ -388,7 +391,7 @@ class PegaNixlPullConnector(NixlPullConnector):
     ):
         NixlBaseConnector.__init__(self, vllm_config, role, kv_cache_config)
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = NixlPullConnectorScheduler(
+            self.connector_scheduler = PegaNixlPullConnectorScheduler(
                 vllm_config, self.engine_id, kv_cache_config
             )
             self.connector_worker = None

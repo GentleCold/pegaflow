@@ -551,18 +551,38 @@ class NixlBaseConnectorWorker:
                 )
 
                 start_time = time.perf_counter()
-                # Send query for the request.
-                msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank))
-                # Set receive timeout to 5 seconds to avoid hanging on dead server
-                sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
-                sock.send(msg)
-                handshake_bytes = sock.recv()
+                request_extensions = self._build_handshake_request_extensions(
+                    expected_engine_id,
+                    remote_rank,
+                )
+                if request_extensions is None:
+                    msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank))
+                else:
+                    msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank, request_extensions))
+
+                try:
+                    # Set receive timeout to 5 seconds to avoid hanging on dead server
+                    sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
+                    sock.send(msg)
+                    handshake_bytes = sock.recv()
+                except Exception:
+                    self._handle_handshake_request_failure(
+                        expected_engine_id,
+                        remote_rank,
+                        request_extensions,
+                    )
+                    raise
 
                 # Decode handshake payload to get compatibility hash
                 handshake_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
                 try:
                     handshake_payload = handshake_decoder.decode(handshake_bytes)
                 except (msgspec.DecodeError, msgspec.ValidationError) as e:
+                    self._handle_handshake_request_failure(
+                        expected_engine_id,
+                        remote_rank,
+                        request_extensions,
+                    )
                     raise RuntimeError(
                         f"Failed to decode NixlHandshakePayload. This likely indicates "
                         f"an incompatibility between connector version. Error: {e}"
@@ -614,6 +634,21 @@ class NixlBaseConnectorWorker:
                         f"received {metadata.engine_id}."
                     )
 
+                try:
+                    self._handle_handshake_response_extensions(
+                        expected_engine_id,
+                        remote_rank,
+                        handshake_payload.extensions,
+                        request_extensions,
+                    )
+                except Exception:
+                    self._handle_handshake_request_failure(
+                        expected_engine_id,
+                        remote_rank,
+                        request_extensions,
+                    )
+                    raise
+
                 # Register Remote agent.
                 remote_agent_name = self.add_remote_agent(metadata, remote_rank, remote_tp_size)
                 setup_agent_time = time.perf_counter()
@@ -623,6 +658,31 @@ class NixlBaseConnectorWorker:
                 )
                 remote_rank_to_agent_name[remote_rank] = remote_agent_name
         return remote_rank_to_agent_name
+
+    def _build_handshake_request_extensions(
+        self,
+        remote_engine_id: str,
+        remote_rank: int,
+    ) -> dict[str, Any] | None:
+        """Build connector-specific metadata for an outgoing NIXL handshake."""
+        return None
+
+    def _handle_handshake_response_extensions(
+        self,
+        remote_engine_id: str,
+        remote_rank: int,
+        response_extensions: dict[str, Any] | None,
+        request_extensions: dict[str, Any] | None,
+    ) -> None:
+        """Consume connector-specific metadata from a NIXL handshake response."""
+
+    def _handle_handshake_request_failure(
+        self,
+        remote_engine_id: str,
+        remote_rank: int,
+        request_extensions: dict[str, Any] | None,
+    ) -> None:
+        """Clean up connector-specific state after an outgoing handshake fails."""
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """

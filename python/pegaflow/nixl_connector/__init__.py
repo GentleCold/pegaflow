@@ -22,6 +22,9 @@ from pegaflow.nixl_connector.metadata import (
     NixlConnectorMetadata,
     NixlHandshakePayload,
 )
+from pegaflow.nixl_connector.pega_pull_scheduler import (
+    PegaNixlPullConnectorScheduler,
+)
 from pegaflow.nixl_connector.pega_pull_worker import (
     PegaNixlPullConnectorWorker,
 )
@@ -66,5 +69,6 @@ __all__ = [
     "NixlPushConnectorWorker",
     "PegaNixlConnector",
     "PegaNixlPullConnector",
+    "PegaNixlPullConnectorScheduler",
     "PegaNixlPullConnectorWorker",
 ]
