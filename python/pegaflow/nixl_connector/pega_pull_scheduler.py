@@ -20,10 +20,13 @@ from pegaflow.nixl_connector.pega_rdma_v1 import (
     PEGA_RDMA_V1_ACCEPT_ACK,
     PEGA_RDMA_V1_ACCEPT_ENDPOINT,
     PEGA_RDMA_V1_ACCEPT_REGISTER,
+    PEGA_RDMA_V1_ACCEPT_REQUEST,
+    PEGA_RDMA_V1_ACCEPT_RESPONSE,
     PEGA_RDMA_V1_EXTENSION,
+    PegaRdmaV1BrokerState,
     PegaRdmaV1Config,
     accept_handshake_via_zmq,
-    make_accept_broker_endpoint,
+    make_accept_broker_endpoint_from_config,
     reverse_peer_key,
 )
 from pegaflow.nixl_connector.pull_scheduler import NixlPullConnectorScheduler
@@ -48,9 +51,9 @@ class PegaNixlPullConnectorScheduler(NixlPullConnectorScheduler):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self._pega_rdma_config = PegaRdmaV1Config.from_extra_config(extra_config)
-        self._pega_accept_broker_endpoint = make_accept_broker_endpoint(
+        self._pega_accept_broker_endpoint = make_accept_broker_endpoint_from_config(
             self.engine_id,
-            self.side_channel_port,
+            self.vllm_config,
         )
         self._pega_accept_broker_stop = threading.Event()
         self._pega_accept_broker_thread: threading.Thread | None = None
@@ -100,36 +103,22 @@ class PegaNixlPullConnectorScheduler(NixlPullConnectorScheduler):
         stop_event: threading.Event,
     ) -> None:
         """Route scheduler accept requests to the worker owning target TP rank."""
-        workers: dict[int, bytes] = {}
-        deadline_by_request: dict[int, float] = {}
-        pending: dict[int, tuple[tuple[bytes, ...], int]] = {}
-        payload_by_request: dict[int, dict[str, Any]] = {}
-        waiting_by_rank: dict[int, list[int]] = {}
-        next_request_id = 1
-        timeout_s = self._pega_rdma_config.handshake_timeout_s
+        state = PegaRdmaV1BrokerState(self._pega_rdma_config.handshake_timeout_s)
         with zmq_ctx(zmq.ROUTER, endpoint) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 100)
             ready_event.set()
             while not stop_event.is_set():
                 now = time.monotonic()
-                for request_id, deadline in list(deadline_by_request.items()):
-                    if now <= deadline:
-                        continue
-                    pending_entry = pending.pop(request_id, None)
-                    deadline_by_request.pop(request_id, None)
-                    if pending_entry is not None:
-                        client_reply_prefix, target_tp_rank = pending_entry
-                        if waiting := waiting_by_rank.get(target_tp_rank):
-                            with suppress(ValueError):
-                                waiting.remove(request_id)
-                        payload_by_request.pop(request_id, None)
-                        response = {
-                            "ok": False,
-                            "error": "Pega RDMA v1 worker accept timed out",
-                        }
-                        sock.send_multipart(
-                            (*client_reply_prefix, msgspec.msgpack.encode(response))
-                        )
+                for client_reply_prefix, request_id in state.pop_timed_out(now):
+                    response = {
+                        "kind": PEGA_RDMA_V1_ACCEPT_RESPONSE,
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": "Pega RDMA v1 worker accept timed out",
+                    }
+                    sock.send_multipart(
+                        (*client_reply_prefix, msgspec.msgpack.encode(response))
+                    )
                 try:
                     frames = sock.recv_multipart()
                 except zmq.Again:
@@ -148,7 +137,7 @@ class PegaNixlPullConnectorScheduler(NixlPullConnectorScheduler):
                         tp_rank = payload.get("tp_rank")
                         if not isinstance(tp_rank, int):
                             raise ValueError("worker register missing tp_rank")
-                        workers[tp_rank] = identity
+                        queued_payloads = state.register_worker(tp_rank, identity)
                         sock.send_multipart(
                             (
                                 identity,
@@ -157,45 +146,38 @@ class PegaNixlPullConnectorScheduler(NixlPullConnectorScheduler):
                                 ),
                             )
                         )
-                        for request_id in list(waiting_by_rank.pop(tp_rank, [])):
-                            pending_entry = pending.get(request_id)
-                            if pending_entry is None:
-                                continue
-                            _client_reply_prefix, _target_tp_rank = pending_entry
-                            payload_to_send = payload_by_request.pop(request_id)
+                        for payload_to_send in queued_payloads:
                             sock.send_multipart(
                                 (identity, msgspec.msgpack.encode(payload_to_send))
                             )
-                    elif "request_id" in payload:
+                    elif kind == PEGA_RDMA_V1_ACCEPT_RESPONSE:
                         request_id = payload.get("request_id")
-                        pending_entry = pending.pop(request_id, None)
-                        deadline_by_request.pop(request_id, None)
-                        payload_by_request.pop(request_id, None)
-                        if pending_entry is None:
+                        if not isinstance(request_id, int):
+                            raise ValueError("worker response missing request_id")
+                        client_reply_prefix = state.complete_request(request_id)
+                        if client_reply_prefix is None:
                             logger.warning(
                                 "Pega RDMA v1 broker got response for unknown request %s",
                                 request_id,
                             )
                             continue
-                        client_reply_prefix, _target_tp_rank = pending_entry
                         sock.send_multipart(
                             (*client_reply_prefix, msgspec.msgpack.encode(payload))
                         )
-                    else:
+                    elif kind == PEGA_RDMA_V1_ACCEPT_REQUEST:
                         target_tp_rank = payload.get("target_tp_rank")
                         if not isinstance(target_tp_rank, int):
                             raise ValueError("accept request missing target_tp_rank")
-                        request_id = next_request_id
-                        next_request_id += 1
-                        payload["request_id"] = request_id
-                        pending[request_id] = (reply_prefix, target_tp_rank)
-                        deadline_by_request[request_id] = time.monotonic() + timeout_s
-                        worker = workers.get(target_tp_rank)
-                        if worker is None:
-                            payload_by_request[request_id] = payload
-                            waiting_by_rank.setdefault(target_tp_rank, []).append(request_id)
-                        else:
-                            sock.send_multipart((worker, msgspec.msgpack.encode(payload)))
+                        worker, payload_to_send = state.add_request(
+                            reply_prefix=reply_prefix,
+                            target_tp_rank=target_tp_rank,
+                            payload=payload,
+                            now=time.monotonic(),
+                        )
+                        if worker is not None:
+                            sock.send_multipart((worker, msgspec.msgpack.encode(payload_to_send)))
+                    else:
+                        raise ValueError(f"unexpected broker payload kind {kind!r}")
                 except Exception as exc:
                     logger.debug("Pega RDMA v1 broker request failed", exc_info=True)
                     response = {"ok": False, "error": str(exc)}

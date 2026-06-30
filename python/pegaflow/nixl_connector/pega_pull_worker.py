@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 import msgspec
 import numpy as np
 import zmq
-from vllm import envs
 from vllm.logger import init_logger
 
 from pegaflow.nixl_connector.metadata import TransferHandle
@@ -20,13 +19,14 @@ from pegaflow.nixl_connector.pega_rdma_v1 import (
     PEGA_RDMA_V1_ACCEPT_ACK,
     PEGA_RDMA_V1_ACCEPT_REGISTER,
     PEGA_RDMA_V1_ACCEPT_REQUEST,
+    PEGA_RDMA_V1_ACCEPT_RESPONSE,
     PegaRdmaV1Config,
     PegaRdmaV1Perf,
     PegaRdmaV1Read,
     build_handshake_request_extension,
     build_memory_regions,
     create_rdma_engine,
-    make_accept_broker_endpoint,
+    make_accept_broker_endpoint_from_config,
     make_peer_key,
     parse_handshake_response_extension,
     worker_identity,
@@ -79,13 +79,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_completed_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_accept_stop = None
         self._pega_accept_thread = None
-        side_channel_port = (
-            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
-            + vllm_config.parallel_config.data_parallel_index
-        )
-        self._pega_accept_broker_endpoint = make_accept_broker_endpoint(
+        self._pega_accept_broker_endpoint = make_accept_broker_endpoint_from_config(
             self.engine_id,
-            side_channel_port,
+            vllm_config,
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -161,10 +157,12 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                     msg = sock.recv()
                 except zmq.Again:
                     continue
+                request: dict[str, object] | None = None
                 try:
-                    request = msgspec.msgpack.decode(msg)
-                    if not isinstance(request, dict):
+                    decoded = msgspec.msgpack.decode(msg)
+                    if not isinstance(decoded, dict):
                         raise ValueError("accept request must be a dict")
+                    request = decoded
                     if request.get("kind") != PEGA_RDMA_V1_ACCEPT_REQUEST:
                         raise ValueError(f"unexpected accept request kind {request.get('kind')!r}")
                     peer_key = request.get("peer_key")
@@ -175,6 +173,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                     with self._pega_rdma_perf.measure("handle_hs_request"):
                         response_metadata = self._pega_rdma.accept_handshake(peer_key, metadata)
                     response = {
+                        "kind": PEGA_RDMA_V1_ACCEPT_RESPONSE,
                         "ok": True,
                         "request_id": request_id,
                         "metadata": bytes(response_metadata),
@@ -182,8 +181,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 except Exception as exc:
                     logger.debug("Pega RDMA v1 local accept failed", exc_info=True)
                     response = {
+                        "kind": PEGA_RDMA_V1_ACCEPT_RESPONSE,
                         "ok": False,
-                        "request_id": request.get("request_id") if isinstance(request, dict) else None,
+                        "request_id": request.get("request_id") if request is not None else None,
                         "error": str(exc),
                     }
                 sock.send(msgspec.msgpack.encode(response))

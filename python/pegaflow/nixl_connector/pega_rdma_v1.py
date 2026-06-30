@@ -17,7 +17,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import zmq
@@ -30,7 +30,11 @@ PEGA_RDMA_V1_EXTENSION = "pegaflow_rdma_v1"
 PEGA_RDMA_V1_ACCEPT_ENDPOINT = "pegaflow_rdma_v1_accept_endpoint"
 PEGA_RDMA_V1_ACCEPT_REGISTER = "register"
 PEGA_RDMA_V1_ACCEPT_REQUEST = "accept"
+PEGA_RDMA_V1_ACCEPT_RESPONSE = "accept_response"
 PEGA_RDMA_V1_ACCEPT_ACK = "registered"
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,92 @@ class PegaRdmaV1Read:
     submitted_at: float
     bytes_transferred: int
     num_descriptors: int
+
+
+@dataclass(frozen=True)
+class PegaRdmaV1BrokerRequest:
+    reply_prefix: tuple[bytes, ...]
+    target_tp_rank: int
+    payload: dict[str, Any]
+    deadline: float
+
+
+class PegaRdmaV1BrokerState:
+    """In-memory routing state for scheduler-owned RDMA accept broker."""
+
+    def __init__(self, timeout_s: float):
+        self._timeout_s = timeout_s
+        self._next_request_id = 1
+        self._workers: dict[int, bytes] = {}
+        self._pending: dict[int, PegaRdmaV1BrokerRequest] = {}
+        self._waiting_by_rank: dict[int, list[int]] = defaultdict(list)
+
+    def add_request(
+        self,
+        *,
+        reply_prefix: tuple[bytes, ...],
+        target_tp_rank: int,
+        payload: dict[str, Any],
+        now: float,
+    ) -> tuple[bytes | None, dict[str, Any]]:
+        """Add a scheduler request and return the worker to send to, if ready."""
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        payload = dict(payload)
+        payload["request_id"] = request_id
+        self._pending[request_id] = PegaRdmaV1BrokerRequest(
+            reply_prefix=reply_prefix,
+            target_tp_rank=target_tp_rank,
+            payload=payload,
+            deadline=now + self._timeout_s,
+        )
+        worker = self._workers.get(target_tp_rank)
+        if worker is None:
+            self._waiting_by_rank[target_tp_rank].append(request_id)
+        return worker, payload
+
+    def register_worker(self, tp_rank: int, identity: bytes) -> list[dict[str, Any]]:
+        """Remember a worker identity and return queued requests for that rank."""
+        self._workers[tp_rank] = identity
+        queued_payloads = []
+        for request_id in self._waiting_by_rank.pop(tp_rank, []):
+            request = self._pending.get(request_id)
+            if request is not None:
+                queued_payloads.append(request.payload)
+        return queued_payloads
+
+    def complete_request(
+        self,
+        request_id: int,
+    ) -> tuple[bytes, ...] | None:
+        """Remove a completed worker request and return the client reply route."""
+        request = self._pending.pop(request_id, None)
+        if request is None:
+            return None
+        self._remove_waiting_request(request.target_tp_rank, request_id)
+        return request.reply_prefix
+
+    def pop_timed_out(self, now: float) -> list[tuple[tuple[bytes, ...], int]]:
+        """Remove expired requests and return reply routes with request IDs."""
+        expired = []
+        for request_id, request in list(self._pending.items()):
+            if now <= request.deadline:
+                continue
+            self._pending.pop(request_id, None)
+            self._remove_waiting_request(request.target_tp_rank, request_id)
+            expired.append((request.reply_prefix, request_id))
+        return expired
+
+    def _remove_waiting_request(self, tp_rank: int, request_id: int) -> None:
+        waiting = self._waiting_by_rank.get(tp_rank)
+        if not waiting:
+            return
+        try:
+            waiting.remove(request_id)
+        except ValueError:
+            return
+        if not waiting:
+            self._waiting_by_rank.pop(tp_rank, None)
 
 
 class PegaRdmaV1Perf:
@@ -209,6 +299,15 @@ def make_accept_broker_endpoint(engine_id: str, side_channel_port: int) -> str:
     return f"ipc://{base_path / filename}"
 
 
+def make_accept_broker_endpoint_from_config(engine_id: str, vllm_config: VllmConfig) -> str:
+    """Build the Pega RDMA accept broker endpoint using vLLM's NIXL port rule."""
+    side_channel_port = (
+        envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+        + vllm_config.parallel_config.data_parallel_index
+    )
+    return make_accept_broker_endpoint(engine_id, side_channel_port)
+
+
 def build_memory_regions(blocks_data: list[tuple[int, int, int]]) -> list[dict[str, int]]:
     """Build native registration regions from NIXL block descriptors.
 
@@ -278,6 +377,8 @@ def accept_handshake_via_zmq(
         response = msgspec.msgpack.decode(sock.recv())
     if not isinstance(response, dict):
         raise ValueError("Pega RDMA v1 accept response must be a dict")
+    if response.get("kind") != PEGA_RDMA_V1_ACCEPT_RESPONSE:
+        raise ValueError(f"Pega RDMA v1 accept got unexpected response {response.get('kind')!r}")
     if not response.get("ok"):
         error = response.get("error")
         raise RuntimeError(f"Pega RDMA v1 accept failed: {error}")
