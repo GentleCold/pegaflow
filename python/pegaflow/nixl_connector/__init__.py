@@ -22,17 +22,13 @@ from pegaflow.nixl_connector.metadata import (
     NixlConnectorMetadata,
     NixlHandshakePayload,
 )
-from pegaflow.nixl_connector.pega_pull_scheduler import (
-    PegaNixlPullConnectorScheduler,
-)
-from pegaflow.nixl_connector.pega_pull_worker import (
-    PegaNixlPullConnectorWorker,
-)
 from pegaflow.nixl_connector.pull_scheduler import (
     NixlPullConnectorScheduler,
+    PegaNixlPullConnectorScheduler,
 )
 from pegaflow.nixl_connector.pull_worker import (
     NixlPullConnectorWorker,
+    PegaNixlPullConnectorWorker,
 )
 from pegaflow.nixl_connector.push_scheduler import (
     NixlPushConnectorScheduler,
