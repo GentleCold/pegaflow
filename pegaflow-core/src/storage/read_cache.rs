@@ -57,6 +57,23 @@ impl ReadCache {
         }
     }
 
+    pub(super) fn batch_insert_resident_keys(
+        &self,
+        blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
+    ) -> Vec<BlockKey> {
+        let mut inner = self.inner.lock();
+        let mut resident_keys = Vec::new();
+        for (key, block) in blocks {
+            match insert_block(&mut inner, key.clone(), block) {
+                CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists => {
+                    resident_keys.push(key);
+                }
+                CacheInsertOutcome::Rejected => {}
+            }
+        }
+        resident_keys
+    }
+
     pub(super) fn batch_insert_refs(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
         let mut inner = self.inner.lock();
         for (key, block) in blocks {
@@ -89,9 +106,14 @@ impl ReadCache {
     }
 }
 
-fn insert_block(inner: &mut ReadCacheInner, key: BlockKey, block: Arc<SealedBlock>) {
+fn insert_block(
+    inner: &mut ReadCacheInner,
+    key: BlockKey,
+    block: Arc<SealedBlock>,
+) -> CacheInsertOutcome {
     let footprint_bytes = block.memory_footprint();
-    match inner.cache.insert(key, block) {
+    let outcome = inner.cache.insert(key, block);
+    match outcome {
         CacheInsertOutcome::InsertedNew => {
             let m = core_metrics();
             m.cache_block_insertions.add(1, &[]);
@@ -102,6 +124,7 @@ fn insert_block(inner: &mut ReadCacheInner, key: BlockKey, block: Arc<SealedBloc
             core_metrics().cache_block_admission_rejections.add(1, &[]);
         }
     }
+    outcome
 }
 
 #[cfg(test)]
@@ -203,5 +226,41 @@ mod tests {
         assert_eq!(removed.len(), 2);
         assert_eq!(cache.get_blocks(&[key1, key2]).len(), 0);
         assert!(cache.remove_all().is_empty());
+    }
+
+    #[test]
+    fn batch_insert_resident_keys_excludes_lfu_rejected_blocks() {
+        let cache = ReadCache::new(1, true, Some(1));
+        let hot_key = BlockKey::new("ns".into(), vec![1]);
+        let cold_key = BlockKey::new("ns".into(), vec![2]);
+
+        assert_eq!(
+            cache.batch_insert_resident_keys(vec![(hot_key.clone(), make_block())]),
+            vec![hot_key.clone()]
+        );
+
+        for _ in 0..2 {
+            assert_eq!(cache.get_blocks(std::slice::from_ref(&hot_key)).len(), 1);
+        }
+
+        assert!(
+            cache
+                .batch_insert_resident_keys(vec![(cold_key.clone(), make_block())])
+                .is_empty()
+        );
+        assert_eq!(cache.get_blocks(&[hot_key]).len(), 1);
+        assert_eq!(cache.get_blocks(&[cold_key]).len(), 0);
+    }
+
+    #[test]
+    fn batch_insert_resident_keys_includes_already_existing_blocks() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+
+        assert_eq!(
+            cache.batch_insert_resident_keys(vec![(key.clone(), make_block())]),
+            vec![key]
+        );
     }
 }

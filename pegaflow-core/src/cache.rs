@@ -30,6 +30,7 @@ pub(crate) struct TinyLfuCache<K, V> {
     freq: Option<TinyLfu>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CacheInsertOutcome {
     /// Key was not present and is now inserted.
     InsertedNew,
