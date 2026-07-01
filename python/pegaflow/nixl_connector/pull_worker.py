@@ -58,21 +58,27 @@ class PegaRdmaV1Config:
     perf_log_every: int
 
     @classmethod
-    def from_extra_config(cls, extra_config: dict[str, Any]) -> PegaRdmaV1Config:
+    def from_extra_config(
+        cls,
+        extra_config: dict[str, Any],
+        *,
+        tp_rank: int | None = None,
+    ) -> PegaRdmaV1Config:
         """Parse Pega RDMA v1 settings from vLLM's connector extra config."""
-        raw_nics = extra_config.get("pegaflow.nixl.rdma_v1.nics")
-        if raw_nics is None:
-            raw_nics = extra_config.get("pegaflow.pd.rdma.nics")
-        if isinstance(raw_nics, str):
-            nics = [item.strip() for item in raw_nics.split(",") if item.strip()]
-        elif isinstance(raw_nics, list):
-            nics = [str(item) for item in raw_nics]
-        else:
-            nics = []
+        nics = _parse_rank_nics(
+            extra_config.get("pegaflow.nixl.rdma_v1.nics_by_rank"),
+            tp_rank,
+        )
+        if nics is None:
+            raw_nics = extra_config.get("pegaflow.nixl.rdma_v1.nics")
+            if raw_nics is None:
+                raw_nics = extra_config.get("pegaflow.pd.rdma.nics")
+            nics = _parse_nics(raw_nics)
         if not nics:
             raise ValueError(
                 "PegaNixlPullConnector requires kv_connector_extra_config "
-                "'pegaflow.nixl.rdma_v1.nics' with non-bond RDMA NIC names"
+                "'pegaflow.nixl.rdma_v1.nics' or "
+                "'pegaflow.nixl.rdma_v1.nics_by_rank' with non-bond RDMA NIC names"
             )
 
         qps_per_peer = int(extra_config.get("pegaflow.nixl.rdma_v1.qps_per_peer", 4))
@@ -273,6 +279,48 @@ def _config_bool(value: Any, *, default: bool) -> bool:
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _parse_nics(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if item is not None and str(item).strip()]
+    return []
+
+
+def _parse_rank_nics(value: Any, tp_rank: int | None) -> list[str] | None:
+    if value is None:
+        return None
+    if tp_rank is None:
+        if isinstance(value, dict):
+            rank_values = value.values()
+        elif isinstance(value, list):
+            rank_values = value
+        else:
+            raise ValueError("pegaflow.nixl.rdma_v1.nics_by_rank must be a dict or list")
+        nics: list[str] = []
+        for rank_value in rank_values:
+            for nic in _parse_nics(rank_value):
+                if nic not in nics:
+                    nics.append(nic)
+        return nics
+    raw_rank_nics: Any
+    if isinstance(value, dict):
+        raw_rank_nics = value.get(str(tp_rank))
+        if raw_rank_nics is None:
+            raw_rank_nics = value.get(tp_rank)
+    elif isinstance(value, list):
+        raw_rank_nics = value[tp_rank] if tp_rank < len(value) else None
+    else:
+        raise ValueError("pegaflow.nixl.rdma_v1.nics_by_rank must be a dict or list")
+    nics = _parse_nics(raw_rank_nics)
+    if not nics:
+        raise ValueError(
+            "pegaflow.nixl.rdma_v1.nics_by_rank missing non-empty NIC list "
+            f"for tp_rank {tp_rank}"
+        )
+    return nics
 
 
 def make_peer_key(local_engine_id: str, local_tp_rank: int, remote_engine_id: str, remote_rank: int):
@@ -759,7 +807,10 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        self._pega_rdma_config = PegaRdmaV1Config.from_extra_config(extra_config)
+        self._pega_rdma_config = PegaRdmaV1Config.from_extra_config(
+            extra_config,
+            tp_rank=self.tp_rank,
+        )
         self._pega_rdma = create_rdma_engine(self._pega_rdma_config)
         self._pega_rdma_perf = PegaRdmaV1Perf(
             enabled=self._pega_rdma_config.perf_enabled,
