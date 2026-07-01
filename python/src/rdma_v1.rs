@@ -476,8 +476,11 @@ impl PegaRdmaV1Engine {
             }
         };
 
-        py.detach(|| self.engine.complete_handshake(remote_addr, &local, &remote))
-            .map_err(|err| rdma_v1_error("accept_handshake complete failed", err))?;
+        if let Err(err) = py.detach(|| self.engine.complete_handshake(remote_addr, &local, &remote))
+        {
+            py.detach(|| self.engine.abort_handshake(remote_addr, &local));
+            return Err(rdma_v1_error("accept_handshake complete failed", err));
+        }
         Ok(local.to_bytes())
     }
 
