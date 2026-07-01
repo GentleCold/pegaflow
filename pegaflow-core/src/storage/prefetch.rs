@@ -254,24 +254,18 @@ impl PrefetchScheduler {
             );
         }
 
-        // RDMA-fetched blocks are now resident on this node. Re-advertise them
-        // to the MetaServer so peers can discover and fetch from here too.
-        // SSD prefetch is skipped: those blocks were already registered by this
-        // node's own save path, and eviction explicitly unregisters them.
-        let rdma_registration: Option<(String, Vec<Vec<u8>>)> =
-            if result.source == Some(PrefetchSource::Rdma) && !result.cache_inserts.is_empty() {
-                let namespace = result.cache_inserts[0].0.namespace.clone();
-                let hashes = result
-                    .cache_inserts
-                    .iter()
-                    .map(|(k, _)| k.hash.clone())
-                    .collect();
-                Some((namespace, hashes))
-            } else {
-                None
-            };
-
-        read_cache.batch_insert(result.cache_inserts);
+        // RDMA-fetched blocks that survive cache admission are now resident on
+        // this node. Re-advertise only those resident blocks to the MetaServer
+        // so peers can discover and fetch from here too. SSD prefetch is
+        // skipped: those blocks were already registered by this node's own save
+        // path, and eviction explicitly unregisters them.
+        let rdma_registration = if result.source == Some(PrefetchSource::Rdma) {
+            let resident_keys = read_cache.batch_insert_resident_keys(result.cache_inserts);
+            rdma_registration_from_resident_keys(result.source, &resident_keys)
+        } else {
+            read_cache.batch_insert(result.cache_inserts);
+            None
+        };
 
         if let Some(client) = &self.metaserver_client
             && let Some((namespace, hashes)) = rdma_registration
@@ -511,6 +505,19 @@ fn build_ready_result(
     }
 }
 
+fn rdma_registration_from_resident_keys(
+    source: Option<PrefetchSource>,
+    resident_keys: &[BlockKey],
+) -> Option<(String, Vec<Vec<u8>>)> {
+    if source != Some(PrefetchSource::Rdma) || resident_keys.is_empty() {
+        return None;
+    }
+
+    let namespace = resident_keys[0].namespace.clone();
+    let hashes = resident_keys.iter().map(|key| key.hash.clone()).collect();
+    Some((namespace, hashes))
+}
+
 async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> PrefetchTaskResult {
     let PrefetchTaskInput {
         req_id,
@@ -653,5 +660,27 @@ mod tests {
         assert!(Arc::ptr_eq(&result.ready_blocks[0], &b1));
         assert_eq!(result.missing, 2);
         assert_eq!(result.cache_inserts.len(), 2);
+    }
+
+    #[test]
+    fn rdma_registration_uses_only_resident_keys() {
+        let k1 = key(1);
+        let k3 = key(3);
+
+        let (namespace, hashes) =
+            rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &[k1, k3])
+                .expect("RDMA resident keys should register");
+
+        assert_eq!(namespace, "ns");
+        assert_eq!(hashes, vec![vec![1], vec![3]]);
+    }
+
+    #[test]
+    fn rdma_registration_skips_ssd_and_empty_resident_keys() {
+        let k1 = key(1);
+
+        assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Ssd), &[k1]).is_none());
+        assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &[]).is_none());
+        assert!(rdma_registration_from_resident_keys(None, &[]).is_none());
     }
 }
