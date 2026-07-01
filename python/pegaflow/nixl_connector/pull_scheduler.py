@@ -20,7 +20,7 @@ from pegaflow.nixl_connector.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
 from pegaflow.nixl_connector.metadata import NixlHandshakePayload
-from pegaflow.nixl_connector.pull_worker import (
+from pegaflow.nixl_connector.pega_rdma_v1 import (
     PEGA_RDMA_V1_ACCEPT_ACK,
     PEGA_RDMA_V1_ACCEPT_ENDPOINT,
     PEGA_RDMA_V1_ACCEPT_REGISTER,
