@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -80,6 +81,18 @@ class _PegaLocalBlockTables:
 
     def clear(self) -> None:
         self._items.clear()
+
+
+@dataclass(frozen=True)
+class PegaReadPlan:
+    request_id: str
+    dst_engine_id: str
+    remote_rank: int
+    peer_key: str
+    notif_msg: bytes
+    local_desc_ids: list[int]
+    remote_desc_ids: list[int]
+    has_payload: bool
 
 
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
@@ -666,10 +679,32 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         The inherited NIXL worker computes all request/block/TP mapping state.
         This override only changes how the final READ payload is transferred.
         """
+        plan = self._build_pega_read_plan(
+            read_spec=read_spec,
+            dst_engine_id=dst_engine_id,
+            request_id=request_id,
+            remote_request_id=remote_request_id,
+        )
+        if not plan.has_payload:
+            self._send_empty_pega_read_notification(plan)
+            return
+
+        self._submit_pega_read(plan, local_xfer_side_handle)
+
+    def _build_pega_read_plan(
+        self,
+        read_spec: ReadSpec,
+        dst_engine_id: str,
+        request_id: str,
+        remote_request_id: str,
+    ) -> PegaReadPlan:
+        """Build NIXL-compatible descriptor ids for a Pega RDMA READ."""
         assert self.transfer_topo is not None
         remote_rank = read_spec.remote_rank
         local_block_ids = read_spec.local_block_ids
         remote_block_ids = read_spec.remote_block_ids
+        peer_key = make_peer_key(self.engine_id, self.tp_rank, dst_engine_id, remote_rank)
+        notif_id = f"{remote_request_id}:{self.world_size}".encode()
 
         remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
         block_size_ratio = self.transfer_topo.block_size_ratio(remote_info.remote_block_size)
@@ -685,23 +720,17 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             local_block_ids = [local_block_ids_mapped] if local_block_ids_mapped else []
             remote_block_ids = [remote_block_ids0]
 
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
         if len(local_block_ids) == 0:
-            agent_name = self._remote_agents[dst_engine_id][remote_rank]
-            try:
-                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
-            except Exception as e:
-                self._log_failure(
-                    failure_type="notification_failed",
-                    msg="P worker blocks will be freed after timeout.",
-                    req_id=request_id,
-                    error=e,
-                    dst_engine_id=dst_engine_id,
-                    remote_rank=remote_rank,
-                    remote_agent_name=agent_name,
-                )
-                self.xfer_stats.record_failed_notification()
-            return
+            return PegaReadPlan(
+                request_id=request_id,
+                dst_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+                peer_key=peer_key,
+                notif_msg=notif_id,
+                local_desc_ids=[],
+                remote_desc_ids=[],
+                has_payload=False,
+            )
 
         assert len(remote_block_ids) == len(local_block_ids) == len(
             self.kv_cache_config.kv_cache_groups
@@ -730,52 +759,85 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         )
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
+        return PegaReadPlan(
+            request_id=request_id,
+            dst_engine_id=dst_engine_id,
+            remote_rank=remote_rank,
+            peer_key=peer_key,
+            notif_msg=notif_id,
+            local_desc_ids=local_block_descs_ids.tolist(),
+            remote_desc_ids=remote_block_descs_ids.tolist(),
+            has_payload=True,
+        )
+
+    def _send_empty_pega_read_notification(self, plan: PegaReadPlan) -> None:
+        """Notify the P worker that a full prefix-cache hit needs no READ."""
+        agent_name = self._remote_agents[plan.dst_engine_id][plan.remote_rank]
+        try:
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=plan.notif_msg)
+        except Exception as e:
+            self._log_failure(
+                failure_type="notification_failed",
+                msg="P worker blocks will be freed after timeout.",
+                req_id=plan.request_id,
+                error=e,
+                dst_engine_id=plan.dst_engine_id,
+                remote_rank=plan.remote_rank,
+                remote_agent_name=agent_name,
+            )
+            self.xfer_stats.record_failed_notification()
+
+    def _submit_pega_read(
+        self,
+        plan: PegaReadPlan,
+        local_xfer_side_handle: object,
+    ) -> None:
+        """Submit a Pega RDMA READ for a prepared descriptor plan."""
         handle = None
         try:
-            peer_key = make_peer_key(self.engine_id, self.tp_rank, dst_engine_id, remote_rank)
-            self._pega_expected_peers[request_id].add(peer_key)
-            self._require_pega_rdma_connection(peer_key)
-            if peer_key in self._pega_submitted_peers[request_id]:
+            self._pega_expected_peers[plan.request_id].add(plan.peer_key)
+            self._require_pega_rdma_connection(plan.peer_key)
+            if plan.peer_key in self._pega_submitted_peers[plan.request_id]:
                 return
 
             with self._pega_rdma_perf.measure("read_async_submit"):
                 local_table_id = self._pega_local_block_tables.get(local_xfer_side_handle)
                 handle, bytes_transferred, num_descriptors = self._pega_rdma.read_async_indices(
-                    peer_key,
+                    plan.peer_key,
                     local_table_id,
-                    dst_engine_id,
-                    remote_rank,
-                    local_block_descs_ids.tolist(),
-                    remote_block_descs_ids.tolist(),
+                    plan.dst_engine_id,
+                    plan.remote_rank,
+                    plan.local_desc_ids,
+                    plan.remote_desc_ids,
                 )
             self._pega_rdma_reads[handle] = PegaRdmaV1Read(
-                remote_addr=peer_key,
+                remote_addr=plan.peer_key,
                 handle=handle,
-                notif_agent=self._remote_agents[dst_engine_id][remote_rank],
-                notif_msg=notif_id,
+                notif_agent=self._remote_agents[plan.dst_engine_id][plan.remote_rank],
+                notif_msg=plan.notif_msg,
                 submitted_at=time.perf_counter(),
                 bytes_transferred=bytes_transferred,
                 num_descriptors=num_descriptors,
             )
-            self._recving_transfers[request_id].append(handle)
-            self._pega_submitted_peers[request_id].add(peer_key)
+            self._recving_transfers[plan.request_id].append(handle)
+            self._pega_submitted_peers[plan.request_id].add(plan.peer_key)
             logger.debug(
                 "Pega RDMA v1 READ submitted req=%s remote=%s rank=%s descs=%d",
-                request_id,
-                dst_engine_id,
-                remote_rank,
+                plan.request_id,
+                plan.dst_engine_id,
+                plan.remote_rank,
                 num_descriptors,
             )
         except Exception as e:
             self._log_failure(
                 failure_type="transfer_setup_failed",
-                req_id=request_id,
+                req_id=plan.request_id,
                 msg="Pega RDMA v1 READ setup failed; marking blocks invalid",
                 error=e,
-                dst_engine_id=dst_engine_id,
-                remote_rank=remote_rank,
+                dst_engine_id=plan.dst_engine_id,
+                remote_rank=plan.remote_rank,
             )
-            self._handle_failed_transfer(request_id, handle)
+            self._handle_failed_transfer(plan.request_id, handle)
 
     def _require_pega_rdma_connection(self, peer_key: str) -> None:
         """Require the RDMA connection created by the initial NIXL handshake."""
