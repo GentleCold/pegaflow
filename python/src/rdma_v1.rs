@@ -77,6 +77,7 @@ struct EngineState {
     pending_handshakes: HashMap<String, HandshakeMetadata>,
     pending_reads: HashMap<u64, PendingRead>,
     next_handle: u64,
+    next_local_table_id: u64,
     local_block_tables: HashMap<u64, Vec<BlockEntry>>,
     remote_block_tables: HashMap<(String, usize), Vec<BlockEntry>>,
 }
@@ -105,6 +106,7 @@ impl PegaRdmaV1Engine {
                 pending_handshakes: HashMap::new(),
                 pending_reads: HashMap::new(),
                 next_handle: 1,
+                next_local_table_id: 1,
                 local_block_tables: HashMap::new(),
                 remote_block_tables: HashMap::new(),
             }),
@@ -207,29 +209,30 @@ impl PegaRdmaV1Engine {
         Ok(())
     }
 
-    fn register_local_blocks(
-        &self,
-        nixl_handle: u64,
-        blocks: Vec<(u64, u64, u64)>,
-    ) -> PyResult<()> {
-        // Blocks are stable after NIXL registers KV cache memory.  Rust owns the
-        // descriptor tables keyed by NIXL's actual dlist handle, so Python does
-        // not need shadow maps or synthetic table handles.
+    fn register_local_blocks(&self, blocks: Vec<(u64, u64, u64)>) -> PyResult<u64> {
+        // Blocks are stable after NIXL registers KV cache memory. Rust owns a
+        // monotonically increasing table id so Python does not need to expose
+        // object addresses such as id(nixl_handle) across the PyO3 boundary.
         let table = Self::build_block_table(blocks)?;
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
-            .local_block_tables
-            .insert(nixl_handle, table);
-        Ok(())
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?;
+        let table_id = state.next_local_table_id;
+        state.next_local_table_id = state
+            .next_local_table_id
+            .checked_add(1)
+            .ok_or_else(|| PyRuntimeError::new_err("local block table id overflow"))?;
+        state.local_block_tables.insert(table_id, table);
+        Ok(table_id)
     }
 
-    fn unregister_local_blocks(&self, nixl_handle: u64) -> PyResult<()> {
+    fn unregister_local_blocks(&self, table_id: u64) -> PyResult<()> {
         self.state
             .lock()
             .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
             .local_block_tables
-            .remove(&nixl_handle);
+            .remove(&table_id);
         Ok(())
     }
 
@@ -268,7 +271,7 @@ impl PegaRdmaV1Engine {
         &self,
         py: Python<'_>,
         remote_addr: String,
-        local_xfer_side_handle: u64,
+        local_table_id: u64,
         remote_engine_id: String,
         remote_tp_rank: usize,
         local_desc_ids: Vec<usize>,
@@ -290,11 +293,9 @@ impl PegaRdmaV1Engine {
                 .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?;
             let local_table = state
                 .local_block_tables
-                .get(&local_xfer_side_handle)
+                .get(&local_table_id)
                 .ok_or_else(|| {
-                    PyValueError::new_err(format!(
-                        "unknown local block table for NIXL handle {local_xfer_side_handle}"
-                    ))
+                    PyValueError::new_err(format!("unknown local block table id {local_table_id}"))
                 })?;
             let remote_key = (remote_engine_id.clone(), remote_tp_rank);
             let remote_table = state.remote_block_tables.get(&remote_key).ok_or_else(|| {

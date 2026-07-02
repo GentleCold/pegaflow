@@ -51,6 +51,37 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class _PegaLocalBlockTables:
+    """Track NIXL handle objects without exporting Python object ids to Rust."""
+
+    def __init__(self) -> None:
+        self._items: list[tuple[object, int]] = []
+
+    def ensure_unregistered(self, handle: object) -> None:
+        for existing, existing_table_id in self._items:
+            if existing is handle:
+                raise RuntimeError(
+                    "Pega RDMA v1 local NIXL handle registered twice "
+                    f"(table_id={existing_table_id})"
+                )
+
+    def register(self, handle: object, table_id: int) -> None:
+        self.ensure_unregistered(handle)
+        self._items.append((handle, table_id))
+
+    def get(self, handle: object) -> int:
+        for existing, table_id in self._items:
+            if existing is handle:
+                return table_id
+        raise KeyError("unknown Pega RDMA v1 local NIXL handle")
+
+    def table_ids(self) -> list[int]:
+        return [table_id for _handle, table_id in self._items]
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     """Pull-specific (READ) worker logic."""
 
@@ -424,7 +455,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_expected_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_submitted_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_completed_peers: dict[str, set[str]] = defaultdict(set)
-        self._pega_local_block_table_handles: set[int] = set()
+        self._pega_local_block_tables = _PegaLocalBlockTables()
         self._pega_accept_stop = None
         self._pega_accept_thread = None
         self._pega_accept_broker_endpoint = make_accept_broker_endpoint_from_config(
@@ -466,9 +497,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         nixl_handle: object,
         blocks_data: list[tuple[int, int, int]],
     ) -> None:
-        table_handle = id(nixl_handle)
-        self._pega_rdma.register_local_blocks(table_handle, blocks_data)
-        self._pega_local_block_table_handles.add(table_handle)
+        self._pega_local_block_tables.ensure_unregistered(nixl_handle)
+        table_id = self._pega_rdma.register_local_blocks(blocks_data)
+        self._pega_local_block_tables.register(nixl_handle, table_id)
 
     def _on_remote_blocks_registered(
         self,
@@ -708,9 +739,10 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 return
 
             with self._pega_rdma_perf.measure("read_async_submit"):
+                local_table_id = self._pega_local_block_tables.get(local_xfer_side_handle)
                 handle, bytes_transferred, num_descriptors = self._pega_rdma.read_async_indices(
                     peer_key,
-                    id(local_xfer_side_handle),
+                    local_table_id,
                     dst_engine_id,
                     remote_rank,
                     local_block_descs_ids.tolist(),
@@ -853,16 +885,16 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             self._pega_rdma.release_read(read.handle)
         self._pega_rdma_reads.clear()
         self._recving_transfers.clear()
-        for table_handle in list(self._pega_local_block_table_handles):
+        for table_id in self._pega_local_block_tables.table_ids():
             try:
-                self._pega_rdma.unregister_local_blocks(table_handle)
+                self._pega_rdma.unregister_local_blocks(table_id)
             except Exception:
                 logger.debug(
-                    "Failed to unregister Pega RDMA v1 local blocks for handle %s",
-                    table_handle,
+                    "Failed to unregister Pega RDMA v1 local blocks for table %s",
+                    table_id,
                     exc_info=True,
                 )
-        self._pega_local_block_table_handles.clear()
+        self._pega_local_block_tables.clear()
         try:
             self._pega_rdma.unregister_memory(
                 [addr for addr, _size, _device_id, _tag in self._pega_local_memory_regions]
