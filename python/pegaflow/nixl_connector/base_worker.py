@@ -548,10 +548,7 @@ class NixlBaseConnectorWorker:
                     expected_engine_id,
                     remote_rank,
                 )
-                if request_extensions is None:
-                    msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank))
-                else:
-                    msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank, request_extensions))
+                msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank, request_extensions))
 
                 try:
                     # Set receive timeout to 5 seconds to avoid hanging on dead server
@@ -656,16 +653,16 @@ class NixlBaseConnectorWorker:
         self,
         remote_engine_id: str,
         remote_rank: int,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         """Build connector-specific metadata for an outgoing NIXL handshake."""
-        return None
+        return {}
 
     def _handle_handshake_response_extensions(
         self,
         remote_engine_id: str,
         remote_rank: int,
         response_extensions: dict[str, Any] | None,
-        request_extensions: dict[str, Any] | None,
+        request_extensions: dict[str, Any],
     ) -> None:
         """Consume connector-specific metadata from a NIXL handshake response."""
 
@@ -673,7 +670,7 @@ class NixlBaseConnectorWorker:
         self,
         remote_engine_id: str,
         remote_rank: int,
-        request_extensions: dict[str, Any] | None,
+        request_extensions: dict[str, Any],
     ) -> None:
         """Clean up connector-specific state after an outgoing handshake fails."""
 

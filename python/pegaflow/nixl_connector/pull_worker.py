@@ -619,13 +619,13 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self,
         remote_engine_id: str,
         remote_rank: int,
-    ) -> dict[str, object] | None:
+    ) -> dict[str, object]:
         """Attach D-side RDMA metadata to the outgoing NIXL handshake."""
         peer_key = make_peer_key(self.engine_id, self.tp_rank, remote_engine_id, remote_rank)
         status = self._pega_rdma.prepare_handshake(peer_key)
         if status.status == "existing":
             self._pega_rdma_perf.record_ns("rdma_conn_existing", 0)
-            return None
+            return {}
         if status.status == "connecting":
             self._pega_rdma_perf.record_ns("rdma_conn_connecting", 0)
             raise RuntimeError(f"RDMA v1 handshake already in progress for {peer_key}")
@@ -639,7 +639,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         remote_engine_id: str,
         remote_rank: int,
         response_extensions: dict[str, object] | None,
-        request_extensions: dict[str, object] | None,
+        request_extensions: dict[str, object],
     ) -> None:
         """Finish RDMA setup from metadata folded into the NIXL response."""
         response_metadata = parse_handshake_response_extension(response_extensions)
@@ -657,7 +657,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self,
         remote_engine_id: str,
         remote_rank: int,
-        request_extensions: dict[str, object] | None,
+        request_extensions: dict[str, object],
     ) -> None:
         """Abort locally prepared RDMA metadata when NIXL handshake fails."""
         if not request_extensions:

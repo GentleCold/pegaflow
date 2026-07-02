@@ -297,19 +297,13 @@ class NixlBaseConnectorScheduler:
                     if stop_event.is_set():
                         break
                     continue
-                # Decode either the original (GET_META_MSG, rank) request or
-                # the extended (GET_META_MSG, rank, extensions) form. The latter
-                # lets transport-specific connectors fold their own metadata
+                # Transport-specific connectors fold their own metadata
                 # exchange into NIXL's existing request/response handshake.
                 decoded = msgspec.msgpack.decode(msg)
-                if len(decoded) == 2:
-                    msg, target_tp_rank = decoded
-                    request_extensions = None
-                elif len(decoded) == 3:
-                    msg, target_tp_rank, request_extensions = decoded
-                else:
+                if len(decoded) != 3:
                     logger.warning("Connection listener got malformed message %s", decoded)
                     continue
+                msg, target_tp_rank, request_extensions = decoded
                 logger.debug(
                     "Received message for tp rank %s",
                     target_tp_rank,
@@ -317,14 +311,13 @@ class NixlBaseConnectorScheduler:
                 if msg != GET_META_MSG:
                     logger.warning("Connection listener got unexpected message %s", msg)
                 payload = handshake_payloads[target_tp_rank]
-                if request_extensions is not None:
-                    if not isinstance(request_extensions, dict):
-                        logger.warning(
-                            "Connection listener got invalid extensions %s",
-                            request_extensions,
-                        )
-                        continue
-                    payload = extension_handler(target_tp_rank, payload, request_extensions)
+                if not isinstance(request_extensions, dict):
+                    logger.warning(
+                        "Connection listener got invalid extensions %s",
+                        request_extensions,
+                    )
+                    continue
+                payload = extension_handler(target_tp_rank, payload, request_extensions)
                 sock.send_multipart((identity, b"", msgspec.msgpack.encode(payload)))
 
     def _handle_handshake_extensions(
