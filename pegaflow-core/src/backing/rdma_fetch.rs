@@ -1,6 +1,7 @@
 // RDMA remote block fetch: MetaServer query -> gRPC QueryBlocksForTransfer -> RDMA READ.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ use pegaflow_common::NumaNode;
 
 use opentelemetry::KeyValue;
 
-use super::{AllocateFn, PrefetchResult, RdmaTransport};
+use super::{AllocateFn, PrefetchChunkConsumer, PrefetchResult, RdmaPrefetchResult, RdmaTransport};
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
@@ -50,6 +51,7 @@ pub(crate) struct RdmaFetchStore {
     /// peer would each create QPs and race on the server, causing all but
     /// the last handshake's QPs to be invalidated.
     connect_group: Arc<Group<String, ()>>,
+    rdma_fetch_chunk_bytes: u64,
 }
 
 impl RdmaFetchStore {
@@ -58,8 +60,12 @@ impl RdmaFetchStore {
         rdma_transport: Arc<RdmaTransport>,
         allocate_fn: AllocateFn,
         advertise_addr: String,
+        rdma_fetch_chunk_bytes: u64,
     ) -> Self {
-        info!("RDMA remote fetch enabled (advertise={})", advertise_addr);
+        info!(
+            "RDMA remote fetch enabled (advertise={}, chunk_bytes={})",
+            advertise_addr, rdma_fetch_chunk_bytes
+        );
         Self {
             metaserver_client,
             rdma_transport,
@@ -67,6 +73,7 @@ impl RdmaFetchStore {
             advertise_addr,
             grpc_channels: Arc::new(DashMap::new()),
             connect_group: Arc::new(Group::new()),
+            rdma_fetch_chunk_bytes,
         }
     }
 
@@ -115,7 +122,8 @@ impl RdmaFetchStore {
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
-    ) -> PrefetchResult {
+        chunk_consumer: Option<PrefetchChunkConsumer>,
+    ) -> RdmaPrefetchResult {
         rdma_fetch_task(
             &self.rdma_transport,
             &self.allocate_fn,
@@ -126,6 +134,8 @@ impl RdmaFetchStore {
             &self.advertise_addr,
             namespace,
             hashes,
+            self.rdma_fetch_chunk_bytes,
+            chunk_consumer,
         )
         .await
     }
@@ -151,7 +161,9 @@ async fn rdma_fetch_task(
     advertise_addr: &str,
     namespace: &str,
     block_hashes: &[Vec<u8>],
-) -> PrefetchResult {
+    rdma_fetch_chunk_bytes: u64,
+    chunk_consumer: Option<PrefetchChunkConsumer>,
+) -> RdmaPrefetchResult {
     let t0 = Instant::now();
 
     // 1. Ensure RDMA connection (singleflight: at most one handshake per remote_addr)
@@ -169,7 +181,7 @@ async fn rdma_fetch_task(
         core_metrics()
             .rdma_fetch_total
             .add(1, &[KeyValue::new("status", "error")]);
-        return Vec::new();
+        return RdmaPrefetchResult::default();
     }
     let connect_elapsed = connect_start.elapsed();
 
@@ -190,7 +202,7 @@ async fn rdma_fetch_task(
             core_metrics()
                 .rdma_fetch_total
                 .add(1, &[KeyValue::new("status", "error")]);
-            return Vec::new();
+            return RdmaPrefetchResult::default();
         }
     };
     let query_elapsed = query_start.elapsed();
@@ -200,11 +212,7 @@ async fn rdma_fetch_task(
     // 3. RDMA READ all blocks + build SealedBlocks
     let transfer_timeout = transfer_timeout_from_server(response.lock_timeout_secs);
     let blocks = response.blocks;
-    let total_bytes: u64 = blocks
-        .iter()
-        .flat_map(|b| &b.slots)
-        .map(|s| s.k_size + s.v_size)
-        .sum();
+    let total_bytes = transfer_blocks_bytes(&blocks).unwrap_or(u64::MAX);
     let (result, transfer_timing) = match fetch_blocks_via_rdma(
         rdma,
         allocate_fn,
@@ -212,6 +220,8 @@ async fn rdma_fetch_task(
         remote_addr,
         &blocks,
         transfer_timeout,
+        rdma_fetch_chunk_bytes,
+        chunk_consumer.clone(),
     )
     .await
     {
@@ -223,7 +233,7 @@ async fn rdma_fetch_task(
             core_metrics()
                 .rdma_fetch_total
                 .add(1, &[KeyValue::new("status", "error")]);
-            return Vec::new();
+            return RdmaPrefetchResult::default();
         }
     };
 
@@ -231,7 +241,14 @@ async fn rdma_fetch_task(
     spawn_release_lock(client, transfer_session_id);
 
     let elapsed = t0.elapsed();
-    let mb = total_bytes as f64 / (1024.0 * 1024.0);
+    let fetched_bytes = transfer_timing.transferred_bytes;
+    let inserted_by_consumer = rdma_fetch_chunk_bytes > 0 && chunk_consumer.is_some();
+    let fetched_blocks = if inserted_by_consumer {
+        transfer_timing.fetched_block_count
+    } else {
+        result.len()
+    };
+    let mb = fetched_bytes as f64 / (1024.0 * 1024.0);
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
     let throughput_mib_s = if elapsed.as_secs_f64() > 0.0 {
         mb / elapsed.as_secs_f64()
@@ -239,12 +256,22 @@ async fn rdma_fetch_task(
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
-        result.len(),
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} chunking={} chunk_size_mib={:.1} chunks={} successful_chunks={} max_chunk_mib={:.1} bytes_mib={mb:.1} requested_mib={:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        fetched_blocks,
         block_hashes.len(),
         transfer_timing.slot_count,
         transfer_timing.transfer_desc_count,
         transfer_timing.numa_slab_count,
+        if transfer_timing.chunk_size_bytes > 0 {
+            "on"
+        } else {
+            "off"
+        },
+        transfer_timing.chunk_size_bytes as f64 / (1024.0 * 1024.0),
+        transfer_timing.chunk_count,
+        transfer_timing.successful_chunk_count,
+        transfer_timing.max_chunk_bytes as f64 / (1024.0 * 1024.0),
+        total_bytes as f64 / (1024.0 * 1024.0),
     );
     info!(
         "RDMA fetch stages: req_id={req_id} remote={remote_addr} connect_ms={:.2} query_ms={:.2} build_transfer_tasks_ms={:.2} submit_transfer_ms={:.2} rdma_wait_ms={:.2} rebuild_ms={:.2}",
@@ -260,8 +287,12 @@ async fn rdma_fetch_task(
     m.rdma_fetch_total.add(1, ok);
     m.rdma_fetch_duration_seconds
         .record(elapsed.as_secs_f64(), ok);
-    m.rdma_fetch_bytes.add(total_bytes, ok);
-    result
+    m.rdma_fetch_bytes.add(fetched_bytes, ok);
+    RdmaPrefetchResult {
+        fetched_blocks,
+        cache_inserts: result,
+        inserted_by_consumer,
+    }
 }
 
 /// Ensure an RDMA connection to `remote_addr` exists, using singleflight to
@@ -322,6 +353,10 @@ type StagedSlot = (Vec<SegmentAlloc>, NumaNode);
 type StagedBlock = (Vec<u8>, Vec<StagedSlot>);
 
 /// Allocate local memory, build TransferDescs, execute RDMA READ, build SealedBlocks.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "RDMA fetch context is passed through without creating a short-lived config object"
+)]
 async fn fetch_blocks_via_rdma(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,
@@ -329,13 +364,104 @@ async fn fetch_blocks_via_rdma(
     remote_addr: &str,
     blocks: &[TransferBlockInfo],
     transfer_timeout: Duration,
+    chunk_bytes: u64,
+    chunk_consumer: Option<PrefetchChunkConsumer>,
 ) -> Result<(PrefetchResult, TransferTiming), String> {
     if blocks.is_empty() {
         return Ok((Vec::new(), TransferTiming::default()));
     }
 
-    let bytes_per_numa = sum_segment_bytes_by_numa(blocks)?;
-    let mut numa_slabs = allocate_numa_slabs(allocate_fn, bytes_per_numa)?;
+    if chunk_bytes == 0 {
+        return fetch_block_chunk_via_rdma(
+            rdma,
+            allocate_fn,
+            namespace,
+            remote_addr,
+            blocks,
+            transfer_timeout,
+            ChunkAllocationMode::ChunkSlab,
+        )
+        .await
+        .map_err(|err| err.message);
+    }
+
+    let ranges = split_transfer_blocks_by_chunk_bytes(blocks, chunk_bytes)?;
+    let mut all_results = Vec::with_capacity(blocks.len());
+    let mut total_timing = TransferTiming {
+        chunk_size_bytes: chunk_bytes,
+        chunk_count: ranges.len(),
+        ..TransferTiming::default()
+    };
+
+    for range in ranges {
+        let chunk = &blocks[range];
+        let chunk_bytes_total = transfer_blocks_bytes(chunk)?;
+        total_timing.max_chunk_bytes = total_timing.max_chunk_bytes.max(chunk_bytes_total);
+        match fetch_block_chunk_via_rdma(
+            rdma,
+            allocate_fn,
+            namespace,
+            remote_addr,
+            chunk,
+            transfer_timeout,
+            ChunkAllocationMode::BlockSlab,
+        )
+        .await
+        {
+            Ok((mut result, timing)) => {
+                total_timing.successful_chunk_count += 1;
+                total_timing.merge_successful_chunk(timing);
+                if let Some(consumer) = &chunk_consumer {
+                    let fetched = result.len();
+                    consumer(result);
+                    total_timing.fetched_block_count += fetched;
+                } else {
+                    all_results.append(&mut result);
+                    total_timing.fetched_block_count = all_results.len();
+                }
+            }
+            Err(err) => {
+                if err.reason == "transfer" {
+                    rdma.engine().invalidate_connection(remote_addr);
+                }
+                core_metrics()
+                    .rdma_fetch_partial_total
+                    .add(1, &[KeyValue::new("reason", err.reason)]);
+                warn!(
+                    "RDMA chunkwise fetch stopped early: remote={} namespace={} successful_chunks={}/{} returned_blocks={} reason={} error={}",
+                    remote_addr,
+                    namespace,
+                    total_timing.successful_chunk_count,
+                    total_timing.chunk_count,
+                    total_timing.fetched_block_count,
+                    err.reason,
+                    err.message
+                );
+                break;
+            }
+        }
+    }
+
+    Ok((all_results, total_timing))
+}
+
+async fn fetch_block_chunk_via_rdma(
+    rdma: &RdmaTransport,
+    allocate_fn: &AllocateFn,
+    namespace: &str,
+    remote_addr: &str,
+    blocks: &[TransferBlockInfo],
+    transfer_timeout: Duration,
+    allocation_mode: ChunkAllocationMode,
+) -> Result<(PrefetchResult, TransferTiming), ChunkFetchError> {
+    let mut chunk_slabs = HashMap::new();
+    let mut numa_slab_count = 0usize;
+    if allocation_mode == ChunkAllocationMode::ChunkSlab {
+        let bytes_per_numa = sum_segment_bytes_by_numa(blocks).map_err(ChunkFetchError::rebuild)?;
+        chunk_slabs = allocate_numa_slabs(allocate_fn, bytes_per_numa)
+            .map_err(ChunkFetchError::allocation)?;
+        numa_slab_count = chunk_slabs.len();
+    }
 
     // (block_hash, Vec<(slot_segments, slot_numa)>) — for building SealedBlock afterwards.
     // The per-slot NUMA is preserved so a re-served fetched block advertises real topology.
@@ -349,64 +475,34 @@ async fn fetch_blocks_via_rdma(
         let mut all_descs: Vec<TransferDesc> = Vec::new();
 
         for block_info in blocks {
-            slot_count += block_info.slots.len();
-            let mut slot_allocs = Vec::with_capacity(block_info.slots.len());
-
-            for slot in &block_info.slots {
-                let mut segments = Vec::new();
-                let numa = NumaNode(slot.numa_node);
-
-                // K segment
-                if slot.k_size > 0 {
-                    let len = usize::try_from(slot.k_size)
-                        .map_err(|_| format!("K size exceeds usize: {}", slot.k_size))?;
-                    let (local_ptr, alloc) =
-                        alloc_segment_from_slab(&mut numa_slabs, numa, len, "K")?;
-                    let remote_ptr = NonNull::new(slot.k_ptr as *mut u8)
-                        .ok_or_else(|| "remote K ptr is null".to_string())?;
-                    all_descs.push(TransferDesc {
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                    });
-                    segments.push(SegmentAlloc {
-                        ptr_addr: local_ptr.as_ptr() as u64,
-                        alloc,
-                        size: len,
-                    });
+            let (staged_block, staged_slots, block_slab_count) = match allocation_mode {
+                ChunkAllocationMode::ChunkSlab => {
+                    stage_block_transfer_descs(block_info, &mut chunk_slabs, &mut all_descs)?
                 }
-
-                // V segment (split KV)
-                if slot.v_size > 0 && slot.v_ptr != 0 {
-                    let len = usize::try_from(slot.v_size)
-                        .map_err(|_| format!("V size exceeds usize: {}", slot.v_size))?;
-                    let (local_ptr, alloc) =
-                        alloc_segment_from_slab(&mut numa_slabs, numa, len, "V")?;
-                    let remote_ptr = NonNull::new(slot.v_ptr as *mut u8)
-                        .ok_or_else(|| "remote V ptr is null".to_string())?;
-                    all_descs.push(TransferDesc {
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                    });
-                    segments.push(SegmentAlloc {
-                        ptr_addr: local_ptr.as_ptr() as u64,
-                        alloc,
-                        size: len,
-                    });
+                ChunkAllocationMode::BlockSlab => {
+                    let bytes_per_numa =
+                        sum_segment_bytes_by_numa(std::slice::from_ref(block_info))
+                            .map_err(ChunkFetchError::rebuild)?;
+                    let mut block_slabs = allocate_numa_slabs(allocate_fn, bytes_per_numa)
+                        .map_err(ChunkFetchError::allocation)?;
+                    let slab_count = block_slabs.len();
+                    let (staged_block, staged_slots, _) =
+                        stage_block_transfer_descs(block_info, &mut block_slabs, &mut all_descs)?;
+                    (staged_block, staged_slots, slab_count)
                 }
-
-                slot_allocs.push((segments, numa));
-            }
-
-            block_allocs.push((block_info.block_hash.clone(), slot_allocs));
+            };
+            slot_count += staged_slots;
+            numa_slab_count += block_slab_count;
+            block_allocs.push(staged_block);
         }
 
         if all_descs.is_empty() {
             let timing = TransferTiming {
                 build_transfer_tasks: build_start.elapsed(),
                 slot_count,
-                numa_slab_count: numa_slabs.len(),
+                numa_slab_count,
+                chunk_count: 1,
+                successful_chunk_count: 1,
                 ..TransferTiming::default()
             };
             return Ok((Vec::new(), timing));
@@ -419,7 +515,9 @@ async fn fetch_blocks_via_rdma(
         let receivers = rdma
             .engine()
             .batch_transfer_async(TransferOp::Read, remote_addr, &all_descs)
-            .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?;
+            .map_err(|e| {
+                ChunkFetchError::transfer(format!("RDMA batch_transfer_async failed: {e}"))
+            })?;
         let submit_transfer = submit_start.elapsed();
 
         let timing = TransferTiming {
@@ -427,7 +525,9 @@ async fn fetch_blocks_via_rdma(
             submit_transfer,
             transfer_desc_count,
             slot_count,
-            numa_slab_count: numa_slabs.len(),
+            numa_slab_count,
+            chunk_count: 1,
+            successful_chunk_count: 1,
             ..TransferTiming::default()
         };
         (receivers, timing)
@@ -443,7 +543,8 @@ async fn fetch_blocks_via_rdma(
         Ok::<(), String>(())
     })
     .await
-    .map_err(|_| "RDMA transfer timed out".to_string())??;
+    .map_err(|_| ChunkFetchError::transfer("RDMA transfer timed out"))?
+    .map_err(ChunkFetchError::transfer)?;
     timing.rdma_wait = wait_start.elapsed();
 
     // Build SealedBlocks from allocated memory
@@ -469,8 +570,159 @@ async fn fetch_blocks_via_rdma(
         result.push((key, sealed));
     }
     timing.rebuild = rebuild_start.elapsed();
+    timing.transferred_bytes = transfer_blocks_bytes(blocks).map_err(ChunkFetchError::rebuild)?;
+    timing.max_chunk_bytes = timing.transferred_bytes;
 
     Ok((result, timing))
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ChunkAllocationMode {
+    ChunkSlab,
+    BlockSlab,
+}
+
+fn stage_block_transfer_descs(
+    block_info: &TransferBlockInfo,
+    numa_slabs: &mut HashMap<NumaNode, NumaSlab>,
+    all_descs: &mut Vec<TransferDesc>,
+) -> Result<(StagedBlock, usize, usize), ChunkFetchError> {
+    let mut slot_allocs = Vec::with_capacity(block_info.slots.len());
+
+    for slot in &block_info.slots {
+        let mut segments = Vec::new();
+        let numa = NumaNode(slot.numa_node);
+
+        if slot.k_size > 0 {
+            let len = usize::try_from(slot.k_size).map_err(|_| {
+                ChunkFetchError::rebuild(format!("K size exceeds usize: {}", slot.k_size))
+            })?;
+            let (local_ptr, alloc) = alloc_segment_from_slab(numa_slabs, numa, len, "K")
+                .map_err(ChunkFetchError::allocation)?;
+            let remote_ptr = NonNull::new(slot.k_ptr as *mut u8)
+                .ok_or_else(|| ChunkFetchError::rebuild("remote K ptr is null"))?;
+            all_descs.push(TransferDesc {
+                local_ptr,
+                remote_ptr,
+                len,
+            });
+            segments.push(SegmentAlloc {
+                ptr_addr: local_ptr.as_ptr() as u64,
+                alloc,
+                size: len,
+            });
+        }
+
+        if slot.v_size > 0 && slot.v_ptr != 0 {
+            let len = usize::try_from(slot.v_size).map_err(|_| {
+                ChunkFetchError::rebuild(format!("V size exceeds usize: {}", slot.v_size))
+            })?;
+            let (local_ptr, alloc) = alloc_segment_from_slab(numa_slabs, numa, len, "V")
+                .map_err(ChunkFetchError::allocation)?;
+            let remote_ptr = NonNull::new(slot.v_ptr as *mut u8)
+                .ok_or_else(|| ChunkFetchError::rebuild("remote V ptr is null"))?;
+            all_descs.push(TransferDesc {
+                local_ptr,
+                remote_ptr,
+                len,
+            });
+            segments.push(SegmentAlloc {
+                ptr_addr: local_ptr.as_ptr() as u64,
+                alloc,
+                size: len,
+            });
+        }
+
+        slot_allocs.push((segments, numa));
+    }
+
+    Ok((
+        (block_info.block_hash.clone(), slot_allocs),
+        block_info.slots.len(),
+        0,
+    ))
+}
+
+struct ChunkFetchError {
+    reason: &'static str,
+    message: String,
+}
+
+impl ChunkFetchError {
+    fn allocation(message: impl Into<String>) -> Self {
+        Self {
+            reason: "allocation",
+            message: message.into(),
+        }
+    }
+
+    fn transfer(message: impl Into<String>) -> Self {
+        Self {
+            reason: "transfer",
+            message: message.into(),
+        }
+    }
+
+    fn rebuild(message: impl Into<String>) -> Self {
+        Self {
+            reason: "rebuild",
+            message: message.into(),
+        }
+    }
+}
+
+fn split_transfer_blocks_by_chunk_bytes(
+    blocks: &[TransferBlockInfo],
+    chunk_bytes: u64,
+) -> Result<Vec<Range<usize>>, String> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    if chunk_bytes == 0 {
+        return Ok(std::iter::once(0..blocks.len()).collect());
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut current_bytes = 0u64;
+
+    for (idx, block) in blocks.iter().enumerate() {
+        let block_bytes = transfer_block_bytes(block)?;
+        if idx > start && current_bytes.saturating_add(block_bytes) > chunk_bytes {
+            ranges.push(start..idx);
+            start = idx;
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes
+            .checked_add(block_bytes)
+            .ok_or_else(|| "chunk bytes overflow while splitting RDMA blocks".to_string())?;
+    }
+
+    if start < blocks.len() {
+        ranges.push(start..blocks.len());
+    }
+    Ok(ranges)
+}
+
+fn transfer_blocks_bytes(blocks: &[TransferBlockInfo]) -> Result<u64, String> {
+    let mut total = 0u64;
+    for block in blocks {
+        total = total
+            .checked_add(transfer_block_bytes(block)?)
+            .ok_or_else(|| "RDMA transfer bytes overflow".to_string())?;
+    }
+    Ok(total)
+}
+
+fn transfer_block_bytes(block: &TransferBlockInfo) -> Result<u64, String> {
+    let mut total = 0u64;
+    for slot in &block.slots {
+        total = total
+            .checked_add(slot.k_size)
+            .and_then(|sum| sum.checked_add(slot.v_size))
+            .ok_or_else(|| "RDMA transfer block bytes overflow".to_string())?;
+    }
+    Ok(total)
 }
 
 fn sum_segment_bytes_by_numa(
@@ -581,6 +833,26 @@ struct TransferTiming {
     transfer_desc_count: usize,
     slot_count: usize,
     numa_slab_count: usize,
+    chunk_size_bytes: u64,
+    chunk_count: usize,
+    successful_chunk_count: usize,
+    max_chunk_bytes: u64,
+    transferred_bytes: u64,
+    fetched_block_count: usize,
+}
+
+impl TransferTiming {
+    fn merge_successful_chunk(&mut self, chunk: Self) {
+        self.build_transfer_tasks += chunk.build_transfer_tasks;
+        self.submit_transfer += chunk.submit_transfer;
+        self.rdma_wait += chunk.rdma_wait;
+        self.rebuild += chunk.rebuild;
+        self.transfer_desc_count += chunk.transfer_desc_count;
+        self.slot_count += chunk.slot_count;
+        self.numa_slab_count += chunk.numa_slab_count;
+        self.max_chunk_bytes = self.max_chunk_bytes.max(chunk.max_chunk_bytes);
+        self.transferred_bytes += chunk.transferred_bytes;
+    }
 }
 
 fn get_or_create_channel(
@@ -703,6 +975,16 @@ mod tests {
         }
     }
 
+    fn block(hash: u8, slot_bytes: &[(u64, u64)]) -> TransferBlockInfo {
+        TransferBlockInfo {
+            block_hash: vec![hash],
+            slots: slot_bytes
+                .iter()
+                .map(|(k, v)| slot(*k, if *v > 0 { 0x2000 } else { 0 }, *v, 0))
+                .collect(),
+        }
+    }
+
     fn test_allocate_fn(calls: Arc<AtomicUsize>) -> AllocateFn {
         let allocator = Arc::new(crate::pinned_pool::PinnedAllocator::new_global(
             32 * 1024 * 1024,
@@ -736,6 +1018,39 @@ mod tests {
         let totals = sum_segment_bytes_by_numa(&blocks).expect("sum bytes");
         assert_eq!(totals.get(&NumaNode(0)), Some(&600)); // 100 + (200 + 300)
         assert_eq!(totals.get(&NumaNode(1)), Some(&900)); // 400 + 500
+    }
+
+    #[test]
+    fn split_transfer_blocks_zero_chunk_keeps_single_range() {
+        let blocks = vec![block(1, &[(100, 0)]), block(2, &[(200, 0)])];
+        let ranges = split_transfer_blocks_by_chunk_bytes(&blocks, 0).expect("split");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..2);
+    }
+
+    #[test]
+    fn split_transfer_blocks_by_chunk_bytes_preserves_prefix_order() {
+        let blocks = vec![
+            block(1, &[(100, 20)]), // 120
+            block(2, &[(90, 10)]),  // 100
+            block(3, &[(60, 0)]),   // 60
+            block(4, &[(140, 0)]),  // 140
+        ];
+
+        let ranges = split_transfer_blocks_by_chunk_bytes(&blocks, 200).expect("split");
+        assert_eq!(ranges, vec![0..1, 1..3, 3..4]);
+    }
+
+    #[test]
+    fn split_transfer_blocks_allows_oversized_single_block_chunk() {
+        let blocks = vec![
+            block(1, &[(300, 0)]),
+            block(2, &[(50, 0)]),
+            block(3, &[(40, 0)]),
+        ];
+
+        let ranges = split_transfer_blocks_by_chunk_bytes(&blocks, 128).expect("split");
+        assert_eq!(ranges, vec![0..1, 1..3]);
     }
 
     #[test]

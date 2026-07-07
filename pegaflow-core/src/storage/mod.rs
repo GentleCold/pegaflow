@@ -32,6 +32,7 @@ use write_path::{InsertDeps, WritePipeline};
 // Each reclaim iteration emits one MetaServer removal command; a small batch
 // turns an eviction burst into a command flood that overflows the removal queue.
 const RECLAIM_BATCH_SIZE: usize = 512;
+const RECLAIM_TARGET_MULTIPLIER: u64 = 2;
 pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,9 @@ pub struct StorageConfig {
     /// Allocate each block separately instead of contiguous batch allocation.
     /// Reduces fragmentation when blocks are freed in different order.
     pub blockwise_alloc: bool,
+    /// Split RDMA fetched transfer descriptors into chunks no larger than this
+    /// many bytes before local allocation/transfer. 0 keeps the legacy full-slab path.
+    pub rdma_fetch_chunk_bytes: u64,
     /// Transfer lock timeout for cross-node RDMA transfers.
     pub transfer_lock_timeout: Duration,
     /// MetaServer address for p2p block discovery + registration (None = disabled).
@@ -84,6 +88,7 @@ impl Default for StorageConfig {
             rdma_qps_per_peer: DEFAULT_RDMA_QPS_PER_PEER,
             enable_numa_affinity: true,
             blockwise_alloc: false,
+            rdma_fetch_chunk_bytes: 0,
             transfer_lock_timeout: Duration::from_secs(120),
             metaserver_addr: None,
             advertise_addr: None,
@@ -121,6 +126,7 @@ impl StorageEngine {
         #[cfg(feature = "rdma")]
         let rdma_qps_per_peer = config.rdma_qps_per_peer;
         let blockwise_alloc = config.blockwise_alloc;
+        let rdma_fetch_chunk_bytes = config.rdma_fetch_chunk_bytes;
         let transfer_lock_timeout = config.transfer_lock_timeout;
 
         // Create MetaServer client if configured
@@ -224,6 +230,7 @@ impl StorageEngine {
                     Arc::clone(rdma),
                     allocate_fn.clone(),
                     advertise,
+                    rdma_fetch_chunk_bytes,
                 ))))
             });
             #[cfg(not(feature = "rdma"))]
@@ -453,7 +460,7 @@ impl StorageEngine {
         hashes: &[Vec<u8>],
     ) -> PrefetchStatus {
         self.prefetch
-            .check_and_prefetch(&self.read_cache, req_id, namespace, hashes)
+            .check_and_prefetch(Arc::clone(&self.read_cache), req_id, namespace, hashes)
             .await
     }
 
@@ -472,12 +479,25 @@ impl StorageEngine {
 
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0u64;
+        let mut reclaimed_bytes = 0u64;
         let mut largest_free = self.allocator.largest_free_allocation_for_node(target_node);
+        let target_reclaim_bytes = required_bytes.saturating_mul(RECLAIM_TARGET_MULTIPLIER);
 
         while largest_free < required_bytes {
             let used_before = self.allocator.usage().0;
 
-            let evicted = self.read_cache.remove_lru_batch(RECLAIM_BATCH_SIZE);
+            let mut evicted = Vec::new();
+            let mut batch_bytes = 0u64;
+            for _ in 0..RECLAIM_BATCH_SIZE {
+                let Some((key, block)) = self.read_cache.remove_lru() else {
+                    break;
+                };
+                batch_bytes = batch_bytes.saturating_add(block.memory_footprint());
+                evicted.push((key, block));
+                if batch_bytes >= target_reclaim_bytes {
+                    break;
+                }
+            }
 
             if evicted.is_empty() {
                 break;
@@ -492,11 +512,9 @@ impl StorageEngine {
                 client.try_unregister(entries);
             }
 
-            let mut batch_bytes = 0u64;
             let mut still_referenced = 0u64;
             for (_key, block) in &evicted {
                 let b = block.memory_footprint();
-                batch_bytes = batch_bytes.saturating_add(b);
                 if Arc::strong_count(block) > 1 {
                     still_referenced += 1;
                 }
@@ -516,6 +534,7 @@ impl StorageEngine {
             let used_after = self.allocator.usage().0;
             let reclaimed = used_before.saturating_sub(used_after);
             if reclaimed > 0 {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(reclaimed);
                 core_metrics()
                     .cache_eviction_reclaimed_bytes
                     .add(reclaimed, &[]);
@@ -536,6 +555,16 @@ impl StorageEngine {
             core_metrics()
                 .cache_block_evictions
                 .add(freed_blocks as u64, &[]);
+            let metrics = core_metrics();
+            metrics
+                .cache_reclaim_required_bytes
+                .record(required_bytes as f64, &[]);
+            metrics
+                .cache_reclaim_largest_free_bytes
+                .record(largest_free as f64, &[]);
+            metrics
+                .cache_reclaim_reclaimed_bytes
+                .record(reclaimed_bytes as f64, &[]);
         }
 
         (freed_blocks, freed_bytes, largest_free)

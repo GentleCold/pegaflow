@@ -153,6 +153,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub blockwise_alloc: bool,
 
+    /// RDMA fetch chunk size for local allocation/transfer. 0 keeps the legacy
+    /// full-prefix per-NUMA slab allocation path.
+    #[arg(long, default_value = "0", value_parser = parse_memory_size)]
+    pub rdma_fetch_chunk_size: usize,
+
     /// RDMA NIC names for inter-node transfer (e.g. --nics mlx5_0,mlx5_1 or --nics mlx5_0 mlx5_1).
     /// When set, pinned memory is registered for RDMA access on these NICs.
     #[arg(long, value_delimiter = ',', value_parser = parse_nic_name, num_args = 1..)]
@@ -548,6 +553,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rdma_qps_per_peer: cli.qps_per_peer,
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
+        rdma_fetch_chunk_bytes: cli.rdma_fetch_chunk_size as u64,
         transfer_lock_timeout: Duration::from_secs(cli.transfer_lock_timeout_secs),
         metaserver_addr: cli.metaserver_addr.clone(),
         advertise_addr,
@@ -732,6 +738,21 @@ mod tests {
             parse_hll_windows(&cli.metric_hll_windows).unwrap(),
             expected_hll_windows()
         );
+    }
+
+    #[test]
+    fn cli_default_rdma_fetch_chunk_size_keeps_legacy_path() {
+        let cli = Cli::try_parse_from(["pegaflow-server"]).unwrap();
+
+        assert_eq!(cli.rdma_fetch_chunk_size, 0);
+    }
+
+    #[test]
+    fn cli_parses_rdma_fetch_chunk_size() {
+        let cli =
+            Cli::try_parse_from(["pegaflow-server", "--rdma-fetch-chunk-size", "512mb"]).unwrap();
+
+        assert_eq!(cli.rdma_fetch_chunk_size, 512 * 1024 * 1024);
     }
 
     #[test]

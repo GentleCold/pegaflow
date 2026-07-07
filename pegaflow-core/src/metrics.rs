@@ -49,6 +49,9 @@ pub(crate) struct CoreMetrics {
     pub cache_block_evictions: Counter<u64>,
     pub cache_block_evictions_still_referenced: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
+    pub cache_reclaim_required_bytes: Histogram<f64>,
+    pub cache_reclaim_largest_free_bytes: Histogram<f64>,
+    pub cache_reclaim_reclaimed_bytes: Histogram<f64>,
 
     // GPU <-> CPU transfer
     pub save_bytes: Counter<u64>,
@@ -73,6 +76,8 @@ pub(crate) struct CoreMetrics {
     pub ssd_prefetch_inflight: UpDownCounter<i64>,
     pub ssd_prefetch_queue_full: Counter<u64>,
     pub ssd_prefetch_backpressure_blocks: Counter<u64>,
+    pub rdma_prefetch_active_blocks: UpDownCounter<i64>,
+    pub rdma_prefetch_backpressure_blocks: Counter<u64>,
 
     // MetaServer registration
     pub metaserver_registration_blocks: Counter<u64>,
@@ -98,6 +103,8 @@ pub(crate) struct CoreMetrics {
     pub rdma_fetch_duration_seconds: Histogram<f64>,
     #[cfg(feature = "rdma")]
     pub rdma_fetch_bytes: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub rdma_fetch_partial_total: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -286,6 +293,21 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_unit("bytes")
                 .with_description("Estimated bytes actually reclaimed in pinned allocator after cache eviction")
                 .build(),
+            cache_reclaim_required_bytes: meter
+                .f64_histogram("pegaflow_cache_reclaim_required_bytes")
+                .with_unit("bytes")
+                .with_description("Allocator request size that triggered LRU reclaim")
+                .build(),
+            cache_reclaim_largest_free_bytes: meter
+                .f64_histogram("pegaflow_cache_reclaim_largest_free_bytes")
+                .with_unit("bytes")
+                .with_description("Largest free allocation after an LRU reclaim attempt")
+                .build(),
+            cache_reclaim_reclaimed_bytes: meter
+                .f64_histogram("pegaflow_cache_reclaim_reclaimed_bytes")
+                .with_unit("bytes")
+                .with_description("Pinned bytes reclaimed during one LRU reclaim attempt")
+                .build(),
 
             // Transfer
             save_bytes: meter
@@ -376,6 +398,16 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_ssd_prefetch_backpressure_blocks")
                 .with_description("Blocks treated as missing due to max prefetch backpressure")
                 .build(),
+            rdma_prefetch_active_blocks: meter
+                .i64_up_down_counter("pegaflow_rdma_prefetch_active_blocks")
+                .with_description("Current active RDMA prefetch block reservations")
+                .build(),
+            rdma_prefetch_backpressure_blocks: meter
+                .u64_counter("pegaflow_rdma_prefetch_backpressure_blocks")
+                .with_description(
+                    "RDMA prefetch blocks skipped because max prefetch block budget was exhausted",
+                )
+                .build(),
 
             // MetaServer registration
             metaserver_registration_blocks: meter
@@ -445,6 +477,13 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_rdma_fetch_bytes")
                 .with_unit("bytes")
                 .with_description("Total bytes fetched via RDMA from remote nodes")
+                .build(),
+            #[cfg(feature = "rdma")]
+            rdma_fetch_partial_total: meter
+                .u64_counter("pegaflow_rdma_fetch_partial")
+                .with_description(
+                    "Logical RDMA fetches that returned a partial prefix because chunkwise fetch stopped early (reason=allocation|transfer|rebuild)",
+                )
                 .build(),
         }
     })

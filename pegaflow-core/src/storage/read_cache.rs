@@ -57,21 +57,39 @@ impl ReadCache {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "kept as the narrow API for callers that only need resident registration keys"
+    )]
     pub(super) fn batch_insert_resident_keys(
         &self,
         blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
     ) -> Vec<BlockKey> {
+        self.batch_insert_split_residency(blocks).0
+    }
+
+    pub(super) fn batch_insert_split_residency(
+        &self,
+        blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
+    ) -> (Vec<BlockKey>, Vec<(BlockKey, Arc<SealedBlock>)>) {
         let mut inner = self.inner.lock();
         let mut resident_keys = Vec::new();
+        let mut rejected_blocks = Vec::new();
         for (key, block) in blocks {
-            match insert_block(&mut inner, key.clone(), block) {
+            match insert_block(&mut inner, key.clone(), Arc::clone(&block)) {
                 CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists => {
                     resident_keys.push(key);
                 }
-                CacheInsertOutcome::Rejected => {}
+                CacheInsertOutcome::Rejected => {
+                    rejected_blocks.push((key, block));
+                }
             }
         }
-        resident_keys
+        (resident_keys, rejected_blocks)
+    }
+
+    pub(super) fn get_block(&self, key: &BlockKey) -> Option<Arc<SealedBlock>> {
+        self.inner.lock().cache.get(key)
     }
 
     pub(super) fn batch_insert_refs(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
@@ -94,11 +112,8 @@ impl ReadCache {
         found
     }
 
-    pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
-        let mut inner = self.inner.lock();
-        (0..batch_size)
-            .map_while(|_| inner.cache.remove_lru())
-            .collect()
+    pub(super) fn remove_lru(&self) -> Option<(BlockKey, Arc<SealedBlock>)> {
+        self.inner.lock().cache.remove_lru()
     }
 
     pub(super) fn remove_all(&self) -> Vec<(BlockKey, Arc<SealedBlock>)> {
@@ -262,5 +277,29 @@ mod tests {
             cache.batch_insert_resident_keys(vec![(key.clone(), make_block())]),
             vec![key]
         );
+    }
+
+    #[test]
+    fn batch_insert_split_residency_returns_rejected_blocks() {
+        let cache = ReadCache::new(1, true, Some(1));
+        let hot_key = BlockKey::new("ns".into(), vec![1]);
+        let cold_key = BlockKey::new("ns".into(), vec![2]);
+        let cold_block = make_block();
+
+        let (resident, rejected) =
+            cache.batch_insert_split_residency(vec![(hot_key.clone(), make_block())]);
+        assert_eq!(resident, vec![hot_key.clone()]);
+        assert!(rejected.is_empty());
+
+        for _ in 0..2 {
+            assert_eq!(cache.get_blocks(std::slice::from_ref(&hot_key)).len(), 1);
+        }
+
+        let (resident, rejected) =
+            cache.batch_insert_split_residency(vec![(cold_key.clone(), Arc::clone(&cold_block))]);
+        assert!(resident.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].0, cold_key);
+        assert!(Arc::ptr_eq(&rejected[0].1, &cold_block));
     }
 }

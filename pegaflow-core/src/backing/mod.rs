@@ -30,6 +30,14 @@ pub(crate) use ssd::SsdBackingStore;
 pub(crate) use ssd::new_ssd;
 
 pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
+pub(crate) type PrefetchChunkConsumer = Arc<dyn Fn(PrefetchResult) + Send + Sync>;
+
+#[derive(Default)]
+pub(crate) struct RdmaPrefetchResult {
+    pub cache_inserts: PrefetchResult,
+    pub fetched_blocks: usize,
+    pub inserted_by_consumer: bool,
+}
 
 /// Allocator closure for pinned memory, passed to the SSD backing store.
 pub(crate) type AllocateFn =

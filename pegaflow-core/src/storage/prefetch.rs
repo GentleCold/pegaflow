@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 
 #[cfg(feature = "rdma")]
 use crate::backing::RdmaFetchStore;
-use crate::backing::{PrefetchResult, SsdBackingStore};
+use crate::backing::{PrefetchChunkConsumer, PrefetchResult, RdmaPrefetchResult, SsdBackingStore};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
@@ -34,30 +34,47 @@ impl RdmaFetch {
         Self(store)
     }
 
-    async fn try_fetch_prefix(
+    async fn query_prefix(
         &self,
-        req_id: &str,
         namespace: &str,
         remaining_hashes: &[Vec<u8>],
-    ) -> Option<(usize, PrefetchResult)> {
-        let (node, found) = self.0.query_prefix(namespace, remaining_hashes).await?;
-        let blocks = self
-            .0
-            .fetch_blocks(&node, req_id, namespace, &remaining_hashes[..found])
-            .await;
-        Some((found, blocks))
+    ) -> Option<(String, usize)> {
+        self.0.query_prefix(namespace, remaining_hashes).await
+    }
+
+    async fn fetch_blocks(
+        &self,
+        remote_addr: &str,
+        req_id: &str,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        chunk_consumer: Option<PrefetchChunkConsumer>,
+    ) -> RdmaPrefetchResult {
+        self.0
+            .fetch_blocks(remote_addr, req_id, namespace, hashes, chunk_consumer)
+            .await
     }
 }
 
 #[cfg(not(feature = "rdma"))]
 impl RdmaFetch {
-    async fn try_fetch_prefix(
+    async fn query_prefix(
         &self,
-        _req_id: &str,
         _namespace: &str,
         _remaining_hashes: &[Vec<u8>],
-    ) -> Option<(usize, PrefetchResult)> {
+    ) -> Option<(String, usize)> {
         None
+    }
+
+    async fn fetch_blocks(
+        &self,
+        _remote_addr: &str,
+        _req_id: &str,
+        _namespace: &str,
+        _hashes: &[Vec<u8>],
+        _chunk_consumer: Option<PrefetchChunkConsumer>,
+    ) -> RdmaPrefetchResult {
+        RdmaPrefetchResult::default()
     }
 }
 
@@ -74,6 +91,30 @@ impl PrefetchSource {
             Self::Rdma => AttributionSource::Rdma,
         }
     }
+
+    fn record_backpressure(self, blocks: usize) {
+        if blocks == 0 {
+            return;
+        }
+        let metrics = core_metrics();
+        match self {
+            Self::Ssd => metrics
+                .ssd_prefetch_backpressure_blocks
+                .add(blocks as u64, &[]),
+            Self::Rdma => metrics
+                .rdma_prefetch_backpressure_blocks
+                .add(blocks as u64, &[]),
+        }
+    }
+
+    fn record_active_delta(self, blocks: i64) {
+        if blocks == 0 {
+            return;
+        }
+        if self == Self::Rdma {
+            core_metrics().rdma_prefetch_active_blocks.add(blocks, &[]);
+        }
+    }
 }
 
 struct PrefetchEntry {
@@ -84,7 +125,9 @@ struct PrefetchEntry {
 struct PrefetchTaskResult {
     source: Option<PrefetchSource>,
     found: usize,
+    fetched: usize,
     cache_inserts: PrefetchResult,
+    cache_inserts_handled: bool,
     ready_blocks: Vec<Arc<SealedBlock>>,
     missing: usize,
 }
@@ -109,6 +152,8 @@ struct PrefetchStart<'a> {
 struct PrefetchTaskDeps {
     rdma_fetch: Option<RdmaFetch>,
     ssd_store: Option<Arc<SsdBackingStore>>,
+    read_cache: Arc<ReadCache>,
+    metaserver_client: Option<Arc<MetaServerClient>>,
     prefetch_state: Arc<Mutex<PrefetchState>>,
     max_prefetch_blocks: usize,
 }
@@ -125,8 +170,8 @@ struct PrefetchTaskInput {
 
 struct PrefetchState {
     active: HashMap<String, PrefetchEntry>,
-    /// Reserved SSD prefetch budget for active background tasks.
-    reserved_ssd_prefetch_blocks: usize,
+    /// Reserved prefetch block budget for active background tasks.
+    reserved_prefetch_blocks: usize,
     /// req_ids where RDMA remote fetch returned zero blocks (remote evicted).
     /// Prevents re-triggering RDMA on every subsequent poll for the same request.
     failed_remote: HashMap<String, Instant>,
@@ -138,17 +183,17 @@ impl PrefetchState {
     }
 }
 
-struct SsdPrefetchReservation {
+struct PrefetchReservation {
     state: Arc<Mutex<PrefetchState>>,
+    source: PrefetchSource,
     blocks: usize,
 }
 
-impl Drop for SsdPrefetchReservation {
+impl Drop for PrefetchReservation {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        state.reserved_ssd_prefetch_blocks = state
-            .reserved_ssd_prefetch_blocks
-            .saturating_sub(self.blocks);
+        state.reserved_prefetch_blocks = state.reserved_prefetch_blocks.saturating_sub(self.blocks);
+        self.source.record_active_delta(-(self.blocks as i64));
     }
 }
 
@@ -170,7 +215,7 @@ impl PrefetchScheduler {
         Self {
             state: Arc::new(Mutex::new(PrefetchState {
                 active: HashMap::new(),
-                reserved_ssd_prefetch_blocks: 0,
+                reserved_prefetch_blocks: 0,
                 failed_remote: HashMap::new(),
             })),
             ssd_store,
@@ -182,13 +227,13 @@ impl PrefetchScheduler {
 
     pub(super) async fn check_and_prefetch(
         &self,
-        read_cache: &ReadCache,
+        read_cache: Arc<ReadCache>,
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
     ) -> PrefetchStatus {
         // Default: this call may be the first decision and should attribute.
-        match self.poll_existing(read_cache, req_id).await {
+        match self.poll_existing(&read_cache, req_id).await {
             PollResult::NoActivePrefetch => {}
             PollResult::StillLoading => {
                 return PrefetchStatus::Loading;
@@ -197,13 +242,14 @@ impl PrefetchScheduler {
         }
 
         self.full_prefix_scan(
-            read_cache,
+            &read_cache,
             PrefixScan {
                 req_id,
                 namespace,
                 hashes,
                 emit_tier_metrics: true,
             },
+            Arc::clone(&read_cache),
         )
         .await
     }
@@ -229,7 +275,9 @@ impl PrefetchScheduler {
                 PrefetchTaskResult {
                     source: None,
                     found: 0,
+                    fetched: 0,
                     cache_inserts: Vec::new(),
+                    cache_inserts_handled: false,
                     ready_blocks: Vec::new(),
                     missing: 0,
                 }
@@ -239,7 +287,7 @@ impl PrefetchScheduler {
         // RDMA remote node can return fewer blocks than MetaServer promised
         // (likely evicted). Don't re-trigger RDMA on subsequent scans.
         if result.source == Some(PrefetchSource::Rdma)
-            && result.cache_inserts.len() < result.found
+            && result.fetched < result.found
             && result.found > 0
         {
             self.state
@@ -248,9 +296,7 @@ impl PrefetchScheduler {
                 .insert(req_id.to_string(), Instant::now());
             info!(
                 "RDMA prefetch returned fewer blocks than expected: req_id={} returned={} expected={}",
-                req_id,
-                result.cache_inserts.len(),
-                result.found
+                req_id, result.fetched, result.found
             );
         }
 
@@ -259,13 +305,17 @@ impl PrefetchScheduler {
         // so peers can discover and fetch from here too. SSD prefetch is
         // skipped: those blocks were already registered by this node's own save
         // path, and eviction explicitly unregisters them.
-        let rdma_registration = if result.source == Some(PrefetchSource::Rdma) {
-            let resident_keys = read_cache.batch_insert_resident_keys(result.cache_inserts);
-            rdma_registration_from_resident_keys(result.source, &resident_keys)
-        } else {
-            read_cache.batch_insert(result.cache_inserts);
-            None
-        };
+        let rdma_registration =
+            if result.source == Some(PrefetchSource::Rdma) && !result.cache_inserts_handled {
+                let (resident_keys, _rejected_blocks) =
+                    read_cache.batch_insert_split_residency(result.cache_inserts);
+                rdma_registration_from_resident_keys(result.source, &resident_keys)
+            } else {
+                if !result.cache_inserts_handled {
+                    read_cache.batch_insert(result.cache_inserts);
+                }
+                None
+            };
 
         if let Some(client) = &self.metaserver_client
             && let Some((namespace, hashes)) = rdma_registration
@@ -283,6 +333,7 @@ impl PrefetchScheduler {
         &self,
         read_cache: &ReadCache,
         scan: PrefixScan<'_>,
+        read_cache_arc: Arc<ReadCache>,
     ) -> PrefetchStatus {
         let total_start = Instant::now();
 
@@ -301,15 +352,18 @@ impl PrefetchScheduler {
 
         let task_start = Instant::now();
         let task_started = !remaining.is_empty()
-            && self.start_prefetch_task(PrefetchStart {
-                req_id: scan.req_id,
-                namespace: scan.namespace,
-                remaining,
-                prefix_blocks: prefix_blocks.clone(),
-                total: keys.len(),
-                hit,
-                emit_tier_metrics: scan.emit_tier_metrics,
-            });
+            && self.start_prefetch_task(
+                PrefetchStart {
+                    req_id: scan.req_id,
+                    namespace: scan.namespace,
+                    remaining,
+                    prefix_blocks: prefix_blocks.clone(),
+                    total: keys.len(),
+                    hit,
+                    emit_tier_metrics: scan.emit_tier_metrics,
+                },
+                read_cache_arc,
+            );
         let task_schedule = task_start.elapsed();
 
         if task_started {
@@ -353,7 +407,7 @@ impl PrefetchScheduler {
         }
     }
 
-    fn start_prefetch_task(&self, start: PrefetchStart<'_>) -> bool {
+    fn start_prefetch_task(&self, start: PrefetchStart<'_>, read_cache: Arc<ReadCache>) -> bool {
         if start.remaining.is_empty() {
             return false;
         }
@@ -376,6 +430,8 @@ impl PrefetchScheduler {
         let deps = PrefetchTaskDeps {
             rdma_fetch,
             ssd_store: self.ssd_store.clone(),
+            read_cache,
+            metaserver_client: self.metaserver_client.clone(),
             prefetch_state: Arc::clone(&self.state),
             max_prefetch_blocks: self.max_prefetch_blocks,
         };
@@ -442,36 +498,32 @@ fn record_tier_attribution(
     record_cache_tier_block_requests(total, attribution);
 }
 
-fn reserve_ssd_prefetch_slots(
+fn reserve_prefetch_slots(
     state: Arc<Mutex<PrefetchState>>,
     max_prefetch_blocks: usize,
     requested: usize,
-) -> Option<(usize, SsdPrefetchReservation)> {
+    source: PrefetchSource,
+) -> Option<(usize, PrefetchReservation)> {
     let mut guard = state.lock();
-    let available = max_prefetch_blocks.saturating_sub(guard.reserved_ssd_prefetch_blocks);
+    let available = max_prefetch_blocks.saturating_sub(guard.reserved_prefetch_blocks);
 
     if available == 0 {
-        core_metrics()
-            .ssd_prefetch_backpressure_blocks
-            .add(requested as u64, &[]);
+        source.record_backpressure(requested);
         return None;
     }
 
     let reserved = requested.min(available);
     let skipped = requested - reserved;
-    if skipped > 0 {
-        core_metrics()
-            .ssd_prefetch_backpressure_blocks
-            .add(skipped as u64, &[]);
-    }
-
-    guard.reserved_ssd_prefetch_blocks += reserved;
+    source.record_backpressure(skipped);
+    guard.reserved_prefetch_blocks += reserved;
     drop(guard);
+    source.record_active_delta(reserved as i64);
 
     Some((
         reserved,
-        SsdPrefetchReservation {
+        PrefetchReservation {
             state,
+            source,
             blocks: reserved,
         },
     ))
@@ -499,10 +551,69 @@ fn build_ready_result(
     PrefetchTaskResult {
         source,
         found,
+        fetched: cache_inserts.len(),
         cache_inserts,
+        cache_inserts_handled: false,
         ready_blocks,
         missing,
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "ready reconstruction carries the completed prefetch context without allocating a temporary struct"
+)]
+fn build_ready_result_from_cache(
+    read_cache: &ReadCache,
+    prefix_blocks: Vec<Arc<SealedBlock>>,
+    total: usize,
+    source: Option<PrefetchSource>,
+    found: usize,
+    fetched: usize,
+    requested_keys: &[BlockKey],
+    retained_blocks: PrefetchResult,
+) -> PrefetchTaskResult {
+    let mut ready_blocks = prefix_blocks;
+    let retained_by_key: HashMap<_, _> = retained_blocks
+        .iter()
+        .map(|(key, block)| (key, block))
+        .collect();
+
+    for key in requested_keys {
+        if let Some(block) = read_cache.get_block(key) {
+            ready_blocks.push(block);
+        } else if let Some(block) = retained_by_key.get(key) {
+            ready_blocks.push(Arc::clone(*block));
+        } else {
+            break;
+        }
+    }
+
+    let missing = total.saturating_sub(ready_blocks.len());
+    PrefetchTaskResult {
+        source,
+        found,
+        fetched,
+        cache_inserts: Vec::new(),
+        cache_inserts_handled: true,
+        ready_blocks,
+        missing,
+    }
+}
+
+fn insert_and_register_rdma_blocks(
+    read_cache: &ReadCache,
+    metaserver_client: Option<&Arc<MetaServerClient>>,
+    blocks: PrefetchResult,
+) -> PrefetchResult {
+    let (resident_keys, rejected_blocks) = read_cache.batch_insert_split_residency(blocks);
+    if let Some(client) = metaserver_client
+        && let Some((namespace, hashes)) =
+            rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &resident_keys)
+    {
+        client.try_register_namespace(namespace, hashes);
+    }
+    rejected_blocks
 }
 
 fn rdma_registration_from_resident_keys(
@@ -519,6 +630,14 @@ fn rdma_registration_from_resident_keys(
 }
 
 async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> PrefetchTaskResult {
+    let PrefetchTaskDeps {
+        rdma_fetch,
+        ssd_store,
+        read_cache,
+        metaserver_client,
+        prefetch_state,
+        max_prefetch_blocks,
+    } = deps;
     let PrefetchTaskInput {
         req_id,
         namespace,
@@ -530,37 +649,88 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
     } = input;
     let remaining_hashes: Vec<Vec<u8>> = remaining_keys.iter().map(|k| k.hash.clone()).collect();
 
-    if let Some(rdma) = deps.rdma_fetch
-        && let Some((found, blocks)) = rdma
-            .try_fetch_prefix(&req_id, &namespace, &remaining_hashes)
-            .await
+    if let Some(rdma) = rdma_fetch
+        && let Some((node, found)) = rdma.query_prefix(&namespace, &remaining_hashes).await
     {
-        record_tier_attribution(
-            total,
-            hit,
+        if let Some((reserved, _reservation)) = reserve_prefetch_slots(
+            Arc::clone(&prefetch_state),
+            max_prefetch_blocks,
             found,
-            Some(PrefetchSource::Rdma.as_attribution()),
-            emit_tier_metrics,
-        );
-        return build_ready_result(
-            prefix_blocks,
-            total,
-            Some(PrefetchSource::Rdma),
-            found,
-            &remaining_keys[..found],
-            blocks,
+            PrefetchSource::Rdma,
+        ) {
+            let retained_blocks = Arc::new(Mutex::new(Vec::new()));
+            let chunk_consumer: PrefetchChunkConsumer = {
+                let read_cache = Arc::clone(&read_cache);
+                let metaserver_client = metaserver_client.clone();
+                let retained_blocks = Arc::clone(&retained_blocks);
+                Arc::new(move |blocks| {
+                    let rejected = insert_and_register_rdma_blocks(
+                        &read_cache,
+                        metaserver_client.as_ref(),
+                        blocks,
+                    );
+                    retained_blocks.lock().extend(rejected);
+                })
+            };
+            let rdma_result = rdma
+                .fetch_blocks(
+                    &node,
+                    &req_id,
+                    &namespace,
+                    &remaining_hashes[..reserved],
+                    Some(chunk_consumer),
+                )
+                .await;
+            record_tier_attribution(
+                total,
+                hit,
+                reserved,
+                Some(PrefetchSource::Rdma.as_attribution()),
+                emit_tier_metrics,
+            );
+            return if rdma_result.inserted_by_consumer {
+                let fetched = rdma_result.fetched_blocks.min(reserved);
+                let retained = std::mem::take(&mut *retained_blocks.lock());
+                build_ready_result_from_cache(
+                    &read_cache,
+                    prefix_blocks,
+                    total,
+                    Some(PrefetchSource::Rdma),
+                    reserved,
+                    fetched,
+                    &remaining_keys[..fetched],
+                    retained,
+                )
+            } else {
+                build_ready_result(
+                    prefix_blocks,
+                    total,
+                    Some(PrefetchSource::Rdma),
+                    reserved,
+                    &remaining_keys[..reserved],
+                    rdma_result.cache_inserts,
+                )
+            };
+        }
+
+        warn!(
+            "RDMA prefetch skipped by active block backpressure: req_id={} found={}",
+            req_id, found
         );
     }
 
-    if let Some(ssd) = deps.ssd_store {
+    if let Some(ssd) = ssd_store {
         let found = ssd.prefix_len(&remaining_keys);
         if found == 0 {
             record_tier_attribution(total, hit, 0, None, emit_tier_metrics);
             return build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new());
         }
-        let Some((reserved, _reservation)) =
-            reserve_ssd_prefetch_slots(deps.prefetch_state, deps.max_prefetch_blocks, found)
-        else {
+        let Some((reserved, _reservation)) = reserve_prefetch_slots(
+            prefetch_state,
+            max_prefetch_blocks,
+            found,
+            PrefetchSource::Ssd,
+        ) else {
             record_tier_attribution(total, hit, 0, None, emit_tier_metrics);
             return build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new());
         };
@@ -598,6 +768,14 @@ enum PollResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prefetch_state() -> Arc<Mutex<PrefetchState>> {
+        Arc::new(Mutex::new(PrefetchState {
+            active: HashMap::new(),
+            reserved_prefetch_blocks: 0,
+            failed_remote: HashMap::new(),
+        }))
+    }
 
     fn key(n: u8) -> BlockKey {
         BlockKey::new("ns".to_string(), vec![n])
@@ -663,6 +841,36 @@ mod tests {
     }
 
     #[test]
+    fn ready_result_from_cache_uses_retained_non_resident_blocks() {
+        let cache = ReadCache::new(1 << 20, false, None);
+        let k1 = key(1);
+        let k2 = key(2);
+        let k3 = key(3);
+        let b1 = block();
+        let b2 = block();
+
+        cache.batch_insert(vec![(k1.clone(), Arc::clone(&b1))]);
+
+        let result = build_ready_result_from_cache(
+            &cache,
+            Vec::new(),
+            3,
+            Some(PrefetchSource::Rdma),
+            3,
+            3,
+            &[k1.clone(), k2.clone(), k3],
+            vec![(k2, Arc::clone(&b2))],
+        );
+
+        assert!(result.cache_inserts_handled);
+        assert_eq!(result.fetched, 3);
+        assert_eq!(result.ready_blocks.len(), 2);
+        assert!(Arc::ptr_eq(&result.ready_blocks[0], &b1));
+        assert!(Arc::ptr_eq(&result.ready_blocks[1], &b2));
+        assert_eq!(result.missing, 1);
+    }
+
+    #[test]
     fn rdma_registration_uses_only_resident_keys() {
         let k1 = key(1);
         let k3 = key(3);
@@ -682,5 +890,36 @@ mod tests {
         assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Ssd), &[k1]).is_none());
         assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &[]).is_none());
         assert!(rdma_registration_from_resident_keys(None, &[]).is_none());
+    }
+
+    #[test]
+    fn prefetch_reservation_uses_shared_budget_across_sources() {
+        let state = prefetch_state();
+
+        let (rdma_reserved, rdma_reservation) =
+            reserve_prefetch_slots(Arc::clone(&state), 4, 3, PrefetchSource::Rdma)
+                .expect("RDMA reserve");
+        assert_eq!(rdma_reserved, 3);
+
+        let (ssd_reserved, ssd_reservation) =
+            reserve_prefetch_slots(Arc::clone(&state), 4, 3, PrefetchSource::Ssd)
+                .expect("SSD reserve");
+        assert_eq!(ssd_reserved, 1);
+        assert_eq!(state.lock().reserved_prefetch_blocks, 4);
+
+        drop(rdma_reservation);
+        assert_eq!(state.lock().reserved_prefetch_blocks, 1);
+        drop(ssd_reservation);
+        assert_eq!(state.lock().reserved_prefetch_blocks, 0);
+    }
+
+    #[test]
+    fn prefetch_reservation_rejects_when_budget_exhausted() {
+        let state = prefetch_state();
+        let (_reserved, _reservation) =
+            reserve_prefetch_slots(Arc::clone(&state), 2, 2, PrefetchSource::Rdma)
+                .expect("initial reserve");
+
+        assert!(reserve_prefetch_slots(state, 2, 1, PrefetchSource::Ssd).is_none());
     }
 }
