@@ -306,7 +306,9 @@ def _parse_rank_nics(value: Any, tp_rank: int | None) -> list[str] | None:
     return nics
 
 
-def make_peer_key(local_engine_id: str, local_tp_rank: int, remote_engine_id: str, remote_rank: int):
+def make_peer_key(
+    local_engine_id: str, local_tp_rank: int, remote_engine_id: str, remote_rank: int
+):
     """Build a stable directional key for one local TP rank to one remote rank."""
     return f"{local_engine_id}:{local_tp_rank}->{remote_engine_id}:{remote_rank}"
 
@@ -345,10 +347,14 @@ def make_accept_broker_endpoint(engine_id: str, side_channel_port: int) -> str:
 def make_accept_broker_endpoint_from_config(engine_id: str, vllm_config: VllmConfig) -> str:
     """Build the Pega RDMA accept broker endpoint using vLLM's NIXL port rule."""
     side_channel_port = (
-        envs.VLLM_NIXL_SIDE_CHANNEL_PORT
-        + vllm_config.parallel_config.data_parallel_index
+        envs.VLLM_NIXL_SIDE_CHANNEL_PORT + vllm_config.parallel_config.data_parallel_index
     )
     return make_accept_broker_endpoint(engine_id, side_channel_port)
+
+
+def make_accept_control_endpoint(engine_id: str, tp_rank: int, token: int) -> str:
+    """Build a worker-local inproc endpoint used only to wake accept shutdown."""
+    return f"inproc://pegaflow-nixl-rdma-v1-accept-stop-{engine_id}-{tp_rank}-{token}"
 
 
 def build_memory_regions(blocks_data: list[tuple[int, int, int]]) -> list[dict[str, int]]:
