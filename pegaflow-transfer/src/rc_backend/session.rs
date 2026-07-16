@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Weak};
 
 use mea::oneshot;
 use std::thread;
@@ -108,7 +108,12 @@ impl RcSession {
             cmd_tx,
         });
 
-        Self::spawn_worker(Arc::clone(&session), cmd_rx, runtime.numa_node)?;
+        Self::spawn_worker(
+            Arc::downgrade(&session),
+            cmd_rx,
+            runtime.numa_node,
+            local_endpoint.qp_num,
+        )?;
         Ok(session)
     }
 
@@ -197,10 +202,14 @@ impl RcSession {
         Ok(done_rx)
     }
 
+    // The worker holds only a Weak ref: a strong Arc here would keep the
+    // session (and its cmd_tx) alive forever, so recv() could never
+    // disconnect and every invalidated connection would leak its thread + QP.
     fn spawn_worker(
-        session: Arc<Self>,
+        session: Weak<Self>,
         cmd_rx: std_mpsc::Receiver<SessionCommand>,
         numa_node: NumaNode,
+        qpn: u32,
     ) -> Result<()> {
         thread::Builder::new()
             .name("pegaflow-rc-session".to_string())
@@ -210,30 +219,40 @@ impl RcSession {
                 {
                     warn!("Failed to pin rc session worker to {}: {}", numa_node, e);
                 }
-                debug!(
-                    "session worker started: local_qpn={}, numa={}",
-                    session.local_endpoint.qp_num, numa_node
-                );
+                debug!("session worker started: local_qpn={qpn}, numa={numa_node}");
                 while let Ok(command) = cmd_rx.recv() {
+                    // The upgraded Arc pins the session (and its QP) for the
+                    // duration of the batch.
+                    let Some(session) = session.upgrade() else {
+                        // The session died between enqueue and execution: fail
+                        // accepted commands explicitly instead of dropping
+                        // them as a generic channel-closed error.
+                        Self::reply_session_invalidated(command);
+                        while let Ok(queued) = cmd_rx.try_recv() {
+                            Self::reply_session_invalidated(queued);
+                        }
+                        break;
+                    };
                     match command {
                         SessionCommand::Transfer { ops, op, done_tx } => {
                             let result = Self::execute_batch(&session, ops, op);
                             if done_tx.send(result).is_err() {
-                                debug!(
-                                    "session worker reply receiver dropped: local_qpn={}",
-                                    session.local_endpoint.qp_num
-                                );
+                                debug!("session worker reply receiver dropped: local_qpn={qpn}");
                             }
                         }
                     }
                 }
-                debug!(
-                    "session worker stopped: local_qpn={}",
-                    session.local_endpoint.qp_num
-                );
+                debug!("session worker stopped: local_qpn={qpn}");
             })
             .map_err(|e| TransferError::Backend(format!("failed to spawn session worker: {e}")))?;
         Ok(())
+    }
+
+    fn reply_session_invalidated(command: SessionCommand) {
+        let SessionCommand::Transfer { done_tx, .. } = command;
+        let _ = done_tx.send(Err(TransferError::Backend(
+            "session invalidated before batch execution".to_string(),
+        )));
     }
 
     fn post_rdma_wr_chain(
