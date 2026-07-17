@@ -107,7 +107,6 @@ impl ReadCache {
         let mut found = Vec::new();
         for key in keys {
             if let Some(block) = inner.cache.get(key) {
-                let block = Arc::clone(block);
                 refresh_recency(&mut inner, key);
                 found.push((key.clone(), block));
             }
