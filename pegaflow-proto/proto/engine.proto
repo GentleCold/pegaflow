@@ -243,6 +243,9 @@ message InsertBlockHashesRequest {
 message InsertBlockHashesResponse {
   ResponseStatus status = 1;
   uint64 inserted_count = 2;
+  // Post-insert owner count, including this node, aligned with
+  // InsertBlockHashesRequest.block_hashes. Clients treat this as a best-effort hint.
+  repeated uint32 owner_counts = 3;
 }
 
 message RemoveBlockHashesRequest {

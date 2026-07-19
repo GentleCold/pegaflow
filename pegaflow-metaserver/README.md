@@ -136,8 +136,13 @@ message InsertBlockHashesRequest {
 message InsertBlockHashesResponse {
   ResponseStatus status = 1;    // Success/error status
   uint64 inserted_count = 2;    // Number of hashes inserted
+  repeated uint32 owner_counts = 3; // Post-insert owners per requested hash, including this node
 }
 ```
+
+`owner_counts` is an aligned snapshot for cache replacement hints. Clients do not use it for
+ownership correctness; Pega server and MetaServer versions carrying this contract are deployed
+together.
 
 ### 4. RemoveBlockHashes
 

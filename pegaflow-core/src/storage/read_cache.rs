@@ -7,6 +7,8 @@ use crate::block::{BlockKey, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::{CACHE_CLASS_RECLAIMABLE, CACHE_CLASS_RETAINED, core_metrics};
 
+const MIN_RECLAIMABLE_OWNER_COUNT: u32 = 3;
+
 pub(super) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
 }
@@ -170,6 +172,15 @@ impl ReadCache {
         let mut inner = self.inner.lock();
         for key in keys {
             if inner.cache.contains_key(key) {
+                mark_reclaimable(&mut inner, key);
+            }
+        }
+    }
+
+    pub(super) fn apply_owner_hints(&self, keys: &[BlockKey], owner_counts: &[u32]) {
+        let mut inner = self.inner.lock();
+        for (key, owner_count) in keys.iter().zip(owner_counts) {
+            if *owner_count >= MIN_RECLAIMABLE_OWNER_COUNT && inner.cache.contains_key(key) {
                 mark_reclaimable(&mut inner, key);
             }
         }
@@ -370,7 +381,7 @@ mod tests {
 
         let evicted = cache.remove_lru_batch(1);
         assert_eq!(evicted[0].0, reclaimable_miss);
-        assert!(cache.contains_keys(&[reclaimable_hit.clone()])[0]);
+        assert!(cache.contains_keys(std::slice::from_ref(&reclaimable_hit))[0]);
         let inner = cache.inner.lock();
         assert!(inner.reclaimable.contains_key(&reclaimable_hit));
         assert!(!inner.retained.contains_key(&reclaimable_hit));
@@ -388,7 +399,7 @@ mod tests {
 
         let evicted = cache.remove_lru_batch(1);
         assert_eq!(evicted[0].0, other);
-        assert!(cache.contains_keys(&[existing.clone()])[0]);
+        assert!(cache.contains_keys(std::slice::from_ref(&existing))[0]);
         let inner = cache.inner.lock();
         assert!(inner.reclaimable.contains_key(&existing));
         assert!(!inner.retained.contains_key(&existing));
@@ -416,6 +427,36 @@ mod tests {
 
         cache.mark_reclaimable(std::slice::from_ref(&key));
         assert_eq!(cache.remove_lru_batch(1)[0].0, key);
+    }
+
+    #[test]
+    fn owner_hint_marks_only_third_local_owner_as_reclaimable() {
+        let cache = make_cache();
+        let second_owner = BlockKey::new("ns".into(), vec![1]);
+        let third_owner = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert(vec![(second_owner.clone(), make_block())]);
+        cache.batch_insert(vec![(third_owner.clone(), make_block())]);
+        cache.apply_owner_hints(
+            &[second_owner.clone(), third_owner.clone()],
+            &[2, MIN_RECLAIMABLE_OWNER_COUNT],
+        );
+
+        let evicted = cache.remove_lru_batch(1);
+        assert_eq!(evicted[0].0, third_owner);
+        assert!(cache.contains_keys(&[second_owner])[0]);
+    }
+
+    #[test]
+    fn owner_hint_for_evicted_block_is_noop() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+        cache.remove_lru_batch(1);
+
+        cache.apply_owner_hints(&[key], &[MIN_RECLAIMABLE_OWNER_COUNT]);
+
+        assert!(cache.remove_lru_batch(1).is_empty());
     }
 
     #[test]
