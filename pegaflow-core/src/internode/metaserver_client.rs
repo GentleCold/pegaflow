@@ -199,8 +199,8 @@ impl MetaServerClient {
     }
 
     /// Enqueue a batched registration whose response carries post-insert
-    /// owner-count hints. The callback is best effort: it is not called when
-    /// the RPC fails or returns a malformed response.
+    /// owner counts. The callback runs only after a successful, aligned
+    /// response; queue, RPC, or protocol failures leave cache class unchanged.
     pub(crate) fn try_register_namespace_with_hint<F>(
         &self,
         namespace: String,
@@ -614,7 +614,7 @@ async fn registration_loop(
                         Ok(resp) => {
                             let inner = resp.into_inner();
                             if inner.owner_counts.len() != chunk.len() {
-                                warn!(
+                                error!(
                                     "MetaServer owner hint length mismatch: expected={} got={}",
                                     chunk.len(),
                                     inner.owner_counts.len()
