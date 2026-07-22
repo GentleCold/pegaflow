@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 
 use crate::backing::SsdBackingStore;
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
+use crate::cache::CacheInsertOutcome;
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
 use crate::offload::InsertEntries;
@@ -199,8 +200,8 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(deps) = &deps
     {
-        deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(deps, namespace, &sealed_blocks);
+        let resident_saves = deps.read_cache.batch_insert_refs(&sealed_blocks);
+        send_backing_batches(deps, namespace, &sealed_blocks, resident_saves);
     }
 
     ordered_fast_path_seals
@@ -269,6 +270,7 @@ fn send_backing_batches(
     deps: &InsertDeps,
     namespace: &str,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
+    resident_saves: Vec<(BlockKey, CacheInsertOutcome)>,
 ) {
     if blocks.is_empty() {
         return;
@@ -286,17 +288,28 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, blocks);
+        register_block_hashes(client, namespace, resident_saves, &deps.read_cache);
     }
 }
 
 fn register_block_hashes(
     client: &MetaServerClient,
     namespace: &str,
-    blocks: &[(BlockKey, Arc<SealedBlock>)],
+    resident_saves: Vec<(BlockKey, CacheInsertOutcome)>,
+    read_cache: &Arc<ReadCache>,
 ) {
-    let hashes: Vec<Vec<u8>> = blocks.iter().map(|(key, _)| key.hash.clone()).collect();
-    client.try_register_namespace(namespace.to_string(), hashes);
+    if resident_saves.is_empty() {
+        return;
+    }
+    let hashes: Vec<Vec<u8>> = resident_saves
+        .iter()
+        .map(|(key, _)| key.hash.clone())
+        .collect();
+
+    let read_cache = Arc::clone(read_cache);
+    client.try_register_namespace_with_hint(namespace.to_string(), hashes, move |owner_counts| {
+        read_cache.apply_owner_hints(&resident_saves, &owner_counts);
+    });
 }
 
 fn gc_inflight(

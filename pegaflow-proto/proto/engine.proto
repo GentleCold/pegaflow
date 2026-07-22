@@ -233,6 +233,10 @@ message InsertBlockHashesRequest {
 message InsertBlockHashesResponse {
   ResponseStatus status = 1;
   uint64 inserted_count = 2;
+  // Required post-insert owner count, including this node, aligned with
+  // InsertBlockHashesRequest.block_hashes. Pega server and MetaServer are
+  // deployed together; a missing or misaligned response is a protocol error.
+  repeated uint32 owner_counts = 3;
 }
 
 message RemoveBlockHashesRequest {
