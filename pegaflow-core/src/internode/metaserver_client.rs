@@ -5,8 +5,7 @@ use log::{debug, error, info, warn};
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    HeartbeatNodeRequest, InsertBlockHashesRequest, InsertBlockHashesResponse,
-    RemoveBlockHashesRequest, UnregisterNodeRequest,
+    HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
 #[cfg(feature = "rdma")]
 use pegaflow_proto::proto::engine::{NodePrefixResult, QueryPrefixBlocksRequest};
@@ -193,16 +192,9 @@ impl MetaServerClient {
         if hashes.is_empty() {
             return;
         }
-        self.try_send_register_batch(BlockHashBatch::single_namespace(namespace, hashes));
-    }
-
-    fn try_send_register_batch(&self, batch: BlockHashBatch) {
+        let batch = BlockHashBatch::single_namespace(namespace, hashes);
         let count = batch.count();
-        self.try_send_registration(MetaServerCommand::Insert(batch), count);
-    }
-
-    fn try_send_registration(&self, command: MetaServerCommand, count: usize) {
-        match self.command_tx.try_send(command) {
+        match self.command_tx.try_send(MetaServerCommand::Insert(batch)) {
             Ok(()) => {
                 core_metrics()
                     .metaserver_registration_blocks
@@ -486,29 +478,40 @@ async fn registration_loop(
         'insert: for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
             for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
                 let count = chunk.len();
-                match send_insert_chunk(c, namespace, chunk, &advertise_addr, &node_id).await {
+                let request = InsertBlockHashesRequest {
+                    namespace: namespace.clone(),
+                    block_hashes: chunk.to_vec(),
+                    node: advertise_addr.clone(),
+                    node_id: node_id.clone(),
+                };
+
+                match c.insert_block_hashes(request).await {
                     Ok(resp) => {
+                        let inner = resp.into_inner();
                         if let Some(cache) = read_cache.upgrade() {
-                            cache.mark_reclaimable_hashes(namespace, &resp.reclaimable_hashes);
+                            cache.mark_reclaimable_hashes(namespace, &inner.reclaimable_hashes);
                         }
                         debug!(
                             "Registered {} block hashes with MetaServer (namespace={}, inserted={}, reclaimable={})",
                             count,
                             namespace,
-                            resp.inserted_count,
-                            resp.reclaimable_hashes.len()
+                            inner.inserted_count,
+                            inner.reclaimable_hashes.len()
                         );
                     }
                     Err(e) => {
-                        handle_insert_error(
-                            "insert_block_hashes",
-                            namespace,
-                            count,
-                            &e,
-                            &advertise_addr,
-                            &node_id,
-                            &mut heartbeat,
+                        error!(
+                            "MetaServer insert_block_hashes failed (namespace={}, count={}): {e}",
+                            namespace, count
                         );
+                        if e.code() == Code::FailedPrecondition {
+                            warn!(
+                                "MetaServer insert rejected current session; resetting node registration: node={} node_id={}",
+                                advertise_addr, node_id
+                            );
+                            core_metrics().metaserver_session_resets.add(1, &[]);
+                            heartbeat.node_registered = false;
+                        }
                         insert_failed_at = Some((i, chunk_idx * MAX_HASHES_PER_RPC));
                         break 'insert;
                     }
@@ -585,45 +588,6 @@ async fn registration_loop(
     }
 
     info!("MetaServer registration loop shutting down");
-}
-
-async fn send_insert_chunk(
-    client: &mut MetaServerGrpcClient<Channel>,
-    namespace: &str,
-    hashes: &[Vec<u8>],
-    advertise_addr: &str,
-    node_id: &str,
-) -> Result<InsertBlockHashesResponse, tonic::Status> {
-    let request = InsertBlockHashesRequest {
-        namespace: namespace.to_string(),
-        block_hashes: hashes.to_vec(),
-        node: advertise_addr.to_string(),
-        node_id: node_id.to_string(),
-    };
-    client
-        .insert_block_hashes(request)
-        .await
-        .map(|response| response.into_inner())
-}
-
-fn handle_insert_error(
-    operation: &str,
-    namespace: &str,
-    count: usize,
-    error: &tonic::Status,
-    advertise_addr: &str,
-    node_id: &str,
-    heartbeat: &mut HeartbeatState,
-) {
-    error!("MetaServer {operation} failed (namespace={namespace}, count={count}): {error}");
-    if error.code() == Code::FailedPrecondition {
-        warn!(
-            "MetaServer insert rejected current session; resetting node registration: node={} node_id={}",
-            advertise_addr, node_id
-        );
-        core_metrics().metaserver_session_resets.add(1, &[]);
-        heartbeat.node_registered = false;
-    }
 }
 
 fn ack_flushes(acks: Vec<oneshot::Sender<()>>) {

@@ -222,7 +222,14 @@ impl BlockHashStore {
                     key_register_time: now,
                 },
             );
-            if previous.is_none() && owners.len() >= MIN_RECLAIMABLE_OWNER_COUNT {
+            let is_new_owner = previous.is_none_or(|owner| owner.node_id != node_id);
+            if is_new_owner
+                && owners
+                    .iter()
+                    .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
+                    .count()
+                    >= MIN_RECLAIMABLE_OWNER_COUNT
+            {
                 reclaimable_hashes.push(hash.clone());
             }
         }
@@ -555,6 +562,74 @@ mod tests {
                 .insert_hashes("ns", &hashes, "node-d:50055", node_d)
                 .unwrap(),
             vec![vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn stale_owner_does_not_count_toward_reclaim_hint() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_secs(30),
+            ttl: Duration::from_secs(60),
+        });
+        let hash = vec![1];
+        let node_a = heartbeat_node(&store, "node-a");
+        let node_b = heartbeat_node(&store, "node-b");
+        let node_c = heartbeat_node(&store, "node-c");
+        let node_d = heartbeat_node(&store, "node-d");
+
+        store
+            .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", node_a)
+            .unwrap();
+        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+
+        store
+            .insert_hashes("ns", std::slice::from_ref(&hash), "node-b", node_b)
+            .unwrap();
+        assert!(
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), "node-c", node_c)
+                .unwrap()
+                .is_empty(),
+            "the stale owner must not make node-c the third live owner"
+        );
+        assert_eq!(
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), "node-d", node_d)
+                .unwrap(),
+            vec![hash]
+        );
+    }
+
+    #[test]
+    fn new_session_at_same_address_counts_as_new_owner() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_secs(30),
+            ttl: Duration::from_secs(60),
+        });
+        let hash = vec![1];
+        let old_node_a = heartbeat_node(&store, "node-a");
+        let node_b = heartbeat_node(&store, "node-b");
+        let node_c = heartbeat_node(&store, "node-c");
+
+        for (node, node_id) in [
+            ("node-a", old_node_a),
+            ("node-b", node_b),
+            ("node-c", node_c),
+        ] {
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), node, node_id)
+                .unwrap();
+        }
+
+        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+        let new_node_a = heartbeat_node(&store, "node-a");
+        assert_ne!(old_node_a, new_node_a);
+
+        assert_eq!(
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", new_node_a,)
+                .unwrap(),
+            vec![hash]
         );
     }
 
