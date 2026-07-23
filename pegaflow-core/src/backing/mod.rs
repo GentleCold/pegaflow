@@ -31,6 +31,7 @@ pub(crate) use rdma_fetch::RdmaFetchStore;
 pub(crate) use ssd::SsdBackingStore;
 pub(crate) use ssd::new_ssd;
 
+/// Successful backing reads in the corresponding request-key order.
 pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
 
 /// Allocator closure for pinned memory, passed to the SSD backing store.

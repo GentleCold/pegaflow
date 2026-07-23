@@ -106,6 +106,7 @@ struct PrefetchTaskResult {
     source: Option<PrefetchSource>,
     found: usize,
     cache_inserts: PrefetchResult,
+    ready_keys: Vec<BlockKey>,
     ready_blocks: Vec<Arc<SealedBlock>>,
     missing: usize,
 }
@@ -122,6 +123,7 @@ struct PrefetchStart<'a> {
     req_id: &'a str,
     namespace: &'a str,
     remaining: &'a [BlockKey],
+    prefix_keys: &'a [BlockKey],
     prefix_blocks: Vec<Arc<SealedBlock>>,
     total: usize,
     hit: usize,
@@ -140,6 +142,7 @@ struct PrefetchTaskInput {
     req_id: String,
     namespace: String,
     remaining_keys: Vec<BlockKey>,
+    prefix_keys: Vec<BlockKey>,
     prefix_blocks: Vec<Arc<SealedBlock>>,
     total: usize,
     hit: usize,
@@ -257,6 +260,7 @@ impl PrefetchScheduler {
                     source: None,
                     found: 0,
                     cache_inserts: Vec::new(),
+                    ready_keys: Vec::new(),
                     ready_blocks: Vec::new(),
                     missing: 0,
                 }
@@ -286,13 +290,19 @@ impl PrefetchScheduler {
         // so peers can discover and fetch from here too. SSD prefetch is
         // skipped: those blocks were already registered by this node's own save
         // path, and eviction explicitly unregisters them.
+        // Backing stores return blocks in request order; insert from suffix to
+        // prefix so the resulting resident LRU has the desired order.
+        let mut cache_inserts = result.cache_inserts;
+        cache_inserts.reverse();
         let rdma_registration = if result.source == Some(PrefetchSource::Rdma) {
-            let resident_keys = read_cache.batch_insert_resident_keys(result.cache_inserts);
+            let resident_keys = read_cache.batch_insert_resident_keys(cache_inserts);
             rdma_registration_from_resident_keys(result.source, &resident_keys)
         } else {
-            read_cache.batch_insert(result.cache_inserts);
+            read_cache.batch_insert(cache_inserts);
             None
         };
+
+        read_cache.touch_keys_in_reverse(&result.ready_keys);
 
         if let Some(client) = &self.metaserver_client
             && let Some((namespace, hashes)) = rdma_registration
@@ -332,6 +342,7 @@ impl PrefetchScheduler {
                 req_id: scan.req_id,
                 namespace: scan.namespace,
                 remaining,
+                prefix_keys: &keys[..hit],
                 prefix_blocks: prefix_blocks.clone(),
                 total: keys.len(),
                 hit,
@@ -411,6 +422,7 @@ impl PrefetchScheduler {
             req_id: start.req_id.to_string(),
             namespace: start.namespace.to_string(),
             remaining_keys: start.remaining.to_vec(),
+            prefix_keys: start.prefix_keys.to_vec(),
             prefix_blocks: start.prefix_blocks,
             total: start.total,
             hit: start.hit,
@@ -512,6 +524,7 @@ fn reserve_ssd_prefetch_slots(
 }
 
 fn build_ready_result(
+    prefix_keys: Vec<BlockKey>,
     prefix_blocks: Vec<Arc<SealedBlock>>,
     total: usize,
     source: Option<PrefetchSource>,
@@ -519,21 +532,25 @@ fn build_ready_result(
     requested_keys: &[BlockKey],
     cache_inserts: PrefetchResult,
 ) -> PrefetchTaskResult {
+    let mut ready_keys = prefix_keys;
     let mut ready_blocks = prefix_blocks;
-    let inserts_by_key: HashMap<_, _> = cache_inserts
-        .iter()
-        .map(|(key, block)| (key, block))
-        .collect();
-    ready_blocks.extend(
-        requested_keys
-            .iter()
-            .map_while(|key| inserts_by_key.get(key).map(|block| Arc::clone(*block))),
-    );
+    let mut inserts = cache_inserts.iter();
+    for key in requested_keys {
+        let Some((inserted_key, block)) = inserts.next() else {
+            break;
+        };
+        if inserted_key != key {
+            break;
+        }
+        ready_keys.push(key.clone());
+        ready_blocks.push(Arc::clone(block));
+    }
     let missing = total.saturating_sub(ready_blocks.len());
     PrefetchTaskResult {
         source,
         found,
         cache_inserts,
+        ready_keys,
         ready_blocks,
         missing,
     }
@@ -557,6 +574,7 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
         req_id,
         namespace,
         remaining_keys,
+        prefix_keys,
         prefix_blocks,
         total,
         hit,
@@ -578,6 +596,7 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
             emit_tier_metrics,
         );
         return build_ready_result(
+            prefix_keys,
             prefix_blocks,
             total,
             Some(PrefetchSource::Rdma),
@@ -611,6 +630,7 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
                     emit_tier_metrics,
                 );
                 return build_ready_result(
+                    prefix_keys,
                     prefix_blocks,
                     total,
                     Some(PrefetchSource::Ssd),
@@ -638,6 +658,7 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
                     emit_tier_metrics,
                 );
                 return build_ready_result(
+                    prefix_keys,
                     prefix_blocks,
                     total,
                     Some(PrefetchSource::Rdma),
@@ -655,7 +676,7 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
     }
 
     record_tier_attribution(total, hit, 0, None, emit_tier_metrics);
-    build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new())
+    build_ready_result(prefix_keys, prefix_blocks, total, None, 0, &[], Vec::new())
 }
 
 enum PollResult {
@@ -677,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_result_rebuilds_prefix_in_requested_key_order() {
+    fn ready_result_accepts_backing_results_in_request_order() {
         let local = block();
         let k1 = key(1);
         let k2 = key(2);
@@ -687,14 +708,15 @@ mod tests {
         let b3 = block();
 
         let result = build_ready_result(
+            Vec::new(),
             vec![Arc::clone(&local)],
             4,
             Some(PrefetchSource::Ssd),
             3,
             &[k1.clone(), k2.clone(), k3.clone()],
             vec![
-                (k2, Arc::clone(&b2)),
                 (k1, Arc::clone(&b1)),
+                (k2, Arc::clone(&b2)),
                 (k3, Arc::clone(&b3)),
             ],
         );
@@ -718,15 +740,17 @@ mod tests {
 
         let result = build_ready_result(
             Vec::new(),
+            Vec::new(),
             3,
             Some(PrefetchSource::Ssd),
             3,
             &[k1.clone(), k2, k3.clone()],
-            vec![(k3, b3), (k1, Arc::clone(&b1))],
+            vec![(k1.clone(), Arc::clone(&b1)), (k3, b3)],
         );
 
         assert_eq!(result.ready_blocks.len(), 1);
         assert!(Arc::ptr_eq(&result.ready_blocks[0], &b1));
+        assert_eq!(result.ready_keys, vec![k1]);
         assert_eq!(result.missing, 2);
         assert_eq!(result.cache_inserts.len(), 2);
     }
@@ -753,6 +777,46 @@ mod tests {
         assert!(rdma_registration_from_resident_keys(None, &[]).is_none());
     }
 
+    #[tokio::test]
+    async fn ready_prefetch_refreshes_resident_prefix_in_reverse_order() {
+        let scheduler = PrefetchScheduler::new(None, None, None, 16);
+        let read_cache = ReadCache::new(1 << 20, false, None);
+        let keys = [key(1), key(2), key(3)];
+        let result = build_ready_result(
+            Vec::new(),
+            Vec::new(),
+            keys.len(),
+            Some(PrefetchSource::Ssd),
+            keys.len(),
+            &keys,
+            keys.iter().cloned().map(|key| (key, block())).collect(),
+        );
+        let handle = tokio::spawn(async move { result });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        scheduler.state.lock().active.insert(
+            "req".to_string(),
+            PrefetchEntry {
+                handle,
+                started_at: Instant::now(),
+            },
+        );
+
+        assert!(matches!(
+            scheduler.poll_existing(&read_cache, "req").await,
+            PollResult::Ready(PrefetchStatus::Ready { .. })
+        ));
+        assert_eq!(
+            read_cache
+                .remove_lru_batch(keys.len())
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![keys[2].clone(), keys[1].clone(), keys[0].clone()]
+        );
+    }
+
     /// Feed a finished prefetch task with the given outcome through
     /// `poll_existing` and report whether the request got blacklisted.
     async fn poll_outcome_blacklists_req(
@@ -766,6 +830,7 @@ mod tests {
             source,
             found,
             cache_inserts: (0..inserts).map(|i| (key(i as u8), block())).collect(),
+            ready_keys: Vec::new(),
             ready_blocks: Vec::new(),
             missing: 0,
         };

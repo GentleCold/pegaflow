@@ -39,6 +39,7 @@ pub const DEFAULT_SSD_PREFETCH_INFLIGHT: usize = 16;
 
 /// Result of a single prefetch I/O.
 type SinglePrefetchResult = (
+    usize,
     BlockKey,
     SsdIndexEntry,
     Option<Arc<SealedBlock>>,
@@ -46,6 +47,7 @@ type SinglePrefetchResult = (
     u64,
     Arc<BatchContext>,
 );
+type IndexedPrefetchResult = Option<(BlockKey, Arc<SealedBlock>)>;
 
 // ============================================================================
 // Configuration
@@ -402,9 +404,10 @@ pub(super) struct PrefetchBatch {
 }
 
 /// Shared context for a batch of prefetch operations.
-/// Collects successful blocks and delivers them as a batch when all reads finish.
+/// Collects successful blocks in request order and delivers them as a batch
+/// when all reads finish.
 pub(super) struct BatchContext {
-    results: Mutex<super::PrefetchResult>,
+    results: Mutex<Vec<IndexedPrefetchResult>>,
     remaining: AtomicUsize,
     done_tx: Mutex<Option<oneshot::Sender<super::PrefetchResult>>>,
 }
@@ -412,20 +415,23 @@ pub(super) struct BatchContext {
 impl BatchContext {
     fn new(count: usize, done_tx: oneshot::Sender<super::PrefetchResult>) -> Self {
         Self {
-            results: Mutex::new(Vec::with_capacity(count)),
+            results: Mutex::new((0..count).map(|_| None).collect()),
             remaining: AtomicUsize::new(count),
             done_tx: Mutex::new(Some(done_tx)),
         }
     }
 
-    fn complete_one(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
+    fn complete_one(&self, index: usize, key: BlockKey, block: Option<Arc<SealedBlock>>) {
         if let Some(block) = block {
-            self.results.lock().push((key, block));
+            self.results.lock()[index] = Some((key, block));
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
             && let Some(tx) = self.done_tx.lock().take()
         {
-            let results = std::mem::take(&mut *self.results.lock());
+            let results = std::mem::take(&mut *self.results.lock())
+                .into_iter()
+                .flatten()
+                .collect();
             let _ = tx.send(results);
         }
     }
@@ -439,6 +445,7 @@ struct SlotAlloc {
 
 /// Internal: single block prefetch task with per-slot allocated memory.
 struct PrefetchTask {
+    request_index: usize,
     key: BlockKey,
     entry: SsdIndexEntry,
     /// One per slot (parallel to `entry.slots`), each from the correct NUMA pool.
@@ -784,6 +791,7 @@ async fn dispatch_prefetch_batch(
             .collect();
 
         let task = PrefetchTask {
+            request_index: block_idx,
             key: req.key,
             entry: req.entry,
             slot_allocs: allocs,
@@ -793,9 +801,9 @@ async fn dispatch_prefetch_batch(
         if let Err(err) = task_tx.send(task).await {
             debug!("SSD prefetch dispatcher: worker channel closed");
             let task = err.0;
-            ctx.complete_one(task.key, None);
-            for (_, req) in iter {
-                ctx.complete_one(req.key, None);
+            ctx.complete_one(task.request_index, task.key, None);
+            for (request_index, req) in iter {
+                ctx.complete_one(request_index, req.key, None);
             }
             return false;
         }
@@ -824,7 +832,7 @@ async fn ssd_prefetch_worker(
             biased;
 
             // Complete finished tasks first (priority)
-            Some((key, entry, result, duration_secs, block_size, ctx)) = inflight.next(), if !inflight.is_empty() => {
+            Some((request_index, key, entry, result, duration_secs, block_size, ctx)) = inflight.next(), if !inflight.is_empty() => {
                 metrics.ssd_prefetch_inflight.add(-1, &[]);
 
                 // Validate data wasn't overwritten during read
@@ -843,7 +851,7 @@ async fn ssd_prefetch_worker(
                     metrics.ssd_prefetch_failures.add(1, &[]);
                     None
                 };
-                ctx.complete_one(key, result);
+                ctx.complete_one(request_index, key, result);
             }
 
             // Accept new task if below limit
@@ -863,7 +871,9 @@ async fn ssd_prefetch_worker(
     }
 
     // Drain remaining inflight tasks
-    while let Some((key, entry, result, duration_secs, block_size, ctx)) = inflight.next().await {
+    while let Some((request_index, key, entry, result, duration_secs, block_size, ctx)) =
+        inflight.next().await
+    {
         metrics.ssd_prefetch_inflight.add(-1, &[]);
 
         let valid = store.upgrade().is_some_and(|s| s.is_offset_valid(&entry));
@@ -882,7 +892,7 @@ async fn ssd_prefetch_worker(
             metrics.ssd_prefetch_failures.add(1, &[]);
             None
         };
-        ctx.complete_one(key, result);
+        ctx.complete_one(request_index, key, result);
     }
 
     debug!("SSD prefetch worker exiting");
@@ -940,7 +950,15 @@ async fn execute_prefetch(task: PrefetchTask, io: Arc<UringIoEngine>) -> SingleP
         }
     };
 
-    (key, task.entry, block, duration_secs(), block_size, ctx)
+    (
+        task.request_index,
+        key,
+        task.entry,
+        block,
+        duration_secs(),
+        block_size,
+        ctx,
+    )
 }
 
 // ============================================================================
@@ -976,6 +994,31 @@ mod tests {
 
     fn make_key(n: u8) -> BlockKey {
         BlockKey::new("test".to_string(), vec![n])
+    }
+
+    #[tokio::test]
+    async fn batch_context_preserves_request_order_across_out_of_order_completion() {
+        let (done_tx, done_rx) = oneshot::channel();
+        let ctx = BatchContext::new(3, done_tx);
+        let keys = [make_key(1), make_key(2), make_key(3)];
+
+        ctx.complete_one(
+            2,
+            keys[2].clone(),
+            Some(Arc::new(SealedBlock::from_slots(Vec::new()))),
+        );
+        ctx.complete_one(
+            0,
+            keys[0].clone(),
+            Some(Arc::new(SealedBlock::from_slots(Vec::new()))),
+        );
+        ctx.complete_one(1, keys[1].clone(), None);
+
+        let results = done_rx.await.expect("batch completion should be delivered");
+        assert_eq!(
+            results.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![keys[0].clone(), keys[2].clone()]
+        );
     }
 
     impl SsdRingBuffer {

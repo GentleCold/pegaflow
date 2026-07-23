@@ -49,17 +49,17 @@ impl ReadCache {
     pub(super) fn get_prefix_blocks(&self, keys: &[BlockKey]) -> (usize, Vec<Arc<SealedBlock>>) {
         let mut hit = 0usize;
         let mut blocks = Vec::with_capacity(keys.len());
-        {
-            let mut inner = self.inner.lock();
-            for key in keys {
-                if let Some(block) = inner.cache.get(key) {
-                    refresh_recency(&mut inner, key);
-                    hit += 1;
-                    blocks.push(block);
-                } else {
-                    break;
-                }
+        let mut inner = self.inner.lock();
+        for key in keys {
+            if let Some(block) = inner.cache.get(key) {
+                hit += 1;
+                blocks.push(block);
+            } else {
+                break;
             }
+        }
+        for key in keys[..hit].iter().rev() {
+            refresh_recency(&mut inner, key);
         }
         (hit, blocks)
     }
@@ -118,11 +118,18 @@ impl ReadCache {
         let mut found = Vec::new();
         for key in keys {
             if let Some(block) = inner.cache.get(key) {
-                refresh_recency(&mut inner, key);
                 found.push((key.clone(), block));
             }
         }
+        for (key, _) in found.iter().rev() {
+            refresh_recency(&mut inner, key);
+        }
         found
+    }
+
+    pub(super) fn touch_keys_in_reverse(&self, keys: &[BlockKey]) {
+        let mut inner = self.inner.lock();
+        touch_keys_in_reverse(&mut inner, keys);
     }
 
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
@@ -245,6 +252,14 @@ fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
     );
 }
 
+fn touch_keys_in_reverse(inner: &mut ReadCacheInner, keys: &[BlockKey]) {
+    for key in keys.iter().rev() {
+        if inner.cache.touch(key) {
+            refresh_recency(inner, key);
+        }
+    }
+}
+
 fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
     if !inner.cache.contains_key(key) {
         return false;
@@ -360,6 +375,72 @@ mod tests {
     }
 
     #[test]
+    fn prefix_hit_refreshes_in_reverse_order() {
+        let cache = make_cache();
+        let keys: Vec<_> = (1..=3)
+            .map(|value| BlockKey::new("ns".into(), vec![value]))
+            .collect();
+        cache.batch_insert_resident_keys(
+            keys.iter()
+                .cloned()
+                .map(|key| (key, make_block()))
+                .collect(),
+        );
+
+        let (hit, blocks) = cache.get_prefix_blocks(&keys);
+
+        assert_eq!(hit, 3);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            cache
+                .remove_lru_batch(3)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![keys[2].clone(), keys[1].clone(), keys[0].clone()]
+        );
+    }
+
+    #[test]
+    fn prefix_hit_stops_at_first_miss_without_touching_later_keys() {
+        let cache = make_cache();
+        let key1 = BlockKey::new("ns".into(), vec![1]);
+        let missing = BlockKey::new("ns".into(), vec![2]);
+        let key3 = BlockKey::new("ns".into(), vec![3]);
+        cache.batch_insert_resident_keys(vec![
+            (key1.clone(), make_block()),
+            (key3.clone(), make_block()),
+        ]);
+
+        let (hit, blocks) = cache.get_prefix_blocks(&[key1.clone(), missing, key3.clone()]);
+
+        assert_eq!(hit, 1);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(cache.remove_lru_batch(2)[0].0, key3);
+    }
+
+    #[test]
+    fn serving_hits_refresh_found_keys_in_reverse_order() {
+        let cache = make_cache();
+        let key1 = BlockKey::new("ns".into(), vec![1]);
+        let key2 = BlockKey::new("ns".into(), vec![2]);
+        let key3 = BlockKey::new("ns".into(), vec![3]);
+        cache.batch_insert(vec![
+            (key1.clone(), make_block()),
+            (key2.clone(), make_block()),
+            (key3.clone(), make_block()),
+        ]);
+
+        let found = cache.get_blocks(&[key1.clone(), key2.clone(), key3.clone()]);
+
+        assert_eq!(
+            found.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![key1.clone(), key2.clone(), key3.clone()]
+        );
+        assert_eq!(cache.remove_lru_batch(3)[0].0, key3);
+    }
+
+    #[test]
     fn serving_hit_refreshes_recency_without_changing_class() {
         let cache = make_cache();
         let hit = BlockKey::new("ns".into(), vec![1]);
@@ -430,6 +511,31 @@ mod tests {
         assert_class(&cache, &retained, ResidentClass::Reclaimable);
         assert_class(&cache, &reclaimable, ResidentClass::Reclaimable);
         assert_class(&cache, &other_namespace, ResidentClass::Retained);
+    }
+
+    #[test]
+    fn reclaimable_hint_preserves_registration_order_within_class() {
+        let cache = make_cache();
+        let keys: Vec<_> = (1..=3)
+            .map(|value| BlockKey::new("ns".into(), vec![value]))
+            .collect();
+        cache.batch_insert(
+            keys.iter()
+                .cloned()
+                .map(|key| (key, make_block()))
+                .collect(),
+        );
+
+        cache.mark_reclaimable_hashes(
+            "ns",
+            &[
+                keys[2].hash.clone(),
+                keys[1].hash.clone(),
+                keys[0].hash.clone(),
+            ],
+        );
+
+        assert_eq!(cache.remove_lru_batch(3)[0].0, keys[2]);
     }
 
     #[test]

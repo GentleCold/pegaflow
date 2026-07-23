@@ -67,6 +67,11 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
         hit
     }
 
+    /// Moves a resident key to the MRU position without updating frequency.
+    pub(crate) fn touch(&mut self, key: &BlockKey) -> bool {
+        self.lru.get(key).is_some()
+    }
+
     /// Checks membership without updating TinyLFU frequency.
     pub(crate) fn contains_key(&self, key: &BlockKey) -> bool {
         self.lru.contains_key(key)
@@ -279,5 +284,19 @@ mod tests {
         let _ = cache.get(&key);
         let after_get = cache.freq.as_ref().expect("lfu enabled").get(&key);
         assert!(after_get > after_contains);
+    }
+
+    #[test]
+    fn touch_does_not_bump_frequency() {
+        let mut cache = TinyLfuCache::new_unbounded(1024, true, Some(1));
+        let key = BlockKey::new("ns".to_string(), vec![1, 2, 3, 4]);
+        let value = Arc::new(SealedBlock::from_slots(Vec::new()));
+
+        let _ = cache.insert(key.clone(), value);
+        let before = cache.freq.as_ref().expect("lfu enabled").get(&key);
+
+        assert!(cache.touch(&key));
+        let after_touch = cache.freq.as_ref().expect("lfu enabled").get(&key);
+        assert_eq!(before, after_touch);
     }
 }

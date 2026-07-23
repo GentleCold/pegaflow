@@ -23,6 +23,8 @@ use crate::pinned_pool::PinnedAllocation;
 use crate::{EngineError, PegaEngine};
 use pegaflow_common::NumaNode;
 
+type HashedInsertEntry = (Vec<u8>, Vec<(usize, RawBlock)>);
+
 // ============================================================================
 // Types sent to the insert worker (deferred Phase 4)
 // ============================================================================
@@ -118,17 +120,24 @@ fn build_ordered_insert_entries(namespace: String, layers: Vec<RawSaveLayer>) ->
         .collect()
 }
 
-/// Fallback for heterogeneous per-layer hash sets: group via a hash map.
+/// Fallback for heterogeneous per-layer hash sets: group while preserving the
+/// first-seen hash order from the input layers.
 fn build_hashed_insert_entries(namespace: String, layers: Vec<RawSaveLayer>) -> InsertEntries {
     use std::collections::HashMap;
 
-    let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, RawBlock)>> = HashMap::new();
+    let mut hash_indices: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut hash_entries: Vec<HashedInsertEntry> = Vec::new();
     for layer in layers {
         for (block, hash) in layer.blocks.into_iter().zip(layer.block_hashes) {
-            hash_entries
-                .entry(hash)
-                .or_default()
-                .push((layer.slot_id, block));
+            let entry_index = if let Some(index) = hash_indices.get(&hash) {
+                *index
+            } else {
+                let index = hash_entries.len();
+                hash_indices.insert(hash.clone(), index);
+                hash_entries.push((hash, Vec::new()));
+                index
+            };
+            hash_entries[entry_index].1.push((layer.slot_id, block));
         }
     }
 

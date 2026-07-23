@@ -698,11 +698,10 @@ class WorkerConnector:
                 if not save_intent.block_ids:
                     continue
 
-                block_ids = save_intent.block_ids
-                block_hashes = save_intent.block_hashes
-
                 if self._cross_layer_mode:
                     target_layers = (self._cross_layer_key,)
+                    block_ids = list(save_intent.block_ids)
+                    block_hashes = list(save_intent.block_hashes)
                 elif self._page_first:
                     # Page-first: a block's page holds a whole shard's layers, so
                     # this rank writes all its registered layers (its shard).
@@ -716,11 +715,19 @@ class WorkerConnector:
                         # stripe. Layer-split ranks are each the sole writer of
                         # their shard and keep the full block set (no striping).
                         block_ids, block_hashes = self._block_shard(save_intent)
+                    else:
+                        block_ids = list(save_intent.block_ids)
+                        block_hashes = list(save_intent.block_hashes)
                 else:
                     assert self._registered_layers, (
                         "KV caches must be registered before submitting save intents"
                     )
                     target_layers = tuple(self._registered_layers)
+                    block_ids = list(save_intent.block_ids)
+                    block_hashes = list(save_intent.block_hashes)
+
+                block_ids.reverse()
+                block_hashes.reverse()
 
                 if not block_ids:
                     continue

@@ -248,8 +248,8 @@ def test_page_first_saves_all_layers_for_this_ranks_block_stripe():
     assert {name for name, _ids, _hashes in saves_list} == {"a", "b", "c"}
     # ...but only rank 1's block stripe (odd block ids), hashes kept aligned.
     for _name, ids, hashes in saves_list:
-        assert list(ids) == [1, 3]
-        assert list(hashes) == [b"h1", b"h3"]
+        assert list(ids) == [3, 1]
+        assert list(hashes) == [b"h3", b"h1"]
 
 
 def test_page_first_layer_split_saves_own_layers_for_all_blocks():
@@ -290,8 +290,51 @@ def test_page_first_layer_split_saves_own_layers_for_all_blocks():
     assert {name for name, _ids, _hashes in saves_list} == {"b", "d"}
     # ...and every block (no striping), hashes kept aligned.
     for _name, ids, hashes in saves_list:
-        assert list(ids) == [0, 1, 2, 3]
-        assert list(hashes) == [b"h0", b"h1", b"h2", b"h3"]
+        assert list(ids) == [3, 2, 1, 0]
+        assert list(hashes) == [b"h3", b"h2", b"h1", b"h0"]
+
+
+def test_save_reverses_each_request_without_reversing_request_order():
+    """Each request is suffix-first, while earlier requests remain earlier."""
+    from pegaflow.connector.worker import SaveTask, WorkerConnector
+
+    ctx = _make_ctx(device_id=1)
+    worker = WorkerConnector(ctx, vllm_config=SimpleNamespace(additional_config={}))
+    worker._registered_layers = ["layer"]
+    worker._page_first = False
+    worker._torch_device = None
+    ctx.engine_client.save.return_value = (True, "")
+
+    first = PegaConnectorMetadata(
+        save_intents={
+            "r1": SaveIntent(
+                block_ids=(0, 1),
+                block_hashes=(b"h0", b"h1"),
+            )
+        }
+    )
+    second = PegaConnectorMetadata(
+        save_intents={
+            "r2": SaveIntent(
+                block_ids=(2, 3),
+                block_hashes=(b"h2", b"h3"),
+            )
+        }
+    )
+    try:
+        with patch("torch.cuda.synchronize"):
+            worker._process_save_batch(
+                [
+                    SaveTask(metadata=first, request_ids=["r1"]),
+                    SaveTask(metadata=second, request_ids=["r2"]),
+                ]
+            )
+    finally:
+        worker._registered_layers = []
+        worker.shutdown()
+
+    saves_list = ctx.engine_client.save.call_args.args[4]
+    assert saves_list == [("layer", [1, 0, 3, 2], [b"h1", b"h0", b"h3", b"h2"])]
 
 
 # ---------------------------------------------------------------------------
