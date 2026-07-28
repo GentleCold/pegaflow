@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use hashlink::LruCache;
@@ -13,8 +14,7 @@ pub(crate) struct ReadCache {
 
 struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
-    reclaimable: LruCache<BlockKey, ()>,
-    retained: LruCache<BlockKey, ()>,
+    s3_fifo: S3FifoState,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -34,8 +34,7 @@ impl ReadCache {
         Self {
             inner: Mutex::new(ReadCacheInner {
                 cache,
-                reclaimable: LruCache::new_unbounded(),
-                retained: LruCache::new_unbounded(),
+                s3_fifo: S3FifoState::new(),
             }),
         }
     }
@@ -59,7 +58,7 @@ impl ReadCache {
             }
         }
         for key in keys[..hit].iter().rev() {
-            refresh_recency(&mut inner, key);
+            inner.s3_fifo.hit(key);
         }
         (hit, blocks)
     }
@@ -122,7 +121,7 @@ impl ReadCache {
             }
         }
         for (key, _) in found.iter().rev() {
-            refresh_recency(&mut inner, key);
+            inner.s3_fifo.hit(key);
         }
         found
     }
@@ -136,8 +135,8 @@ impl ReadCache {
         let mut inner = self.inner.lock();
         let mut evicted = Vec::with_capacity(batch_size);
         while evicted.len() < batch_size {
-            let next = remove_lru(&mut inner, ResidentClass::Reclaimable)
-                .or_else(|| remove_lru(&mut inner, ResidentClass::Retained));
+            let next = remove_s3_fifo(&mut inner, ResidentClass::Reclaimable)
+                .or_else(|| remove_s3_fifo(&mut inner, ResidentClass::Retained));
             let Some(block) = next else {
                 break;
             };
@@ -148,10 +147,9 @@ impl ReadCache {
 
     pub(super) fn remove_all(&self) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let mut inner = self.inner.lock();
-        let reclaimable_blocks = inner.reclaimable.len() as i64;
-        let retained_blocks = inner.retained.len() as i64;
-        inner.reclaimable.clear();
-        inner.retained.clear();
+        let reclaimable_blocks = inner.s3_fifo.class_len(ResidentClass::Reclaimable) as i64;
+        let retained_blocks = inner.s3_fifo.class_len(ResidentClass::Retained) as i64;
+        inner.s3_fifo.clear();
         let removed = inner.cache.remove_all();
         debug_assert_eq!(
             removed.len() as i64,
@@ -182,6 +180,7 @@ impl ReadCache {
             }
         }
         if moved > 0 {
+            inner.s3_fifo.compact_queues(ResidentClass::Retained);
             let metrics = core_metrics();
             metrics
                 .cache_resident_blocks
@@ -200,7 +199,10 @@ impl ReadCache {
 
     #[cfg(test)]
     pub(crate) fn is_reclaimable_for_test(&self, key: &BlockKey) -> bool {
-        self.inner.lock().reclaimable.contains_key(key)
+        self.inner
+            .lock()
+            .s3_fifo
+            .contains(key, ResidentClass::Reclaimable)
     }
 }
 
@@ -223,13 +225,13 @@ fn insert_block(
     let outcome = inner.cache.insert(key.clone(), block);
     match outcome {
         CacheInsertOutcome::InsertedNew => {
-            class_lru(inner, class).insert(key, ());
+            inner.s3_fifo.insert(class, key, footprint_bytes);
             let m = core_metrics();
             m.cache_block_insertions.add(1, &[]);
             m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
             m.cache_resident_blocks.add(1, class.attributes());
         }
-        CacheInsertOutcome::AlreadyExists => refresh_recency(inner, &key),
+        CacheInsertOutcome::AlreadyExists => inner.s3_fifo.hit(&key),
         CacheInsertOutcome::Rejected => {
             core_metrics().cache_block_admission_rejections.add(1, &[]);
         }
@@ -237,55 +239,39 @@ fn insert_block(
     outcome
 }
 
-fn class_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> &mut LruCache<BlockKey, ()> {
-    match class {
-        ResidentClass::Reclaimable => &mut inner.reclaimable,
-        ResidentClass::Retained => &mut inner.retained,
-    }
-}
-
-fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
-    let classified = inner.reclaimable.get(key).is_some() || inner.retained.get(key).is_some();
-    debug_assert!(
-        classified || !inner.cache.contains_key(key),
-        "resident block is missing its replacement class"
-    );
-}
-
 fn touch_keys_in_reverse(inner: &mut ReadCacheInner, keys: &[BlockKey]) {
     for key in keys.iter().rev() {
-        if inner.cache.touch(key) {
-            refresh_recency(inner, key);
+        if inner.cache.contains_key(key) {
+            inner.s3_fifo.hit(key);
         }
     }
 }
-
 fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
     if !inner.cache.contains_key(key) {
         return false;
     }
-    if inner.retained.remove(key).is_some() {
-        inner.reclaimable.insert(key.clone(), ());
+    if inner.s3_fifo.contains(key, ResidentClass::Retained) {
+        let bytes = inner.s3_fifo.remove(ResidentClass::Retained, key);
+        inner
+            .s3_fifo
+            .insert(ResidentClass::Reclaimable, key.clone(), bytes);
         true
     } else {
         debug_assert!(
-            inner.reclaimable.contains_key(key),
+            inner.s3_fifo.contains(key, ResidentClass::Reclaimable),
             "resident block is missing its replacement class"
         );
         false
     }
 }
 
-fn remove_lru(
+fn remove_s3_fifo(
     inner: &mut ReadCacheInner,
     class: ResidentClass,
 ) -> Option<(BlockKey, Arc<SealedBlock>)> {
-    while let Some((key, ())) = class_lru(inner, class).remove_lru() {
+    while let Some(key) = inner.s3_fifo.remove_next(class) {
         let block = inner.cache.remove(&key);
-        debug_assert!(
-            block.is_some(),
-            "replacement class contains a non-resident block"
-        );
+        debug_assert!(block.is_some(), "S3-FIFO contains a non-resident block");
         let Some(block) = block else {
             continue;
         };
@@ -297,6 +283,215 @@ fn remove_lru(
         return Some((key, block));
     }
     None
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum S3Queue {
+    Small,
+    Main,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct S3Entry {
+    queue: S3Queue,
+    frequency: u8,
+    footprint_bytes: u64,
+}
+
+struct S3FifoClass {
+    small: VecDeque<BlockKey>,
+    main: VecDeque<BlockKey>,
+    ghost: LruCache<BlockKey, ()>,
+    entries: HashMap<BlockKey, S3Entry>,
+    resident_bytes: u64,
+    small_bytes: u64,
+}
+
+impl Default for S3FifoClass {
+    fn default() -> Self {
+        Self {
+            small: VecDeque::new(),
+            main: VecDeque::new(),
+            ghost: LruCache::new_unbounded(),
+            entries: HashMap::new(),
+            resident_bytes: 0,
+            small_bytes: 0,
+        }
+    }
+}
+
+struct S3FifoState {
+    reclaimable: S3FifoClass,
+    retained: S3FifoClass,
+}
+
+impl S3FifoState {
+    fn new() -> Self {
+        Self {
+            reclaimable: S3FifoClass::default(),
+            retained: S3FifoClass::default(),
+        }
+    }
+
+    fn class(&self, class: ResidentClass) -> &S3FifoClass {
+        match class {
+            ResidentClass::Reclaimable => &self.reclaimable,
+            ResidentClass::Retained => &self.retained,
+        }
+    }
+
+    fn class_mut(&mut self, class: ResidentClass) -> &mut S3FifoClass {
+        match class {
+            ResidentClass::Reclaimable => &mut self.reclaimable,
+            ResidentClass::Retained => &mut self.retained,
+        }
+    }
+
+    fn insert(&mut self, class: ResidentClass, key: BlockKey, footprint_bytes: u64) {
+        let state = self.class_mut(class);
+        debug_assert!(!state.entries.contains_key(&key));
+        if state.ghost.remove(&key).is_some() {
+            state.main.push_back(key.clone());
+            state.entries.insert(
+                key,
+                S3Entry {
+                    queue: S3Queue::Main,
+                    frequency: 0,
+                    footprint_bytes,
+                },
+            );
+        } else {
+            state.small.push_back(key.clone());
+            state.small_bytes = state.small_bytes.saturating_add(footprint_bytes);
+            state.entries.insert(
+                key,
+                S3Entry {
+                    queue: S3Queue::Small,
+                    frequency: 0,
+                    footprint_bytes,
+                },
+            );
+        }
+        state.resident_bytes = state.resident_bytes.saturating_add(footprint_bytes);
+    }
+
+    fn hit(&mut self, key: &BlockKey) {
+        for class in [ResidentClass::Reclaimable, ResidentClass::Retained] {
+            let state = self.class_mut(class);
+            if let Some(entry) = state.entries.get_mut(key) {
+                entry.frequency = entry.frequency.saturating_add(1).min(3);
+                return;
+            }
+        }
+        debug_assert!(false, "S3-FIFO hit for missing resident key");
+    }
+
+    fn contains(&self, key: &BlockKey, class: ResidentClass) -> bool {
+        self.class(class).entries.contains_key(key)
+    }
+
+    fn remove(&mut self, class: ResidentClass, key: &BlockKey) -> u64 {
+        let state = self.class_mut(class);
+        let Some(entry) = state.entries.remove(key) else {
+            return 0;
+        };
+        state.resident_bytes = state.resident_bytes.saturating_sub(entry.footprint_bytes);
+        if entry.queue == S3Queue::Small {
+            state.small_bytes = state.small_bytes.saturating_sub(entry.footprint_bytes);
+        }
+        state.trim_ghost();
+        entry.footprint_bytes
+    }
+
+    fn compact_queues(&mut self, class: ResidentClass) {
+        let state = self.class_mut(class);
+        let entries = &state.entries;
+        state.small.retain(|key| {
+            entries
+                .get(key)
+                .is_some_and(|entry| entry.queue == S3Queue::Small)
+        });
+        state.main.retain(|key| {
+            entries
+                .get(key)
+                .is_some_and(|entry| entry.queue == S3Queue::Main)
+        });
+        state.trim_ghost();
+    }
+
+    fn class_len(&self, class: ResidentClass) -> usize {
+        self.class(class).entries.len()
+    }
+
+    fn clear(&mut self) {
+        self.reclaimable = S3FifoClass::default();
+        self.retained = S3FifoClass::default();
+    }
+
+    fn remove_next(&mut self, class: ResidentClass) -> Option<BlockKey> {
+        let state = self.class_mut(class);
+        loop {
+            let small_target = state.resident_bytes / 10;
+            let queue = if !state.small.is_empty()
+                && (state.main.is_empty() || state.small_bytes >= small_target)
+            {
+                S3Queue::Small
+            } else if !state.main.is_empty() {
+                S3Queue::Main
+            } else if !state.small.is_empty() {
+                S3Queue::Small
+            } else {
+                return None;
+            };
+            let key = match queue {
+                S3Queue::Small => state.small.pop_front(),
+                S3Queue::Main => state.main.pop_front(),
+            }?;
+            let Some(entry) = state.entries.get_mut(&key) else {
+                continue;
+            };
+            if entry.queue != queue {
+                continue;
+            }
+            match queue {
+                S3Queue::Small if entry.frequency > 1 => {
+                    entry.queue = S3Queue::Main;
+                    entry.frequency = 0;
+                    state.small_bytes = state.small_bytes.saturating_sub(entry.footprint_bytes);
+                    state.main.push_back(key);
+                }
+                S3Queue::Small => {
+                    let entry = state.entries.remove(&key)?;
+                    state.resident_bytes =
+                        state.resident_bytes.saturating_sub(entry.footprint_bytes);
+                    state.small_bytes = state.small_bytes.saturating_sub(entry.footprint_bytes);
+                    state.ghost.insert(key.clone(), ());
+                    state.trim_ghost();
+                    return Some(key);
+                }
+                S3Queue::Main if entry.frequency > 0 => {
+                    entry.frequency -= 1;
+                    state.main.push_back(key);
+                }
+                S3Queue::Main => {
+                    let entry = state.entries.remove(&key)?;
+                    state.resident_bytes =
+                        state.resident_bytes.saturating_sub(entry.footprint_bytes);
+                    state.trim_ghost();
+                    return Some(key);
+                }
+            }
+        }
+    }
+}
+
+impl S3FifoClass {
+    fn trim_ghost(&mut self) {
+        let limit = self.main.len().max(1);
+        while self.ghost.len() > limit {
+            self.ghost.remove_lru();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -311,16 +506,169 @@ mod tests {
         Arc::new(SealedBlock::from_slots(Vec::new()))
     }
 
+    fn make_key(id: u8) -> BlockKey {
+        BlockKey::new("ns".into(), vec![id])
+    }
+
     fn assert_class(cache: &ReadCache, key: &BlockKey, expected: ResidentClass) {
         let inner = cache.inner.lock();
         assert!(inner.cache.contains_key(key));
         assert_eq!(
-            inner.reclaimable.contains_key(key),
+            inner.s3_fifo.contains(key, ResidentClass::Reclaimable),
             expected == ResidentClass::Reclaimable
         );
         assert_eq!(
-            inner.retained.contains_key(key),
+            inner.s3_fifo.contains(key, ResidentClass::Retained),
             expected == ResidentClass::Retained
+        );
+    }
+
+    #[test]
+    fn s3_fifo_ghost_hit_enters_main() {
+        let mut state = S3FifoState::new();
+        let key = make_key(1);
+
+        state.insert(ResidentClass::Retained, key.clone(), 100);
+        assert_eq!(
+            state.class(ResidentClass::Retained).entries[&key].queue,
+            S3Queue::Small
+        );
+        assert_eq!(
+            state.remove_next(ResidentClass::Retained),
+            Some(key.clone())
+        );
+        assert!(
+            state
+                .class(ResidentClass::Retained)
+                .ghost
+                .contains_key(&key)
+        );
+
+        state.insert(ResidentClass::Retained, key.clone(), 100);
+        let retained = state.class(ResidentClass::Retained);
+        assert_eq!(retained.entries[&key].queue, S3Queue::Main);
+        assert!(!retained.ghost.contains_key(&key));
+    }
+
+    #[test]
+    fn s3_fifo_caps_frequency_and_promotes_reused_small_entry() {
+        let mut state = S3FifoState::new();
+        let hot = make_key(1);
+        let cold = make_key(2);
+        state.insert(ResidentClass::Retained, hot.clone(), 100);
+        state.insert(ResidentClass::Retained, cold.clone(), 100);
+
+        for _ in 0..4 {
+            state.hit(&hot);
+        }
+        assert_eq!(
+            state.class(ResidentClass::Retained).entries[&hot].frequency,
+            3
+        );
+
+        assert_eq!(state.remove_next(ResidentClass::Retained), Some(cold));
+        let hot_entry = state
+            .class(ResidentClass::Retained)
+            .entries
+            .get(&hot)
+            .expect("hot entry should remain resident");
+        assert_eq!(hot_entry.queue, S3Queue::Main);
+        assert_eq!(hot_entry.frequency, 0);
+    }
+
+    #[test]
+    fn s3_fifo_requeues_main_entry_with_frequency() {
+        let mut state = S3FifoState::new();
+        let first = make_key(1);
+        let second = make_key(2);
+
+        for key in [&first, &second] {
+            state.insert(ResidentClass::Retained, key.clone(), 100);
+            assert_eq!(
+                state.remove_next(ResidentClass::Retained),
+                Some(key.clone())
+            );
+            state.insert(ResidentClass::Retained, key.clone(), 100);
+        }
+        state.hit(&first);
+
+        assert_eq!(state.remove_next(ResidentClass::Retained), Some(second));
+        let first_entry = state
+            .class(ResidentClass::Retained)
+            .entries
+            .get(&first)
+            .expect("frequent main entry should remain resident");
+        assert_eq!(first_entry.queue, S3Queue::Main);
+        assert_eq!(first_entry.frequency, 0);
+    }
+
+    #[test]
+    fn s3_fifo_uses_resident_bytes_for_small_target() {
+        let mut state = S3FifoState::new();
+        let main = make_key(1);
+        let small = make_key(2);
+
+        state.insert(ResidentClass::Retained, main.clone(), 990);
+        assert_eq!(
+            state.remove_next(ResidentClass::Retained),
+            Some(main.clone())
+        );
+        state.insert(ResidentClass::Retained, main.clone(), 990);
+        state.insert(ResidentClass::Retained, small.clone(), 10);
+
+        assert_eq!(state.remove_next(ResidentClass::Retained), Some(main));
+        assert!(state.contains(&small, ResidentClass::Retained));
+    }
+
+    #[test]
+    fn s3_fifo_bounds_ghost_by_main_entries() {
+        let mut state = S3FifoState::new();
+        let main_keys = [make_key(1), make_key(2)];
+        for key in &main_keys {
+            state.insert(ResidentClass::Retained, key.clone(), 1_000);
+            assert_eq!(
+                state.remove_next(ResidentClass::Retained),
+                Some(key.clone())
+            );
+            state.insert(ResidentClass::Retained, key.clone(), 1_000);
+        }
+
+        let ghost_candidates = [make_key(3), make_key(4), make_key(5)];
+        for key in &ghost_candidates {
+            state.insert(ResidentClass::Retained, key.clone(), 1_000);
+            assert_eq!(
+                state.remove_next(ResidentClass::Retained),
+                Some(key.clone())
+            );
+        }
+
+        let retained = state.class(ResidentClass::Retained);
+        assert_eq!(retained.main.len(), 2);
+        assert_eq!(retained.ghost.len(), 2);
+        assert!(!retained.ghost.contains_key(&ghost_candidates[0]));
+        assert!(retained.ghost.contains_key(&ghost_candidates[1]));
+        assert!(retained.ghost.contains_key(&ghost_candidates[2]));
+    }
+
+    #[test]
+    fn s3_fifo_classes_have_independent_frequency_and_bytes() {
+        let mut state = S3FifoState::new();
+        let reclaimable = make_key(1);
+        let retained = make_key(2);
+        state.insert(ResidentClass::Reclaimable, reclaimable.clone(), 10);
+        state.insert(ResidentClass::Retained, retained.clone(), 20);
+        state.hit(&retained);
+
+        assert_eq!(state.class(ResidentClass::Reclaimable).resident_bytes, 10);
+        assert_eq!(state.class(ResidentClass::Reclaimable).small_bytes, 10);
+        assert_eq!(state.class(ResidentClass::Retained).resident_bytes, 20);
+        assert_eq!(
+            state.class(ResidentClass::Retained).entries[&retained].frequency,
+            1
+        );
+        assert_eq!(
+            state.class(ResidentClass::Reclaimable).entries[&reclaimable].frequency,
+            0
         );
     }
 
@@ -358,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn local_hit_refreshes_recency_without_changing_class() {
+    fn repeated_local_hit_promotes_entry_without_changing_class() {
         let cache = make_cache();
         let hit = BlockKey::new("ns".into(), vec![1]);
         let oldest = BlockKey::new("ns".into(), vec![2]);
@@ -367,41 +715,14 @@ mod tests {
             (hit.clone(), make_block()),
             (oldest.clone(), make_block()),
         ]);
-        let (count, _) = cache.get_prefix_blocks(std::slice::from_ref(&hit));
+        let (first_count, _) = cache.get_prefix_blocks(std::slice::from_ref(&hit));
+        let (second_count, _) = cache.get_prefix_blocks(std::slice::from_ref(&hit));
 
-        assert_eq!(count, 1);
+        assert_eq!((first_count, second_count), (1, 1));
         assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
         assert_class(&cache, &hit, ResidentClass::Reclaimable);
     }
 
-    #[test]
-    fn prefix_hit_refreshes_in_reverse_order() {
-        let cache = make_cache();
-        let keys: Vec<_> = (1..=3)
-            .map(|value| BlockKey::new("ns".into(), vec![value]))
-            .collect();
-        cache.batch_insert_resident_keys(
-            keys.iter()
-                .cloned()
-                .map(|key| (key, make_block()))
-                .collect(),
-        );
-
-        let (hit, blocks) = cache.get_prefix_blocks(&keys);
-
-        assert_eq!(hit, 3);
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(
-            cache
-                .remove_lru_batch(3)
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect::<Vec<_>>(),
-            vec![keys[2].clone(), keys[1].clone(), keys[0].clone()]
-        );
-    }
-
-    #[test]
     fn prefix_hit_stops_at_first_miss_without_touching_later_keys() {
         let cache = make_cache();
         let key1 = BlockKey::new("ns".into(), vec![1]);
@@ -416,32 +737,19 @@ mod tests {
 
         assert_eq!(hit, 1);
         assert_eq!(blocks.len(), 1);
-        assert_eq!(cache.remove_lru_batch(2)[0].0, key3);
-    }
-
-    #[test]
-    fn serving_hits_refresh_found_keys_in_reverse_order() {
-        let cache = make_cache();
-        let key1 = BlockKey::new("ns".into(), vec![1]);
-        let key2 = BlockKey::new("ns".into(), vec![2]);
-        let key3 = BlockKey::new("ns".into(), vec![3]);
-        cache.batch_insert(vec![
-            (key1.clone(), make_block()),
-            (key2.clone(), make_block()),
-            (key3.clone(), make_block()),
-        ]);
-
-        let found = cache.get_blocks(&[key1.clone(), key2.clone(), key3.clone()]);
-
+        let inner = cache.inner.lock();
         assert_eq!(
-            found.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
-            vec![key1.clone(), key2.clone(), key3.clone()]
+            inner.s3_fifo.class(ResidentClass::Reclaimable).entries[&key1].frequency,
+            1
         );
-        assert_eq!(cache.remove_lru_batch(3)[0].0, key3);
+        assert_eq!(
+            inner.s3_fifo.class(ResidentClass::Reclaimable).entries[&key3].frequency,
+            0
+        );
     }
 
     #[test]
-    fn serving_hit_refreshes_recency_without_changing_class() {
+    fn repeated_serving_hit_promotes_entry_without_changing_class() {
         let cache = make_cache();
         let hit = BlockKey::new("ns".into(), vec![1]);
         let oldest = BlockKey::new("ns".into(), vec![2]);
@@ -450,6 +758,7 @@ mod tests {
             (hit.clone(), make_block()),
             (oldest.clone(), make_block()),
         ]);
+        assert_eq!(cache.get_blocks(std::slice::from_ref(&hit)).len(), 1);
         assert_eq!(cache.get_blocks(std::slice::from_ref(&hit)).len(), 1);
 
         assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
@@ -467,8 +776,10 @@ mod tests {
         cache.batch_insert_resident_keys(vec![(remote_first.clone(), make_block())]);
         cache.batch_insert_resident_keys(vec![(remote_other.clone(), make_block())]);
         cache.batch_insert(vec![(remote_first.clone(), make_block())]);
+        cache.batch_insert(vec![(remote_first.clone(), make_block())]);
         cache.batch_insert(vec![(local_first.clone(), make_block())]);
         cache.batch_insert(vec![(local_other.clone(), make_block())]);
+        cache.batch_insert_resident_keys(vec![(local_first.clone(), make_block())]);
         cache.batch_insert_resident_keys(vec![(local_first.clone(), make_block())]);
 
         assert_class(&cache, &remote_first, ResidentClass::Reclaimable);
@@ -637,8 +948,8 @@ mod tests {
         assert_eq!(removed.len(), 2);
         assert_eq!(cache.get_blocks(&[key1, key2]).len(), 0);
         let inner = cache.inner.lock();
-        assert!(inner.reclaimable.is_empty());
-        assert!(inner.retained.is_empty());
+        assert_eq!(inner.s3_fifo.class_len(ResidentClass::Reclaimable), 0);
+        assert_eq!(inner.s3_fifo.class_len(ResidentClass::Retained), 0);
         drop(inner);
         assert!(cache.remove_all().is_empty());
     }
@@ -663,7 +974,13 @@ mod tests {
                 .batch_insert_resident_keys(vec![(cold_key.clone(), make_block())])
                 .is_empty()
         );
-        assert!(!cache.inner.lock().reclaimable.contains_key(&cold_key));
+        assert!(
+            !cache
+                .inner
+                .lock()
+                .s3_fifo
+                .contains(&cold_key, ResidentClass::Reclaimable)
+        );
         assert_eq!(cache.get_blocks(&[hot_key]).len(), 1);
         assert_eq!(cache.get_blocks(&[cold_key]).len(), 0);
     }
