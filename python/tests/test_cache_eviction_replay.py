@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import tarfile
+from collections import UserDict
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ from pegaflow.benchmarks.cache_eviction_replay import (
     PreparedRequest,
     RequestResult,
     TraceEntry,
+    _extract_token_ids,
+    _normalize_text_messages,
     adapt_request,
     compare_command,
     counter_delta,
@@ -135,6 +138,40 @@ def test_non_stream_request_drops_stream_options() -> None:
 
     assert payload["stream"] is False
     assert "stream_options" not in payload
+
+
+def test_text_content_normalization_matches_vllm_string_format() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"},
+            ],
+        },
+        {"role": "assistant", "content": None, "tool_calls": []},
+    ]
+
+    normalized = _normalize_text_messages(messages)
+
+    assert normalized == [
+        {"role": "user", "content": "first\nsecond"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+    ]
+    assert isinstance(messages[0]["content"], list)
+
+
+def test_text_content_normalization_rejects_non_text_parts() -> None:
+    with pytest.raises(ValueError, match="only text chat content parts"):
+        _normalize_text_messages(
+            [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]
+        )
+
+
+def test_token_ids_support_non_dict_mapping_results() -> None:
+    tokenized = UserDict({"input_ids": [[1, 2, 3]], "attention_mask": [[1, 1, 1]]})
+
+    assert _extract_token_ids(tokenized) == [1, 2, 3]
 
 
 def test_dispatcher_starts_requests_in_export_order_and_caps_concurrency() -> None:

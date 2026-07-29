@@ -17,7 +17,7 @@ import re
 import subprocess
 import tarfile
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -162,6 +162,45 @@ class HyperLogLog:
         return raw
 
 
+def _normalize_text_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Match vLLM's string-format normalization for text-only chat content."""
+
+    normalized = []
+    for message in messages:
+        item = dict(message)
+        content = item.get("content")
+        if content is None:
+            item["content"] = ""
+        elif isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                elif (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    text_parts.append(part["text"])
+                else:
+                    raise ValueError("only text chat content parts are supported")
+            item["content"] = "\n".join(text_parts)
+        normalized.append(item)
+    return normalized
+
+
+def _extract_token_ids(tokenized: Any) -> list[int]:
+    if isinstance(tokenized, Mapping):
+        tokenized = tokenized["input_ids"]
+    if tokenized and isinstance(tokenized[0], list):
+        tokenized = tokenized[0]
+    if not isinstance(tokenized, list) or any(
+        not isinstance(item, int) for item in tokenized
+    ):
+        raise TypeError("chat template did not return a flat token ID list")
+    return tokenized
+
+
 class VllmBlockHasher:
     """Tokenize chat payloads and reproduce vLLM's chained block hashes."""
 
@@ -208,6 +247,7 @@ class VllmBlockHasher:
             "model": model,
             "hash_algo": hash_algo,
             "block_size": block_size,
+            "chat_content_format": "string",
             "tokenizer_sha256": hashlib.sha256(encoded).hexdigest(),
             "tokenizer_name_or_path": self._tokenizer.name_or_path,
             "model_revision": self._tokenizer.init_kwargs.get("_commit_hash"),
@@ -220,11 +260,10 @@ class VllmBlockHasher:
         }
         if payload.get("tools"):
             template_args["tools"] = payload["tools"]
-        token_ids = self._tokenizer.apply_chat_template(payload["messages"], **template_args)
-        if isinstance(token_ids, dict):
-            token_ids = token_ids["input_ids"]
-        if token_ids and isinstance(token_ids[0], list):
-            token_ids = token_ids[0]
+        messages = _normalize_text_messages(payload["messages"])
+        token_ids = _extract_token_ids(
+            self._tokenizer.apply_chat_template(messages, **template_args)
+        )
 
         hashes: list[bytes] = []
         parent: bytes | None = None
