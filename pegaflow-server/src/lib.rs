@@ -19,6 +19,7 @@ pub use service::GrpcEngineService;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
+use cudarc::runtime::result as cuda_runtime;
 use log::{error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
@@ -330,7 +331,6 @@ fn init_python_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
     Python::attach(|py| -> pyo3::PyResult<()> {
         let torch = py.import("torch")?;
         let cuda = torch.getattr("cuda")?;
-        cuda.call_method0("init")?;
 
         // Initialize CUDA context for each device by performing a real CUDA operation
         // PyTorch uses lazy initialization, so we need to actually allocate something
@@ -442,6 +442,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;
+    if let Some(&device_id) = cli.devices.first() {
+        cuda_runtime::device::set(device_id).map_err(|err| {
+            std::io::Error::other(format!(
+                "failed to select initial CUDA device {device_id}: {err}"
+            ))
+        })?;
+    }
     check_cuda_version::preflight()?;
 
     // Determine which devices to initialize
