@@ -205,9 +205,7 @@ def test_dispatcher_starts_requests_in_export_order_and_caps_concurrency() -> No
 
 
 def test_theoretical_ratios_use_prefix_first_miss_and_successes_only() -> None:
-    hashes = {
-        name: hashlib.sha256(name.encode()).digest() for name in ("a", "b", "c", "d", "x")
-    }
+    hashes = {name: hashlib.sha256(name.encode()).digest() for name in ("a", "b", "c", "d", "x")}
     completed = [
         CompletedRequest(request_result(0), (hashes["a"], hashes["b"], hashes["c"])),
         CompletedRequest(request_result(1), (hashes["a"], hashes["b"], hashes["d"])),
@@ -347,9 +345,7 @@ def test_compare_rejects_different_success_sets(tmp_path: Path) -> None:
 
 
 def test_metric_sample_shape_is_stable() -> None:
-    assert MetricSample("metric", (("class", "retained"),), 1.0).labels == (
-        ("class", "retained"),
-    )
+    assert MetricSample("metric", (("class", "retained"),), 1.0).labels == (("class", "retained"),)
 
 
 def test_prepare_error_does_not_persist_exception_text() -> None:

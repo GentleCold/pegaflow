@@ -194,9 +194,7 @@ def _extract_token_ids(tokenized: Any) -> list[int]:
         tokenized = tokenized["input_ids"]
     if tokenized and isinstance(tokenized[0], list):
         tokenized = tokenized[0]
-    if not isinstance(tokenized, list) or any(
-        not isinstance(item, int) for item in tokenized
-    ):
+    if not isinstance(tokenized, list) or any(not isinstance(item, int) for item in tokenized):
         raise TypeError("chat template did not return a flat token ID list")
     return tokenized
 
@@ -553,9 +551,7 @@ async def run_replay(
     return completed, time.perf_counter() - replay_started
 
 
-_METRIC_RE = re.compile(
-    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([\d.eE+-]+)(?:\s+\d+)?$"
-)
+_METRIC_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([\d.eE+-]+)(?:\s+\d+)?$")
 _LABEL_RE = re.compile(r'(\w+)="((?:\\.|[^"\\])*)"')
 
 
@@ -590,7 +586,9 @@ def metric_sum(
     return total
 
 
-def fetch_metrics(endpoints: dict[str, str]) -> tuple[dict[str, str], dict[str, list[MetricSample]]]:
+def fetch_metrics(
+    endpoints: dict[str, str],
+) -> tuple[dict[str, str], dict[str, list[MetricSample]]]:
     raw = {}
     parsed = {}
     for name, url in endpoints.items():
@@ -666,9 +664,7 @@ def summarize_metrics(
         "eviction_deltas_by_class": classes,
         "occupancy": occupancy,
         "mean_resident_block_bytes": (
-            sum(resident_block_bytes) / len(resident_block_bytes)
-            if resident_block_bytes
-            else None
+            sum(resident_block_bytes) / len(resident_block_bytes) if resident_block_bytes else None
         ),
     }
 
@@ -677,7 +673,9 @@ def theoretical_stats(
     completed: Sequence[CompletedRequest],
     bucket_bits: int,
 ) -> dict[str, Any]:
-    successful = sorted((item for item in completed if item.result.ok), key=lambda item: item.result.index)
+    successful = sorted(
+        (item for item in completed if item.result.ok), key=lambda item: item.result.index
+    )
     hll = HyperLogLog(bucket_bits)
     exact: set[bytes] = set()
     seen: set[bytes] = set()
@@ -932,7 +930,10 @@ def comparison_row(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any], dict[
 def compare_command(args: argparse.Namespace) -> int:
     if len(args.run_dir) < 2:
         raise ValueError("compare requires at least two run directories")
-    runs = [(Path(value).expanduser().resolve(), *comparison_row(Path(value).expanduser())) for value in args.run_dir]
+    runs = [
+        (Path(value).expanduser().resolve(), *comparison_row(Path(value).expanduser()))
+        for value in args.run_dir
+    ]
     contract_fields = (
         "trace_sha256",
         "start_offset",
@@ -982,14 +983,10 @@ def compare_command(args: argparse.Namespace) -> int:
                 "p99_e2e_ms": summary["e2e"]["p99_ms"],
                 "request_throughput": summary["successful_request_throughput"],
                 "evictions": counters["pegaflow_cache_block_evictions"],
-                "admission_rejections": counters[
-                    "pegaflow_cache_block_admission_rejections"
-                ],
+                "admission_rejections": counters["pegaflow_cache_block_admission_rejections"],
                 "load_failures": counters["pegaflow_load_failures"],
                 "end_occupancy_bytes": sum(item["end_bytes"] for item in occupancy.values()),
-                "estimated_unique_footprint_bytes": summary[
-                    "estimated_unique_footprint_bytes"
-                ],
+                "estimated_unique_footprint_bytes": summary["estimated_unique_footprint_bytes"],
             }
         )
     rows.sort(
