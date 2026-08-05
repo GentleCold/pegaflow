@@ -723,31 +723,6 @@ mod tests {
         assert_class(&cache, &hit, ResidentClass::Reclaimable);
     }
 
-    fn prefix_hit_stops_at_first_miss_without_touching_later_keys() {
-        let cache = make_cache();
-        let key1 = BlockKey::new("ns".into(), vec![1]);
-        let missing = BlockKey::new("ns".into(), vec![2]);
-        let key3 = BlockKey::new("ns".into(), vec![3]);
-        cache.batch_insert_resident_keys(vec![
-            (key1.clone(), make_block()),
-            (key3.clone(), make_block()),
-        ]);
-
-        let (hit, blocks) = cache.get_prefix_blocks(&[key1.clone(), missing, key3.clone()]);
-
-        assert_eq!(hit, 1);
-        assert_eq!(blocks.len(), 1);
-        let inner = cache.inner.lock();
-        assert_eq!(
-            inner.s3_fifo.class(ResidentClass::Reclaimable).entries[&key1].frequency,
-            1
-        );
-        assert_eq!(
-            inner.s3_fifo.class(ResidentClass::Reclaimable).entries[&key3].frequency,
-            0
-        );
-    }
-
     #[test]
     fn repeated_serving_hit_promotes_entry_without_changing_class() {
         let cache = make_cache();
