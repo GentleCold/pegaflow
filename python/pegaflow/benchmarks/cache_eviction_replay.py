@@ -18,7 +18,9 @@ import subprocess
 import tarfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.request import Request, urlopen
@@ -111,6 +113,7 @@ class RequestResult:
     ttft_ms: float | None
     e2e_ms: float | None
     dispatch_offset_ms: float | None
+    completion_offset_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,115 @@ class MetricSample:
     name: str
     labels: tuple[tuple[str, str], ...]
     value: float
+
+
+@dataclass
+class CompletionLedger:
+    """Successful request progress visible to the metrics sampler."""
+
+    successful_requests: int = 0
+    successful_full_blocks: int = 0
+
+    def record(self, completed: CompletedRequest) -> None:
+        if completed.result.ok:
+            self.successful_requests += 1
+            self.successful_full_blocks += completed.result.full_blocks
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "successful_requests": self.successful_requests,
+            "successful_full_blocks": self.successful_full_blocks,
+        }
+
+
+@dataclass
+class TimeSeriesCollector:
+    """Collect periodic metrics and completed-request progress for one replay."""
+
+    output_dir: Path
+    endpoints: dict[str, str]
+    baseline: dict[str, list[MetricSample]]
+    replay_started: float
+    interval_s: float
+    ledger: CompletionLedger
+    samples: list[dict[str, Any]] = field(default_factory=list)
+
+    def add_sample(
+        self,
+        *,
+        kind: str,
+        raw: dict[str, str],
+        parsed: dict[str, list[MetricSample]],
+        errors: dict[str, str] | None = None,
+    ) -> None:
+        sample_index = len(self.samples)
+        elapsed_s = max(0.0, time.perf_counter() - self.replay_started)
+        progress = self.ledger.snapshot()
+        sample_errors = errors or {}
+        metrics: dict[str, Any] | None = None
+        hit_blocks_delta: float | None = None
+        ram_hit_blocks_delta: float | None = None
+        rdma_hit_blocks_delta: float | None = None
+        ratio: float | None = None
+        ram_ratio: float | None = None
+        rdma_ratio: float | None = None
+        invalid_reason: str | None = None
+        if parsed and set(parsed) == set(self.baseline):
+            metrics = summarize_metrics(self.baseline, parsed)
+            tier_deltas = metrics["tier_block_request_deltas"]
+            ram_hit_blocks_delta = tier_deltas.get("ram", 0.0)
+            rdma_hit_blocks_delta = tier_deltas.get("rdma", 0.0)
+            hit_blocks_delta = ram_hit_blocks_delta + rdma_hit_blocks_delta
+            denominator = progress["successful_full_blocks"]
+            if ram_hit_blocks_delta < 0 or rdma_hit_blocks_delta < 0:
+                invalid_reason = "hit_counter_reset"
+            elif denominator <= 0:
+                invalid_reason = "no_completed_successful_full_blocks"
+            elif hit_blocks_delta > denominator:
+                invalid_reason = "hits_exceed_completed_full_blocks"
+            else:
+                ratio = hit_blocks_delta / denominator
+                ram_ratio = ram_hit_blocks_delta / denominator
+                rdma_ratio = rdma_hit_blocks_delta / denominator
+        elif parsed:
+            invalid_reason = "incomplete_metrics_endpoints"
+        elif not sample_errors:
+            invalid_reason = "metrics_empty"
+
+        sample = {
+            "sample_index": sample_index,
+            "sample_kind": kind,
+            "elapsed_sec": elapsed_s,
+            "sample_wall_time": datetime.now(timezone.utc).isoformat(),
+            "interval_s": self.interval_s,
+            **progress,
+            "hit_blocks_delta": hit_blocks_delta,
+            "cumulative_actual_hit_ratio": ratio,
+            "ram_hit_blocks_delta": ram_hit_blocks_delta,
+            "cumulative_ram_hit_ratio": ram_ratio,
+            "rdma_hit_blocks_delta": rdma_hit_blocks_delta,
+            "cumulative_rdma_hit_ratio": rdma_ratio,
+            "ratio_invalid_reason": invalid_reason,
+            "metrics_errors": sample_errors,
+            "metrics": metrics,
+        }
+        self.samples.append(sample)
+
+        if raw:
+            sample_dir = self.output_dir / "metrics_samples"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            write_raw_metrics(sample_dir / f"{sample_index:04d}_{kind}.prom", raw, self.endpoints)
+
+    async def run(self) -> None:
+        if self.interval_s <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(self.interval_s)
+                raw, parsed, errors = await asyncio.to_thread(fetch_metrics_partial, self.endpoints)
+                self.add_sample(kind="interval", raw=raw, parsed=parsed, errors=errors)
+        except asyncio.CancelledError:
+            raise
 
 
 class HyperLogLog:
@@ -493,6 +605,7 @@ async def send_request(
         ttft_ms=ttft_ms,
         e2e_ms=e2e_ms,
         dispatch_offset_ms=(started - replay_started) * 1000,
+        completion_offset_ms=(time.perf_counter() - replay_started) * 1000,
     )
     return CompletedRequest(result, prepared.block_hashes if ok else ())
 
@@ -501,6 +614,7 @@ async def replay_prepared(
     prepared_requests: Iterable[PreparedRequest],
     concurrency: int,
     sender: Callable[[PreparedRequest], Any],
+    on_complete: Callable[[CompletedRequest], None] | None = None,
 ) -> list[CompletedRequest]:
     if concurrency <= 0:
         raise ValueError("concurrency must be positive")
@@ -518,7 +632,10 @@ async def replay_prepared(
             try:
                 if item is None:
                     return
-                completed.append(await sender(item))
+                result = await sender(item)
+                completed.append(result)
+                if on_complete is not None:
+                    on_complete(result)
             finally:
                 queue.task_done()
 
@@ -534,6 +651,8 @@ async def run_replay(
     concurrency: int,
     timeout_s: float,
     api_key: str | None,
+    replay_started: float | None = None,
+    on_complete: Callable[[CompletedRequest], None] | None = None,
 ) -> tuple[list[CompletedRequest], float]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     limits = httpx.Limits(
@@ -541,13 +660,18 @@ async def run_replay(
         max_keepalive_connections=concurrency,
     )
     timeout = httpx.Timeout(timeout_s if timeout_s > 0 else None)
-    replay_started = time.perf_counter()
+    replay_started = replay_started if replay_started is not None else time.perf_counter()
     async with httpx.AsyncClient(headers=headers, timeout=timeout, limits=limits) as client:
 
         async def sender(prepared: PreparedRequest) -> CompletedRequest:
             return await send_request(client, endpoint, prepared, replay_started)
 
-        completed = await replay_prepared(prepared_requests, concurrency, sender)
+        completed = await replay_prepared(
+            prepared_requests,
+            concurrency,
+            sender,
+            on_complete=on_complete,
+        )
     return completed, time.perf_counter() - replay_started
 
 
@@ -600,12 +724,125 @@ def fetch_metrics(
     return raw, parsed
 
 
+def fetch_metrics_partial(
+    endpoints: dict[str, str],
+) -> tuple[dict[str, str], dict[str, list[MetricSample]], dict[str, str]]:
+    """Fetch each endpoint independently for best-effort timeline samples."""
+
+    raw: dict[str, str] = {}
+    parsed: dict[str, list[MetricSample]] = {}
+    errors: dict[str, str] = {}
+    for name, url in endpoints.items():
+        try:
+            request = Request(url, headers={"Accept": "text/plain"})
+            with urlopen(request, timeout=10) as response:
+                content = response.read().decode("utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001 - preserve endpoint-local failures in samples
+            errors[name] = f"{type(exc).__name__}: {exc}"
+            continue
+        raw[name] = content
+        parsed[name] = parse_prometheus(content)
+    return raw, parsed, errors
+
+
 def write_raw_metrics(path: Path, raw: dict[str, str], endpoints: dict[str, str]) -> None:
     chunks = []
     for name in sorted(raw):
         chunks.append(f"# PEGAFLOW_REPLAY_ENDPOINT name={name} url={endpoints[name]}\n")
         chunks.append(raw[name].rstrip() + "\n")
     path.write_text("".join(chunks), encoding="utf-8")
+
+
+TIMESERIES_FIELDS = (
+    "sample_index",
+    "sample_kind",
+    "elapsed_sec",
+    "sample_wall_time",
+    "interval_s",
+    "successful_requests",
+    "successful_full_blocks",
+    "hit_blocks_delta",
+    "cumulative_actual_hit_ratio",
+    "ram_hit_blocks_delta",
+    "cumulative_ram_hit_ratio",
+    "rdma_hit_blocks_delta",
+    "cumulative_rdma_hit_ratio",
+    "ratio_invalid_reason",
+    "evictions_delta",
+    "admission_rejections_delta",
+    "load_failures_delta",
+    "ram_block_requests_delta",
+    "rdma_block_requests_delta",
+    "ssd_block_requests_delta",
+    "miss_block_requests_delta",
+    "end_resident_bytes",
+    "metrics_errors",
+)
+
+
+def _timeseries_row(sample: dict[str, Any]) -> dict[str, Any]:
+    metrics = sample.get("metrics") or {}
+    counters = metrics.get("counter_deltas") or {}
+    tiers = metrics.get("tier_block_request_deltas") or {}
+    occupancy = metrics.get("occupancy") or {}
+    return {
+        "sample_index": sample["sample_index"],
+        "sample_kind": sample["sample_kind"],
+        "elapsed_sec": sample["elapsed_sec"],
+        "sample_wall_time": sample["sample_wall_time"],
+        "interval_s": sample["interval_s"],
+        "successful_requests": sample["successful_requests"],
+        "successful_full_blocks": sample["successful_full_blocks"],
+        "hit_blocks_delta": sample["hit_blocks_delta"],
+        "cumulative_actual_hit_ratio": sample["cumulative_actual_hit_ratio"],
+        "ram_hit_blocks_delta": sample["ram_hit_blocks_delta"],
+        "cumulative_ram_hit_ratio": sample["cumulative_ram_hit_ratio"],
+        "rdma_hit_blocks_delta": sample["rdma_hit_blocks_delta"],
+        "cumulative_rdma_hit_ratio": sample["cumulative_rdma_hit_ratio"],
+        "ratio_invalid_reason": sample["ratio_invalid_reason"],
+        "evictions_delta": counters.get("pegaflow_cache_block_evictions"),
+        "admission_rejections_delta": counters.get("pegaflow_cache_block_admission_rejections"),
+        "load_failures_delta": counters.get("pegaflow_load_failures"),
+        "ram_block_requests_delta": tiers.get("ram"),
+        "rdma_block_requests_delta": tiers.get("rdma"),
+        "ssd_block_requests_delta": tiers.get("ssd"),
+        "miss_block_requests_delta": tiers.get("miss"),
+        "end_resident_bytes": sum(item.get("end_bytes", 0) for item in occupancy.values()),
+        "metrics_errors": json.dumps(sample.get("metrics_errors") or {}, sort_keys=True),
+    }
+
+
+def write_timeseries(
+    output_dir: Path,
+    samples: Sequence[dict[str, Any]],
+    block_stats: dict[str, Any],
+) -> None:
+    """Persist non-sensitive timeline samples and theoretical references."""
+
+    timeline_path = output_dir / "metrics_timeseries.jsonl"
+    with timeline_path.open("w", encoding="utf-8") as destination:
+        for sample in samples:
+            payload = {
+                **sample,
+                "hll_theoretical_hit_ratio": block_stats["hll_theoretical_hit_ratio"],
+                "prefix_aware_ideal_hit_ratio": block_stats["prefix_aware_ideal_hit_ratio"],
+            }
+            destination.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    csv_path = output_dir / "hit_rate_timeseries.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as destination:
+        fields = [
+            *TIMESERIES_FIELDS,
+            "hll_theoretical_hit_ratio",
+            "prefix_aware_ideal_hit_ratio",
+        ]
+        writer = csv.DictWriter(destination, fieldnames=fields)
+        writer.writeheader()
+        for sample in samples:
+            row = _timeseries_row(sample)
+            row["hll_theoretical_hit_ratio"] = block_stats["hll_theoretical_hit_ratio"]
+            row["prefix_aware_ideal_hit_ratio"] = block_stats["prefix_aware_ideal_hit_ratio"]
+            writer.writerow(row)
 
 
 def counter_delta(
@@ -759,6 +996,69 @@ def public_result(result: RequestResult) -> dict[str, Any]:
     return asdict(result)
 
 
+async def run_replay_with_metrics(
+    prepared: Sequence[PreparedRequest],
+    *,
+    endpoint: str,
+    concurrency: int,
+    timeout_s: float,
+    api_key: str | None,
+    metrics_endpoints: dict[str, str],
+    output_dir: Path,
+    metrics_interval_s: float,
+) -> tuple[
+    list[CompletedRequest],
+    float,
+    dict[str, str],
+    dict[str, list[MetricSample]],
+    dict[str, str],
+    dict[str, list[MetricSample]],
+    TimeSeriesCollector,
+]:
+    raw_start, parsed_start = await asyncio.to_thread(fetch_metrics, metrics_endpoints)
+    write_raw_metrics(output_dir / "metrics_start.prom", raw_start, metrics_endpoints)
+
+    replay_started = time.perf_counter()
+    ledger = CompletionLedger()
+    collector = TimeSeriesCollector(
+        output_dir=output_dir,
+        endpoints=metrics_endpoints,
+        baseline=parsed_start,
+        replay_started=replay_started,
+        interval_s=metrics_interval_s,
+        ledger=ledger,
+    )
+    collector.add_sample(kind="baseline", raw=raw_start, parsed=parsed_start)
+    sampler_task = asyncio.create_task(collector.run())
+    try:
+        completed, replay_duration_s = await run_replay(
+            prepared,
+            endpoint=endpoint,
+            concurrency=concurrency,
+            timeout_s=timeout_s,
+            api_key=api_key,
+            replay_started=replay_started,
+            on_complete=ledger.record,
+        )
+    finally:
+        sampler_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sampler_task
+
+    raw_end, parsed_end = await asyncio.to_thread(fetch_metrics, metrics_endpoints)
+    write_raw_metrics(output_dir / "metrics_end.prom", raw_end, metrics_endpoints)
+    collector.add_sample(kind="final", raw=raw_end, parsed=parsed_end)
+    return (
+        completed,
+        replay_duration_s,
+        raw_start,
+        parsed_start,
+        raw_end,
+        parsed_end,
+        collector,
+    )
+
+
 def build_summary(
     strategy: str,
     results: Sequence[CompletedRequest],
@@ -777,7 +1077,11 @@ def build_summary(
     ttfts = [result.ttft_ms for result in successful if result.ttft_ms is not None]
     e2es = [result.e2e_ms for result in successful if result.e2e_ms is not None]
     denominator = block_stats["total_full_block_references"]
-    actual_hits = metrics["counter_deltas"]["pegaflow_cache_block_hits"]
+    tier_hits = metrics["tier_block_request_deltas"]
+    ram_hits = tier_hits.get("ram", 0.0)
+    rdma_hits = tier_hits.get("rdma", 0.0)
+    actual_hits = ram_hits + rdma_hits
+    external_counter_hits = metrics["counter_deltas"]["pegaflow_cache_block_hits"]
     mean_block_bytes = metrics["mean_resident_block_bytes"]
     exact_distinct = block_stats["exact_distinct_full_blocks"]
     return {
@@ -791,7 +1095,18 @@ def build_summary(
         "block_stats": block_stats,
         "actual_external_hit_blocks": actual_hits,
         "actual_external_hit_ratio": actual_hits / denominator if denominator else None,
-        "actual_ratio_valid": bool(denominator and 0 <= actual_hits <= denominator),
+        "external_hit_counter_delta": external_counter_hits,
+        "actual_ram_hit_blocks": ram_hits,
+        "actual_ram_hit_ratio": ram_hits / denominator if denominator else None,
+        "actual_rdma_hit_blocks": rdma_hits,
+        "actual_rdma_hit_ratio": rdma_hits / denominator if denominator else None,
+        "actual_ratio_valid": bool(
+            denominator
+            and 0 <= ram_hits <= denominator
+            and 0 <= rdma_hits <= denominator
+            and actual_hits <= denominator
+            and actual_hits == external_counter_hits
+        ),
         "estimated_unique_footprint_bytes": (
             exact_distinct * mean_block_bytes if mean_block_bytes is not None else None
         ),
@@ -829,6 +1144,8 @@ def ensure_empty_output_dir(path: Path) -> None:
 
 
 def replay_command(args: argparse.Namespace) -> int:
+    if args.metrics_interval_s < 0:
+        raise ValueError("metrics interval must be non-negative")
     output_dir = Path(args.output_dir).expanduser().resolve()
     ensure_empty_output_dir(output_dir)
     trace_path = Path(args.trace).expanduser().resolve()
@@ -849,19 +1166,26 @@ def replay_command(args: argparse.Namespace) -> int:
         else:
             preparation_failures.append(outcome)
 
-    raw_start, parsed_start = fetch_metrics(metrics_endpoints)
-    write_raw_metrics(output_dir / "metrics_start.prom", raw_start, metrics_endpoints)
-    completed, replay_duration_s = asyncio.run(
-        run_replay(
+    (
+        completed,
+        replay_duration_s,
+        raw_start,
+        parsed_start,
+        raw_end,
+        parsed_end,
+        collector,
+    ) = asyncio.run(
+        run_replay_with_metrics(
             prepared,
             endpoint=args.endpoint,
             concurrency=args.concurrency,
             timeout_s=args.timeout_s,
             api_key=os.environ.get(args.api_key_env) if args.api_key_env else None,
+            metrics_endpoints=metrics_endpoints,
+            output_dir=output_dir,
+            metrics_interval_s=args.metrics_interval_s,
         )
     )
-    raw_end, parsed_end = fetch_metrics(metrics_endpoints)
-    write_raw_metrics(output_dir / "metrics_end.prom", raw_end, metrics_endpoints)
 
     completed.sort(key=lambda item: item.result.index)
     preparation_failures.sort(key=lambda item: item.index)
@@ -879,6 +1203,7 @@ def replay_command(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     metrics = summarize_metrics(parsed_start, parsed_end)
+    write_timeseries(output_dir, collector.samples, block_stats)
     summary = build_summary(
         args.strategy,
         completed,
@@ -905,6 +1230,9 @@ def replay_command(args: argparse.Namespace) -> int:
         "max_tokens": args.max_tokens,
         "concurrency": args.concurrency,
         "request_rate": "inf",
+        "metrics_interval_s": args.metrics_interval_s,
+        "timeseries_schema_version": 1,
+        "timeseries_time_base": "monotonic_elapsed_sec",
         "block_size": args.block_size,
         "prefix_caching_hash_algo": args.prefix_caching_hash_algo,
         "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
@@ -976,6 +1304,11 @@ def compare_command(args: argparse.Namespace) -> int:
                 "total_full_blocks": blocks["total_full_block_references"],
                 "hll_theoretical_hit_ratio": blocks["hll_theoretical_hit_ratio"],
                 "prefix_aware_ideal_hit_ratio": blocks["prefix_aware_ideal_hit_ratio"],
+                "actual_ram_hit_blocks": summary["actual_ram_hit_blocks"],
+                "actual_ram_hit_ratio": summary["actual_ram_hit_ratio"],
+                "actual_rdma_hit_blocks": summary["actual_rdma_hit_blocks"],
+                "actual_rdma_hit_ratio": summary["actual_rdma_hit_ratio"],
+                "actual_external_hit_blocks": summary["actual_external_hit_blocks"],
                 "actual_external_hit_ratio": summary["actual_external_hit_ratio"],
                 "mean_ttft_ms": summary["ttft"]["mean_ms"],
                 "p99_ttft_ms": summary["ttft"]["p99_ms"],
@@ -991,8 +1324,8 @@ def compare_command(args: argparse.Namespace) -> int:
         )
     rows.sort(
         key=lambda row: (
-            row["actual_external_hit_ratio"] is not None,
-            row["actual_external_hit_ratio"] or -1,
+            row["actual_ram_hit_ratio"] is not None,
+            row["actual_ram_hit_ratio"] or -1,
         ),
         reverse=True,
     )
@@ -1032,6 +1365,12 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--start-offset", type=int, default=0)
     replay.add_argument("--max-records", type=int, default=1000)
     replay.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    replay.add_argument(
+        "--metrics-interval-s",
+        type=float,
+        default=0.0,
+        help="periodic metrics sample interval; 0 disables interval samples",
+    )
     replay.add_argument("--max-tokens", type=int, default=1)
     replay.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     replay.add_argument("--prefix-caching-hash-algo", default=DEFAULT_HASH_ALGO)

@@ -10,15 +10,19 @@ from typing import Any
 
 import pytest
 
+import pegaflow.benchmarks.cache_eviction_replay as replay_module
 from pegaflow.benchmarks.cache_eviction_replay import (
     CompletedRequest,
+    CompletionLedger,
     MetricSample,
     PreparedRequest,
     RequestResult,
+    TimeSeriesCollector,
     TraceEntry,
     _extract_token_ids,
     _normalize_text_messages,
     adapt_request,
+    build_summary,
     compare_command,
     counter_delta,
     iter_trace_entries,
@@ -27,8 +31,10 @@ from pegaflow.benchmarks.cache_eviction_replay import (
     prepare_entry,
     public_result,
     replay_prepared,
+    run_replay_with_metrics,
     summarize_metrics,
     theoretical_stats,
+    write_timeseries,
 )
 
 
@@ -259,12 +265,161 @@ pegaflow_cache_resident_blocks{class="retained"} 4
     assert summary["mean_resident_block_bytes"] == 512
 
 
+def test_time_series_collector_marks_inflight_denominator_mismatch(tmp_path: Path) -> None:
+    before_text = """
+pegaflow_cache_block_hits_total 10
+pegaflow_cache_tier_block_requests_total{tier="ram"} 7
+pegaflow_cache_tier_block_requests_total{tier="rdma"} 3
+"""
+    after_text = """
+pegaflow_cache_block_hits_total 16
+pegaflow_cache_tier_block_requests_total{tier="ram"} 11
+pegaflow_cache_tier_block_requests_total{tier="rdma"} 5
+"""
+    endpoints = {"p0": "http://127.0.0.1:1/metrics"}
+    ledger = CompletionLedger()
+    collector = TimeSeriesCollector(
+        output_dir=tmp_path,
+        endpoints=endpoints,
+        baseline={"p0": parse_prometheus(before_text)},
+        replay_started=0.0,
+        interval_s=5.0,
+        ledger=ledger,
+    )
+
+    collector.add_sample(
+        kind="interval",
+        raw={"p0": after_text},
+        parsed={"p0": parse_prometheus(after_text)},
+    )
+
+    sample = collector.samples[0]
+    assert sample["hit_blocks_delta"] == 6
+    assert sample["cumulative_actual_hit_ratio"] is None
+    assert sample["ratio_invalid_reason"] == "no_completed_successful_full_blocks"
+    assert (tmp_path / "metrics_samples/0000_interval.prom").is_file()
+
+
+def test_time_series_collector_writes_valid_ratio_and_theoretical_columns(tmp_path: Path) -> None:
+    before_text = """
+pegaflow_cache_block_hits_total 10
+pegaflow_cache_tier_block_requests_total{tier="ram"} 7
+pegaflow_cache_tier_block_requests_total{tier="rdma"} 3
+"""
+    after_text = """
+pegaflow_cache_block_hits_total 12
+pegaflow_cache_tier_block_requests_total{tier="ram"} 8
+pegaflow_cache_tier_block_requests_total{tier="rdma"} 4
+"""
+    endpoints = {"p0": "http://127.0.0.1:1/metrics"}
+    ledger = CompletionLedger()
+    ledger.record(CompletedRequest(request_result(0), (b"a", b"b")))
+    collector = TimeSeriesCollector(
+        output_dir=tmp_path,
+        endpoints=endpoints,
+        baseline={"p0": parse_prometheus(before_text)},
+        replay_started=0.0,
+        interval_s=5.0,
+        ledger=ledger,
+    )
+    collector.add_sample(
+        kind="final",
+        raw={"p0": after_text},
+        parsed={"p0": parse_prometheus(after_text)},
+    )
+    block_stats = {
+        "hll_theoretical_hit_ratio": 0.8,
+        "prefix_aware_ideal_hit_ratio": 0.7,
+    }
+
+    write_timeseries(tmp_path, collector.samples, block_stats)
+
+    lines = (tmp_path / "metrics_timeseries.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["cumulative_actual_hit_ratio"] == pytest.approx(1.0)
+    assert json.loads(lines[0])["cumulative_ram_hit_ratio"] == pytest.approx(0.5)
+    assert json.loads(lines[0])["cumulative_rdma_hit_ratio"] == pytest.approx(0.5)
+    csv_text = (tmp_path / "hit_rate_timeseries.csv").read_text()
+    assert "cumulative_ram_hit_ratio" in csv_text
+    assert "cumulative_rdma_hit_ratio" in csv_text
+    assert "hll_theoretical_hit_ratio" in csv_text
+    assert "prefix_aware_ideal_hit_ratio" in csv_text
+
+
+def test_replay_with_metrics_cleans_up_sampler_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metrics_text = 'pegaflow_cache_block_hits_total{otel_scope_name="pegaflow-core"} 10\n'
+    endpoints = {"p0": "http://127.0.0.1:1/metrics"}
+
+    def fake_fetch_metrics(
+        requested_endpoints: dict[str, str],
+    ) -> tuple[dict[str, str], dict[str, list[MetricSample]]]:
+        assert requested_endpoints == endpoints
+        return {"p0": metrics_text}, {"p0": parse_prometheus(metrics_text)}
+
+    async def fake_run_replay(*args: Any, **kwargs: Any) -> tuple[list[CompletedRequest], float]:
+        return [], 0.01
+
+    monkeypatch.setattr(replay_module, "fetch_metrics", fake_fetch_metrics)
+    monkeypatch.setattr(replay_module, "run_replay", fake_run_replay)
+
+    async def run() -> TimeSeriesCollector:
+        tasks_before = asyncio.all_tasks()
+        *_, collector = await run_replay_with_metrics(
+            [],
+            endpoint="http://127.0.0.1:1/v1/chat/completions",
+            concurrency=1,
+            timeout_s=1.0,
+            api_key=None,
+            metrics_endpoints=endpoints,
+            output_dir=tmp_path,
+            metrics_interval_s=3600.0,
+        )
+        assert asyncio.all_tasks() == tasks_before
+        return collector
+
+    collector = asyncio.run(run())
+
+    assert [sample["sample_kind"] for sample in collector.samples] == ["baseline", "final"]
+    assert (tmp_path / "metrics_start.prom").is_file()
+    assert (tmp_path / "metrics_end.prom").is_file()
+
+
+def test_summary_uses_full_blocks_for_ram_rdma_and_external_ratios() -> None:
+    metrics = {
+        "counter_deltas": {"pegaflow_cache_block_hits": 7},
+        "tier_block_request_deltas": {"ram": 5, "rdma": 2},
+        "mean_resident_block_bytes": 128,
+    }
+    block_stats = {
+        "total_full_block_references": 10,
+        "exact_distinct_full_blocks": 8,
+    }
+
+    summary = build_summary(
+        "lru",
+        [CompletedRequest(request_result(0), (b"a", b"b"))],
+        [],
+        1.0,
+        block_stats,
+        metrics,
+    )
+
+    assert summary["actual_ram_hit_ratio"] == pytest.approx(0.5)
+    assert summary["actual_rdma_hit_ratio"] == pytest.approx(0.2)
+    assert summary["actual_external_hit_ratio"] == pytest.approx(0.7)
+    assert summary["actual_external_hit_blocks"] == 7
+    assert summary["actual_ratio_valid"] is True
+
+
 def write_comparison_run(
     run_dir: Path,
     strategy: str,
     actual_ratio: float,
     evictions: int,
     successful_indices: list[int] | None = None,
+    rdma_ratio: float = 0,
 ) -> None:
     run_dir.mkdir()
     config = {
@@ -291,7 +446,12 @@ def write_comparison_run(
     summary = {
         "strategy": strategy,
         "requests": {"successful": 2},
-        "actual_external_hit_ratio": actual_ratio,
+        "actual_ram_hit_blocks": actual_ratio * 10,
+        "actual_ram_hit_ratio": actual_ratio,
+        "actual_rdma_hit_blocks": rdma_ratio * 10,
+        "actual_rdma_hit_ratio": rdma_ratio,
+        "actual_external_hit_blocks": (actual_ratio + rdma_ratio) * 10,
+        "actual_external_hit_ratio": actual_ratio + rdma_ratio,
         "successful_request_throughput": 1.0,
         "estimated_unique_footprint_bytes": 100,
         "ttft": {"mean_ms": 10, "p99_ms": 20},
@@ -302,6 +462,11 @@ def write_comparison_run(
                 "pegaflow_cache_block_admission_rejections": 0,
                 "pegaflow_load_failures": 0,
             },
+            "tier_block_request_deltas": {
+                "ram": actual_ratio * 10,
+                "rdma": rdma_ratio * 10,
+                "miss": 0,
+            },
             "occupancy": {"p0": {"end_bytes": 100}},
         },
     }
@@ -310,11 +475,11 @@ def write_comparison_run(
     (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
 
 
-def test_compare_sorts_by_actual_ratio_and_requires_eviction(tmp_path: Path) -> None:
+def test_compare_sorts_by_ram_ratio_and_requires_eviction(tmp_path: Path) -> None:
     first = tmp_path / "lru"
     second = tmp_path / "s3fifo"
     output = tmp_path / "comparison"
-    write_comparison_run(first, "lru", 0.3, evictions=2)
+    write_comparison_run(first, "lru", 0.3, evictions=2, rdma_ratio=0.5)
     write_comparison_run(second, "s3fifo", 0.4, evictions=0)
 
     compare_command(
@@ -327,6 +492,7 @@ def test_compare_sorts_by_actual_ratio_and_requires_eviction(tmp_path: Path) -> 
     comparison = json.loads((output / "comparison.json").read_text(encoding="utf-8"))
     assert comparison["status"] == "inconclusive_no_eviction_pressure"
     assert [row["strategy"] for row in comparison["rows"]] == ["s3fifo", "lru"]
+    assert comparison["rows"][1]["actual_external_hit_ratio"] == pytest.approx(0.8)
 
 
 def test_compare_rejects_different_success_sets(tmp_path: Path) -> None:
