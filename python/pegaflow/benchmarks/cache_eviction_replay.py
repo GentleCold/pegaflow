@@ -114,6 +114,7 @@ class RequestResult:
     e2e_ms: float | None
     dispatch_offset_ms: float | None
     completion_offset_ms: float | None = None
+    attempts: int = 1
 
 
 @dataclass(frozen=True)
@@ -508,6 +509,14 @@ def prepare_entry(
     )
 
 
+def exceeds_model_len(
+    prepared: PreparedRequest,
+    max_tokens: int,
+    max_model_len: int,
+) -> bool:
+    return bool(max_model_len and prepared.prompt_tokens + max_tokens > max_model_len)
+
+
 def _usage(payload: dict[str, Any]) -> tuple[int | None, int | None]:
     usage = payload.get("usage")
     if not isinstance(usage, dict):
@@ -523,7 +532,7 @@ def _usage(payload: dict[str, Any]) -> tuple[int | None, int | None]:
 async def _consume_sse(
     response: httpx.Response,
     started: float,
-) -> tuple[int | None, int | None, float | None, str | None]:
+) -> tuple[int | None, int | None, float | None, str | None, bool]:
     prompt_tokens = None
     completion_tokens = None
     ttft_ms = None
@@ -545,25 +554,38 @@ async def _consume_sse(
             if chunk_completion is not None:
                 completion_tokens = chunk_completion
     except (json.JSONDecodeError, UnicodeDecodeError, httpx.HTTPError) as exc:
-        return prompt_tokens, completion_tokens, ttft_ms, f"stream_{type(exc).__name__}"
+        return (
+            prompt_tokens,
+            completion_tokens,
+            ttft_ms,
+            f"stream_{type(exc).__name__}",
+            isinstance(exc, httpx.ReadError),
+        )
     if not saw_done:
-        return prompt_tokens, completion_tokens, ttft_ms, "stream_incomplete"
-    return prompt_tokens, completion_tokens, ttft_ms, None
+        return prompt_tokens, completion_tokens, ttft_ms, "stream_incomplete", False
+    return prompt_tokens, completion_tokens, ttft_ms, None, False
 
 
-async def send_request(
+async def _send_request_once(
     client: httpx.AsyncClient,
     endpoint: str,
     prepared: PreparedRequest,
-    replay_started: float,
-) -> CompletedRequest:
-    started = time.perf_counter()
-    request_id = f"trace-replay-{prepared.index}"
+    request_id: str,
+    started: float,
+) -> tuple[
+    int | None,
+    int | None,
+    int | None,
+    float | None,
+    str | None,
+    bool,
+]:
     status_code = None
     prompt_tokens = None
     completion_tokens = None
     ttft_ms = None
     failure_kind = None
+    retryable = False
     try:
         async with client.stream(
             "POST",
@@ -575,10 +597,15 @@ async def send_request(
             if not response.is_success:
                 await response.aread()
                 failure_kind = f"http_{response.status_code // 100}xx"
+                retryable = 500 <= response.status_code < 600
             elif prepared.payload["stream"]:
-                prompt_tokens, completion_tokens, ttft_ms, failure_kind = await _consume_sse(
-                    response, started
-                )
+                (
+                    prompt_tokens,
+                    completion_tokens,
+                    ttft_ms,
+                    failure_kind,
+                    retryable,
+                ) = await _consume_sse(response, started)
             else:
                 raw = await response.aread()
                 parsed = json.loads(raw)
@@ -586,6 +613,49 @@ async def send_request(
                 ttft_ms = (time.perf_counter() - started) * 1000
     except (httpx.HTTPError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         failure_kind = f"request_{type(exc).__name__}"
+        retryable = isinstance(exc, httpx.ReadError)
+    return (
+        status_code,
+        prompt_tokens,
+        completion_tokens,
+        ttft_ms,
+        failure_kind,
+        retryable,
+    )
+
+
+async def send_request(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    prepared: PreparedRequest,
+    replay_started: float,
+    max_request_retries: int = 0,
+) -> CompletedRequest:
+    if max_request_retries < 0:
+        raise ValueError("max_request_retries must be non-negative")
+    started = time.perf_counter()
+    base_request_id = f"trace-replay-{prepared.index}"
+    attempts = 0
+    while True:
+        attempts += 1
+        request_id = base_request_id if attempts == 1 else f"{base_request_id}-retry-{attempts - 1}"
+        (
+            status_code,
+            prompt_tokens,
+            completion_tokens,
+            ttft_ms,
+            failure_kind,
+            retryable,
+        ) = await _send_request_once(
+            client,
+            endpoint,
+            prepared,
+            request_id,
+            started,
+        )
+        if failure_kind is None or not retryable or attempts > max_request_retries:
+            break
+        await asyncio.sleep(min(0.1 * attempts, 0.5))
 
     if failure_kind is None and prompt_tokens is None:
         failure_kind = "missing_usage"
@@ -606,6 +676,7 @@ async def send_request(
         e2e_ms=e2e_ms,
         dispatch_offset_ms=(started - replay_started) * 1000,
         completion_offset_ms=(time.perf_counter() - replay_started) * 1000,
+        attempts=attempts,
     )
     return CompletedRequest(result, prepared.block_hashes if ok else ())
 
@@ -651,6 +722,7 @@ async def run_replay(
     concurrency: int,
     timeout_s: float,
     api_key: str | None,
+    max_request_retries: int = 0,
     replay_started: float | None = None,
     on_complete: Callable[[CompletedRequest], None] | None = None,
 ) -> tuple[list[CompletedRequest], float]:
@@ -664,7 +736,13 @@ async def run_replay(
     async with httpx.AsyncClient(headers=headers, timeout=timeout, limits=limits) as client:
 
         async def sender(prepared: PreparedRequest) -> CompletedRequest:
-            return await send_request(client, endpoint, prepared, replay_started)
+            return await send_request(
+                client,
+                endpoint,
+                prepared,
+                replay_started,
+                max_request_retries=max_request_retries,
+            )
 
         completed = await replay_prepared(
             prepared_requests,
@@ -974,6 +1052,28 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def build_workload_manifest(
+    *,
+    selected_indices: Sequence[int],
+    prepared_requests: Sequence[PreparedRequest],
+    preparation_failures: Sequence[RequestResult],
+    filtered_requests: Sequence[dict[str, Any]],
+    max_model_len: int,
+    max_tokens: int,
+) -> dict[str, Any]:
+    manifest = {
+        "schema_version": 1,
+        "max_model_len": max_model_len,
+        "max_tokens": max_tokens,
+        "selected_indices": list(selected_indices),
+        "eligible_indices": [request.index for request in prepared_requests],
+        "preparation_failure_indices": [result.index for result in preparation_failures],
+        "filtered_requests": list(filtered_requests),
+    }
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    return {**manifest, "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
 def git_metadata(repo: Path) -> dict[str, str | None]:
     def command(*args: str) -> str | None:
         result = subprocess.run(
@@ -1003,6 +1103,7 @@ async def run_replay_with_metrics(
     concurrency: int,
     timeout_s: float,
     api_key: str | None,
+    max_request_retries: int,
     metrics_endpoints: dict[str, str],
     output_dir: Path,
     metrics_interval_s: float,
@@ -1037,6 +1138,7 @@ async def run_replay_with_metrics(
             concurrency=concurrency,
             timeout_s=timeout_s,
             api_key=api_key,
+            max_request_retries=max_request_retries,
             replay_started=replay_started,
             on_complete=ledger.record,
         )
@@ -1066,6 +1168,10 @@ def build_summary(
     replay_duration_s: float,
     block_stats: dict[str, Any],
     metrics: dict[str, Any],
+    *,
+    selected_count: int | None = None,
+    filtered_count: int = 0,
+    eligible_count: int | None = None,
 ) -> dict[str, Any]:
     all_results = [item.result for item in results] + list(preparation_failures)
     successful = [result for result in all_results if result.ok]
@@ -1084,12 +1190,19 @@ def build_summary(
     external_counter_hits = metrics["counter_deltas"]["pegaflow_cache_block_hits"]
     mean_block_bytes = metrics["mean_resident_block_bytes"]
     exact_distinct = block_stats["exact_distinct_full_blocks"]
+    selected_count = len(all_results) if selected_count is None else selected_count
+    eligible_count = len(all_results) if eligible_count is None else eligible_count
+    retried = [result for result in all_results if result.attempts > 1]
     return {
         "strategy": strategy,
         "requests": {
-            "selected": len(all_results),
+            "selected": selected_count,
+            "filtered": filtered_count,
+            "eligible": eligible_count,
             "successful": len(successful),
-            "failed": len(all_results) - len(successful),
+            "failed": eligible_count - len(successful),
+            "retried": len(retried),
+            "retry_attempts": sum(result.attempts - 1 for result in retried),
             "failure_kinds": failures,
         },
         "block_stats": block_stats,
@@ -1146,6 +1259,10 @@ def ensure_empty_output_dir(path: Path) -> None:
 def replay_command(args: argparse.Namespace) -> int:
     if args.metrics_interval_s < 0:
         raise ValueError("metrics interval must be non-negative")
+    if args.max_model_len < 0:
+        raise ValueError("max model len must be non-negative")
+    if args.max_request_retries < 0:
+        raise ValueError("max request retries must be non-negative")
     output_dir = Path(args.output_dir).expanduser().resolve()
     ensure_empty_output_dir(output_dir)
     trace_path = Path(args.trace).expanduser().resolve()
@@ -1159,12 +1276,39 @@ def replay_command(args: argparse.Namespace) -> int:
 
     prepared = []
     preparation_failures = []
+    filtered_requests = []
+    selected_indices = []
     for entry in iter_trace_entries(trace_path, args.start_offset, args.max_records):
+        selected_indices.append(entry.index)
         outcome = prepare_entry(entry, args.served_model, args.max_tokens, block_hasher)
         if isinstance(outcome, PreparedRequest):
-            prepared.append(outcome)
+            total_tokens = outcome.prompt_tokens + args.max_tokens
+            if exceeds_model_len(outcome, args.max_tokens, args.max_model_len):
+                filtered_requests.append(
+                    {
+                        "index": outcome.index,
+                        "prompt_tokens": outcome.prompt_tokens,
+                        "total_tokens": total_tokens,
+                        "reason": "max_model_len_exceeded",
+                    }
+                )
+            else:
+                prepared.append(outcome)
         else:
             preparation_failures.append(outcome)
+
+    workload_manifest = build_workload_manifest(
+        selected_indices=selected_indices,
+        prepared_requests=prepared,
+        preparation_failures=preparation_failures,
+        filtered_requests=filtered_requests,
+        max_model_len=args.max_model_len,
+        max_tokens=args.max_tokens,
+    )
+    (output_dir / "workload_manifest.json").write_text(
+        json.dumps(workload_manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
     (
         completed,
@@ -1181,6 +1325,7 @@ def replay_command(args: argparse.Namespace) -> int:
             concurrency=args.concurrency,
             timeout_s=args.timeout_s,
             api_key=os.environ.get(args.api_key_env) if args.api_key_env else None,
+            max_request_retries=args.max_request_retries,
             metrics_endpoints=metrics_endpoints,
             output_dir=output_dir,
             metrics_interval_s=args.metrics_interval_s,
@@ -1211,6 +1356,9 @@ def replay_command(args: argparse.Namespace) -> int:
         replay_duration_s,
         block_stats,
         metrics,
+        selected_count=len(selected_indices),
+        filtered_count=len(filtered_requests),
+        eligible_count=len(prepared) + len(preparation_failures),
     )
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),
@@ -1228,6 +1376,9 @@ def replay_command(args: argparse.Namespace) -> int:
         "model": args.model,
         "served_model": args.served_model,
         "max_tokens": args.max_tokens,
+        "max_model_len": args.max_model_len,
+        "max_request_retries": args.max_request_retries,
+        "workload_manifest_sha256": workload_manifest["sha256"],
         "concurrency": args.concurrency,
         "request_rate": "inf",
         "metrics_interval_s": args.metrics_interval_s,
@@ -1269,6 +1420,9 @@ def compare_command(args: argparse.Namespace) -> int:
         "model",
         "served_model",
         "max_tokens",
+        "max_model_len",
+        "max_request_retries",
+        "workload_manifest_sha256",
         "concurrency",
         "request_rate",
         "block_size",
@@ -1288,6 +1442,16 @@ def compare_command(args: argparse.Namespace) -> int:
             "total_full_block_references"
         ):
             raise ValueError(f"block denominator mismatch: {run_dir}")
+
+    for run_dir, _config, summary, _blocks in runs:
+        requests = summary["requests"]
+        if requests.get("successful") != requests.get("eligible"):
+            raise ValueError(f"eligible request did not complete successfully: {run_dir}")
+        if not summary.get("actual_ratio_valid"):
+            raise ValueError(f"actual hit ratio is invalid: {run_dir}")
+        load_failures = summary["metrics"]["counter_deltas"].get("pegaflow_load_failures", 0)
+        if load_failures:
+            raise ValueError(f"PegaFlow load failures are non-zero: {run_dir}")
 
     rows = []
     for run_dir, config, summary, blocks in runs:
@@ -1372,6 +1536,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="periodic metrics sample interval; 0 disables interval samples",
     )
     replay.add_argument("--max-tokens", type=int, default=1)
+    replay.add_argument(
+        "--max-model-len",
+        type=int,
+        default=0,
+        help="filter requests whose prompt plus output tokens exceed this limit; 0 disables",
+    )
+    replay.add_argument(
+        "--max-request-retries",
+        type=int,
+        default=0,
+        help="retry transient HTTP 5xx and connection read failures in place",
+    )
     replay.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     replay.add_argument("--prefix-caching-hash-algo", default=DEFAULT_HASH_ALGO)
     replay.add_argument("--hll-bucket-bits", type=int, default=DEFAULT_HLL_BUCKET_BITS)

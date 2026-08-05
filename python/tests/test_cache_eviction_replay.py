@@ -23,8 +23,10 @@ from pegaflow.benchmarks.cache_eviction_replay import (
     _normalize_text_messages,
     adapt_request,
     build_summary,
+    build_workload_manifest,
     compare_command,
     counter_delta,
+    exceeds_model_len,
     iter_trace_entries,
     metric_sum,
     parse_prometheus,
@@ -32,6 +34,7 @@ from pegaflow.benchmarks.cache_eviction_replay import (
     public_result,
     replay_prepared,
     run_replay_with_metrics,
+    send_request,
     summarize_metrics,
     theoretical_stats,
     write_timeseries,
@@ -210,6 +213,130 @@ def test_dispatcher_starts_requests_in_export_order_and_caps_concurrency() -> No
     assert sorted(item.result.index for item in completed) == list(range(8))
 
 
+def test_model_len_filter_boundary_and_manifest_are_stable() -> None:
+    requests = [
+        PreparedRequest(
+            index=index,
+            payload={"stream": False},
+            prompt_tokens=prompt_tokens,
+            block_hashes=(),
+        )
+        for index, prompt_tokens in ((0, 99), (1, 100))
+    ]
+
+    assert exceeds_model_len(requests[0], max_tokens=1, max_model_len=100) is False
+    assert exceeds_model_len(requests[1], max_tokens=1, max_model_len=100) is True
+
+    manifest = build_workload_manifest(
+        selected_indices=[0, 1],
+        prepared_requests=[requests[0]],
+        preparation_failures=[],
+        filtered_requests=[
+            {
+                "index": 1,
+                "prompt_tokens": 100,
+                "total_tokens": 101,
+                "reason": "max_model_len_exceeded",
+            }
+        ],
+        max_model_len=100,
+        max_tokens=1,
+    )
+    repeated = build_workload_manifest(
+        selected_indices=[0, 1],
+        prepared_requests=[requests[0]],
+        preparation_failures=[],
+        filtered_requests=manifest["filtered_requests"],
+        max_model_len=100,
+        max_tokens=1,
+    )
+
+    assert manifest["eligible_indices"] == [0]
+    assert manifest["filtered_requests"][0]["index"] == 1
+    assert manifest["sha256"] == repeated["sha256"]
+    assert "payload" not in json.dumps(manifest)
+
+
+def test_request_retries_transient_failure_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    prepared = PreparedRequest(
+        index=7,
+        payload={"stream": False},
+        prompt_tokens=2,
+        block_hashes=(b"hash",),
+    )
+    attempts = []
+    outcomes = iter(
+        [
+            (500, None, None, None, "http_5xx", True),
+            (200, 2, 1, 10.0, None, False),
+        ]
+    )
+
+    async def fake_send_once(
+        client: Any,
+        endpoint: str,
+        item: PreparedRequest,
+        request_id: str,
+        started: float,
+    ) -> tuple[int | None, int | None, int | None, float | None, str | None, bool]:
+        attempts.append((item.index, request_id))
+        return next(outcomes)
+
+    monkeypatch.setattr(replay_module, "_send_request_once", fake_send_once)
+    completed = asyncio.run(
+        send_request(
+            object(),
+            "http://example.invalid",
+            prepared,
+            replay_started=0.0,
+            max_request_retries=2,
+        )
+    )
+
+    assert completed.result.ok is True
+    assert completed.result.attempts == 2
+    assert attempts == [(7, "trace-replay-7"), (7, "trace-replay-7-retry-1")]
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected_attempts"),
+    [
+        ([(400, None, None, None, "http_4xx", False)], 1),
+        ([(500, None, None, None, "http_5xx", True)] * 3, 3),
+    ],
+    ids=("deterministic-error", "retry-budget-exhausted"),
+)
+def test_request_retry_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[tuple[int | None, int | None, int | None, float | None, str | None, bool]],
+    expected_attempts: int,
+) -> None:
+    prepared = PreparedRequest(
+        index=8,
+        payload={"stream": False},
+        prompt_tokens=2,
+        block_hashes=(b"hash",),
+    )
+    remaining = iter(outcomes)
+
+    async def fake_send_once(*args: Any, **kwargs: Any) -> Any:
+        return next(remaining)
+
+    monkeypatch.setattr(replay_module, "_send_request_once", fake_send_once)
+    completed = asyncio.run(
+        send_request(
+            object(),
+            "http://example.invalid",
+            prepared,
+            replay_started=0.0,
+            max_request_retries=2,
+        )
+    )
+
+    assert completed.result.ok is False
+    assert completed.result.attempts == expected_attempts
+
+
 def test_theoretical_ratios_use_prefix_first_miss_and_successes_only() -> None:
     hashes = {name: hashlib.sha256(name.encode()).digest() for name in ("a", "b", "c", "d", "x")}
     completed = [
@@ -372,6 +499,7 @@ def test_replay_with_metrics_cleans_up_sampler_task(
             concurrency=1,
             timeout_s=1.0,
             api_key=None,
+            max_request_retries=0,
             metrics_endpoints=endpoints,
             output_dir=tmp_path,
             metrics_interval_s=3600.0,
@@ -429,6 +557,9 @@ def write_comparison_run(
         "model": "model",
         "served_model": "model",
         "max_tokens": 1,
+        "max_model_len": 150144,
+        "max_request_retries": 2,
+        "workload_manifest_sha256": "manifest",
         "concurrency": 8,
         "request_rate": "inf",
         "block_size": 128,
@@ -445,13 +576,14 @@ def write_comparison_run(
     }
     summary = {
         "strategy": strategy,
-        "requests": {"successful": 2},
+        "requests": {"eligible": 2, "successful": 2, "failed": 0},
         "actual_ram_hit_blocks": actual_ratio * 10,
         "actual_ram_hit_ratio": actual_ratio,
         "actual_rdma_hit_blocks": rdma_ratio * 10,
         "actual_rdma_hit_ratio": rdma_ratio,
         "actual_external_hit_blocks": (actual_ratio + rdma_ratio) * 10,
         "actual_external_hit_ratio": actual_ratio + rdma_ratio,
+        "actual_ratio_valid": True,
         "successful_request_throughput": 1.0,
         "estimated_unique_footprint_bytes": 100,
         "ttft": {"mean_ms": 10, "p99_ms": 20},
