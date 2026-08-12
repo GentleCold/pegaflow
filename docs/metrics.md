@@ -120,18 +120,20 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
 
 ### HLL Reuse Metrics
 - **pegaflow_hll_cardinality** (Gauge)
-  - Estimated distinct block hashes observed in a configured sliding window
+  - Per-server estimated distinct `(namespace, block hash)` objects classified
+    as misses in a configured sliding window
   - Labels: `window` (`15m`, `1h`, `1d` by default)
   - Use case: Derive approximate prefix reuse over longer windows without
     storing every block hash
 
 - **pegaflow_hll_total_requests** (Gauge)
-  - Total block hash observations in the same configured sliding window
+  - Total queried blocks in the same configured sliding window, including
+    already-ready blocks and duplicates
   - Labels: `window` (`15m`, `1h`, `1d` by default)
   - Use case: Denominator for HLL-based estimated hit-rate PromQL
 
-PegaFlow does not export a separate HLL hit-rate gauge. Use PromQL so the
-ratio is computed from values in the same scrape:
+An individual PegaFlow server does not export a separate HLL hit-rate gauge.
+Use PromQL so the ratio is computed from values in the same scrape:
 
 ```promql
 1 - (
@@ -140,6 +142,44 @@ ratio is computed from values in the same scrape:
   clamp_min(pegaflow_hll_total_requests{window="1h"}, 1)
 )
 ```
+
+The MetaServer exports the active-node register union. Do not sum the
+per-server cardinality gauges: the same object observed on multiple nodes must
+be distinct only once at cluster scope.
+
+- **pegaflow_metaserver_hll_cardinality** (Gauge)
+  - Estimated distinct cache objects in the active-node register union
+  - Labels: `window`
+- **pegaflow_metaserver_hll_total_requests** (Gauge)
+  - Sum of observations in the latest reports from all active node sessions
+  - Labels: `window`
+- **pegaflow_metaserver_hll_estimated_hit_rate** (Gauge)
+  - Miss-based infinite-cache theoretical reuse reference derived from the
+    union cardinality of final query misses
+    and total observations in one aggregate snapshot
+  - Labels: `window`
+- **pegaflow_metaserver_hll_active_nodes** (Gauge)
+  - Number of active node sessions included in the cluster union
+  - Labels: `window`
+- **pegaflow_metaserver_hll_snapshot_age_seconds** (Gauge)
+  - Age of the oldest active-node report in the aggregate
+  - Labels: `window`
+
+Every node heartbeat carries all configured windows, including all-zero
+registers before traffic. A missing, damaged, incomplete, or schema-incompatible
+report rejects the whole heartbeat. Node-local sliding windows are not aligned
+to a global epoch, so the cluster value is a near-time union whose skew is
+bounded by heartbeat/report freshness rather than a strict common boundary.
+
+The miss-based HLL reuse metric is a theoretical infinite-cache reference.
+With exact distinct-miss counting it is an upper bound on reuse for the same
+observation stream. Raw HLL cardinality is still an estimate and can be high
+or low; use a cardinality lower confidence bound when a statistical upper
+bound is required. HLL windows and actual counters must use the same interval
+and active node set. With the default `bucket_bits=14`, the HLL standard error
+is approximately 0.8%.
+P2P is already represented by the `rdma` tier in actual attribution; do not add
+the RDMA ratio to the HLL reference.
 
 ### Save Metrics (GPU → CPU)
 - **pegaflow_save_bytes_total** (Counter)
@@ -396,6 +436,8 @@ Same as above: http://localhost:3000
 |--------------------|-------|----------|--------------------------------------|
 | PegaFlow Server    | 50055 | gRPC     | Engine service                       |
 | PegaFlow Server    | 9091  | HTTP     | Prometheus metrics endpoint          |
+| PegaFlow MetaServer| 50056 | gRPC     | Cross-node metadata and HLL reports  |
+| PegaFlow MetaServer| 9092  | HTTP     | Prometheus metrics endpoint          |
 | OTel Collector     | 4321  | gRPC     | OTLP gRPC receiver (deprecated)      |
 | OTel Collector     | 8889  | HTTP     | Prometheus exporter (deprecated)     |
 | Prometheus         | 9090  | HTTP     | Query API & Web UI                   |
@@ -436,14 +478,24 @@ rate(pegaflow_save_bytes_total[1m]) / 1e6
 # Pool memory utilization
 pegaflow_pool_used_bytes / pegaflow_pool_capacity_bytes
 
-# HLL estimated hit rate for the 1h window
-1 - (
-  pegaflow_hll_cardinality{window="1h"}
-  /
-  clamp_min(pegaflow_hll_total_requests{window="1h"}, 1)
-)
+# Cluster HLL miss-based theoretical reuse reference for the 15m window
+pegaflow_metaserver_hll_estimated_hit_rate{job="pegaflow-metaserver",window="15m"}
 
-# HLL estimated hit rate for every configured window
+# Actual tier-attributed ratio over the same 15m interval
+sum(increase(pegaflow_cache_tier_block_requests_total{job="pegaflow",tier!="miss"}[15m]))
+/
+clamp_min(sum(increase(pegaflow_cache_tier_block_requests_total{job="pegaflow"}[15m])), 1)
+
+# RAM / RDMA / SSD / miss decomposition with the same denominator
+sum by (tier) (increase(pegaflow_cache_tier_block_requests_total{job="pegaflow"}[15m]))
+/
+clamp_min(sum(increase(pegaflow_cache_tier_block_requests_total{job="pegaflow"}[15m])), 1)
+
+# Cluster HLL participation and freshness
+pegaflow_metaserver_hll_active_nodes{job="pegaflow-metaserver",window="15m"}
+pegaflow_metaserver_hll_snapshot_age_seconds{job="pegaflow-metaserver",window="15m"}
+
+# Per-server HLL estimated reuse for every configured window
 1 - (
   pegaflow_hll_cardinality
   /
