@@ -10,6 +10,7 @@ const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
 
 pub const DEFAULT_NODE_STALE_SECS: u64 = 30;
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
+pub const MANUAL_CLEANUP_AGE_SECS: u64 = 60 * 60;
 
 /// A prefix query result: one block hash and all live nodes that own it.
 #[derive(Debug, Clone)]
@@ -97,9 +98,9 @@ struct NodeRecord {
 }
 
 /// Both lifecycle decisions for one owner record, produced from a single `nodes`
-/// lookup: `keep` (survives the TTL purge) and `visible` (query-visible: current
-/// session and node still fresh). Lets the sweep tally live redundancy without
-/// probing the node map twice per owner.
+/// lookup: `keep` (survives the node-liveness sweep) and `visible` (query-visible:
+/// current session and node still fresh). Lets the sweep tally live redundancy
+/// without probing the node map twice per owner.
 struct OwnerEval {
     keep: bool,
     visible: bool,
@@ -300,8 +301,8 @@ impl BlockHashStore {
         result
     }
 
-    /// Sweep owners whose node is missing or whose ownership TTL has expired, and
-    /// refresh the cached live-owner redundancy snapshot in the same walk.
+    /// Sweep owners whose node is missing or no longer active, and refresh the
+    /// cached live-owner redundancy snapshot in the same walk.
     pub fn sweep_expired(&self) -> SweepStats {
         let now = Instant::now();
         let mut stats = SweepStats::default();
@@ -327,9 +328,9 @@ impl BlockHashStore {
         });
 
         let node_before = self.nodes.len();
-        let ttl = self.config.ttl;
+        let node_stale_after = self.config.node_stale_after;
         self.nodes.retain(|node, record| {
-            let keep = now.duration_since(record.last_seen) <= ttl;
+            let keep = now.duration_since(record.last_seen) <= node_stale_after;
             if !keep {
                 info!(
                     "MetaServer node swept: node={} node_id={} last_seen_age_secs={}",
@@ -346,6 +347,28 @@ impl BlockHashStore {
             .redundancy
             .lock()
             .expect("redundancy snapshot mutex poisoned") = snapshot;
+
+        stats
+    }
+
+    /// Remove ownership records older than `max_age`, regardless of node
+    /// liveness. This is reserved for explicit operator maintenance; the
+    /// periodic lifecycle sweep intentionally does not use owner age.
+    pub fn remove_owners_older_than(&self, max_age: Duration) -> SweepStats {
+        let now = Instant::now();
+        let mut stats = SweepStats::default();
+
+        self.blocks.retain(|_, owners| {
+            let before = owners.len();
+            owners.retain(|_, owner| now.duration_since(owner.key_register_time) <= max_age);
+            stats.removed_owners += before.saturating_sub(owners.len());
+            if owners.is_empty() {
+                stats.removed_keys += 1;
+                false
+            } else {
+                true
+            }
+        });
 
         stats
     }
@@ -377,7 +400,7 @@ impl BlockHashStore {
             let age = now.duration_since(node.last_seen);
             if age <= self.config.node_stale_after {
                 active += 1;
-            } else if age <= self.config.ttl {
+            } else {
                 stale += 1;
             }
         }
@@ -443,8 +466,7 @@ impl BlockHashStore {
         };
         let node_age = now.duration_since(record.last_seen);
         OwnerEval {
-            keep: now.duration_since(owner.key_register_time) <= self.config.ttl
-                && node_age <= self.config.ttl,
+            keep: node_age <= self.config.node_stale_after,
             visible: record.node_id == owner.node_id && node_age <= self.config.node_stale_after,
         }
     }
@@ -915,6 +937,58 @@ mod tests {
         let removed = store.sweep_expired();
         assert_eq!(removed, SweepStats::default());
         assert_eq!(store.entry_count(), 2);
+    }
+
+    #[test]
+    fn test_sweep_keeps_old_owner_on_active_node() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_secs(60),
+            ttl: Duration::from_secs(1),
+        });
+        let node_id = heartbeat_node(&store, "node-a");
+        store
+            .insert_hashes("ns", &[vec![1]], "node-a", node_id)
+            .unwrap();
+        store
+            .blocks
+            .get_mut(&BlockKey::new("ns".to_string(), vec![1]))
+            .unwrap()
+            .get_mut("node-a")
+            .unwrap()
+            .key_register_time = Instant::now() - Duration::from_secs(2);
+
+        let removed = store.sweep_expired();
+        assert_eq!(removed, SweepStats::default());
+        assert_eq!(store.owner_count(), 1);
+        assert_eq!(store.query_prefix("ns", &[vec![1]]).len(), 1);
+    }
+
+    #[test]
+    fn test_remove_owners_older_than_removes_only_expired_owners() {
+        let store = BlockHashStore::new();
+        let node_id = heartbeat_node(&store, "node-a");
+        store
+            .insert_hashes("ns", &[vec![1], vec![2]], "node-a", node_id)
+            .unwrap();
+        store
+            .blocks
+            .get_mut(&BlockKey::new("ns".to_string(), vec![1]))
+            .unwrap()
+            .get_mut("node-a")
+            .unwrap()
+            .key_register_time = Instant::now() - Duration::from_secs(3601);
+
+        let removed = store.remove_owners_older_than(Duration::from_secs(3600));
+        assert_eq!(
+            removed,
+            SweepStats {
+                removed_owners: 1,
+                removed_keys: 1,
+                removed_nodes: 0,
+            }
+        );
+        assert_eq!(store.owner_count(), 1);
+        assert_eq!(store.entry_count(), 1);
     }
 
     #[test]
