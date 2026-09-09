@@ -41,20 +41,36 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-async fn cleanup_expired_blocks_handler(State(state): State<AppState>) -> Json<CleanupResponse> {
-    let stats = state
-        .store
-        .remove_owners_older_than(std::time::Duration::from_secs(MANUAL_CLEANUP_AGE_SECS));
-    Json(CleanupResponse {
+async fn cleanup_expired_blocks_handler(
+    State(state): State<AppState>,
+) -> Result<Json<CleanupResponse>, StatusCode> {
+    let store = Arc::clone(&state.store);
+    let stats = match tokio::task::spawn_blocking(move || {
+        store.remove_owners_older_than(std::time::Duration::from_secs(MANUAL_CLEANUP_AGE_SECS))
+    })
+    .await
+    {
+        Ok(stats) => stats,
+        Err(err) => {
+            warn!("manual cleanup worker failed: {err}");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    Ok(Json(CleanupResponse {
         removed_owners: stats.removed_owners,
         removed_keys: stats.removed_keys,
-    })
+    }))
 }
 
-fn app(state: AppState) -> Router {
+fn public_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .with_state(state)
+}
+
+fn admin_app(state: AppState) -> Router {
+    Router::new()
         .route(
             "/admin/cleanup-expired-blocks",
             post(cleanup_expired_blocks_handler),
@@ -64,32 +80,50 @@ fn app(state: AppState) -> Router {
 
 pub async fn start_http_server(
     addr: std::net::SocketAddr,
+    admin_addr: std::net::SocketAddr,
     prometheus_registry: Registry,
     store: Arc<BlockHashStore>,
     shutdown: Arc<Notify>,
 ) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
+    if !admin_addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("admin HTTP address must be loopback, got {admin_addr}"),
+        ));
+    }
     let listener = TcpListener::bind(addr).await?;
+    let admin_listener = TcpListener::bind(admin_addr).await?;
 
     let state = AppState {
+        prometheus_registry: prometheus_registry.clone(),
+        store: Arc::clone(&store),
+    };
+    let admin_state = AppState {
         prometheus_registry,
         store,
     };
 
-    let app = app(state);
-
     info!(
-        "Starting HTTP server on {} (/health, /metrics, POST /admin/cleanup-expired-blocks)",
-        addr
+        "Starting HTTP server on {} (/health, /metrics); admin cleanup on {} (localhost only)",
+        addr, admin_addr
     );
 
     let handle = tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
+        let public_shutdown = Arc::clone(&shutdown);
+        let public = axum::serve(listener, public_app(state)).with_graceful_shutdown(async move {
+            public_shutdown.notified().await;
+        });
+        let admin = axum::serve(admin_listener, admin_app(admin_state)).with_graceful_shutdown(
+            async move {
                 shutdown.notified().await;
-            })
-            .await
-        {
+            },
+        );
+        let (public_result, admin_result) = tokio::join!(public, admin);
+        if let Err(err) = public_result {
             warn!("HTTP server stopped with error: {err}");
+        }
+        if let Err(err) = admin_result {
+            warn!("Admin HTTP server stopped with error: {err}");
         }
     });
 
@@ -105,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_route_accepts_post_and_returns_stats() {
-        let response = app(AppState {
+        let response = admin_app(AppState {
             prometheus_registry: Registry::new(),
             store: Arc::new(BlockHashStore::new()),
         })
@@ -127,5 +161,24 @@ mod tests {
                 .as_ref(),
             br#"{"removed_owners":0,"removed_keys":0}"#
         );
+    }
+
+    #[tokio::test]
+    async fn public_route_does_not_expose_admin_cleanup() {
+        let response = public_app(AppState {
+            prometheus_registry: Registry::new(),
+            store: Arc::new(BlockHashStore::new()),
+        })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/cleanup-expired-blocks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

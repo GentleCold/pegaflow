@@ -104,8 +104,11 @@ impl MetaServer for GrpcMetaService {
         );
         let result = async {
             let node_id = Self::parse_node_id(&req.node_id)?;
-            self.store
-                .heartbeat_node(&req.node, node_id)
+            let store = Arc::clone(&self.store);
+            let node = req.node.clone();
+            tokio::task::spawn_blocking(move || store.heartbeat_node(&node, node_id))
+                .await
+                .map_err(|err| Status::internal(format!("heartbeat worker failed: {err}")))?
                 .map_err(Self::store_error_status)?;
             Ok(Response::new(HeartbeatNodeResponse {
                 stale_after_secs: self.store.config().node_stale_after.as_secs(),
@@ -128,10 +131,13 @@ impl MetaServer for GrpcMetaService {
         );
         let result = async {
             let node_id = Self::parse_node_id(&req.node_id)?;
-            let removed = self
-                .store
-                .unregister_node(&req.node, node_id)
-                .map_err(Self::store_error_status)?;
+            let store = Arc::clone(&self.store);
+            let node = req.node.clone();
+            let removed =
+                tokio::task::spawn_blocking(move || store.unregister_node(&node, node_id))
+                    .await
+                    .map_err(|err| Status::internal(format!("unregister worker failed: {err}")))?
+                    .map_err(Self::store_error_status)?;
             Ok(Response::new(UnregisterNodeResponse {
                 removed_owners: removed as u64,
             }))
@@ -186,18 +192,30 @@ impl MetaServer for GrpcMetaService {
         };
 
         let inserted_count = req.block_hashes.len() as u64;
-        let reclaimable_hashes =
-            match self
-                .store
-                .insert_hashes(&req.namespace, &req.block_hashes, &req.node, node_id)
-            {
+        let store = Arc::clone(&self.store);
+        let namespace = req.namespace.clone();
+        let hashes = req.block_hashes;
+        let node = req.node.clone();
+        let reclaimable_hashes = match tokio::task::spawn_blocking(move || {
+            store.insert_hashes(&namespace, &hashes, &node, node_id)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("insert worker failed: {err}")))
+        {
+            Ok(result) => match result {
                 Ok(reclaimable_hashes) => reclaimable_hashes,
                 Err(err) => {
                     let result = Err(Self::store_error_status(err));
                     record_rpc_result("insert_block_hashes", &result, start);
                     return result;
                 }
-            };
+            },
+            Err(status) => {
+                let result: Result<Response<InsertBlockHashesResponse>, Status> = Err(status);
+                record_rpc_result("insert_block_hashes", &result, start);
+                return result;
+            }
+        };
 
         let elapsed = start.elapsed();
         debug!(
@@ -252,18 +270,30 @@ impl MetaServer for GrpcMetaService {
             }
         };
 
-        let removed =
-            match self
-                .store
-                .remove_hashes(&req.namespace, &req.block_hashes, &req.node, node_id)
-            {
+        let store = Arc::clone(&self.store);
+        let namespace = req.namespace.clone();
+        let hashes = req.block_hashes;
+        let node = req.node.clone();
+        let removed = match tokio::task::spawn_blocking(move || {
+            store.remove_hashes(&namespace, &hashes, &node, node_id)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("remove worker failed: {err}")))
+        {
+            Ok(result) => match result {
                 Ok(removed) => removed,
                 Err(err) => {
                     let result = Err(Self::store_error_status(err));
                     record_rpc_result("remove_block_hashes", &result, start);
                     return result;
                 }
-            };
+            },
+            Err(status) => {
+                let result: Result<Response<RemoveBlockHashesResponse>, Status> = Err(status);
+                record_rpc_result("remove_block_hashes", &result, start);
+                return result;
+            }
+        };
 
         let elapsed = start.elapsed();
         debug!(
