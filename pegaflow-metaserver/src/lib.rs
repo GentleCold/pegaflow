@@ -53,13 +53,26 @@ pub struct Cli {
     #[arg(long, default_value_t = store::DEFAULT_NODE_STALE_SECS)]
     pub node_stale_secs: u64,
 
-    /// Deprecated compatibility setting. Background sweep no longer purges by owner age.
+    /// Minutes without node activity before lifecycle cleanup (not block age).
     #[arg(long, default_value_t = store::DEFAULT_TTL_MINUTES)]
     pub ttl_minutes: u64,
 
     /// Seconds between lifecycle sweeps.
     #[arg(long, default_value_t = DEFAULT_SWEEP_INTERVAL_SECS)]
     pub sweep_interval_secs: u64,
+}
+
+impl Cli {
+    fn node_ttl(&self) -> Result<Duration, &'static str> {
+        let seconds = self
+            .ttl_minutes
+            .checked_mul(60)
+            .ok_or("ttl-minutes is too large")?;
+        if seconds == 0 || seconds < self.node_stale_secs {
+            return Err("ttl-minutes must be positive and >= node-stale-secs");
+        }
+        Ok(Duration::from_secs(seconds))
+    }
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -117,9 +130,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
     info!(
-        "Node lifecycle: stale_after={}s manual_cleanup_age=1h sweep_interval={}s (ttl_minutes={} retained for compatibility)",
+        "Node lifecycle: stale_after={}s manual_cleanup_age=1h sweep_interval={}s node_ttl_minutes={}",
         cli.node_stale_secs, cli.sweep_interval_secs, cli.ttl_minutes
     );
+    let ttl = cli.node_ttl()?;
     if cli.sweep_interval_secs == 0 {
         return Err("sweep-interval-secs must be greater than 0".into());
     }
@@ -128,7 +142,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     let store = Arc::new(BlockHashStore::with_config(store::StoreConfig {
         node_stale_after: Duration::from_secs(cli.node_stale_secs),
-        ttl: Duration::MAX,
+        ttl,
     }));
 
     // Register store observable gauges
@@ -203,4 +217,31 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("MetaServer shut down gracefully");
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn node_ttl_has_finite_default_and_validates_override() {
+        let cli = Cli::try_parse_from(["metaserver"]).unwrap();
+        assert_eq!(cli.node_ttl().unwrap(), Duration::from_secs(7200));
+        for (minutes, stale, valid) in [
+            ("1", "30", true),
+            ("0", "30", false),
+            ("1", "61", false),
+            ("18446744073709551615", "30", false),
+        ] {
+            let cli = Cli::try_parse_from([
+                "metaserver",
+                "--ttl-minutes",
+                minutes,
+                "--node-stale-secs",
+                stale,
+            ])
+            .unwrap();
+            assert_eq!(cli.node_ttl().is_ok(), valid, "{minutes}/{stale}");
+        }
+    }
 }
