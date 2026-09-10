@@ -267,6 +267,7 @@ impl BlockHashStore {
             drop(record);
             let is_new_owner = previous.is_none_or(|owner| owner.node_id != node_id);
             if is_new_owner
+                && owners.len() >= MIN_RECLAIMABLE_OWNER_COUNT
                 && owners
                     .iter()
                     .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
@@ -291,7 +292,8 @@ impl BlockHashStore {
         let mut removed = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            let should_remove_key = if let Some(mut owners) = self.blocks.get_mut(&key) {
+            if let Entry::Occupied(mut entry) = self.blocks.entry(key) {
+                let owners = entry.get_mut();
                 let before = owners.len();
                 if owners
                     .get(node)
@@ -301,12 +303,9 @@ impl BlockHashStore {
                     removed += 1;
                 }
                 self.redundancy.adjust(before as u64, owners.len() as u64);
-                owners.is_empty()
-            } else {
-                false
-            };
-            if should_remove_key {
-                self.blocks.remove_if(&key, |_, owners| owners.is_empty());
+                if owners.is_empty() {
+                    entry.remove();
+                }
             }
         }
         Ok(removed)
@@ -393,7 +392,8 @@ impl BlockHashStore {
     }
 
     pub fn entry_count(&self) -> u64 {
-        self.blocks.len() as u64
+        let snap = self.redundancy.snapshot();
+        snap.keys_1 + snap.keys_2 + snap.keys_3 + snap.keys_4plus
     }
 
     pub fn owner_count(&self) -> u64 {
@@ -509,6 +509,7 @@ pub(crate) mod tests {
             expected.copies += owners.len() as u64;
         }
         assert_eq!(store.owner_count(), expected.copies);
+        assert_eq!(store.entry_count(), store.blocks.len() as u64);
         assert_eq!(store.redundancy_snapshot(), expected);
     }
 
@@ -607,7 +608,7 @@ pub(crate) mod tests {
         store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
         assert!(store.query_prefix("ns", &[vec![1]]).is_empty());
 
-        // A held block shard must not prevent the healthy-node-table fast path.
+        // Healthy sweeps and entry metrics must not wait for block shard locks.
         let guard = store
             .blocks
             .get_mut(&BlockKey::new("ns".into(), vec![1]))
@@ -615,10 +616,13 @@ pub(crate) mod tests {
         std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::channel();
             let store_ref = &store;
-            scope.spawn(move || tx.send(store_ref.sweep_expired()).unwrap());
+            scope.spawn(move || {
+                tx.send((store_ref.sweep_expired(), store_ref.entry_count()))
+                    .unwrap();
+            });
             let result = rx.recv_timeout(Duration::from_secs(2));
             drop(guard);
-            assert_eq!(result.unwrap(), SweepStats::default());
+            assert_eq!(result.unwrap(), (SweepStats::default(), 1));
         });
         assert_eq!(store.node_counts(), (0, 1));
         assert_stored_counts(&store);
@@ -1218,69 +1222,39 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_redundancy_snapshot_buckets_stored_owners() {
+    fn test_redundancy_counters_follow_owner_mutations() {
         let store = BlockHashStore::new();
-        let a = heartbeat_node(&store, "n-a");
-        let b = heartbeat_node(&store, "n-b");
-        let c = heartbeat_node(&store, "n-c");
-        let d = heartbeat_node(&store, "n-d");
-
-        // 1 owner, 2 owners, and 4 owners across three distinct keys.
-        store.insert_hashes("ns", &[vec![1]], "n-a", a).unwrap();
-        store.insert_hashes("ns", &[vec![2]], "n-a", a).unwrap();
-        store.insert_hashes("ns", &[vec![2]], "n-b", b).unwrap();
-        for (node, id) in [("n-a", a), ("n-b", b), ("n-c", c), ("n-d", d)] {
-            store.insert_hashes("ns", &[vec![3]], node, id).unwrap();
+        let nodes = ["a", "b", "c", "d", "e"];
+        let ids = nodes.map(|node| heartbeat_node(&store, node));
+        let hashes = [vec![1], vec![2], vec![3], vec![4], vec![5]];
+        assert_stored_counts(&store);
+        for (i, node) in nodes.iter().enumerate() {
+            for _ in 0..2 {
+                store
+                    .insert_hashes("ns", &hashes[i..], node, ids[i])
+                    .unwrap();
+                assert_stored_counts(&store);
+            }
         }
-
-        store.sweep_expired();
-
         assert_eq!(
             store.redundancy_snapshot(),
             RedundancySnapshot {
                 keys_1: 1,
                 keys_2: 1,
-                keys_3: 0,
-                keys_4plus: 1,
-                copies: 1 + 2 + 4,
+                keys_3: 1,
+                keys_4plus: 2,
+                copies: 15,
             }
         );
-    }
-
-    #[test]
-    fn test_redundancy_counters_follow_owner_mutations() {
-        let store = BlockHashStore::new();
-        let node_a = heartbeat_node(&store, "node-a");
-        let node_b = heartbeat_node(&store, "node-b");
-        let hash = vec![1];
-
-        store
-            .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", node_a)
-            .unwrap();
-        assert_eq!(store.redundancy_snapshot().keys_1, 1);
-
-        store
-            .insert_hashes("ns", std::slice::from_ref(&hash), "node-b", node_b)
-            .unwrap();
-        assert_eq!(store.redundancy_snapshot().keys_2, 1);
-        assert_eq!(store.redundancy_snapshot().copies, 2);
-
-        store
-            .remove_hashes("ns", std::slice::from_ref(&hash), "node-a", node_a)
-            .unwrap();
-        assert_eq!(store.redundancy_snapshot().keys_1, 1);
-        assert_eq!(store.redundancy_snapshot().keys_2, 0);
-        assert_eq!(store.redundancy_snapshot().copies, 1);
-
-        store
-            .blocks
-            .get_mut(&BlockKey::new("ns".to_string(), hash))
-            .unwrap()
-            .get_mut("node-b")
-            .unwrap()
-            .key_register_time = Instant::now() - Duration::from_secs(3601);
-        let cleanup = store.remove_owners_older_than(Duration::from_secs(3600));
-        assert_eq!(cleanup.removed_owners, 1);
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(
+                store
+                    .remove_hashes("ns", &hashes[i..], node, ids[i])
+                    .unwrap(),
+                hashes.len() - i
+            );
+            assert_stored_counts(&store);
+        }
         assert_eq!(store.redundancy_snapshot(), RedundancySnapshot::default());
     }
 }
