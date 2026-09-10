@@ -62,19 +62,6 @@ pub struct Cli {
     pub sweep_interval_secs: u64,
 }
 
-impl Cli {
-    fn node_ttl(&self) -> Result<Duration, &'static str> {
-        let seconds = self
-            .ttl_minutes
-            .checked_mul(60)
-            .ok_or("ttl-minutes is too large")?;
-        if seconds == 0 || seconds < self.node_stale_secs {
-            return Err("ttl-minutes must be positive and >= node-stale-secs");
-        }
-        Ok(Duration::from_secs(seconds))
-    }
-}
-
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
     let registry = Registry::new();
     let exporter = opentelemetry_prometheus::exporter()
@@ -133,16 +120,30 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         "Node lifecycle: stale_after={}s manual_cleanup_age=1h sweep_interval={}s node_ttl_minutes={}",
         cli.node_stale_secs, cli.sweep_interval_secs, cli.ttl_minutes
     );
-    let ttl = cli.node_ttl()?;
+    let ttl_secs = cli
+        .ttl_minutes
+        .checked_mul(60)
+        .ok_or("ttl-minutes is too large")?;
+    if cli.ttl_minutes == 0 {
+        return Err("ttl-minutes must be greater than 0".into());
+    }
     if cli.sweep_interval_secs == 0 {
         return Err("sweep-interval-secs must be greater than 0".into());
     }
+    if ttl_secs < cli.node_stale_secs {
+        return Err(format!(
+            "ttl-minutes ({}) must be >= node-stale-secs ({})",
+            cli.ttl_minutes, cli.node_stale_secs
+        )
+        .into());
+    }
+
     // Initialize metrics
     let (meter_provider, prometheus_registry) = init_metrics()?;
 
     let store = Arc::new(BlockHashStore::with_config(store::StoreConfig {
         node_stale_after: Duration::from_secs(cli.node_stale_secs),
-        ttl,
+        ttl: Duration::from_secs(ttl_secs),
     }));
 
     // Register store observable gauges
@@ -217,31 +218,4 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("MetaServer shut down gracefully");
     Ok(())
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    #[test]
-    fn node_ttl_has_finite_default_and_validates_override() {
-        let cli = Cli::try_parse_from(["metaserver"]).unwrap();
-        assert_eq!(cli.node_ttl().unwrap(), Duration::from_secs(7200));
-        for (minutes, stale, valid) in [
-            ("1", "30", true),
-            ("0", "30", false),
-            ("1", "61", false),
-            ("18446744073709551615", "30", false),
-        ] {
-            let cli = Cli::try_parse_from([
-                "metaserver",
-                "--ttl-minutes",
-                minutes,
-                "--node-stale-secs",
-                stale,
-            ])
-            .unwrap();
-            assert_eq!(cli.node_ttl().is_ok(), valid, "{minutes}/{stale}");
-        }
-    }
 }
