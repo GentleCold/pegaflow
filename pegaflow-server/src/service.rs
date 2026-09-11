@@ -1126,6 +1126,7 @@ mod tests {
             req_id: String::new(),
             wait_for_full_prefix: false,
             group_id: 0,
+            direct_gpu: false,
         })
         .expect_err("empty req_id must be rejected before engine lookup");
 
@@ -1141,6 +1142,7 @@ mod tests {
             req_id: "request".to_string(),
             wait_for_full_prefix: false,
             group_id: 0,
+            direct_gpu: false,
         })
         .expect("empty block_hashes are a valid zero-hit query");
     }
