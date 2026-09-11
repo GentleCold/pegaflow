@@ -983,7 +983,10 @@ impl PegaEngine {
     }
 
     #[cfg(feature = "rdma")]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "direct load helper keeps the validated instance, GPU and batched load payload explicit"
+    )]
     fn batch_direct_load_multi_layer_inner(
         &self,
         instance: &Arc<InstanceContext>,
