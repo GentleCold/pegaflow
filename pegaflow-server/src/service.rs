@@ -560,7 +560,47 @@ impl Engine for GrpcEngineService {
                 req.block_hashes.len()
             );
 
-            let outcome = if req.group_id > 0 && req.wait_for_full_prefix {
+            let outcome = if req.direct_gpu {
+                if req.group_id != 0 {
+                    return Err(Status::invalid_argument(
+                        "direct_gpu is only supported for dense attention group 0",
+                    ));
+                }
+                #[cfg(feature = "rdma")]
+                {
+                    let plan = self
+                        .engine
+                        .query_direct_gpu_plan(&req.instance_id, &req.block_hashes)
+                        .await
+                        .map_err(Self::map_engine_error)?;
+                    let Some(plan) = plan else {
+                        return Ok(Response::new(QueryResponse {
+                            outcome: Some(query_response::Outcome::Ready(QueryReady {
+                                num_hit_blocks: 0,
+                                lease: Vec::new(),
+                                hit_positions: Vec::new(),
+                            })),
+                        }));
+                    };
+                    let lease = self
+                        .engine
+                        .create_direct_query_lease(&req.instance_id, plan.clone())
+                        .map_err(Self::map_engine_error)?
+                        .to_bytes()
+                        .to_vec();
+                    query_response::Outcome::Ready(QueryReady {
+                        num_hit_blocks: plan.block_count() as u64,
+                        lease,
+                        hit_positions: Vec::new(),
+                    })
+                }
+                #[cfg(not(feature = "rdma"))]
+                {
+                    return Err(Status::failed_precondition(
+                        "direct_gpu requires an RDMA-enabled server",
+                    ));
+                }
+            } else if req.group_id > 0 && req.wait_for_full_prefix {
                 // All-or-nothing membership fetch: the hash list is an exact
                 // want-set and misses are pulled from SSD / remote peers, so
                 // the query may report Loading before it resolves. A Ready
