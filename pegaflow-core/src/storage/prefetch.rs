@@ -9,9 +9,9 @@ use log::{info, warn};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
-#[cfg(feature = "rdma")]
-use crate::backing::RdmaFetchStore;
 use crate::backing::{PrefetchResult, SsdBackingStore};
+#[cfg(feature = "rdma")]
+use crate::backing::{RdmaFetchStore, RemoteSourceRequirement};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
@@ -44,7 +44,14 @@ impl RdmaFetch {
         remaining_hashes: &[Vec<u8>],
         require_full_prefix: bool,
     ) -> Option<(usize, PrefetchResult)> {
-        let plan = self.0.query_plan(namespace, remaining_hashes).await?;
+        let plan = self
+            .0
+            .query_plan(
+                namespace,
+                remaining_hashes,
+                RemoteSourceRequirement::RamOrSsd,
+            )
+            .await?;
         let found = plan.block_count();
         if require_full_prefix && found != remaining_hashes.len() {
             return None;
