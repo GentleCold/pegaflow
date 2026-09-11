@@ -251,13 +251,11 @@ impl RcBackend {
         unsafe { libc::close(dmabuf_fd) };
 
         let mut state = self.state.lock();
-        if let Err(error) = Arc::make_mut(&mut state.registered).insert(RegisteredMemoryEntry {
+        Arc::make_mut(&mut state.registered).insert(RegisteredMemoryEntry {
             base_ptr: raw,
             len,
             mrs,
-        }) {
-            return Err(error);
-        }
+        })?;
         info!(
             "CUDA memory registered for direct RDMA: ptr={:#x}, len={}, device={}, nics={}",
             raw,
