@@ -75,21 +75,18 @@ pub(crate) struct FetchPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteSourceRequirement {
-    RamOnly,
     RamOrSsd,
 }
 
 impl RemoteSourceRequirement {
     const fn metaserver_tier_mask(self) -> u32 {
         match self {
-            Self::RamOnly => CACHE_TIER_RAM,
             Self::RamOrSsd => CACHE_TIER_RAM | CACHE_TIER_SSD,
         }
     }
 
     const fn transfer_requirement(self) -> TransferSourceRequirement {
         match self {
-            Self::RamOnly => TransferSourceRequirement::RamOnly,
             Self::RamOrSsd => TransferSourceRequirement::RamOrSsd,
         }
     }
@@ -1044,7 +1041,7 @@ mod tests {
             vec![segment("node-a", 2), segment("node-b", 1)],
             3,
             "requester",
-            RemoteSourceRequirement::RamOnly,
+            RemoteSourceRequirement::RamOrSsd,
         )
         .expect("plan should be valid")
         .expect("plan should be non-empty");
@@ -1081,7 +1078,7 @@ mod tests {
             ),
         ] {
             let error =
-                validate_fetch_plan(segments, 1, "requester", RemoteSourceRequirement::RamOnly)
+                validate_fetch_plan(segments, 1, "requester", RemoteSourceRequirement::RamOrSsd)
                     .expect_err("plan should be rejected");
             assert!(error.contains(expected), "unexpected error: {error}");
         }
@@ -1093,7 +1090,7 @@ mod tests {
             vec![segment("node-a", 2), segment("node-b", 1)],
             3,
             "requester",
-            RemoteSourceRequirement::RamOnly,
+            RemoteSourceRequirement::RamOrSsd,
         )
         .unwrap()
         .unwrap();
