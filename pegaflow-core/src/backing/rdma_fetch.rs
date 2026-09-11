@@ -398,7 +398,6 @@ impl RdmaFetchStore {
     /// `targets` contains one entry per local layer and one destination block
     /// per planned hash. All segments are fetched in plan order so a stale
     /// owner cannot make a later prefix segment appear valid.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fetch_plan_to_gpu(
         &self,
         plan: &DirectFetchPlan,

@@ -504,9 +504,10 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         )],
     );
     if let Err(error) = direct_load {
-        if !skip_if_gpu_rdma_unsupported(&error) {
-            panic!("direct GPU load: {error}");
-        }
+        assert!(
+            skip_if_gpu_rdma_unsupported(&error),
+            "direct GPU load: {error}"
+        );
     } else {
         let direct_deadline = Instant::now() + Duration::from_secs(10);
         loop {

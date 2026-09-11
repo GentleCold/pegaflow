@@ -477,6 +477,10 @@ impl EngineRpcClient {
     /// Returns:
     ///     QueryLoading while backing fetch is in progress, otherwise QueryReady.
     #[pyo3(signature = (instance_id, block_hashes, req_id, wait_for_full_prefix=false, group_id=0, direct_gpu=false))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Python API preserves existing query arguments and adds an optional direct GPU flag"
+    )]
     fn query_prefetch(
         &self,
         py: Python<'_>,
