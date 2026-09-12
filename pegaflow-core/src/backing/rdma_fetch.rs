@@ -75,19 +75,25 @@ pub(crate) struct FetchPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteSourceRequirement {
+    RamOnly,
     RamOrSsd,
+    SsdOnly,
 }
 
 impl RemoteSourceRequirement {
     const fn metaserver_tier_mask(self) -> u32 {
         match self {
+            Self::RamOnly => CACHE_TIER_RAM,
             Self::RamOrSsd => CACHE_TIER_RAM | CACHE_TIER_SSD,
+            Self::SsdOnly => CACHE_TIER_SSD,
         }
     }
 
     const fn transfer_requirement(self) -> TransferSourceRequirement {
         match self {
+            Self::RamOnly => TransferSourceRequirement::RamOnly,
             Self::RamOrSsd => TransferSourceRequirement::RamOrSsd,
+            Self::SsdOnly => TransferSourceRequirement::SsdOnly,
         }
     }
 }

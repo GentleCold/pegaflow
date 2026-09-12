@@ -14,6 +14,7 @@ use std::time::Duration;
 use crate::backing::{
     AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig, SsdOwnerTierMutation,
 };
+use pegaflow_proto::proto::engine::TransferSourceRequirement;
 #[cfg(feature = "rdma")]
 use crate::backing::{RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
@@ -600,9 +601,23 @@ impl StorageEngine {
     pub(crate) async fn get_blocks_for_transfer(
         &self,
         keys: &[BlockKey],
-        allow_ssd: bool,
+        source_requirement: TransferSourceRequirement,
     ) -> Vec<(BlockKey, Arc<SealedBlock>)> {
-        let ram = self.read_cache.get_blocks_aligned(keys);
+        let use_ram = matches!(
+            source_requirement,
+            TransferSourceRequirement::RamOnly
+                | TransferSourceRequirement::RamOrSsd
+                | TransferSourceRequirement::Unspecified
+        );
+        let use_ssd = matches!(
+            source_requirement,
+            TransferSourceRequirement::SsdOnly | TransferSourceRequirement::RamOrSsd
+        );
+        let ram = if use_ram {
+            self.read_cache.get_blocks_aligned(keys)
+        } else {
+            vec![None; keys.len()]
+        };
         let mut found = Vec::with_capacity(keys.len());
         let mut index = 0;
         while index < keys.len() {
@@ -611,7 +626,7 @@ impl StorageEngine {
                 index += 1;
                 continue;
             }
-            if !allow_ssd {
+            if !use_ssd {
                 break;
             }
             let Some(ssd) = self.ssd_store.as_ref() else {
@@ -787,7 +802,10 @@ mod tests {
 
         // Serving must stop at the first missing block.
         let result = storage
-            .get_blocks_for_transfer(&[key1.clone(), key2, key3.clone()], false)
+            .get_blocks_for_transfer(
+                &[key1.clone(), key2, key3.clone()],
+                TransferSourceRequirement::RamOnly,
+            )
             .await;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, key1);
@@ -796,7 +814,9 @@ mod tests {
     #[tokio::test]
     async fn get_blocks_for_transfer_empty_keys() {
         let storage = make_engine();
-        let result = storage.get_blocks_for_transfer(&[], false).await;
+        let result = storage
+            .get_blocks_for_transfer(&[], TransferSourceRequirement::RamOnly)
+            .await;
         assert!(result.is_empty());
     }
 

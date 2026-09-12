@@ -829,17 +829,15 @@ impl Engine for GrpcEngineService {
         }
 
         let result: Result<Response<QueryBlocksForTransferResponse>, Status> = async {
-            let allow_ssd = matches!(
-                TransferSourceRequirement::try_from(req.source_requirement),
-                Ok(TransferSourceRequirement::RamOrSsd)
-            );
+            let source_requirement = TransferSourceRequirement::try_from(req.source_requirement)
+                .unwrap_or(TransferSourceRequirement::Unspecified);
             let (session_id, found_blocks) = self
                 .engine
                 .query_blocks_for_transfer(
                     &req.namespace,
                     &req.block_hashes,
                     &req.requester_id,
-                    allow_ssd,
+                    source_requirement,
                 )
                 .await;
 

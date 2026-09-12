@@ -43,13 +43,14 @@ impl RdmaFetch {
         namespace: &str,
         remaining_hashes: &[Vec<u8>],
         require_full_prefix: bool,
+        source_requirement: RemoteSourceRequirement,
     ) -> Option<(usize, PrefetchResult)> {
         let plan = self
             .0
             .query_plan(
                 namespace,
                 remaining_hashes,
-                RemoteSourceRequirement::RamOrSsd,
+                source_requirement,
             )
             .await?;
         let found = plan.block_count();
@@ -84,6 +85,7 @@ impl RdmaFetch {
         _namespace: &str,
         _remaining_hashes: &[Vec<u8>],
         _require_full_prefix: bool,
+        _source_requirement: RemoteSourceRequirement,
     ) -> Option<(usize, PrefetchResult)> {
         None
     }
@@ -574,7 +576,13 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
 
     if let Some(rdma) = deps.rdma_fetch.as_ref()
         && let Some((found, blocks)) = rdma
-            .try_fetch_prefix(&req_id, &namespace, &remaining_hashes, wait_for_full_prefix)
+            .try_fetch_prefix(
+                &req_id,
+                &namespace,
+                &remaining_hashes,
+                wait_for_full_prefix,
+                RemoteSourceRequirement::RamOnly,
+            )
             .await
     {
         record_tier_attribution(
@@ -629,12 +637,46 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
         }
     }
 
+    if let Some(rdma) = deps.rdma_fetch.as_ref()
+        && let Some((found, blocks)) = rdma
+            .try_fetch_prefix(
+                &req_id,
+                &namespace,
+                &remaining_hashes,
+                wait_for_full_prefix,
+                RemoteSourceRequirement::SsdOnly,
+            )
+            .await
+    {
+        record_tier_attribution(
+            total,
+            hit,
+            found,
+            Some(PrefetchSource::Rdma.as_attribution()),
+            emit_tier_metrics,
+        );
+        return build_ready_result(
+            prefix_blocks,
+            total,
+            Some(PrefetchSource::Rdma),
+            found,
+            &remaining_keys[..found],
+            blocks,
+        );
+    }
+
     if wait_for_full_prefix && let Some(rdma) = deps.rdma_fetch {
         let started_at = Instant::now();
         while started_at.elapsed() < REMOTE_WAIT_TIMEOUT {
             tokio::time::sleep(REMOTE_WAIT_POLL_INTERVAL).await;
             if let Some((found, blocks)) = rdma
-                .try_fetch_prefix(&req_id, &namespace, &remaining_hashes, true)
+                .try_fetch_prefix(
+                    &req_id,
+                    &namespace,
+                    &remaining_hashes,
+                    true,
+                    RemoteSourceRequirement::RamOrSsd,
+                )
                 .await
             {
                 record_tier_attribution(

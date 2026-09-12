@@ -44,6 +44,7 @@ pub use internode::{
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use pegaflow_common::NumaNode;
+use pegaflow_proto::proto::engine::TransferSourceRequirement;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
@@ -956,14 +957,17 @@ impl PegaEngine {
         namespace: &str,
         block_hashes: &[Vec<u8>],
         requester_id: &str,
-        allow_ssd: bool,
+        source_requirement: TransferSourceRequirement,
     ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
             .collect();
 
-        let found = self.storage.get_blocks_for_transfer(&keys, allow_ssd).await;
+        let found = self
+            .storage
+            .get_blocks_for_transfer(&keys, source_requirement)
+            .await;
         let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
 
         debug!(
