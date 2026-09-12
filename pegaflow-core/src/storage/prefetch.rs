@@ -585,10 +585,11 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
             )
             .await
     {
+        let actual_found = blocks.len().min(found);
         record_tier_attribution(
             total,
             hit,
-            found,
+            actual_found,
             Some(PrefetchSource::Rdma.as_attribution()),
             emit_tier_metrics,
         );
@@ -596,8 +597,8 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
             prefix_blocks,
             total,
             Some(PrefetchSource::Rdma),
-            found,
-            &remaining_keys[..found],
+            actual_found,
+            &remaining_keys[..actual_found],
             blocks,
         );
     }
@@ -614,14 +615,15 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
         {
             let keys = remaining_keys[..reserved].to_vec();
             let (found, blocks) = ssd.prefetch_prefix(keys).await;
+            let actual_found = blocks.len().min(found);
             // wait_for_full_prefix is all-or-nothing: a partial SSD result
             // (backpressured reservation or short read) must not let the
             // caller proceed with a partial prefix.
-            if found > 0 && (!wait_for_full_prefix || found == remaining_keys.len()) {
+            if actual_found > 0 && (!wait_for_full_prefix || actual_found == remaining_keys.len()) {
                 record_tier_attribution(
                     total,
                     hit,
-                    found,
+                    actual_found,
                     Some(PrefetchSource::Ssd.as_attribution()),
                     emit_tier_metrics,
                 );
@@ -629,8 +631,8 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
                     prefix_blocks,
                     total,
                     Some(PrefetchSource::Ssd),
-                    found,
-                    &remaining_keys[..found],
+                    actual_found,
+                    &remaining_keys[..actual_found],
                     blocks,
                 );
             }
@@ -648,10 +650,11 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
             )
             .await
     {
+        let actual_found = blocks.len().min(found);
         record_tier_attribution(
             total,
             hit,
-            found,
+            actual_found,
             Some(PrefetchSource::Rdma.as_attribution()),
             emit_tier_metrics,
         );
@@ -659,8 +662,8 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
             prefix_blocks,
             total,
             Some(PrefetchSource::Rdma),
-            found,
-            &remaining_keys[..found],
+            actual_found,
+            &remaining_keys[..actual_found],
             blocks,
         );
     }
@@ -679,10 +682,11 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
                 )
                 .await
             {
+                let actual_found = blocks.len().min(found);
                 record_tier_attribution(
                     total,
                     hit,
-                    found,
+                    actual_found,
                     Some(PrefetchSource::Rdma.as_attribution()),
                     emit_tier_metrics,
                 );
@@ -690,8 +694,8 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
                     prefix_blocks,
                     total,
                     Some(PrefetchSource::Rdma),
-                    found,
-                    &remaining_keys[..found],
+                    actual_found,
+                    &remaining_keys[..actual_found],
                     blocks,
                 );
             }
