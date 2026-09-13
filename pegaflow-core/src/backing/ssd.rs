@@ -129,10 +129,10 @@ impl SsdBackingStore {
         let mut inner = self.inner.lock();
         let prepared = inner.ring.prepare_batch(candidates);
         let evicted = inner.ring.take_evictions();
-        if !evicted.is_empty() {
-            if let Some(callback) = &self.owner_mutation_callback {
-                callback(SsdOwnerTierMutation::Evicted(evicted));
-            }
+        if !evicted.is_empty()
+            && let Some(callback) = &self.owner_mutation_callback
+        {
+            callback(SsdOwnerTierMutation::Evicted(evicted));
         }
         prepared
     }
@@ -145,10 +145,8 @@ impl SsdBackingStore {
     ) {
         let mut inner = self.inner.lock();
         let committed = inner.ring.commit(key, entry, success);
-        if committed {
-            if let Some(callback) = &self.owner_mutation_callback {
-                callback(SsdOwnerTierMutation::Committed(vec![key.clone()]));
-            }
+        if committed && let Some(callback) = &self.owner_mutation_callback {
+            callback(SsdOwnerTierMutation::Committed(vec![key.clone()]));
         }
     }
 

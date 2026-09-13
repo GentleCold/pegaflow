@@ -47,11 +47,7 @@ impl RdmaFetch {
     ) -> Option<(usize, PrefetchResult)> {
         let plan = self
             .0
-            .query_plan(
-                namespace,
-                remaining_hashes,
-                source_requirement,
-            )
+            .query_plan(namespace, remaining_hashes, source_requirement)
             .await?;
         let found = plan.block_count();
         if require_full_prefix && found != remaining_hashes.len() {

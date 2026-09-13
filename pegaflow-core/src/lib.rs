@@ -44,8 +44,8 @@ pub use internode::{
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use pegaflow_common::NumaNode;
-use pegaflow_proto::proto::engine::TransferSourceRequirement;
 use pegaflow_common::{NumaTopology, group_hash};
+use pegaflow_proto::proto::engine::TransferSourceRequirement;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};

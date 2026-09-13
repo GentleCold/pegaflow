@@ -14,7 +14,6 @@ use std::time::Duration;
 use crate::backing::{
     AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig, SsdOwnerTierMutation,
 };
-use pegaflow_proto::proto::engine::TransferSourceRequirement;
 #[cfg(feature = "rdma")]
 use crate::backing::{RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
@@ -23,6 +22,7 @@ use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
+use pegaflow_proto::proto::engine::TransferSourceRequirement;
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]

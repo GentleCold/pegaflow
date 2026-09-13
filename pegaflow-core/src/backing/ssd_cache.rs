@@ -249,10 +249,9 @@ impl SsdRingBuffer {
             };
             if self.entries.get(&key).is_some_and(|state| {
                 state.entry().shard_id == shard_id && state.entry().begin == begin
-            }) {
-                if matches!(self.entries.remove(&key), Some(SsdEntryState::Committed(_))) {
-                    self.evictions.push(key);
-                }
+            }) && matches!(self.entries.remove(&key), Some(SsdEntryState::Committed(_)))
+            {
+                self.evictions.push(key);
             }
         }
     }
