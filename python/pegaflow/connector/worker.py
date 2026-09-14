@@ -620,6 +620,38 @@ class WorkerConnector:
         request_ids: list[str] = []
 
         for req_id, load_intent in metadata.load_intents.items():
+            if load_intent.leases_by_group is not None:
+                if load_intent.recurrent_hold is not None:
+                    raise RuntimeError(
+                        "per-group leases cannot be combined with recurrent HMA holds yet"
+                    )
+                if len(load_intent.leases_by_group) != self._cache_groups.group_count:
+                    raise RuntimeError(
+                        f"load intent has {len(load_intent.leases_by_group)} group lease vectors; "
+                        f"expected {self._cache_groups.group_count}"
+                    )
+                destinations = [list(group) for group in load_intent.block_ids_by_group]
+                shard = self._ctx.tp_shard_index
+                for group_index, group_leases in enumerate(load_intent.leases_by_group):
+                    if len(group_leases) != self._ctx.tp_shard_count:
+                        raise RuntimeError(
+                            f"load intent group {group_index} has {len(group_leases)} TP shard "
+                            f"leases; expected {self._ctx.tp_shard_count}"
+                        )
+                    lease = group_leases[shard]
+                    if not lease:
+                        continue
+                    vectors = [
+                        [None] * len(destinations[group_index])
+                        for _ in range(self._cache_groups.group_count)
+                    ]
+                    vectors[group_index] = destinations[group_index]
+                    all_block_ids.extend(
+                        block_id for block_id in destinations[group_index] if block_id is not None
+                    )
+                    loads.append((lease, vectors))
+                request_ids.append(req_id)
+                continue
             if len(load_intent.leases) != self._ctx.tp_shard_count:
                 raise RuntimeError(
                     f"load intent has {len(load_intent.leases)} TP shard leases; "
@@ -1011,7 +1043,15 @@ class WorkerConnector:
                 raise RuntimeError(
                     f"save intent is missing cache group {group_index} for {layer_name}"
                 ) from exc
-            block_hashes = save_intent.block_hashes
+            if save_intent.block_hashes_by_group is None:
+                block_hashes = save_intent.block_hashes
+            else:
+                try:
+                    block_hashes = save_intent.block_hashes_by_group[group_index]
+                except IndexError as exc:
+                    raise RuntimeError(
+                        f"save intent is missing hashes for cache group {group_index}"
+                    ) from exc
             if len(block_ids) != len(block_hashes):
                 raise RuntimeError(
                     f"save block/hash count mismatch for {layer_name}: "

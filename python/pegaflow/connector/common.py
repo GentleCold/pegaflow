@@ -241,6 +241,10 @@ class LoadIntent:
     block_ids_by_group: tuple[tuple[int | None, ...], ...]
     leases: tuple[bytes, ...]
     num_tokens: int
+    # Optional per-cache-group leases.  The legacy ``leases`` field remains
+    # the group-0 compatibility path; heterogeneous layouts use one lease
+    # vector per storage group so block counts can differ safely.
+    leases_by_group: tuple[tuple[bytes, ...], ...] | None = None
     # Hybrid-cache loads carry one membership lease per recurrent storage
     # group (pinned checkpoints in hit-positions order) on top of the
     # attention prefix leases. See RecurrentLoadHold.
@@ -308,6 +312,9 @@ class SaveIntent:
 
     block_ids_by_group: tuple[tuple[int, ...], ...]
     block_hashes: tuple[bytes, ...]
+    # Optional per-group hash vectors.  When absent, ``block_hashes`` is used
+    # for every group for backwards compatibility with uniform layouts.
+    block_hashes_by_group: tuple[tuple[bytes, ...], ...] | None = None
 
 
 @dataclass(frozen=True)
