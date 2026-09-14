@@ -49,7 +49,7 @@ pub struct Cli {
     #[arg(long, default_value_t = store::DEFAULT_NODE_STALE_SECS)]
     pub node_stale_secs: u64,
 
-    /// Minutes before block ownership records are purged by the lifecycle sweep.
+    /// Minutes without node activity before lifecycle cleanup (not block age).
     #[arg(long, default_value_t = store::DEFAULT_TTL_MINUTES)]
     pub ttl_minutes: u64,
 
@@ -113,8 +113,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
     info!(
-        "Node lifecycle: stale_after={}s ttl={}m sweep_interval={}s",
-        cli.node_stale_secs, cli.ttl_minutes, cli.sweep_interval_secs
+        "Node lifecycle: stale_after={}s manual_cleanup_age=1h sweep_interval={}s node_ttl_minutes={}",
+        cli.node_stale_secs, cli.sweep_interval_secs, cli.ttl_minutes
     );
     let ttl_secs = cli
         .ttl_minutes
@@ -153,7 +153,15 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             let mut interval = tokio::time::interval(sweep_interval);
             loop {
                 interval.tick().await;
-                let stats = store.sweep_expired();
+                let sweep_store = Arc::clone(&store);
+                let stats =
+                    match tokio::task::spawn_blocking(move || sweep_store.sweep_expired()).await {
+                        Ok(stats) => stats,
+                        Err(err) => {
+                            error!("Node sweep worker failed: {err}");
+                            continue;
+                        }
+                    };
                 if !stats.is_empty() {
                     metric::record_sweep(stats);
                     info!(
@@ -172,9 +180,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let shutdown = Arc::new(Notify::new());
 
     // Start HTTP server for health check and metrics
-    let _http_handle =
-        http_server::start_http_server(cli.http_addr, prometheus_registry, Arc::clone(&shutdown))
-            .await?;
+    let _http_handle = http_server::start_http_server(
+        cli.http_addr,
+        prometheus_registry,
+        Arc::clone(&store),
+        Arc::clone(&shutdown),
+    )
+    .await?;
 
     // Create the gRPC service
     let service = GrpcMetaService::new(store.clone());
