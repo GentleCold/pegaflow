@@ -63,8 +63,8 @@ cargo run -p pegaflow-metaserver -- --log-level debug
 # Custom node lifecycle timings
 cargo run -p pegaflow-metaserver -- --node-stale-secs 30 --ttl-minutes 120 --sweep-interval-secs 600
 
-# Configure public HTTP and localhost-only maintenance ports
-cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --http-addr 0.0.0.0:9092 --admin-http-addr 127.0.0.1:9093
+# Configure the HTTP listener
+cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --http-addr 0.0.0.0:9092
 
 # Show all options
 cargo run -p pegaflow-metaserver -- --help
@@ -73,8 +73,7 @@ cargo run -p pegaflow-metaserver -- --help
 ### Server Options
 
 - `--addr <ADDR>`: gRPC bind address (default: `127.0.0.1:50056`)
-- `--http-addr <ADDR>`: HTTP health and metrics bind address (default: `0.0.0.0:9092`)
-- `--admin-http-addr <ADDR>`: HTTP maintenance bind address; must be loopback (default: `127.0.0.1:9093`)
+- `--http-addr <ADDR>`: HTTP health, metrics, and maintenance bind address (default: `0.0.0.0:9092`)
 - `--log-level <LEVEL>`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
 - `--node-stale-secs <SECONDS>`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
 - `--ttl-minutes <MINUTES>`: Delete nodes and their owners after this many minutes without node activity (default: `120`); does not expire blocks by registration age
@@ -93,16 +92,15 @@ The MetaServer uses a DashMap-based in-memory store with the following character
 
 ## HTTP APIs
 
-Health and metrics use `--http-addr`; manual cleanup uses the separate
-`--admin-http-addr` listener. The admin address must be loopback (for example,
-`127.0.0.1:9093` or `[::1]:9093`); a non-loopback address makes startup fail.
-Choose distinct available ports when running multiple MetaServers on one host.
+Health, metrics, and manual cleanup use the `--http-addr` listener. These
+endpoints are intended for the internal MetaServer network. Choose distinct
+available ports when running multiple MetaServers on one host.
 
 | Default address | Method and path | Purpose |
 | --- | --- | --- |
 | `0.0.0.0:9092` | `GET /health` | Returns `ok` |
 | `0.0.0.0:9092` | `GET /metrics` | Prometheus metrics |
-| `127.0.0.1:9093` | `POST /admin/cleanup-expired-blocks` | Remove owner registrations older than one hour |
+| `0.0.0.0:9092` | `POST /admin/cleanup-expired-blocks` | Remove owner registrations older than one hour |
 
 ### Manual block cleanup
 
@@ -111,7 +109,7 @@ networking. No request body or authentication is required:
 
 ```bash
 curl --fail-with-body --silent --show-error --request POST \
-  http://127.0.0.1:9093/admin/cleanup-expired-blocks
+  http://127.0.0.1:9092/admin/cleanup-expired-blocks
 ```
 
 The threshold is fixed at one hour and independent of `--ttl-minutes`. The

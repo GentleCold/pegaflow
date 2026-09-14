@@ -41,10 +41,6 @@ pub struct Cli {
     #[arg(long, default_value = "0.0.0.0:9092")]
     pub http_addr: SocketAddr,
 
-    /// Loopback-only HTTP address for destructive operator maintenance.
-    #[arg(long, default_value = "127.0.0.1:9093")]
-    pub admin_http_addr: SocketAddr,
-
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -186,7 +182,6 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Start HTTP server for health check and metrics
     let _http_handle = http_server::start_http_server(
         cli.http_addr,
-        cli.admin_http_addr,
         prometheus_registry,
         Arc::clone(&store),
         Arc::clone(&shutdown),

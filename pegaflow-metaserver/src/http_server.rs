@@ -66,11 +66,6 @@ fn public_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
-        .with_state(state)
-}
-
-fn admin_app(state: AppState) -> Router {
-    Router::new()
         .route(
             "/admin/cleanup-expired-blocks",
             post(cleanup_expired_blocks_handler),
@@ -80,50 +75,25 @@ fn admin_app(state: AppState) -> Router {
 
 pub async fn start_http_server(
     addr: std::net::SocketAddr,
-    admin_addr: std::net::SocketAddr,
     prometheus_registry: Registry,
     store: Arc<BlockHashStore>,
     shutdown: Arc<Notify>,
 ) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
-    if !admin_addr.ip().is_loopback() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("admin HTTP address must be loopback, got {admin_addr}"),
-        ));
-    }
     let listener = TcpListener::bind(addr).await?;
-    let admin_listener = TcpListener::bind(admin_addr).await?;
 
     let state = AppState {
-        prometheus_registry: prometheus_registry.clone(),
-        store: Arc::clone(&store),
-    };
-    let admin_state = AppState {
         prometheus_registry,
         store,
     };
 
-    info!(
-        "Starting HTTP server on {} (/health, /metrics); admin cleanup on {} (localhost only)",
-        addr, admin_addr
-    );
+    info!("Starting HTTP server on {} (/health, /metrics, /admin/cleanup-expired-blocks)", addr);
 
     let handle = tokio::spawn(async move {
-        let public_shutdown = Arc::clone(&shutdown);
-        let public = axum::serve(listener, public_app(state)).with_graceful_shutdown(async move {
-            public_shutdown.notified().await;
-        });
-        let admin = axum::serve(admin_listener, admin_app(admin_state)).with_graceful_shutdown(
-            async move {
-                shutdown.notified().await;
-            },
-        );
-        let (public_result, admin_result) = tokio::join!(public, admin);
-        if let Err(err) = public_result {
+        let result = axum::serve(listener, public_app(state)).with_graceful_shutdown(async move {
+            shutdown.notified().await;
+        }).await;
+        if let Err(err) = result {
             warn!("HTTP server stopped with error: {err}");
-        }
-        if let Err(err) = admin_result {
-            warn!("Admin HTTP server stopped with error: {err}");
         }
     });
 
@@ -140,7 +110,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_route_removes_old_owners_and_preserves_fresh_replicas() {
         let store = Arc::new(crate::store::tests::manual_cleanup_fixture());
-        let app = admin_app(AppState {
+        let app = public_app(AppState {
             prometheus_registry: Registry::new(),
             store: Arc::clone(&store),
         });
@@ -184,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_route_does_not_expose_admin_cleanup() {
+    async fn cleanup_route_is_available_on_public_listener() {
         let response = public_app(AppState {
             prometheus_registry: Registry::new(),
             store: Arc::new(BlockHashStore::new()),
@@ -199,6 +169,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
