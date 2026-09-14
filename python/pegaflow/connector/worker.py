@@ -221,11 +221,6 @@ class WorkerConnector:
             allow_sliding_window=hybrid_kv_enabled,
             hash_block_size=context.hash_block_size,
         )
-        if self._cache_groups.requires_group_specific_block_mapping:
-            raise RuntimeError(
-                "PegaFlow requires per-group save/load mappings for SlidingWindowSpec "
-                "when its logical block size differs from the dense attention group"
-            )
         self._layer_to_group = self._cache_groups.layer_to_group()
         additional_config = getattr(vllm_config, "additional_config", {}) or {}
         self._use_mla_layer_split_registration = context.is_mla and bool(

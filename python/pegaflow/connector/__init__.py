@@ -54,11 +54,6 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             kv_cache_config,
             allow_sliding_window=hybrid_kv_enabled,
         )
-        if cache_group_layout.requires_group_specific_block_mapping:
-            raise RuntimeError(
-                "PegaFlow requires per-group save/load mappings for SlidingWindowSpec "
-                "when its logical block size differs from the dense attention group"
-            )
         collapse_mla_tp = is_mla and len(cache_groups) <= 1
         dcp_world_size = (
             getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) or 1

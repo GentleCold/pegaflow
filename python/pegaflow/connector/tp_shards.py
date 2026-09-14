@@ -10,6 +10,8 @@ from pegaflow.pegaflow import EngineRpcClient, QueryLoading, QueryReady
 class ShardedQueryReady:
     num_hit_blocks: int
     leases: tuple[bytes, ...]
+    leases_by_group: tuple[tuple[bytes, ...], ...] | None = None
+    hit_positions_by_group: tuple[tuple[int, ...], ...] | None = None
     # HMA only: per recurrent group, per shard membership leases and their
     # hit positions (see RecurrentLoadHold for the wire/load contract).
     recurrent_hold: RecurrentLoadHold | None = None

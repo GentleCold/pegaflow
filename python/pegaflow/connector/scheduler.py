@@ -65,6 +65,8 @@ class _QueryProbe:
     # ``None`` means the backend is still loading.
     hit_blocks: int | None = None
     leases: tuple[bytes, ...] = ()
+    leases_by_group: tuple[tuple[bytes, ...], ...] | None = None
+    hit_positions_by_group: tuple[tuple[int, ...], ...] | None = None
     # Hybrid (HMA): pinned recurrent checkpoints from the membership queries,
     # set together with `leases` when the hybrid reconcile found a boundary.
     recurrent_hold: RecurrentLoadHold | None = None
@@ -106,6 +108,8 @@ class _QueryProbe:
         self.hit_blocks = hit_blocks
         self.leased_blocks = hit_blocks
         self.leases = ready.leases
+        self.leases_by_group = ready.leases_by_group
+        self.hit_positions_by_group = ready.hit_positions_by_group
         self.recurrent_hold = ready.recurrent_hold
         self.usable_positions = frozenset(ready.usable_positions)
         self.attention_hit_blocks = ready.attention_hit_blocks
@@ -149,11 +153,6 @@ class SchedulerConnector:
             allow_sliding_window=hybrid_kv_enabled,
             hash_block_size=context.hash_block_size,
         )
-        if self._cache_groups.requires_group_specific_block_mapping:
-            raise RuntimeError(
-                "PegaFlow requires per-group save/load mappings for SlidingWindowSpec "
-                "when its logical block size differs from the dense attention group"
-            )
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
         self._gpu_block_pool = None
@@ -286,6 +285,27 @@ class SchedulerConnector:
                 block_hashes = block_hashes[:hashed]
         return block_hashes_per_block(block_hashes, self._ctx.hash_scale)
 
+    def _request_group_block_hashes(
+        self, request: "Request", group_index: int
+    ) -> tuple[bytes, ...]:
+        """Return hashes at one cache group's logical block cadence."""
+        hash_block_size = self._ctx.hash_block_size
+        if hash_block_size is None:
+            return self._request_block_hashes(request)
+        group_block_size = self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
+        if group_block_size % hash_block_size:
+            raise RuntimeError(
+                f"cache group {group_index} block size {group_block_size} is not aligned "
+                f"to hash block size {hash_block_size}"
+            )
+        raw_hashes = request.block_hashes
+        num_tokens = getattr(request, "num_tokens", 0)
+        if num_tokens:
+            hashed = num_tokens // hash_block_size
+            if len(raw_hashes) > hashed:
+                raw_hashes = raw_hashes[:hashed]
+        return block_hashes_per_block(raw_hashes, group_block_size // hash_block_size)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -336,7 +356,9 @@ class SchedulerConnector:
 
         # No reusable Ready result. Ask backend.
         lookup_start = time.perf_counter()
-        ready = self._count_available_block_prefix(backend_query_hashes, req_id)
+        ready = self._count_available_block_prefix(
+            backend_query_hashes, req_id, request=request, computed_blocks=computed_blocks
+        )
         lookup_us = (time.perf_counter() - lookup_start) * 1e6
 
         # Backend is still loading.  Keep the original snapshot.
@@ -576,6 +598,7 @@ class SchedulerConnector:
             vbs = self._ctx.virtual_block_size
             num_load_blocks = (num_external_tokens + vbs - 1) // vbs
             pending_probe = self._pending_query_probes.get(req_id)
+            leases_by_group = pending_probe.leases_by_group if pending_probe is not None else None
             try:
                 load_block_ids_by_group = self._load_block_ids_by_group(
                     block_ids_by_group,
@@ -586,15 +609,44 @@ class SchedulerConnector:
                         if pending_probe is not None
                         else num_load_blocks
                     ),
+                    sparse_groups=(
+                        getattr(self._cache_groups, "sliding_window_group_indices", frozenset())
+                        if leases_by_group is not None
+                        else frozenset()
+                    ),
                 )
             except RuntimeError:
                 self._release_pending_query_probe(req_id)
                 raise
 
+            if leases_by_group is not None and pending_probe.hit_positions_by_group is not None:
+                # Sliding groups have their own block cadence.  Their lease
+                # order is the membership-query position order, rather than
+                # the dense group's global block slice.
+                for group_index in getattr(
+                    self._cache_groups, "sliding_window_group_indices", frozenset()
+                ):
+                    if group_index == self._cache_groups.hash_group_index:
+                        continue
+                    positions = pending_probe.hit_positions_by_group[group_index]
+                    group = block_ids_by_group[group_index]
+                    group_vbs = (
+                        self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
+                    )
+                    full_vbs = self._ctx.virtual_block_size
+                    start = (num_computed_blocks * full_vbs) // group_vbs
+                    load_block_ids_by_group = tuple(
+                        tuple(group[start + position] for position in positions)
+                        if index == group_index
+                        else values
+                        for index, values in enumerate(load_block_ids_by_group)
+                    )
+
             load_intent = LoadIntent(
                 block_ids_by_group=load_block_ids_by_group,
                 leases=pending_probe.leases if pending_probe is not None else (),
                 num_tokens=num_external_tokens,
+                leases_by_group=leases_by_group,
                 recurrent_hold=(
                     pending_probe.recurrent_hold if pending_probe is not None else None
                 ),
@@ -875,6 +927,18 @@ class SchedulerConnector:
             return regular
         if regular is None:
             return tail
+        hashes_by_group = None
+        if regular.block_hashes_by_group is not None or tail.block_hashes_by_group is not None:
+            group_count = self._cache_groups.group_count
+            regular_groups = regular.block_hashes_by_group or tuple(
+                regular.block_hashes for _ in range(group_count)
+            )
+            tail_groups = tail.block_hashes_by_group or tuple(
+                tail.block_hashes for _ in range(group_count)
+            )
+            hashes_by_group = tuple(
+                regular_groups[index] + tail_groups[index] for index in range(group_count)
+            )
         return SaveIntent(
             block_ids_by_group=tuple(
                 regular_ids + tail_ids
@@ -885,6 +949,7 @@ class SchedulerConnector:
                 )
             ),
             block_hashes=regular.block_hashes + tail.block_hashes,
+            block_hashes_by_group=hashes_by_group,
         )
 
     def _consume_tail_save(self, req_id: str, written: int) -> SaveIntent | None:
@@ -1040,6 +1105,40 @@ class SchedulerConnector:
             else tuple(group[hash_start : hash_start + new_blocks])
             for group_index, group in enumerate(allocated)
         )
+        block_hashes_by_group = None
+        if getattr(self._cache_groups, "requires_group_specific_block_mapping", False):
+            request = self._requests.get(req_id)
+            if request is None:
+                raise RuntimeError(f"req {req_id} is missing while building a save intent")
+            mapped_ids: list[tuple[int, ...]] = []
+            mapped_hashes: list[tuple[bytes, ...]] = []
+            full_vbs = self._ctx.virtual_block_size
+            for group_index, group in enumerate(allocated):
+                if group_index in recurrent:
+                    mapped_ids.append((0,) * new_blocks)
+                    mapped_hashes.append(())
+                    continue
+                group_vbs = (
+                    self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
+                )
+                if group_vbs % full_vbs and full_vbs % group_vbs:
+                    raise RuntimeError(
+                        f"cache group {group_index} block size {group_vbs} cannot align "
+                        f"with scheduler block size {full_vbs}"
+                    )
+                group_hashes = self._request_group_block_hashes(request, group_index)
+                if group_vbs >= full_vbs:
+                    ratio = group_vbs // full_vbs
+                    start = hash_start * ratio
+                    count = new_blocks * ratio
+                else:
+                    ratio = full_vbs // group_vbs
+                    start = hash_start // ratio
+                    count = max(1, (new_blocks + ratio - 1) // ratio)
+                mapped_ids.append(tuple(group[start : start + count]))
+                mapped_hashes.append(tuple(group_hashes[start : start + count]))
+            save_block_ids_by_group = tuple(mapped_ids)
+            block_hashes_by_group = tuple(mapped_hashes)
         self._next_stored_block_idx[req_id] = saveable_block_idx
 
         logger.debug(
@@ -1057,6 +1156,7 @@ class SchedulerConnector:
         return SaveIntent(
             block_ids_by_group=save_block_ids_by_group,
             block_hashes=save_hashes,
+            block_hashes_by_group=block_hashes_by_group,
         )
 
     def _copy_block_ids_by_group(self, block_ids) -> tuple[tuple[int, ...], ...]:
@@ -1076,6 +1176,7 @@ class SchedulerConnector:
         start_block_idx: int,
         num_load_blocks: int,
         leased_blocks: int | None = None,
+        sparse_groups: frozenset[int] = frozenset(),
     ) -> tuple[tuple[int | None, ...], ...]:
         """Destination block IDs per cache group, one entry per leased block.
 
@@ -1087,7 +1188,10 @@ class SchedulerConnector:
         """
         end_block_idx = start_block_idx + num_load_blocks
         available = [len(group) for group in block_ids_by_group]
-        if any(length < end_block_idx for length in available):
+        if any(
+            length < end_block_idx and group_index not in sparse_groups
+            for group_index, length in enumerate(available)
+        ):
             raise RuntimeError(
                 f"load block mismatch: start={start_block_idx} count={num_load_blocks} "
                 f"available_by_group={available}"
@@ -1158,7 +1262,12 @@ class SchedulerConnector:
         self._tail_saved.discard(req_id)
 
     def _count_available_block_prefix(
-        self, block_hashes: Iterable[bytes], req_id: str
+        self,
+        block_hashes: Iterable[bytes],
+        req_id: str,
+        *,
+        request: "Request | None" = None,
+        computed_blocks: int = 0,
     ) -> ShardedQueryReady | None:
         """Query available blocks with prefetch support.
 
@@ -1201,7 +1310,85 @@ class SchedulerConnector:
 
         if self._cache_groups.has_recurrent_state:
             return self._reconcile_hybrid(block_hash_list, ready, req_id)
+        if request is not None and getattr(self._cache_groups, "sliding_window_group_indices", ()):
+            return self._attach_sliding_group_queries(
+                request, computed_blocks, block_hash_list, ready, req_id
+            )
         return ready
+
+    def _attach_sliding_group_queries(
+        self,
+        request: "Request",
+        computed_blocks: int,
+        full_hashes: list[bytes],
+        ready: ShardedQueryReady,
+        req_id: str,
+    ) -> ShardedQueryReady:
+        """Lease sliding-group blocks independently from the dense prefix.
+
+        The dense group determines the resumable prefix length.  Sliding
+        groups are then queried at their own hash cadence for the corresponding
+        token span, producing leases and positions that the worker can load
+        into only that group's destinations.
+        """
+        group_count = self._cache_groups.group_count
+        leases_by_group: list[tuple[bytes, ...]] = [() for _ in range(group_count)]
+        positions_by_group: list[tuple[int, ...]] = [() for _ in range(group_count)]
+        leases_by_group[self._cache_groups.hash_group_index] = ready.leases
+        positions_by_group[self._cache_groups.hash_group_index] = tuple(
+            range(ready.num_hit_blocks)
+        )
+        full_vbs = self._ctx.virtual_block_size
+        try:
+            for group_index in sorted(
+                getattr(self._cache_groups, "sliding_window_group_indices", frozenset())
+            ):
+                if group_index == self._cache_groups.hash_group_index:
+                    continue
+                group_vbs = (
+                    self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
+                )
+                if group_vbs <= 0 or full_vbs % group_vbs:
+                    raise RuntimeError(
+                        f"sliding group {group_index} block size {group_vbs} is not aligned "
+                        f"with scheduler block size {full_vbs}"
+                    )
+                fine_hashes = self._request_group_block_hashes(request, group_index)
+                start = (computed_blocks * full_vbs) // group_vbs
+                count = (ready.num_hit_blocks * full_vbs) // group_vbs
+                query = fine_hashes[start : start + count]
+                results = self._tp_shard_client.query_group_membership(
+                    self._ctx.instance_id,
+                    query,
+                    f"{req_id}:g{self._cache_groups.storage_group_of(group_index)}",
+                    self._cache_groups.storage_group_of(group_index),
+                )
+                common_positions = set(results[0][0]) if results else set()
+                for positions, _ in results[1:]:
+                    common_positions &= set(positions)
+                positions = tuple(sorted(common_positions))
+                if positions != tuple(range(count)):
+                    # A partial sliding-group hit cannot be loaded into the
+                    # dense prefix span without recomputing the missing KV.
+                    # Until window-tail planning is applied, fail closed.
+                    for _, lease in results:
+                        self._tp_shard_client.release((lease,), req_id)
+                    self._release_leases(ready.leases, req_id)
+                    return ShardedQueryReady(
+                        0,
+                        tuple(b"" for _ in ready.leases),
+                    )
+                leases_by_group[group_index] = tuple(lease for _, lease in results)
+                positions_by_group[group_index] = positions
+        except Exception:
+            for leases in leases_by_group:
+                self._release_leases(leases, req_id)
+            raise
+        return replace(
+            ready,
+            leases_by_group=tuple(leases_by_group),
+            hit_positions_by_group=tuple(positions_by_group),
+        )
 
     def _reconcile_hybrid(
         self,
@@ -1361,7 +1548,10 @@ class SchedulerConnector:
 
     def _release_query_probe(self, req_id: str, probe: _QueryProbe) -> bool:
         released = True
-        if probe.leases and any(probe.leases):
+        if probe.leases_by_group is not None:
+            for leases in probe.leases_by_group:
+                released = self._release_leases(leases, req_id) and released
+        elif probe.leases and any(probe.leases):
             released = self._release_leases(probe.leases, req_id)
         else:
             self._cancel_prefetch_tracking(req_id)
