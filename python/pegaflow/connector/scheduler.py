@@ -67,6 +67,7 @@ class _QueryProbe:
     leases: tuple[bytes, ...] = ()
     leases_by_group: tuple[tuple[bytes, ...], ...] | None = None
     hit_positions_by_group: tuple[tuple[int, ...], ...] | None = None
+    block_starts_by_group: tuple[int, ...] | None = None
     # Hybrid (HMA): pinned recurrent checkpoints from the membership queries,
     # set together with `leases` when the hybrid reconcile found a boundary.
     recurrent_hold: RecurrentLoadHold | None = None
@@ -110,6 +111,7 @@ class _QueryProbe:
         self.leases = ready.leases
         self.leases_by_group = ready.leases_by_group
         self.hit_positions_by_group = ready.hit_positions_by_group
+        self.block_starts_by_group = ready.block_starts_by_group
         self.recurrent_hold = ready.recurrent_hold
         self.usable_positions = frozenset(ready.usable_positions)
         self.attention_hit_blocks = ready.attention_hit_blocks
@@ -634,7 +636,10 @@ class SchedulerConnector:
                         self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
                     )
                     full_vbs = self._ctx.virtual_block_size
-                    start = (num_computed_blocks * full_vbs) // group_vbs
+                    if pending_probe.block_starts_by_group is not None:
+                        start = pending_probe.block_starts_by_group[group_index]
+                    else:
+                        start = (num_computed_blocks * full_vbs) // group_vbs
                     load_block_ids_by_group = tuple(
                         tuple(group[start + position] for position in positions)
                         if index == group_index
@@ -1133,8 +1138,8 @@ class SchedulerConnector:
                     count = new_blocks * ratio
                 else:
                     ratio = full_vbs // group_vbs
-                    start = hash_start // ratio
-                    count = max(1, (new_blocks + ratio - 1) // ratio)
+                    start = hash_start * ratio
+                    count = new_blocks * ratio
                 mapped_ids.append(tuple(group[start : start + count]))
                 mapped_hashes.append(tuple(group_hashes[start : start + count]))
             save_block_ids_by_group = tuple(mapped_ids)
@@ -1334,6 +1339,7 @@ class SchedulerConnector:
         group_count = self._cache_groups.group_count
         leases_by_group: list[tuple[bytes, ...]] = [() for _ in range(group_count)]
         positions_by_group: list[tuple[int, ...]] = [() for _ in range(group_count)]
+        starts_by_group = [0 for _ in range(group_count)]
         leases_by_group[self._cache_groups.hash_group_index] = ready.leases
         positions_by_group[self._cache_groups.hash_group_index] = tuple(
             range(ready.num_hit_blocks)
@@ -1354,8 +1360,15 @@ class SchedulerConnector:
                         f"with scheduler block size {full_vbs}"
                     )
                 fine_hashes = self._request_group_block_hashes(request, group_index)
-                start = (computed_blocks * full_vbs) // group_vbs
-                count = (ready.num_hit_blocks * full_vbs) // group_vbs
+                end_token = min(
+                    request.num_tokens,
+                    (computed_blocks + ready.num_hit_blocks) * full_vbs,
+                )
+                window = self._cache_groups.sliding_window_of(group_index)
+                start_token = max(0, end_token - (window or end_token))
+                start = start_token // group_vbs
+                count = max(0, (end_token // group_vbs) - start)
+                starts_by_group[group_index] = start
                 query = fine_hashes[start : start + count]
                 results = self._tp_shard_client.query_group_membership(
                     self._ctx.instance_id,
@@ -1388,6 +1401,7 @@ class SchedulerConnector:
             ready,
             leases_by_group=tuple(leases_by_group),
             hit_positions_by_group=tuple(positions_by_group),
+            block_starts_by_group=tuple(starts_by_group),
         )
 
     def _reconcile_hybrid(

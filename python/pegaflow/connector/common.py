@@ -333,6 +333,7 @@ class CacheGroupLayout:
     recurrent_group_indices: frozenset[int]
     recurrent_layer_names: frozenset[str]
     sliding_window_group_indices: frozenset[int] = frozenset()
+    group_sliding_windows: tuple[int | None, ...] = ()
     storage_group_ids: tuple[int, ...] = (0,)
     group_block_sizes: tuple[int, ...] = ()
     layer_block_sizes: tuple[tuple[tuple[str, int], ...], ...] = ()
@@ -354,6 +355,7 @@ class CacheGroupLayout:
                 recurrent_group_indices=frozenset(),
                 recurrent_layer_names=frozenset(),
                 sliding_window_group_indices=frozenset(),
+                group_sliding_windows=(None,),
                 group_block_sizes=(0,),
                 layer_block_sizes=((),),
             )
@@ -516,6 +518,19 @@ class CacheGroupLayout:
             for index, group in enumerate(groups)
             if has_layer_spec(group.kv_cache_spec, SlidingWindowSpec)
         )
+        group_sliding_windows = tuple(
+            next(
+                (
+                    int(getattr(layer_spec, "sliding_window"))
+                    for layer_spec in (getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}).values()
+                    if isinstance(layer_spec, SlidingWindowSpec)
+                ),
+                int(getattr(group.kv_cache_spec, "sliding_window"))
+                if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+                else None,
+            )
+            for group in groups
+        )
         # The dense full-attention group owns storage group 0 and therefore
         # prefix-query semantics. Sliding-window groups use one shared
         # membership storage group (their block cadence is finer and their
@@ -567,6 +582,7 @@ class CacheGroupLayout:
                 for layer_name in group.layer_names
             ),
             sliding_window_group_indices=sliding_window_group_indices,
+            group_sliding_windows=group_sliding_windows,
             storage_group_ids=storage_group_ids,
             group_block_sizes=group_block_sizes,
             layer_block_sizes=tuple(layer_block_sizes),
@@ -597,6 +613,10 @@ class CacheGroupLayout:
             if name == layer_name:
                 return size
         raise KeyError(f"KV cache layer is not in group {group_index}: {layer_name}")
+
+    def sliding_window_of(self, group_index: int) -> int | None:
+        """Return the token window for a sliding group, if one is declared."""
+        return self.group_sliding_windows[group_index]
 
     @property
     def requires_group_specific_block_mapping(self) -> bool:
