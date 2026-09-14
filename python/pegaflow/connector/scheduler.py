@@ -137,7 +137,23 @@ class SchedulerConnector:
                 f"{expected_shards} TP shards"
             )
         self._tp_shard_client = TpShardQueryClient(engine_clients)
-        self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
+        hybrid_kv_enabled = not bool(
+            getattr(
+                getattr(vllm_config, "scheduler_config", None),
+                "disable_hybrid_kv_cache_manager",
+                False,
+            )
+        )
+        self._cache_groups = CacheGroupLayout.from_config(
+            kv_cache_config,
+            allow_sliding_window=hybrid_kv_enabled,
+            hash_block_size=context.hash_block_size,
+        )
+        if self._cache_groups.requires_group_specific_block_mapping:
+            raise RuntimeError(
+                "PegaFlow requires per-group save/load mappings for SlidingWindowSpec "
+                "when its logical block size differs from the dense attention group"
+            )
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
         self._gpu_block_pool = None

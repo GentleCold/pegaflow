@@ -209,7 +209,23 @@ class WorkerConnector:
     ):
         self._ctx = context
         self._kv_cache_config = kv_cache_config
-        self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
+        hybrid_kv_enabled = not bool(
+            getattr(
+                getattr(vllm_config, "scheduler_config", None),
+                "disable_hybrid_kv_cache_manager",
+                False,
+            )
+        )
+        self._cache_groups = CacheGroupLayout.from_config(
+            kv_cache_config,
+            allow_sliding_window=hybrid_kv_enabled,
+            hash_block_size=context.hash_block_size,
+        )
+        if self._cache_groups.requires_group_specific_block_mapping:
+            raise RuntimeError(
+                "PegaFlow requires per-group save/load mappings for SlidingWindowSpec "
+                "when its logical block size differs from the dense attention group"
+            )
         self._layer_to_group = self._cache_groups.layer_to_group()
         additional_config = getattr(vllm_config, "additional_config", {}) or {}
         self._use_mla_layer_split_registration = context.is_mla and bool(
@@ -360,9 +376,21 @@ class WorkerConnector:
             wrapper = CudaIPCWrapper(registration_tensor)
             wrapper_bytes = pickle.dumps(wrapper)
 
+            group_index = self._layer_to_group.get(layer_name, 0)
+            try:
+                logical_block_size = self._cache_groups.block_size_of(group_index, layer_name)
+            except KeyError:
+                # Synthetic cross-layer registrations and legacy test doubles
+                # are not represented in vLLM's per-layer group table.
+                logical_block_size = self._cache_groups.block_size_of(group_index)
+            # Older connector construction paths do not pass a vLLM
+            # KVCacheConfig.  Their synthetic one-group layout has no spec
+            # block size; retain the context's scheduler block size there.
+            if logical_block_size <= 0:
+                logical_block_size = self._ctx.block_size
             registration = _infer_kv_cache_registration(
                 registration_tensor,
-                self._ctx.block_size,
+                logical_block_size,
                 is_mla=self._ctx.is_mla,
                 is_recurrent_state=is_recurrent_state,
             )
