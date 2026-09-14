@@ -86,12 +86,17 @@ pub async fn start_http_server(
         store,
     };
 
-    info!("Starting HTTP server on {} (/health, /metrics, /admin/cleanup-expired-blocks)", addr);
+    info!(
+        "Starting HTTP server on {} (/health, /metrics, /admin/cleanup-expired-blocks)",
+        addr
+    );
 
     let handle = tokio::spawn(async move {
-        let result = axum::serve(listener, public_app(state)).with_graceful_shutdown(async move {
-            shutdown.notified().await;
-        }).await;
+        let result = axum::serve(listener, public_app(state))
+            .with_graceful_shutdown(async move {
+                shutdown.notified().await;
+            })
+            .await;
         if let Err(err) = result {
             warn!("HTTP server stopped with error: {err}");
         }
