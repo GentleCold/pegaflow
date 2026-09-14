@@ -9,9 +9,9 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.connector.common import CacheGroupLayout, ConnectorContext
-from pegaflow.connector.scheduler import SchedulerConnector
-from pegaflow.connector.tp_shards import ShardedQueryReady
+from pegaflow.connector.common import CacheGroupLayout, ConnectorContext  # noqa: E402
+from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
+from pegaflow.connector.tp_shards import ShardedQueryReady  # noqa: E402
 
 
 def _layout() -> CacheGroupLayout:

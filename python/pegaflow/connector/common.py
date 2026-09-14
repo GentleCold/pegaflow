@@ -521,11 +521,11 @@ class CacheGroupLayout:
         group_sliding_windows = tuple(
             next(
                 (
-                    int(getattr(layer_spec, "sliding_window"))
+                    int(layer_spec.sliding_window)
                     for layer_spec in (getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}).values()
                     if isinstance(layer_spec, SlidingWindowSpec)
                 ),
-                int(getattr(group.kv_cache_spec, "sliding_window"))
+                int(group.kv_cache_spec.sliding_window)
                 if isinstance(group.kv_cache_spec, SlidingWindowSpec)
                 else None,
             )
