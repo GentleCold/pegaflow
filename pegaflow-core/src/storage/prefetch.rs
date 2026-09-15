@@ -23,6 +23,11 @@ use super::tier_attribution::{
 
 const REMOTE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REMOTE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+// A full prefetch budget is shared by concurrent requests.  Returning a
+// completed zero-hit result when the budget is temporarily exhausted turns
+// an SSD-resident prefix into a permanent miss for that request.  Wait for a
+// slot to be released before falling back to recomputation.
+const SSD_BACKPRESSURE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "rdma")]
 #[derive(Clone)]
@@ -511,6 +516,29 @@ fn reserve_ssd_prefetch_slots(
     ))
 }
 
+async fn reserve_ssd_prefetch_slots_wait(
+    state: Arc<Mutex<PrefetchState>>,
+    max_prefetch_blocks: usize,
+    requested: usize,
+    require_full: bool,
+) -> Option<(usize, SsdPrefetchReservation)> {
+    let deadline = Instant::now() + SSD_BACKPRESSURE_WAIT_TIMEOUT;
+    loop {
+        if let Some(reservation) = reserve_ssd_prefetch_slots(
+            Arc::clone(&state),
+            max_prefetch_blocks,
+            requested,
+            require_full,
+        ) {
+            return Some(reservation);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(REMOTE_WAIT_POLL_INTERVAL).await;
+    }
+}
+
 fn build_ready_result(
     prefix_blocks: Vec<Arc<SealedBlock>>,
     total: usize,
@@ -590,12 +618,13 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
     if let Some(ssd) = deps.ssd_store.as_ref() {
         let found = ssd.prefix_len(&remaining_keys);
         if (!wait_for_full_prefix || found == remaining_keys.len())
-            && let Some((reserved, _reservation)) = reserve_ssd_prefetch_slots(
+            && let Some((reserved, _reservation)) = reserve_ssd_prefetch_slots_wait(
                 Arc::clone(&deps.prefetch_state),
                 deps.max_prefetch_blocks,
                 found,
                 wait_for_full_prefix,
             )
+            .await
         {
             let keys = remaining_keys[..reserved].to_vec();
             let (found, blocks) = ssd.prefetch_prefix(keys).await;
