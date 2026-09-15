@@ -17,6 +17,7 @@ from pegaflow.connector.common import (  # noqa: E402
     ConnectorContext,
     LoadIntent,
     PegaConnectorMetadata,
+    SaveIntent,
     resolve_load_async,
 )
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
@@ -57,8 +58,8 @@ def _scheduler() -> SchedulerConnector:
     return scheduler
 
 
-def test_sliding_layout_defaults_to_sync_load_but_explicit_override_wins():
-    assert resolve_load_async(_layout()) is False
+def test_sliding_layout_defaults_to_async_load_but_explicit_override_wins():
+    assert resolve_load_async(_layout()) is True
     assert resolve_load_async(_layout(), True) is True
     assert resolve_load_async(replace(_layout(), sliding_window_group_indices=frozenset()), None)
     with pytest.raises(ValueError, match="JSON boolean"):
@@ -94,6 +95,20 @@ def test_save_maps_one_full_block_to_two_sliding_blocks():
         (hashes[1], hashes[3], hashes[5], hashes[7]),
         hashes,
     )
+
+
+def test_worker_save_keeps_physical_block_zero():
+    worker = WorkerConnector(_scheduler()._ctx)
+    worker._registered_layers = ["full"]
+    worker._layer_to_group = {"full": 0}
+    save_intent = SaveIntent(
+        block_ids_by_group=((0, 7), ()),
+        block_hashes=(b"h0", b"h1"),
+    )
+    rows = list(worker._layer_saves(save_intent))
+    assert rows == [("full", (0, 7), (b"h0", b"h1"))]
+    worker._registered_layers = []
+    worker.shutdown()
 
 
 @pytest.mark.parametrize("window", [32, 96])

@@ -1092,7 +1092,11 @@ class WorkerConnector:
             non_null = tuple(
                 (block_id, block_hash)
                 for block_id, block_hash in zip(block_ids, block_hashes, strict=True)
-                if block_id != 0
+                # Physical block 0 is a valid vLLM cache slot.  ``None`` is
+                # the only empty destination marker used by load intents;
+                # filtering 0 drops the first prefix block and makes every
+                # subsequent prefix query stop at block zero.
+                if block_id is not None
             )
             block_ids = tuple(block_id for block_id, _ in non_null)
             block_hashes = tuple(block_hash for _, block_hash in non_null)

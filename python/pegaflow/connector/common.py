@@ -820,9 +820,15 @@ _TRANSFER_BACKENDS = ("direct", "kernel")
 
 
 def resolve_load_async(layout: CacheGroupLayout, override: object = None) -> bool:
-    """Choose scheduling mode; sliding layouts default to synchronous loads."""
+    """Choose scheduling mode.
+
+    All cache layouts use vLLM's asynchronous receive lifecycle by default.
+    In particular, SlidingWindowSpec must not silently switch to a separate
+    synchronous path: its per-group leases and partial-window boundaries are
+    completed through the same ``finished_recving`` signal as full attention.
+    """
     if override is None:
-        return not bool(layout.sliding_window_group_indices)
+        return True
     if not isinstance(override, bool):
         raise ValueError("pegaflow.load_async must be a JSON boolean")
     return override
