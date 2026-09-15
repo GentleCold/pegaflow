@@ -84,7 +84,7 @@ def test_recurrent_mid_request_saves_keep_attention_cadence():
     scheduler._scheduled_tokens["r1"] = 32
 
     assert scheduler._consume_full_block_saves("r1") == SaveIntent(
-        block_ids_by_group=((11, 12), (0, 0)),
+        block_ids_by_group=((11, 12), ()),
         block_hashes=(_hash(0), _hash(1)),
     )
     assert scheduler._next_stored_block_idx["r1"] == 2
@@ -282,11 +282,19 @@ def test_use_page_first_detection(case: str, kwargs: dict, additional_config: di
 def test_hma_disables_page_first_registration():
     from pegaflow.connector.worker import WorkerConnector
 
-    attention = FullAttentionSpec()
-    attention.block_size = 16
-    recurrent = MambaSpec()
-    recurrent.block_size = 16
-    recurrent.mamba_cache_mode = "align"
+    try:
+        attention = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=None)
+    except TypeError:
+        attention = FullAttentionSpec()
+        attention.block_size = 16
+    try:
+        recurrent = MambaSpec(
+            block_size=16, shapes=((1,),), dtypes=(None,), mamba_cache_mode="align"
+        )
+    except TypeError:
+        recurrent = MambaSpec()
+        recurrent.block_size = 16
+        recurrent.mamba_cache_mode = "align"
     kv_cache_config = SimpleNamespace(
         kv_cache_groups=(
             SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),

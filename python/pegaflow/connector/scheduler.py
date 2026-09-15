@@ -304,7 +304,14 @@ class SchedulerConnector:
         num_tokens = getattr(request, "num_tokens", 0)
         if num_tokens:
             hashed = num_tokens // hash_block_size
-            if len(raw_hashes) > hashed:
+            stale = len(raw_hashes) - hashed
+            if stale > 1:
+                raise RuntimeError(
+                    f"req {request.request_id}: {len(raw_hashes)} group hashes span "
+                    f"more than the request's {num_tokens} tokens at hash granularity "
+                    f"{hash_block_size}"
+                )
+            if stale == 1:
                 raw_hashes = raw_hashes[:hashed]
         return block_hashes_per_block(raw_hashes, group_block_size // hash_block_size)
 
@@ -386,7 +393,11 @@ class SchedulerConnector:
                 computed_blocks,
                 len(query_hashes),
             )
-            self._release_leases(ready.leases, req_id)
+            if ready.leases_by_group is not None:
+                for leases in dict.fromkeys(ready.leases_by_group):
+                    self._release_leases(leases, req_id)
+            else:
+                self._release_leases(ready.leases, req_id)
             if ready.recurrent_hold is not None:
                 for group_index, group_leases in enumerate(ready.recurrent_hold.leases):
                     self._tp_shard_client.release(group_leases, f"{req_id}:g{group_index}")
@@ -972,6 +983,13 @@ class SchedulerConnector:
         """
         if not self._tail_save_enabled or req_id in self._tail_saved:
             return None
+        if self._cache_groups.requires_group_specific_block_mapping:
+            logger.debug(
+                "[PegaKVConnector] req=%s pd_tail_save skipped for heterogeneous "
+                "cache groups",
+                req_id,
+            )
+            return None
         req = self._requests.get(req_id)
         if req is None:
             return None
@@ -1109,7 +1127,7 @@ class SchedulerConnector:
         hash_start = start_block_idx
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
         save_block_ids_by_group = tuple(
-            (0,) * new_blocks
+            ()
             if group_index in recurrent
             else tuple(group[hash_start : hash_start + new_blocks])
             for group_index, group in enumerate(allocated)
@@ -1124,7 +1142,7 @@ class SchedulerConnector:
             full_vbs = self._ctx.virtual_block_size
             for group_index, group in enumerate(allocated):
                 if group_index in recurrent:
-                    mapped_ids.append((0,) * new_blocks)
+                    mapped_ids.append(())
                     mapped_hashes.append(())
                     continue
                 group_vbs = self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size

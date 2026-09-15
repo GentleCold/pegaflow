@@ -68,3 +68,18 @@ def test_missing_additional_config_defaults_to_no_split():
     cfg = _make_vllm_config(pp_size=4)
     cfg.additional_config = None
     assert derive_namespace(cfg, tp_size=8) == _ns(pp_size=4, mla_layer_split=False)
+
+
+def test_layer_block_sizes_isolate_namespace():
+    cfg = _make_vllm_config()
+    assert derive_namespace(
+        cfg,
+        tp_size=8,
+        cache_group_block_sizes=(32, 16),
+        cache_group_layer_block_sizes=((('full', 32),), (('sliding', 16),)),
+    ) != derive_namespace(
+        cfg,
+        tp_size=8,
+        cache_group_block_sizes=(32, 16),
+        cache_group_layer_block_sizes=((('full', 32),), (('sliding', 32),)),
+    )

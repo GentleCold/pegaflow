@@ -425,6 +425,19 @@ class CacheGroupLayout:
                 )
             )
             is_uniform_attention = _is_uniform_attention(spec)
+            if isinstance(spec, SlidingWindowSpec):
+                raise RuntimeError(
+                    "PegaFlow requires a dense FullAttention cache group alongside "
+                    "SlidingWindowSpec"
+                )
+            if is_uniform_attention and any(
+                isinstance(layer_spec, SlidingWindowSpec)
+                for layer_spec in spec.kv_cache_specs.values()
+            ):
+                raise RuntimeError(
+                    "PegaFlow requires SlidingWindowSpec layers to use a separate "
+                    "cache group from FullAttention layers"
+                )
             if (
                 type(spec) not in (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec)
                 and not is_uniform_mla
@@ -448,6 +461,11 @@ class CacheGroupLayout:
             )
             has_sliding_window = any(has_layer_spec(spec, SlidingWindowSpec) for spec in specs)
             has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
+            if has_sliding_window and has_mamba:
+                raise RuntimeError(
+                    "PegaFlow does not support combining SlidingWindowSpec with Mamba "
+                    "cache groups"
+                )
             if not has_dense_full_attention:
                 raise RuntimeError(
                     "PegaFlow requires a dense FullAttention cache group for block hashes"
@@ -574,6 +592,19 @@ class CacheGroupLayout:
                     for layer_name in group.layer_names
                 )
             )
+
+        if recurrent_group_indices:
+            dense_block_size = group_block_sizes[hash_group_index]
+            heterogeneous_recurrent = any(
+                group_block_sizes[index] != dense_block_size
+                or any(size != dense_block_size for _, size in layer_block_sizes[index])
+                for index in recurrent_group_indices
+            )
+            if heterogeneous_recurrent:
+                raise RuntimeError(
+                    "PegaFlow requires recurrent cache groups to use the dense "
+                    "attention block size"
+                )
 
         return cls(
             layer_names=tuple(tuple(group.layer_names) for group in groups),
@@ -756,6 +787,7 @@ def derive_namespace(
     cross_layer_blocks: bool = False,
     hash_block_size: int | None = None,
     cache_group_block_sizes: tuple[int, ...] | None = None,
+    cache_group_layer_block_sizes: tuple[tuple[tuple[str, int], ...], ...] | None = None,
 ) -> str:
     """
     Derive namespace for storage isolation.
@@ -801,6 +833,11 @@ def derive_namespace(
     }
     if cache_group_block_sizes is not None:
         factors["cache_group_block_sizes"] = tuple(cache_group_block_sizes)
+    if cache_group_layer_block_sizes is not None:
+        factors["cache_group_layer_block_sizes"] = tuple(
+            tuple((name, int(size)) for name, size in group)
+            for group in cache_group_layer_block_sizes
+        )
 
     factor_str = str(sorted(factors.items()))
     hash_suffix = hashlib.sha256(factor_str.encode()).hexdigest()[:8]

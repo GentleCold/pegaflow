@@ -145,16 +145,12 @@ more than one endpoint is configured.
 
 #### Load Scheduling
 
-`pegaflow.load_async` defaults to `false` for hybrid sliding-window layouts and
-to `true` for uniform layouts. Set it explicitly in `kv_connector_extra_config`
-to choose the other behavior. Synchronous mode finishes loading before the
-current forward pass and avoids extra scheduler round trips for cache hits, at
-the cost of blocking that forward while the batch transfers. Large transfers
-can benefit from asynchronous overlap.
-
-Synchronous mode waits for GPU transfer completion, including every hybrid
-cache group. A failed or timed out load stops the worker before forward can
-read incomplete KV. The setting must be a JSON boolean.
+PegaFlow always uses vLLM's asynchronous remote-KV lifecycle for loads. A cache
+hit enters `WAITING_FOR_REMOTE_KVS`; the worker starts the transfer after the
+forward boundary and reports completion through `finished_recving`. This is
+also the load path for hybrid cache groups, where full-attention and
+sliding-window groups can have different retained ranges. Failed or timed-out
+loads are reported to vLLM for local recomputation.
 
 #### P/D Partial Tail Blocks
 

@@ -99,6 +99,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             cross_layer_blocks=cross_layer_blocks,
             hash_block_size=hash_block_size,
             cache_group_block_sizes=cache_group_layout.group_block_sizes,
+            cache_group_layer_block_sizes=cache_group_layout.layer_block_sizes,
         )
 
         tp_rank: int | None = None

@@ -249,7 +249,7 @@ class WorkerConnector:
         self._load_completion_lock = threading.Lock()
 
         # Failure surface for vLLM's get_block_ids_with_load_errors / get_finished.
-        # Populated when start_load_kv fails synchronously or when an in-flight
+        # Populated when an asynchronous load RPC fails or when an in-flight
         # load times out waiting for the server. Drained once per get_finished
         # and get_block_ids_with_load_errors call.
         self._failed_load_block_ids: set[int] = set()
@@ -1052,7 +1052,17 @@ class WorkerConnector:
                     raise RuntimeError(
                         f"save intent is missing hashes for cache group {group_index}"
                     ) from exc
+            recurrent_groups = getattr(self._cache_groups, "recurrent_group_indices", None)
+            is_recurrent_placeholder = (
+                group_index in recurrent_groups
+                if recurrent_groups is not None
+                else bool(
+                    getattr(self._cache_groups, "has_recurrent_state", False) and group_index > 0
+                )
+            )
             if len(block_ids) != len(block_hashes):
+                if is_recurrent_placeholder and not block_ids:
+                    continue
                 raise RuntimeError(
                     f"save block/hash count mismatch for {layer_name}: "
                     f"blocks={len(block_ids)} hashes={len(block_hashes)}"
@@ -1065,6 +1075,11 @@ class WorkerConnector:
                 # filtering 0 drops the first prefix block and makes every
                 # subsequent prefix query stop at block zero.
                 if block_id is not None
+                and not (
+                    is_recurrent_placeholder
+                    and save_intent.block_hashes_by_group is None
+                    and block_id == 0
+                )
             )
             block_ids = tuple(block_id for block_id, _ in non_null)
             block_hashes = tuple(block_hash for _, block_hash in non_null)

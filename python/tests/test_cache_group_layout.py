@@ -165,11 +165,11 @@ def test_rejects_single_mamba_group(mode):
         CacheGroupLayout.from_config(_config(_group("recurrent", _mamba(mode=mode))))
 
 
-def test_accepts_single_sliding_window_group():
+def test_rejects_single_sliding_window_group():
     sliding_window = _sliding_window()
 
-    layout = CacheGroupLayout.from_config(_config(_group("sliding_window", sliding_window)))
-    assert layout.hash_group_index == 0
+    with pytest.raises(RuntimeError, match="dense FullAttention"):
+        CacheGroupLayout.from_config(_config(_group("sliding_window", sliding_window)))
 
 
 def test_rejects_sliding_window_when_hybrid_manager_disabled():
@@ -181,14 +181,14 @@ def test_rejects_sliding_window_when_hybrid_manager_disabled():
         )
 
 
-def test_accepts_different_logical_block_sizes_aligned_to_hash_unit():
+def test_rejects_different_recurrent_block_sizes():
     config = _config(
         _group("attention", _full_attention(block_size=16)),
         _group("recurrent", _mamba(block_size=32)),
     )
 
-    layout = CacheGroupLayout.from_config(config, hash_block_size=16)
-    assert layout.group_block_sizes == (16, 32)
+    with pytest.raises(RuntimeError, match="recurrent cache groups"):
+        CacheGroupLayout.from_config(config, hash_block_size=16)
 
 
 def test_rejects_non_integral_logical_block_size_ratio():
@@ -233,6 +233,17 @@ def test_accepts_full_attention_with_sliding_window():
     assert not layout.requires_group_specific_block_mapping
 
 
+def test_rejects_sliding_window_with_mamba():
+    config = _config(
+        _group("attention", _full_attention()),
+        _group("sliding_window", _sliding_window()),
+        _group("recurrent", _mamba()),
+    )
+
+    with pytest.raises(RuntimeError, match="SlidingWindowSpec with Mamba"):
+        CacheGroupLayout.from_config(config)
+
+
 def test_flags_heterogeneous_sliding_window_mapping_until_per_group_intents_exist():
     config = _config(
         _group("attention", _full_attention(block_size=32)),
@@ -245,20 +256,18 @@ def test_flags_heterogeneous_sliding_window_mapping_until_per_group_intents_exis
     assert layout.requires_group_specific_block_mapping
 
 
-def test_accepts_uniform_attention_group_with_sliding_window_layers():
+def test_rejects_uniform_attention_group_with_sliding_window_layers():
     full = _full_attention(block_size=16)
     sliding = _sliding_window(32, 128)
     spec = UniformTypeKVCacheSpecs(
         block_size=16,
         kv_cache_specs={"full": full, "sliding": sliding},
     )
-    layout = CacheGroupLayout.from_config(
-        _config(SimpleNamespace(layer_names=("full", "sliding"), kv_cache_spec=spec)),
-        hash_block_size=16,
-    )
-    assert layout.block_size_of(0, "full") == 16
-    assert layout.block_size_of(0, "sliding") == 32
-    assert layout.requires_group_specific_block_mapping
+    with pytest.raises(RuntimeError, match="separate cache group"):
+        CacheGroupLayout.from_config(
+            _config(SimpleNamespace(layer_names=("full", "sliding"), kv_cache_spec=spec)),
+            hash_block_size=16,
+        )
 
 
 def test_accepts_mla_with_mamba():
