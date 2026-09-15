@@ -738,6 +738,10 @@ class WorkerConnector:
                 len(all_block_ids),
             )
             self._release_load_leases(loads)
+            if not self._ctx.load_async:
+                self._raise_sync_load_failure(
+                    f"load rpc exception: {e}", load_start, len(all_block_ids)
+                )
             self._ctx.state_manager.mark_unavailable(f"load rpc exception: {e}")
             if self._cache_groups.group_count > 1:
                 raise RuntimeError(
@@ -756,6 +760,10 @@ class WorkerConnector:
                 len(all_block_ids),
             )
             self._release_load_leases(loads)
+            if not self._ctx.load_async:
+                self._raise_sync_load_failure(
+                    f"load rpc failed: {message}", load_start, len(all_block_ids)
+                )
             self._ctx.state_manager.mark_unavailable(f"load rpc failed: {message}")
             if self._cache_groups.group_count > 1:
                 raise RuntimeError(
@@ -767,6 +775,22 @@ class WorkerConnector:
 
         num_layers = sum(len(group) for group in layer_groups)
         num_blocks = len(all_block_ids)
+
+        if not self._ctx.load_async:
+            # vLLM schedules these requests in this forward. Wait here rather
+            # than in a layer callback, which CUDA graph replay may bypass.
+            # The shared state becomes ready only after the server's CUDA
+            # completion event; the RPC acknowledgement alone is insufficient.
+            while not load_state.is_ready():
+                if time.perf_counter() - load_start > self.LOAD_TIMEOUT_SECONDS:
+                    self._raise_sync_load_failure("load timeout", load_start, num_blocks)
+                time.sleep(0.0001)
+            state = load_state.get_state()
+            if state < 0:
+                self._raise_sync_load_failure(f"load failed: state={state}", load_start, num_blocks)
+            with self._stats_lock:
+                self._stats.record_load(time.perf_counter() - load_start, num_blocks, True)
+            return
 
         schedule_end = time.perf_counter()
         schedule_time_us = (schedule_end - load_start) * 1e6
@@ -793,6 +817,14 @@ class WorkerConnector:
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
+
+    def _raise_sync_load_failure(self, reason: str, load_start: float, num_blocks: int) -> None:
+        self._ctx.state_manager.mark_unavailable(reason)
+        with self._stats_lock:
+            self._stats.record_load(time.perf_counter() - load_start, num_blocks, False)
+        # No finished_recving signal is legal for a synchronously admitted
+        # request. Abort before forward can read partially loaded cache pages.
+        raise RuntimeError(f"PegaFlow synchronous load failed before forward: {reason}")
 
     def _release_load_leases(self, loads: list[tuple[bytes, list[list[int | None]]]]) -> None:
         seen: set[bytes] = set()

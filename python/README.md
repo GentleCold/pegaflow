@@ -143,6 +143,19 @@ TP sharding currently requires equal contiguous shards and TP-only parallelism.
 Pipeline, decode-context, and prefill-context parallelism are rejected when
 more than one endpoint is configured.
 
+#### Load Scheduling
+
+`pegaflow.load_async` defaults to `false` for hybrid sliding-window layouts and
+to `true` for uniform layouts. Set it explicitly in `kv_connector_extra_config`
+to choose the other behavior. Synchronous mode finishes loading before the
+current forward pass and avoids extra scheduler round trips for cache hits, at
+the cost of blocking that forward while the batch transfers. Large transfers
+can benefit from asynchronous overlap.
+
+Synchronous mode waits for GPU transfer completion, including every hybrid
+cache group. A failed or timed out load stops the worker before forward can
+read incomplete KV. The setting must be a JSON boolean.
+
 #### P/D Partial Tail Blocks
 
 vLLM normally exposes hashes only for complete KV blocks. In a P/D deployment,

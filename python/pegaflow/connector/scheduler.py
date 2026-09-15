@@ -559,7 +559,7 @@ class SchedulerConnector:
             self._release_pending_query_probe(req_id)
             return (0, False)
 
-        return (hit_tokens, True)
+        return (hit_tokens, self._ctx.load_async)
 
     def update_state_after_alloc(
         self,

@@ -271,6 +271,55 @@ def test_hma_load_timeout_crashes_before_vllm_partial_recovery(monkeypatch):
     worker.shutdown()
 
 
+@pytest.mark.parametrize("hybrid", [False, True], ids=["uniform", "hybrid"])
+@pytest.mark.parametrize("outcome", ["success", "error", "timeout", "rpc_false", "rpc_exception"])
+def test_sync_load_finishes_before_forward_without_async_completion(monkeypatch, hybrid, outcome):
+    worker, client, state_mgr = _make_worker(load_async=False)
+    if hybrid:
+        _configure_hma_worker(worker)
+    metadata = _hma_load_metadata("sync") if hybrid else _load_metadata("sync", (11, 12))
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("pegaflow.connector.worker.time.perf_counter", lambda: clock["now"])
+    load_state = MagicMock()
+    load_state.is_ready.side_effect = [False, True]
+    load_state.get_state.return_value = -1 if outcome == "error" else 1
+    monkeypatch.setattr("pegaflow.connector.worker.PyLoadState", lambda: load_state)
+    polls = []
+
+    def progress(_seconds):
+        polls.append(clock["now"])
+        clock["now"] += 0.001
+        if outcome == "timeout":
+            clock["now"] += worker.LOAD_TIMEOUT_SECONDS
+            load_state.is_ready.side_effect = None
+            load_state.is_ready.return_value = False
+
+    monkeypatch.setattr("pegaflow.connector.worker.time.sleep", progress)
+    client.fail_load_with_ok_false = outcome == "rpc_false"
+    if outcome == "rpc_exception":
+        client.fail_load_with_exception = ConnectionError("server gone")
+
+    try:
+        if outcome == "success":
+            worker.start_load_kv(metadata, _stub_forward_context())
+            assert len(polls) == 1
+            load_state.get_state.assert_called_once()
+            state_mgr.mark_unavailable.assert_not_called()
+        else:
+            with pytest.raises(RuntimeError, match="synchronous load failed before forward"):
+                worker.start_load_kv(metadata, _stub_forward_context())
+            state_mgr.mark_unavailable.assert_called_once()
+
+        assert worker.get_finished(set()) == (None, None)
+        assert worker.get_block_ids_with_load_errors() == set()
+        assert worker._pending_loads == {}
+        assert worker._pending_load_reqs == {}
+        assert worker._pending_load_meta == {}
+        assert client.release_calls == ([b"lease-sync"] if outcome.startswith("rpc_") else [])
+    finally:
+        worker.shutdown()
+
+
 def test_in_flight_load_timeout_respects_configured_boundary(monkeypatch):
     """B.2 boundary: elapsed < LOAD_TIMEOUT_SECONDS stays pending, > trips timeout.
 
