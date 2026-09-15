@@ -1123,9 +1123,7 @@ class SchedulerConnector:
                     mapped_ids.append((0,) * new_blocks)
                     mapped_hashes.append(())
                     continue
-                group_vbs = (
-                    self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
-                )
+                group_vbs = self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
                 if group_vbs % full_vbs and full_vbs % group_vbs:
                     raise RuntimeError(
                         f"cache group {group_index} block size {group_vbs} cannot align "
@@ -1329,80 +1327,132 @@ class SchedulerConnector:
         ready: ShardedQueryReady,
         req_id: str,
     ) -> ShardedQueryReady:
-        """Lease sliding-group blocks independently from the dense prefix.
+        """Find and lease the latest boundary served by every sliding group."""
+        if ready.num_hit_blocks == 0:
+            return ready
 
-        The dense group determines the resumable prefix length.  Sliding
-        groups are then queried at their own hash cadence for the corresponding
-        token span, producing leases and positions that the worker can load
-        into only that group's destinations.
-        """
-        group_count = self._cache_groups.group_count
-        leases_by_group: list[tuple[bytes, ...]] = [() for _ in range(group_count)]
-        positions_by_group: list[tuple[int, ...]] = [() for _ in range(group_count)]
-        starts_by_group = [0 for _ in range(group_count)]
-        leases_by_group[self._cache_groups.hash_group_index] = ready.leases
-        positions_by_group[self._cache_groups.hash_group_index] = tuple(
-            range(ready.num_hit_blocks)
-        )
+        layout = self._cache_groups
+        sliding_groups = sorted(layout.sliding_window_group_indices - {layout.hash_group_index})
+        if not sliding_groups:
+            return ready
         full_vbs = self._ctx.virtual_block_size
-        try:
-            for group_index in sorted(
-                getattr(self._cache_groups, "sliding_window_group_indices", frozenset())
-            ):
-                if group_index == self._cache_groups.hash_group_index:
-                    continue
-                group_vbs = (
-                    self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
-                )
-                if group_vbs <= 0 or full_vbs % group_vbs:
-                    raise RuntimeError(
-                        f"sliding group {group_index} block size {group_vbs} is not aligned "
-                        f"with scheduler block size {full_vbs}"
-                    )
-                fine_hashes = self._request_group_block_hashes(request, group_index)
-                end_token = min(
-                    request.num_tokens,
-                    (computed_blocks + ready.num_hit_blocks) * full_vbs,
-                )
-                window = self._cache_groups.sliding_window_of(group_index)
-                start_token = max(0, end_token - (window or end_token))
-                start = start_token // group_vbs
-                count = max(0, (end_token // group_vbs) - start)
-                starts_by_group[group_index] = start
-                query = fine_hashes[start : start + count]
+        computed_tokens = computed_blocks * full_vbs
+        group_sizes = {
+            index: layout.block_size_of(index) * self._ctx.dcp_world_size
+            for index in sliding_groups
+        }
+        # Groups with the same storage id and token span share both their
+        # membership result and lease. The worker combines their destinations.
+        queries: dict[tuple[int, int, int, int], tuple[frozenset[int], tuple[bytes, ...]]] = {}
+        acquired = {ready.leases}
+        retained: set[tuple[bytes, ...]] = set()
+
+        def span(group_index: int, blocks: int) -> tuple[int, int]:
+            size = group_sizes[group_index]
+            end_token = (computed_blocks + blocks) * full_vbs
+            window = layout.sliding_window_of(group_index)
+            start_token = max(computed_tokens, end_token - window if window else 0)
+            return start_token // size, end_token // size
+
+        def query(
+            group_index: int, start: int, end: int
+        ) -> tuple[frozenset[int], tuple[bytes, ...]]:
+            storage_group = layout.storage_group_of(group_index)
+            key = (storage_group, group_sizes[group_index], start, end)
+            if key not in queries:
+                hashes = self._request_group_block_hashes(request, group_index)
                 results = self._tp_shard_client.query_group_membership(
                     self._ctx.instance_id,
-                    query,
-                    f"{req_id}:g{self._cache_groups.storage_group_of(group_index)}",
-                    self._cache_groups.storage_group_of(group_index),
+                    list(hashes[start:end]),
+                    f"{req_id}:g{storage_group}:{start}-{end}",
+                    storage_group,
                 )
-                common_positions = set(results[0][0]) if results else set()
+                leases = tuple(lease for _, lease in results)
+                acquired.add(leases)
+                common = set(results[0][0]) if results else set()
                 for positions, _ in results[1:]:
-                    common_positions &= set(positions)
-                positions = tuple(sorted(common_positions))
-                if positions != tuple(range(count)):
-                    # A partial sliding-group hit cannot be loaded into the
-                    # dense prefix span without recomputing the missing KV.
-                    # Until window-tail planning is applied, fail closed.
-                    for _, lease in results:
-                        self._tp_shard_client.release((lease,), req_id)
-                    self._release_leases(ready.leases, req_id)
-                    return ShardedQueryReady(
-                        0,
-                        tuple(b"" for _ in ready.leases),
+                    common.intersection_update(positions)
+                queries[key] = frozenset(common), leases
+            return queries[key]
+
+        try:
+            for group_index, size in group_sizes.items():
+                if size <= 0 or full_vbs % size:
+                    raise RuntimeError(
+                        f"sliding group {group_index} block size {size} is not aligned "
+                        f"with scheduler block size {full_vbs}"
                     )
-                leases_by_group[group_index] = tuple(lease for _, lease in results)
-                positions_by_group[group_index] = positions
-        except Exception:
-            for leases in leases_by_group:
+
+            candidate = ready.num_hit_blocks
+            complete = True
+            for group_index in sliding_groups:
+                start, end = span(group_index, candidate)
+                positions, _ = query(group_index, start, end)
+                complete = complete and positions == frozenset(range(end - start))
+
+            if not complete:
+                # Sliding hits are not monotone: an earlier boundary needs a
+                # different window. Probe all groups back to the local prefix
+                # and intersect their legal boundaries, rather than taking
+                # the minimum of independently selected hits.
+                membership: dict[int, frozenset[int]] = {}
+                for group_index in sliding_groups:
+                    start = computed_tokens // group_sizes[group_index]
+                    _, end = span(group_index, candidate)
+                    positions, _ = query(group_index, start, end)
+                    membership[group_index] = frozenset(start + p for p in positions)
+                candidate = next(
+                    (
+                        blocks
+                        for blocks in range(candidate - 1, 0, -1)
+                        if all(
+                            membership[index].issuperset(range(*span(index, blocks)))
+                            for index in sliding_groups
+                        )
+                    ),
+                    0,
+                )
+                if candidate == 0:
+                    return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+
+                # Keep the original leases pinned until their exact
+                # replacements have been acquired, including on TP shards.
+                dense = self._tp_shard_client.query(
+                    self._ctx.instance_id,
+                    list(full_hashes[:candidate]),
+                    req_id=f"{req_id}:dense-shrunk-{candidate}",
+                    wait_for_full_prefix=False,
+                )
+                if dense is not None:
+                    acquired.add(dense.leases)
+                if dense is None or dense.num_hit_blocks != candidate:
+                    return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+                ready = dense
+
+            leases_by_group: list[tuple[bytes, ...]] = [() for _ in range(layout.group_count)]
+            positions_by_group: list[tuple[int, ...]] = [() for _ in range(layout.group_count)]
+            starts_by_group = [0 for _ in range(layout.group_count)]
+            leases_by_group[layout.hash_group_index] = ready.leases
+            positions_by_group[layout.hash_group_index] = tuple(range(candidate))
+            for group_index in sliding_groups:
+                start, end = span(group_index, candidate)
+                positions, leases = query(group_index, start, end)
+                if positions != frozenset(range(end - start)):
+                    return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+                starts_by_group[group_index] = start
+                positions_by_group[group_index] = tuple(range(end - start))
+                leases_by_group[group_index] = leases
+
+            retained = set(leases_by_group)
+            return replace(
+                ready,
+                leases_by_group=tuple(leases_by_group),
+                hit_positions_by_group=tuple(positions_by_group),
+                block_starts_by_group=tuple(starts_by_group),
+            )
+        finally:
+            for leases in acquired - retained:
                 self._release_leases(leases, req_id)
-            raise
-        return replace(
-            ready,
-            leases_by_group=tuple(leases_by_group),
-            hit_positions_by_group=tuple(positions_by_group),
-            block_starts_by_group=tuple(starts_by_group),
-        )
 
     def _reconcile_hybrid(
         self,
@@ -1563,7 +1613,7 @@ class SchedulerConnector:
     def _release_query_probe(self, req_id: str, probe: _QueryProbe) -> bool:
         released = True
         if probe.leases_by_group is not None:
-            for leases in probe.leases_by_group:
+            for leases in dict.fromkeys(probe.leases_by_group):
                 released = self._release_leases(leases, req_id) and released
         elif probe.leases and any(probe.leases):
             released = self._release_leases(probe.leases, req_id)

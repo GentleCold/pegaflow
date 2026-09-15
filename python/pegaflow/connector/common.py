@@ -243,7 +243,9 @@ class LoadIntent:
     num_tokens: int
     # Optional per-cache-group leases.  The legacy ``leases`` field remains
     # the group-0 compatibility path; heterogeneous layouts use one lease
-    # vector per storage group so block counts can differ safely.
+    # vector per cache group so block counts can differ safely. Groups with
+    # identical storage queries share a lease; workers combine their targets
+    # into one backend load and release that lease exactly once.
     leases_by_group: tuple[tuple[bytes, ...], ...] | None = None
     # Hybrid-cache loads carry one membership lease per recurrent storage
     # group (pinned checkpoints in hit-positions order) on top of the
@@ -522,7 +524,9 @@ class CacheGroupLayout:
             next(
                 (
                     int(layer_spec.sliding_window)
-                    for layer_spec in (getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}).values()
+                    for layer_spec in (
+                        getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}
+                    ).values()
                     if isinstance(layer_spec, SlidingWindowSpec)
                 ),
                 int(group.kv_cache_spec.sliding_window)
@@ -545,7 +549,8 @@ class CacheGroupLayout:
         storage_group_ids = tuple(
             (0 if index == hash_group_index else 1)
             if index not in recurrent_group_indices
-            else 1 + int(has_secondary_attention)
+            else 1
+            + int(has_secondary_attention)
             + sum(1 for other in recurrent_group_indices if other < index)
             for index in range(len(groups))
         )

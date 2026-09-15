@@ -627,6 +627,7 @@ class WorkerConnector:
                     )
                 destinations = [list(group) for group in load_intent.block_ids_by_group]
                 shard = self._ctx.tp_shard_index
+                shared_loads: dict[bytes, list[list[int | None]]] = {}
                 for group_index, group_leases in enumerate(load_intent.leases_by_group):
                     if len(group_leases) != self._ctx.tp_shard_count:
                         raise RuntimeError(
@@ -636,15 +637,19 @@ class WorkerConnector:
                     lease = group_leases[shard]
                     if not lease:
                         continue
-                    vectors = [
-                        [None] * len(destinations[group_index])
-                        for _ in range(self._cache_groups.group_count)
-                    ]
+                    count = len(destinations[group_index])
+                    if lease not in shared_loads:
+                        shared_loads[lease] = [
+                            [None] * count for _ in range(self._cache_groups.group_count)
+                        ]
+                    vectors = shared_loads[lease]
+                    if any(len(group) != count for group in vectors):
+                        raise RuntimeError("cache groups sharing a load lease have different spans")
                     vectors[group_index] = destinations[group_index]
                     all_block_ids.extend(
                         block_id for block_id in destinations[group_index] if block_id is not None
                     )
-                    loads.append((lease, vectors))
+                loads.extend(shared_loads.items())
                 request_ids.append(req_id)
                 continue
             if len(load_intent.leases) != self._ctx.tp_shard_count:

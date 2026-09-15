@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.connector.common import CacheGroupLayout, ConnectorContext  # noqa: E402
+from pegaflow.connector.common import (  # noqa: E402
+    CacheGroupLayout,
+    ConnectorContext,
+    LoadIntent,
+    PegaConnectorMetadata,
+)
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
 from pegaflow.connector.tp_shards import ShardedQueryReady  # noqa: E402
+from pegaflow.connector.worker import WorkerConnector  # noqa: E402
 
 
 def _layout() -> CacheGroupLayout:
@@ -25,7 +34,7 @@ def _layout() -> CacheGroupLayout:
         group_sliding_windows=(None, 32),
         storage_group_ids=(0, 1),
         group_block_sizes=(32, 16),
-        layer_block_sizes=((('full', 32),), (('sliding', 16),)),
+        layer_block_sizes=((("full", 32),), (("sliding", 16),)),
     )
 
 
@@ -78,8 +87,10 @@ def test_save_maps_one_full_block_to_two_sliding_blocks():
     )
 
 
-def test_sliding_query_uses_retained_window_suffix():
+@pytest.mark.parametrize("window", [32, 96])
+def test_sliding_query_uses_retained_window_suffix(window):
     scheduler = _scheduler()
+    scheduler._cache_groups = replace(_layout(), group_sliding_windows=(None, window))
     hashes = tuple(bytes([index]) for index in range(8))
     request = SimpleNamespace(request_id="r1", num_tokens=128, block_hashes=list(hashes))
     results = []
@@ -99,3 +110,182 @@ def test_sliding_query_uses_retained_window_suffix():
     assert attached.block_starts_by_group == (0, 4)
     assert attached.hit_positions_by_group == ((0,), (0, 1))
     assert attached.leases_by_group == ((b"dense",), (b"lease",))
+
+
+def test_sliding_query_shrinks_to_latest_common_boundary_on_partial_hit():
+    scheduler = _scheduler()
+    hashes = tuple(bytes([index]) for index in range(8))
+    request = SimpleNamespace(request_id="r1", num_tokens=128, block_hashes=list(hashes))
+    membership_queries = []
+
+    def query_group_membership(_instance, block_hashes, req_id, _group_id):
+        query = tuple(block_hashes)
+        membership_queries.append((req_id, query))
+        if query == hashes[6:8]:
+            # The latest 32-token window has a hole at its final block.
+            return [((0,), b"initial")]
+        if query == hashes[0:8]:
+            # The preceding window [4:6] is complete, so the model can resume
+            # at three dense blocks even though four were found by attention.
+            return [((0, 1, 2, 3, 4, 5, 6), b"wide")]
+        if query == hashes[4:6]:
+            return [((0, 1), b"final")]
+        raise AssertionError(f"unexpected membership query: {query!r}")
+
+    scheduler._tp_shard_client.query_group_membership = query_group_membership
+
+    def query(_instance, block_hashes, req_id, wait_for_full_prefix):
+        assert req_id == "r1:dense-shrunk-3"
+        assert wait_for_full_prefix is False
+        assert tuple(block_hashes) == hashes[0:3]
+        return ShardedQueryReady(num_hit_blocks=3, leases=(b"dense-shrunk",))
+
+    scheduler._tp_shard_client.query = query
+    scheduler._tp_shard_client.release = MagicMock(return_value=True)
+
+    attached = scheduler._attach_sliding_group_queries(
+        request,
+        computed_blocks=0,
+        full_hashes=list(hashes[0:4]),
+        ready=ShardedQueryReady(num_hit_blocks=4, leases=(b"dense",)),
+        req_id="r1",
+    )
+
+    assert attached.num_hit_blocks == 3
+    assert attached.leases == (b"dense-shrunk",)
+    assert attached.block_starts_by_group == (0, 4)
+    assert attached.hit_positions_by_group == ((0, 1, 2), (0, 1))
+    assert attached.leases_by_group == ((b"dense-shrunk",), (b"final",))
+
+    released = [args[0][0] for args in scheduler._tp_shard_client.release.call_args_list]
+    assert sorted(released) == [(b"dense",), (b"initial",), (b"wide",)]
+
+
+def test_sliding_groups_intersect_windows_after_boundary_shrinks():
+    scheduler = _scheduler()
+    scheduler._cache_groups = replace(
+        _layout(),
+        layer_names=(("full",), ("sliding",), ("sliding_other",)),
+        sliding_window_group_indices=frozenset({1, 2}),
+        group_sliding_windows=(None, 32, 32),
+        storage_group_ids=(0, 1, 2),
+        group_block_sizes=(32, 16, 16),
+    )
+    hashes = tuple(bytes([i]) for i in range(8))
+    request = SimpleNamespace(request_id="r", num_tokens=128, block_hashes=list(hashes))
+
+    def membership(_instance, keys, _req_id, group_id):
+        available = {0, 1, 2, 3, 6, 7} if group_id == 1 else set(range(7))
+        positions = tuple(i for i, key in enumerate(keys) if key[0] in available)
+        return [(positions, bytes([group_id]) + b"".join(keys))]
+
+    scheduler._tp_shard_client.query_group_membership = membership
+    scheduler._tp_shard_client.query = MagicMock(
+        return_value=ShardedQueryReady(2, (b"dense-shrunk",))
+    )
+    result = scheduler._attach_sliding_group_queries(
+        request, 0, list(hashes[1::2]), ShardedQueryReady(4, (b"dense",)), "r"
+    )
+    # Group 1 serves boundaries 4 and 2, group 2 serves 3 and 2.
+    assert result.num_hit_blocks == 2
+    assert result.block_starts_by_group == (0, 2, 2)
+    assert result.hit_positions_by_group == ((0, 1), (0, 1), (0, 1))
+
+
+def test_shared_sliding_storage_uses_one_query_and_one_worker_load():
+    scheduler = _scheduler()
+    layout = replace(
+        _layout(),
+        layer_names=(("full",), ("sliding",), ("sliding_other",)),
+        sliding_window_group_indices=frozenset({1, 2}),
+        group_sliding_windows=(None, 32, 32),
+        storage_group_ids=(0, 1, 1),
+        group_block_sizes=(32, 16, 16),
+    )
+    scheduler._cache_groups = layout
+    scheduler._tp_shard_client.query_group_membership = MagicMock(
+        return_value=[((0, 1), b"sliding")]
+    )
+    request = SimpleNamespace(num_tokens=128, block_hashes=[bytes([i]) for i in range(8)])
+    result = scheduler._attach_sliding_group_queries(
+        request, 0, [b"h"] * 4, ShardedQueryReady(4, (b"dense",)), "r"
+    )
+    scheduler._tp_shard_client.query_group_membership.assert_called_once()
+    assert result.leases_by_group == ((b"dense",), (b"sliding",), (b"sliding",))
+
+    worker = WorkerConnector(scheduler._ctx)
+    worker._cache_groups = layout
+    worker._registered_layers = ["full", "sliding", "sliding_other"]
+    worker._layer_to_group = layout.layer_to_group()
+    scheduler._ctx.engine_client.load.return_value = (True, "")
+    try:
+        worker.start_load_kv(
+            PegaConnectorMetadata(
+                load_intents={
+                    "r": LoadIntent(
+                        block_ids_by_group=((10, 11, 12, 13), (20, 21), (30, 31)),
+                        leases=result.leases,
+                        leases_by_group=result.leases_by_group,
+                        num_tokens=128,
+                    )
+                }
+            ),
+            SimpleNamespace(),
+        )
+        assert scheduler._ctx.engine_client.load.call_args.args[5] == [
+            (b"dense", [[10, 11, 12, 13], [None] * 4, [None] * 4]),
+            (b"sliding", [[None, None], [20, 21], [30, 31]]),
+        ]
+    finally:
+        worker._registered_layers = []
+        worker.shutdown()
+
+    scheduler._tp_shard_client.release = MagicMock(return_value=True)
+    scheduler._release_query_probe(
+        "r", SimpleNamespace(leases_by_group=result.leases_by_group, recurrent_hold=None)
+    )
+    assert scheduler._tp_shard_client.release.call_count == 2
+
+
+@pytest.mark.parametrize("outcome", ["miss", "error"])
+def test_sliding_query_cleans_all_leases_when_final_query_fails(outcome):
+    scheduler = _scheduler()
+    hashes = [bytes([i]) for i in range(8)]
+    request = SimpleNamespace(num_tokens=128, block_hashes=hashes)
+    final = [((0,), b"final-partial")] if outcome == "miss" else RuntimeError("query failed")
+    scheduler._tp_shard_client.query_group_membership = MagicMock(
+        side_effect=[
+            [((0,), b"initial")],
+            [(tuple(range(7)), b"wide")],
+            final,
+        ]
+    )
+    scheduler._tp_shard_client.query = MagicMock(
+        return_value=ShardedQueryReady(3, (b"dense-shrunk",))
+    )
+    scheduler._tp_shard_client.release = MagicMock(return_value=True)
+    if outcome == "error":
+        with pytest.raises(RuntimeError, match="query failed"):
+            scheduler._attach_sliding_group_queries(
+                request, 0, hashes[1::2], ShardedQueryReady(4, (b"dense",)), "r"
+            )
+    else:
+        result = scheduler._attach_sliding_group_queries(
+            request, 0, hashes[1::2], ShardedQueryReady(4, (b"dense",)), "r"
+        )
+        assert result.num_hit_blocks == 0
+    released = [args[0][0] for args in scheduler._tp_shard_client.release.call_args_list]
+    expected = [(b"dense",), (b"dense-shrunk",), (b"initial",), (b"wide",)]
+    if outcome == "miss":
+        expected.append((b"final-partial",))
+    assert sorted(released) == sorted(expected)
+
+
+def test_dense_miss_skips_sliding_membership_queries():
+    scheduler = _scheduler()
+    scheduler._tp_shard_client.query_group_membership = MagicMock()
+    result = scheduler._attach_sliding_group_queries(
+        SimpleNamespace(), 0, [], ShardedQueryReady(0, (b"",)), "r"
+    )
+    assert result.num_hit_blocks == 0
+    scheduler._tp_shard_client.query_group_membership.assert_not_called()
