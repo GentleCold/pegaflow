@@ -143,9 +143,6 @@ class ConnectorContext:
     pp_size: int = 1
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
     wait_for_full_prefix: bool = False
-    # Synchronous loads finish before this step's forward and do not enter
-    # vLLM's WAITING_FOR_REMOTE_KVS / finished_recving lifecycle.
-    load_async: bool = True
     tp_shards: TpShardTopology | None = None
     # Token span of one `Request.block_hashes` entry; `None` means one per
     # scheduler block.
@@ -819,21 +816,6 @@ def detect_mla(vllm_config) -> bool:
 _TRANSFER_BACKENDS = ("direct", "kernel")
 
 
-def resolve_load_async(layout: CacheGroupLayout, override: object = None) -> bool:
-    """Choose scheduling mode.
-
-    All cache layouts use vLLM's asynchronous receive lifecycle by default.
-    In particular, SlidingWindowSpec must not silently switch to a separate
-    synchronous path: its per-group leases and partial-window boundaries are
-    completed through the same ``finished_recving`` signal as full attention.
-    """
-    if override is None:
-        return True
-    if not isinstance(override, bool):
-        raise ValueError("pegaflow.load_async must be a JSON boolean")
-    return override
-
-
 def resolve_transfer_backend(is_mla: bool, override: str | None) -> str:
     """Pick the engine's H2D/D2H backend for this model.
 
@@ -871,6 +853,5 @@ __all__ = [
     "parse_env_int",
     "reconcile_hybrid_hit",
     "resolve_instance_id",
-    "resolve_load_async",
     "resolve_transfer_backend",
 ]

@@ -559,7 +559,11 @@ class SchedulerConnector:
             self._release_pending_query_probe(req_id)
             return (0, False)
 
-        return (hit_tokens, self._ctx.load_async)
+        # Every external load uses vLLM's WAITING_FOR_REMOTE_KVS lifecycle.
+        # This is required for hybrid layouts because each cache group can
+        # complete at a different boundary while the worker performs one
+        # asynchronous load bookkeeping path.
+        return (hit_tokens, True)
 
     def update_state_after_alloc(
         self,

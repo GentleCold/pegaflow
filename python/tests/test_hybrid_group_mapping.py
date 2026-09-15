@@ -18,7 +18,6 @@ from pegaflow.connector.common import (  # noqa: E402
     LoadIntent,
     PegaConnectorMetadata,
     SaveIntent,
-    resolve_load_async,
 )
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
 from pegaflow.connector.tp_shards import ShardedQueryReady  # noqa: E402
@@ -58,12 +57,10 @@ def _scheduler() -> SchedulerConnector:
     return scheduler
 
 
-def test_sliding_layout_defaults_to_async_load_but_explicit_override_wins():
-    assert resolve_load_async(_layout()) is True
-    assert resolve_load_async(_layout(), True) is True
-    assert resolve_load_async(replace(_layout(), sliding_window_group_indices=frozenset()), None)
-    with pytest.raises(ValueError, match="JSON boolean"):
-        resolve_load_async(_layout(), "false")
+def test_sliding_layout_is_supported_by_the_async_connector_contract():
+    layout = _layout()
+    assert layout.sliding_window_group_indices == frozenset({1})
+    assert layout.group_block_sizes == (32, 16)
 
 
 def test_save_maps_one_full_block_to_two_sliding_blocks():

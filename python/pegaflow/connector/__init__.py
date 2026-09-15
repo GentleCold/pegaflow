@@ -28,7 +28,6 @@ from pegaflow.connector.common import (
     detect_mla,
     logger,
     resolve_instance_id,
-    resolve_load_async,
     resolve_transfer_backend,
 )
 from pegaflow.connector.scheduler import SchedulerConnector
@@ -143,10 +142,6 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
                 "pegaflow.wait_for_full_prefix", False
             )
         )
-        load_async = resolve_load_async(
-            cache_group_layout,
-            vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.load_async", None),
-        )
         default_endpoint = f"{server_host}:{server_port}"
         tp_shards = TpShardTopology.from_config(
             default_endpoint=default_endpoint,
@@ -192,7 +187,6 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             pp_size=pp_size,
             mode=mode,
             wait_for_full_prefix=wait_for_full_prefix,
-            load_async=load_async,
             tp_shards=tp_shards,
             hash_block_size=hash_block_size,
         )
@@ -254,7 +248,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
             "is_mla=%s collapse_mla_tp=%s transfer_backend=%s dcp_world_size=%d "
             "pcp_world_size=%d dcp_rank=%d tp_shard=%d/%d "
-            "mode=%s wait_for_full_prefix=%s load_async=%s",
+            "mode=%s wait_for_full_prefix=%s load_mode=async",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -274,7 +268,6 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             tp_shards.shard_count,
             mode.value,
             wait_for_full_prefix,
-            load_async,
         )
 
     # ==============================

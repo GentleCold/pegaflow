@@ -693,17 +693,15 @@ class TestSchedulerQueryProbeReuse:
         )
         return SchedulerConnector(ctx), engine_client
 
-    @pytest.mark.parametrize("load_async", [True, False])
-    def test_repeated_same_probe_reuses_query_result(self, load_async):
+    def test_repeated_same_probe_reuses_query_result(self):
         sc, engine_client = self._make_connector()
-        sc._ctx = replace(sc._ctx, load_async=load_async)
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
 
         first = sc.get_num_new_matched_tokens(req, num_computed_tokens=0)
         second = sc.get_num_new_matched_tokens(req, num_computed_tokens=0)
 
-        assert first == (32, load_async)
-        assert second == (32, load_async)
+        assert first == (32, True)
+        assert second == (32, True)
         engine_client.query_prefetch.assert_called_once()
         engine_client.release.assert_not_called()
 
