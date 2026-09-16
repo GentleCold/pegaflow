@@ -169,6 +169,7 @@ impl RcBackend {
             base_ptr: raw,
             len,
             mrs,
+            owner: None,
         })?;
         debug!(
             "memory registered: ptr={:#x}, len={}, nics={}",
@@ -184,6 +185,7 @@ impl RcBackend {
         ptr: NonNull<u8>,
         len: usize,
         device_id: u8,
+        imported: Option<Arc<crate::CudaDmaBuf>>,
     ) -> Result<bool> {
         if len == 0 {
             return Err(TransferError::InvalidArgument("len must be non-zero"));
@@ -194,6 +196,11 @@ impl RcBackend {
         // invalidate rkeys already exchanged during an RDMA handshake.
         let raw = ptr.as_ptr() as u64;
         if self.state.lock().registered.contains_exact(raw, len) {
+            if imported.is_some() {
+                return Err(TransferError::InvalidArgument(
+                    "CUDA allocation is already registered",
+                ));
+            }
             return Ok(false);
         }
 
@@ -214,12 +221,23 @@ impl RcBackend {
             )));
         }
 
-        let dmabuf_fd =
-            crate::cuda_lib::driver::cu_get_dma_buf_fd(ptr.cast(), len).map_err(|error| {
-                TransferError::Backend(format!(
-                    "CUDA DMA-BUF export failed for device {device_id}: {error}"
-                ))
-            })?;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let exported = if imported.is_none() {
+            let fd =
+                crate::cuda_lib::driver::cu_get_dma_buf_fd(ptr.cast(), len).map_err(|error| {
+                    TransferError::Backend(format!(
+                        "CUDA DMA-BUF export failed for device {device_id}: {error}"
+                    ))
+                })?;
+            Some(unsafe { OwnedFd::from_raw_fd(fd) })
+        } else {
+            None
+        };
+        let dmabuf_fd = match (&imported, &exported) {
+            (Some(region), _) => region.fd(),
+            (_, Some(fd)) => fd.as_raw_fd(),
+            _ => return Err(TransferError::InvalidArgument("missing DMA-BUF descriptor")),
+        };
 
         let mut mrs = Vec::with_capacity(self.nic_count());
         for runtime in &self.runtimes {
@@ -238,23 +256,15 @@ impl RcBackend {
                     runtime.nic_name
                 ))
             });
-            match mr {
-                Ok(mr) => mrs.push(mr),
-                Err(error) => {
-                    // The fd is process-local and no longer needed after the
-                    // registration call. Existing MRs are dropped here.
-                    unsafe { libc::close(dmabuf_fd) };
-                    return Err(error);
-                }
-            }
+            mrs.push(mr?);
         }
-        unsafe { libc::close(dmabuf_fd) };
 
         let mut state = self.state.lock();
         Arc::make_mut(&mut state.registered).insert(RegisteredMemoryEntry {
             base_ptr: raw,
             len,
             mrs,
+            owner: imported,
         })?;
         info!(
             "CUDA memory registered for direct RDMA: ptr={:#x}, len={}, device={}, nics={}",
@@ -599,6 +609,9 @@ impl RcBackend {
                 let bucket = nic.rot.wrapping_add(i) % n;
                 buckets[bucket].push(RdmaOp {
                     local_mr,
+                    _owner: registered
+                        .find_entry(local_ptr, len)
+                        .and_then(|entry| entry.owner.clone()),
                     local_ptr,
                     remote_ptr,
                     len,
@@ -627,7 +640,15 @@ impl RcBackend {
         // --- Submit outside lock ---
         let mut receivers = Vec::with_capacity(nic_work.len());
         for (session, prepared) in nic_work {
-            receivers.push(session.transfer_batch_async(prepared, op)?);
+            match session.transfer_batch_async(prepared, op) {
+                Ok(receiver) => receivers.push(receiver),
+                Err(error) => {
+                    // Return every accepted completion even if a later session rejects submission.
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(Err(error));
+                    receivers.push(rx);
+                }
+            }
         }
         Ok(receivers)
     }

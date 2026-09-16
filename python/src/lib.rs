@@ -668,6 +668,16 @@ impl PyLoadState {
     }
 }
 
+/// Export from the allocation-owning process with its CUDA context current.
+#[cfg(feature = "rdma")]
+#[pyfunction]
+fn export_cuda_dma_buf(ptr: u64, len: usize) -> PyResult<(i32, u64, usize)> {
+    use std::os::fd::IntoRawFd;
+    let (fd, base, size) = pegaflow_transfer::export_cuda_dma_buf(ptr, len)
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    Ok((fd.into_raw_fd(), base, size))
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -679,6 +689,8 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pd_rdma::add_classes(m)?;
     #[cfg(feature = "rdma")]
     rdma_v1::add_classes(m)?;
+    #[cfg(feature = "rdma")]
+    m.add_function(wrap_pyfunction!(export_cuda_dma_buf, m)?)?;
     // Register custom exceptions for error classification
     m.add("PegaFlowError", m.py().get_type::<PegaFlowError>())?;
     m.add("PegaflowInternal", m.py().get_type::<PegaflowInternal>())?;

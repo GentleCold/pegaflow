@@ -14,6 +14,7 @@ pub(super) struct RegisteredMemoryEntry {
     pub(super) len: usize,
     /// One MR per NIC (different PDs → different rkeys).
     pub(super) mrs: Vec<Arc<MemoryRegion>>,
+    pub(super) owner: Option<Arc<crate::CudaDmaBuf>>,
 }
 
 /// Local registered memory, ordered by base pointer. Insertion rejects
@@ -91,7 +92,7 @@ impl LocalMemoryMap {
     }
 
     /// Non-overlap makes the predecessor the only possible covering region.
-    fn find_entry(&self, ptr: u64, len: usize) -> Option<&RegisteredMemoryEntry> {
+    pub(super) fn find_entry(&self, ptr: u64, len: usize) -> Option<&RegisteredMemoryEntry> {
         let end = ptr.checked_add(len as u64)?;
         let (_, entry) = self.entries.range(..=ptr).next_back()?;
         (end <= entry.base_ptr + entry.len as u64).then_some(entry)
@@ -285,6 +286,7 @@ mod tests {
             base_ptr,
             len,
             mrs: Vec::new(),
+            owner: None,
         }
     }
 

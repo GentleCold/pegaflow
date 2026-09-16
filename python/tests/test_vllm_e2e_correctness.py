@@ -167,6 +167,7 @@ EXECUTION_PLAN: list[tuple[str, str, str]] = [
     ("multi_r1", MULTI_ROUND[0], "cold"),
     # Same-process warm hit proves vLLM's local HMA cache cannot mask PegaFlow.
     ("short_same_process", SHORT_PROMPT, "warm-same-process"),
+    ("long_same_process", LONG_PROMPT, "warm-same-process"),
     # Round 2: warm hits — exact same prompts
     ("short_warm", SHORT_PROMPT, "warm"),
     ("long_warm", LONG_PROMPT, "warm"),
@@ -199,6 +200,7 @@ _LABEL_TO_BASELINE: dict[str, str] = {
     "rollback_long": "rollback_long",
     "multi_r1": "multi_r1",
     "short_same_process": "short",
+    "long_same_process": "long",
     "short_warm": "short",
     "long_warm": "long",
     "prefix_extend": "prefix_extend",
@@ -399,7 +401,7 @@ class TestE2ECorrectness:
             f"hits={hits:.0f} blocks ({load_bytes / 1e6:.1f}MB)"
         )
 
-    def test_same_process_hma_load_uses_pegaflow(self, pegaflow_results):
+    def test_same_process_load_uses_pegaflow(self, pegaflow_results):
         """The warm request in the first vLLM process must load from PegaFlow."""
         m_start = pegaflow_results["metrics_start"]
         m_end = pegaflow_results["metrics_same_process"]
@@ -410,7 +412,7 @@ class TestE2ECorrectness:
             "pegaflow_load_bytes_total", 0
         )
         assert hit_delta > 0 or load_delta > 0, (
-            "same-process warm HMA request bypassed PegaFlow: "
+            "same-process warm request bypassed PegaFlow: "
             f"hit_delta={hit_delta}, load_delta={load_delta}"
         )
 

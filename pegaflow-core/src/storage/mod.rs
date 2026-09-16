@@ -6,8 +6,6 @@ mod write_path;
 
 use bytesize::ByteSize;
 use log::{debug, info, warn};
-#[cfg(feature = "rdma")]
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
@@ -21,11 +19,9 @@ use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
-#[cfg(feature = "rdma")]
-use parking_lot::Mutex;
 use pegaflow_common::NumaNode;
 #[cfg(feature = "rdma")]
-use pegaflow_transfer::DeviceMemoryRegion;
+use pegaflow_transfer::CudaDmaBuf;
 #[cfg(feature = "rdma")]
 use std::ptr::NonNull;
 
@@ -109,8 +105,6 @@ pub(crate) struct StorageEngine {
     rdma_transport: Option<Arc<RdmaTransport>>,
     #[cfg(feature = "rdma")]
     rdma_fetch: Option<Arc<RdmaFetchStore>>,
-    #[cfg(feature = "rdma")]
-    registered_device_ptrs: Mutex<HashMap<String, Vec<u64>>>,
     blockwise_alloc: bool,
     metaserver_client: Option<Arc<MetaServerClient>>,
     transfer_lock: Arc<transfer_lock::TransferLockManager>,
@@ -264,8 +258,6 @@ impl StorageEngine {
                 rdma_transport,
                 #[cfg(feature = "rdma")]
                 rdma_fetch,
-                #[cfg(feature = "rdma")]
-                registered_device_ptrs: Mutex::new(HashMap::new()),
                 blockwise_alloc,
                 metaserver_client,
                 transfer_lock,
@@ -680,18 +672,13 @@ impl StorageEngine {
         self.rdma_transport.as_ref()
     }
 
-    /// Register all CUDA KV allocations belonging to one instance.
-    ///
-    /// GPU registration is deliberately transactional: if one layer cannot
-    /// be exported as a DMA-BUF or registered on every configured NIC, all
-    /// allocations registered by this call are removed again.
+    /// Register owner-exported allocations transactionally on every NIC.
     #[cfg(feature = "rdma")]
     pub(crate) fn register_device_memory(
         &self,
-        instance_id: &str,
         device_id: i32,
-        regions: &[(u64, usize)],
-    ) -> Result<(), String> {
+        regions: &[Arc<CudaDmaBuf>],
+    ) -> Result<DeviceMemoryRegistration, String> {
         let transport = self
             .rdma_transport
             .as_ref()
@@ -699,61 +686,42 @@ impl StorageEngine {
         if device_id < 0 || device_id > u8::MAX as i32 {
             return Err(format!("CUDA device id {device_id} is out of range"));
         }
-        let registered = self.registered_device_ptrs.lock();
-        let existing = registered.get(instance_id);
-        let mut descs = Vec::with_capacity(regions.len());
-        for &(ptr, len) in regions {
-            if existing.is_some_and(|ptrs| ptrs.contains(&ptr)) {
-                continue;
-            }
-            let ptr = NonNull::new(ptr as *mut u8)
-                .ok_or_else(|| "CUDA allocation pointer must not be null".to_string())?;
-            descs.push(DeviceMemoryRegion {
-                ptr,
-                len,
-                device_id: device_id as u8,
-            });
-        }
-        drop(registered);
-        if descs.is_empty() {
-            return Ok(());
-        }
+        let mut allocations = regions.to_vec();
+        allocations.sort_unstable_by_key(|region| (region.ptr, region.len));
+        allocations.dedup_by_key(|region| (region.ptr, region.len));
         transport
             .engine()
-            .register_device_memory(&descs)
+            .register_dma_buf_memory(&allocations, device_id as u8)
             .map_err(|error| error.to_string())?;
-        let mut registered = self.registered_device_ptrs.lock();
-        let ptrs = registered.entry(instance_id.to_string()).or_default();
-        for desc in descs {
-            let ptr = desc.ptr.as_ptr() as u64;
-            if !ptrs.contains(&ptr) {
-                ptrs.push(ptr);
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "rdma")]
-    pub(crate) fn unregister_device_memory(&self, instance_id: &str) {
-        let Some(ptrs) = self.registered_device_ptrs.lock().remove(instance_id) else {
-            return;
-        };
-        if let Some(transport) = &self.rdma_transport {
-            let ptrs: Vec<NonNull<u8>> = ptrs
-                .into_iter()
-                .filter_map(|ptr| NonNull::new(ptr as *mut u8))
-                .collect();
-            if let Err(error) = transport.engine().unregister_memory(&ptrs) {
-                log::error!(
-                    "Failed to unregister CUDA RDMA memory for instance {instance_id}: {error}"
-                );
-            }
-        }
+        Ok(DeviceMemoryRegistration {
+            transport: Arc::clone(transport),
+            ptrs: allocations.iter().map(|region| region.ptr).collect(),
+        })
     }
 
     pub(crate) async fn shutdown_metaserver_client(&self) {
         if let Some(client) = &self.metaserver_client {
             client.shutdown().await;
+        }
+    }
+}
+
+#[cfg(feature = "rdma")]
+pub(crate) struct DeviceMemoryRegistration {
+    transport: Arc<RdmaTransport>,
+    ptrs: Vec<u64>,
+}
+
+#[cfg(feature = "rdma")]
+impl Drop for DeviceMemoryRegistration {
+    fn drop(&mut self) {
+        let ptrs: Vec<_> = self
+            .ptrs
+            .iter()
+            .filter_map(|&ptr| NonNull::new(ptr as *mut u8))
+            .collect();
+        if let Err(error) = self.transport.engine().unregister_memory(&ptrs) {
+            log::error!("Failed to unregister CUDA RDMA memory: {error}");
         }
     }
 }
