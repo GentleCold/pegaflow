@@ -45,6 +45,8 @@ use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
+#[cfg(feature = "rdma")]
+pub use pegaflow_transfer::CudaDmaBuf;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
@@ -453,8 +455,6 @@ impl PegaEngine {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
         drop(removed);
-        #[cfg(feature = "rdma")]
-        self.storage.unregister_device_memory(instance_id);
         self.query_leases.release_instance(instance_id);
         info!("Unregistered instance: {}", instance_id);
         Ok(())
@@ -470,8 +470,6 @@ impl PegaEngine {
         instances.clear();
         drop(instances);
         for id in &ids {
-            #[cfg(feature = "rdma")]
-            self.storage.unregister_device_memory(id);
             self.query_leases.release_instance(id);
         }
         if !ids.is_empty() {
@@ -1065,25 +1063,18 @@ impl PegaEngine {
             }
             direct_loads.push((plan, targets));
         }
-        let mut regions: Vec<(u64, usize)> = direct_loads
-            .iter()
-            .flat_map(|(_, targets)| targets.iter().map(|target| target.layout.device_region()))
-            .collect();
-        regions.sort_unstable();
-        regions.dedup();
-        self.storage
-            .register_device_memory(instance.id(), device_id, &regions)
-            .map_err(|error| {
+        gpu.register_direct_memory(&self.storage, None)
+            .inspect_err(|_| {
                 metrics.direct_gpu_mr_registration_failures.add(1, &[]);
                 metrics
                     .direct_gpu_load_total
                     .add(1, &[opentelemetry::KeyValue::new("status", "error")]);
-                EngineError::Storage(error)
             })?;
         let storage = Arc::clone(&self.storage);
         let req_id = format!("direct-load:{}", uuid::Uuid::new_v4());
         let started_at = std::time::Instant::now();
         tokio::spawn(async move {
+            let _gpu = gpu;
             let result = async {
                 for (plan, targets) in &direct_loads {
                     storage
@@ -1108,6 +1099,26 @@ impl PegaEngine {
             completion.signal(result);
         });
         Ok(())
+    }
+
+    /// Attach allocation-owner DMA-BUF exports before serving direct loads.
+    #[cfg(feature = "rdma")]
+    pub fn register_imported_device_memory(
+        &self,
+        instance_id: &str,
+        device_id: i32,
+        regions: &[Arc<CudaDmaBuf>],
+    ) -> Result<(), EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let gpu = instance
+            .get_gpu(device_id)
+            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
+        gpu.register_direct_memory(&self.storage, Some(regions))
+            .inspect_err(|_| {
+                core_metrics()
+                    .direct_gpu_mr_registration_failures
+                    .add(1, &[]);
+            })
     }
 
     /// Wait until all previously submitted save batches have been processed

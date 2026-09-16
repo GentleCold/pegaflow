@@ -445,6 +445,12 @@ impl RdmaFetchStore {
                 &self.advertise_addr,
             )
             .await?;
+            let lock_guard = TransferLockGuard::new(
+                client,
+                std::mem::take(&mut response.transfer_session_id),
+                remote_addr,
+                req_id,
+            );
             if response.blocks.len() != hashes.len() {
                 return Err(format!(
                     "direct GPU segment {segment_index} returned {} blocks for {} hashes",
@@ -452,14 +458,7 @@ impl RdmaFetchStore {
                     hashes.len()
                 ));
             }
-            let lock_guard = TransferLockGuard::new(
-                client,
-                std::mem::take(&mut response.transfer_session_id),
-                remote_addr,
-                req_id,
-            );
-
-            let receivers = {
+            let (receivers, expected_bytes) = {
                 let build_result = (|| {
                     let mut descs = Vec::new();
                     for (local_index, block) in response.blocks.iter().enumerate() {
@@ -499,29 +498,56 @@ impl RdmaFetchStore {
                         "direct GPU segment {segment_index} has no descriptors"
                     ));
                 }
+                let expected_bytes: usize = descs.iter().map(|desc| desc.len).sum();
                 match self.rdma_transport.engine().batch_transfer_async(
                     TransferOp::Read,
                     remote_addr,
                     &descs,
                 ) {
-                    Ok(receivers) => receivers,
+                    Ok(receivers) => (receivers, expected_bytes),
                     Err(error) => {
                         lock_guard.release();
                         return Err(format!("direct GPU RDMA submit failed: {error}"));
                     }
                 }
             };
-            let wait_result = tokio::time::timeout(transfer_timeout, async {
+            let completions = async {
+                let mut first_error = None;
+                let mut completed_bytes = 0usize;
                 for receiver in receivers {
-                    receiver
-                        .await
-                        .map_err(|_| "direct GPU completion channel closed".to_string())?
-                        .map_err(|error| format!("direct GPU RDMA completion failed: {error}"))?;
+                    match receiver.await {
+                        Ok(Ok(bytes)) => completed_bytes += bytes,
+                        Ok(Err(error)) => {
+                            first_error.get_or_insert_with(|| {
+                                format!("direct GPU RDMA completion failed: {error}")
+                            });
+                        }
+                        Err(_) => {
+                            first_error.get_or_insert_with(|| {
+                                "direct GPU completion channel closed".to_string()
+                            });
+                        }
+                    }
                 }
-                Ok::<(), String>(())
-            })
-            .await
-            .map_err(|_| "direct GPU RDMA transfer timed out".to_string())?;
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+                if completed_bytes != expected_bytes {
+                    return Err(format!(
+                        "direct GPU short completion: {completed_bytes}/{expected_bytes} bytes"
+                    ));
+                }
+                Ok(())
+            };
+            tokio::pin!(completions);
+            let wait_result = match tokio::time::timeout(transfer_timeout, &mut completions).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // A timeout cannot release source locks or destination memory while READs run.
+                    let _ = completions.await;
+                    Err("direct GPU RDMA transfer timed out (completions drained)".to_string())
+                }
+            };
             if let Err(error) = wait_result {
                 lock_guard.release();
                 return Err(error);
@@ -531,8 +557,17 @@ impl RdmaFetchStore {
                     format!("direct GPU CUDA context visibility fence failed: {error:?}")
                 })?;
             cuda_context
-                .synchronize()
+                .bind_to_thread()
                 .map_err(|error| format!("direct GPU CUDA visibility fence failed: {error:?}"))?;
+            let flush = unsafe {
+                cudarc::driver::sys::cuFlushGPUDirectRDMAWrites(
+                    cudarc::driver::sys::CUflushGPUDirectRDMAWritesTarget_enum::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+                    cudarc::driver::sys::CUflushGPUDirectRDMAWritesScope_enum::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER,
+                )
+            };
+            if flush != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("direct GPU visibility flush failed: {flush:?}"));
+            }
             lock_guard.release();
             offset = end;
         }

@@ -337,6 +337,23 @@ impl Engine for GrpcEngineService {
                 return Err(status);
             }
 
+            #[cfg(feature = "rdma")]
+            if metadatas.iter().any(|metadata| metadata.dma_buf.is_some()) {
+                let engine = Arc::clone(&self.engine);
+                let instance_id = req.instance_id.clone();
+                let regions: Vec<_> = metadatas.iter().filter_map(|metadata| metadata.dma_buf.clone()).collect();
+                let result = tokio::task::spawn_blocking(move || {
+                    engine.register_imported_device_memory(&instance_id, req.device_id, &regions)
+                }).await
+                    .map_err(|error| Status::internal(format!("DMA-BUF registration worker failed: {error}")))
+                    .and_then(|result| result.map_err(Self::map_engine_error));
+                if let Err(error) = result {
+                    let _ = self.engine.unregister_instance(&req.instance_id);
+                    self.registry.drop_instance(req.instance_id).await;
+                    return Err(error);
+                }
+            }
+
             Ok(Response::new(Self::build_register_context_response()))
         }
         .await;
