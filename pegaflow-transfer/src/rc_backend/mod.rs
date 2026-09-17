@@ -180,28 +180,24 @@ impl RcBackend {
         Ok(())
     }
 
-    pub(crate) fn register_device_memory(
+    pub(crate) fn register_dma_buf_memory(
         &self,
-        ptr: NonNull<u8>,
-        len: usize,
+        region: Arc<crate::CudaDmaBuf>,
         device_id: u8,
-        imported: Option<Arc<crate::CudaDmaBuf>>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
+        let ptr = NonNull::new(region.ptr as *mut u8)
+            .ok_or(TransferError::InvalidArgument("CUDA allocation is null"))?;
+        let len = region.len;
         if len == 0 {
             return Err(TransferError::InvalidArgument("len must be non-zero"));
         }
 
-        // Registration is instance/load retry safe. The same CUDA allocation
-        // can be used by many direct loads, but replacing its MR would
-        // invalidate rkeys already exchanged during an RDMA handshake.
+        // Replacing an allocation's MR would invalidate exchanged rkeys.
         let raw = ptr.as_ptr() as u64;
         if self.state.lock().registered.contains_exact(raw, len) {
-            if imported.is_some() {
-                return Err(TransferError::InvalidArgument(
-                    "CUDA allocation is already registered",
-                ));
-            }
-            return Ok(false);
+            return Err(TransferError::InvalidArgument(
+                "CUDA allocation is already registered",
+            ));
         }
 
         let attrs = crate::cuda_lib::rt::cudaPointerGetAttributes(ptr.cast()).map_err(|error| {
@@ -221,24 +217,6 @@ impl RcBackend {
             )));
         }
 
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let exported = if imported.is_none() {
-            let fd =
-                crate::cuda_lib::driver::cu_get_dma_buf_fd(ptr.cast(), len).map_err(|error| {
-                    TransferError::Backend(format!(
-                        "CUDA DMA-BUF export failed for device {device_id}: {error}"
-                    ))
-                })?;
-            Some(unsafe { OwnedFd::from_raw_fd(fd) })
-        } else {
-            None
-        };
-        let dmabuf_fd = match (&imported, &exported) {
-            (Some(region), _) => region.fd(),
-            (_, Some(fd)) => fd.as_raw_fd(),
-            _ => return Err(TransferError::InvalidArgument("missing DMA-BUF descriptor")),
-        };
-
         let mut mrs = Vec::with_capacity(self.nic_count());
         for runtime in &self.runtimes {
             let mr = unsafe {
@@ -246,7 +224,7 @@ impl RcBackend {
                     0,
                     len,
                     raw,
-                    dmabuf_fd,
+                    region.fd(),
                     AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
                 )
             }
@@ -264,7 +242,7 @@ impl RcBackend {
             base_ptr: raw,
             len,
             mrs,
-            owner: imported,
+            owner: Some(region),
         })?;
         info!(
             "CUDA memory registered for direct RDMA: ptr={:#x}, len={}, device={}, nics={}",
@@ -273,7 +251,7 @@ impl RcBackend {
             device_id,
             self.nic_count()
         );
-        Ok(true)
+        Ok(())
     }
 
     pub(crate) fn unregister_memory(&self, ptr: NonNull<u8>) -> Result<()> {
@@ -284,13 +262,6 @@ impl RcBackend {
             return Err(TransferError::MemoryNotRegistered { ptr: raw });
         }
         debug!("memory unregistered: ptr={:#x}", raw);
-        Ok(())
-    }
-
-    pub(crate) fn unregister_memory_batch(&self, ptrs: &[NonNull<u8>]) -> Result<()> {
-        for &ptr in ptrs {
-            self.unregister_memory(ptr)?;
-        }
         Ok(())
     }
 

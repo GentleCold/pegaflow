@@ -1225,6 +1225,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn gpu_read_descs_validate_contiguous_shape() {
@@ -1272,8 +1273,6 @@ mod tests {
         let error = build_gpu_read_descs(&layout, 0, &slot).expect_err("shape mismatch");
         assert!(error.contains("shape mismatch"));
     }
-    use std::sync::{Arc, Mutex};
-
     fn test_allocate_fn(calls: Arc<AtomicUsize>) -> AllocateFn {
         let allocator = Arc::new(crate::pinned_pool::PinnedAllocator::new_global(
             32 * 1024 * 1024,

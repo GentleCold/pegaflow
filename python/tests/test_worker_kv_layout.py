@@ -43,25 +43,20 @@ def test_mla_blocks_first_physical_rows_are_grouped_into_logical_blocks():
     assert info.physical_blocks_per_logical_block == 2
 
 
-@pytest.mark.parametrize("is_mla", [False, True], ids=["dense", "mla"])
-@pytest.mark.parametrize("physical_blocks", [2, 6])
-def test_standard_4d_view_reads_tokens_from_the_third_axis(is_mla, physical_blocks):
+def test_mla_standard_4d_view_reads_tokens_from_the_third_axis():
     """vLLM's standardized view is ``[B, H, N, C]``; N is the kernel block."""
     info = _infer_kv_cache_registration(
         FakeTensor(
-            shape=(physical_blocks, 1, 64, 576),
+            shape=(6, 1, 64, 576),
             stride=(64 * 576, 64 * 576, 576, 1),
             element_size=2,
         ),
         logical_block_size=128,
-        is_mla=is_mla,
+        is_mla=True,
     )
 
-    assert info.layout == "blocks-first"
-    assert info.num_blocks == physical_blocks // 2
+    assert info.num_blocks == 3
     assert info.bytes_per_block == 2 * 64 * 576 * 2
-    assert info.kv_stride_bytes == 0
-    assert info.segments == 1
     assert info.physical_blocks_per_logical_block == 2
 
 

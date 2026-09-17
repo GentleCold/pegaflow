@@ -11,8 +11,7 @@ pub mod v2;
 
 pub use dma_buf::{CudaDmaBuf, export_cuda_dma_buf};
 pub use engine::{
-    ConnectionStatus, DeviceMemoryRegion, HandshakeMetadata, MemoryRegion, TransferDesc,
-    TransferEngine, TransferOp,
+    ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
 };
 pub use error::{Result, TransferError};
 

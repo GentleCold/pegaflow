@@ -92,8 +92,7 @@ def _infer_kv_cache_registration(
     if logical_block_size <= 0:
         raise ValueError(f"logical block size must be > 0, got {logical_block_size}")
 
-    standardized_attention = not is_recurrent_state and len(shape) == 4
-    if is_recurrent_state or (not is_mla and not standardized_attention):
+    if is_recurrent_state or not is_mla:
         if not is_recurrent_state and len(shape) >= 2 and shape[0] == 2:
             layout = "KV-first"
             num_blocks = shape[1]
@@ -123,7 +122,7 @@ def _infer_kv_cache_registration(
 
     layout = "blocks-first"
     physical_num_blocks = shape[0]
-    if standardized_attention:
+    if len(shape) == 4:
         # vLLM's standardized per-layer view is ``[B, H, N, C]``: kernel
         # blocks, head slots, tokens (states) per kernel block, content.
         physical_block_size = shape[2]
