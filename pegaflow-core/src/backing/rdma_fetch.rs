@@ -75,15 +75,28 @@ pub(crate) struct FetchPlan {
 /// Remote-only plan carried by a query lease until the destination GPU is
 /// allocated. It contains no local allocation or transfer lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectFetchPlan {
+pub(crate) struct DirectFetchPlan {
     pub(crate) namespace: String,
     pub(crate) hashes: Vec<Vec<u8>>,
     pub(crate) segments: Vec<(String, usize)>,
 }
 
 impl DirectFetchPlan {
-    pub fn block_count(&self) -> usize {
+    pub(crate) fn block_count(&self) -> usize {
         self.hashes.len()
+    }
+}
+
+/// Local sealed prefix and an optional remote suffix, held until GPU allocation.
+#[derive(Clone)]
+pub struct DirectQueryPlan {
+    pub(crate) local_blocks: Vec<Arc<SealedBlock>>,
+    pub(crate) remote: Option<DirectFetchPlan>,
+}
+
+impl DirectQueryPlan {
+    pub fn block_count(&self) -> usize {
+        self.local_blocks.len() + self.remote.as_ref().map_or(0, DirectFetchPlan::block_count)
     }
 }
 
@@ -470,17 +483,17 @@ impl RdmaFetchStore {
                         }
                         let destination_index = offset + local_index;
                         for target in remote_targets {
+                            let Some(destination) = target.destination_block_ids[destination_index]
+                            else {
+                                continue;
+                            };
                             let slot = block.slots.get(target.remote_slot_id).ok_or_else(|| {
                                 format!(
                                     "remote block has no slot {} for layer {}",
                                     target.remote_slot_id, target.layer_name
                                 )
                             })?;
-                            descs.extend(build_gpu_read_descs(
-                                &target.layout,
-                                target.destination_block_ids[destination_index],
-                                slot,
-                            )?);
+                            descs.extend(build_gpu_read_descs(&target.layout, destination, slot)?);
                         }
                     }
                     Ok(descs)
@@ -494,9 +507,8 @@ impl RdmaFetchStore {
                 };
                 if descs.is_empty() {
                     lock_guard.release();
-                    return Err(format!(
-                        "direct GPU segment {segment_index} has no descriptors"
-                    ));
+                    offset = end;
+                    continue;
                 }
                 let expected_bytes: usize = descs.iter().map(|desc| desc.len).sum();
                 match self.rdma_transport.engine().batch_transfer_async(
@@ -607,7 +619,7 @@ impl RdmaFetchStore {
 pub(crate) struct GpuReadTarget {
     pub(crate) layer_name: String,
     pub(crate) layout: KVCacheLayout,
-    pub(crate) destination_block_ids: Vec<usize>,
+    pub(crate) destination_block_ids: Vec<Option<usize>>,
     pub(crate) remote_slot_id: usize,
 }
 

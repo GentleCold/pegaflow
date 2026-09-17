@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 #[cfg(feature = "rdma")]
-use crate::backing::{DirectFetchPlan, GpuReadTarget, RdmaFetchStore, RdmaTransport};
+use crate::backing::{
+    DirectFetchPlan, DirectQueryPlan, GpuReadTarget, RdmaFetchStore, RdmaTransport,
+};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
@@ -494,11 +496,35 @@ impl StorageEngine {
         &self,
         namespace: &str,
         hashes: &[Vec<u8>],
-    ) -> Option<DirectFetchPlan> {
-        self.rdma_fetch
-            .as_ref()?
-            .query_direct_plan(namespace, hashes)
-            .await
+    ) -> Option<DirectQueryPlan> {
+        if hashes.is_empty() {
+            return None;
+        }
+        let keys: Vec<BlockKey> = hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+        let (local_count, local_blocks) = self.read_cache.get_prefix_blocks(&keys);
+        let remote = if local_count < hashes.len() {
+            match self.rdma_fetch.as_ref() {
+                Some(fetch) => {
+                    fetch
+                        .query_direct_plan(namespace, &hashes[local_count..])
+                        .await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let remote_count = remote.as_ref().map_or(0, DirectFetchPlan::block_count);
+        if local_count == 0 && remote_count == 0 {
+            return None;
+        }
+        Some(DirectQueryPlan {
+            local_blocks,
+            remote,
+        })
     }
 
     #[cfg(feature = "rdma")]

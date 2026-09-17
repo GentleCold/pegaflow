@@ -599,14 +599,15 @@ impl Engine for GrpcEngineService {
                             })),
                         }));
                     };
+                    let num_hit_blocks = plan.block_count() as u64;
                     let lease = self
                         .engine
-                        .create_direct_query_lease(&req.instance_id, plan.clone())
+                        .create_direct_query_lease(&req.instance_id, plan)
                         .map_err(Self::map_engine_error)?
                         .to_bytes()
                         .to_vec();
                     query_response::Outcome::Ready(QueryReady {
-                        num_hit_blocks: plan.block_count() as u64,
+                        num_hit_blocks,
                         lease,
                         hit_positions: Vec::new(),
                     })
