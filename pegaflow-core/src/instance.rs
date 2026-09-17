@@ -784,11 +784,6 @@ impl InstanceContext {
         self.page_first
     }
 
-    #[cfg(feature = "rdma")]
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-
     /// Get a GPU context and verify it belongs to the requested save group.
     pub(crate) fn get_gpu_for_save_group(
         &self,
