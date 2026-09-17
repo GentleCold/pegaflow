@@ -454,7 +454,6 @@ impl PegaEngine {
         if removed.is_none() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
-        drop(removed);
         self.query_leases.release_instance(instance_id);
         info!("Unregistered instance: {}", instance_id);
         Ok(())

@@ -61,6 +61,7 @@ pub(crate) struct KVCacheLayout {
 }
 
 impl KVCacheLayout {
+    #[cfg(feature = "rdma")]
     pub(crate) fn device_region(&self) -> (u64, usize) {
         (self.data_ptr, self.size_bytes)
     }
