@@ -418,6 +418,7 @@ async fn registration_loop(
         }
 
         let mut inserts: HashMap<(String, bool), Vec<Vec<u8>>> = HashMap::new();
+        let mut insert_origins: HashMap<(String, Vec<u8>), bool> = HashMap::new();
         let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut mixed_ops: Option<HashMap<(String, Vec<u8>), PendingOperation>> = None;
         let mut saw_insert = false;
@@ -434,12 +435,17 @@ async fn registration_loop(
                     saw_insert = true;
                     if saw_remove {
                         let net = mixed_ops.get_or_insert_with(|| {
-                            build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
+                            build_net(
+                                std::mem::take(&mut inserts),
+                                std::mem::take(&mut insert_origins),
+                                std::mem::take(&mut removes),
+                            )
                         });
                         insert_groups_into_net(net, batch.groups, batch.apply_reclaimable_hint);
                     } else {
                         append_insert_groups(
                             &mut inserts,
+                            &mut insert_origins,
                             batch.groups,
                             batch.apply_reclaimable_hint,
                         );
@@ -449,7 +455,11 @@ async fn registration_loop(
                     saw_remove = true;
                     if saw_insert {
                         let net = mixed_ops.get_or_insert_with(|| {
-                            build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
+                            build_net(
+                                std::mem::take(&mut inserts),
+                                std::mem::take(&mut insert_origins),
+                                std::mem::take(&mut removes),
+                            )
                         });
                         remove_groups_into_net(net, batch.groups);
                     } else {
@@ -692,10 +702,14 @@ fn append_groups(target: &mut HashMap<String, Vec<Vec<u8>>>, groups: Vec<(String
 
 fn append_insert_groups(
     target: &mut HashMap<(String, bool), Vec<Vec<u8>>>,
+    origins: &mut HashMap<(String, Vec<u8>), bool>,
     groups: Vec<(String, Vec<Vec<u8>>)>,
     apply_reclaimable_hint: bool,
 ) {
     for (namespace, mut hashes) in groups {
+        for hash in &hashes {
+            origins.insert((namespace.clone(), hash.clone()), apply_reclaimable_hint);
+        }
         target
             .entry((namespace, apply_reclaimable_hint))
             .or_default()
@@ -711,10 +725,11 @@ enum PendingOperation {
 
 fn build_net(
     inserts: HashMap<(String, bool), Vec<Vec<u8>>>,
+    insert_origins: HashMap<(String, Vec<u8>), bool>,
     removes: HashMap<String, Vec<Vec<u8>>>,
 ) -> HashMap<(String, Vec<u8>), PendingOperation> {
     let mut net = HashMap::new();
-    insert_map_into_net(&mut net, inserts);
+    insert_map_into_net(&mut net, inserts, &insert_origins);
     insert_remove_map_into_net(&mut net, removes);
     net
 }
@@ -722,9 +737,21 @@ fn build_net(
 fn insert_map_into_net(
     net: &mut HashMap<(String, Vec<u8>), PendingOperation>,
     grouped: HashMap<(String, bool), Vec<Vec<u8>>>,
+    origins: &HashMap<(String, Vec<u8>), bool>,
 ) {
     for ((namespace, apply_reclaimable_hint), hashes) in grouped {
-        insert_groups_into_net(net, vec![(namespace, hashes)], apply_reclaimable_hint);
+        for hash in hashes {
+            let apply_reclaimable_hint = origins
+                .get(&(namespace.clone(), hash.clone()))
+                .copied()
+                .unwrap_or(apply_reclaimable_hint);
+            net.insert(
+                (namespace.clone(), hash),
+                PendingOperation::Insert {
+                    apply_reclaimable_hint,
+                },
+            );
+        }
     }
 }
 
@@ -762,7 +789,7 @@ fn insert_groups_into_net(
                 Some(PendingOperation::Insert {
                     apply_reclaimable_hint: existing,
                 }) => {
-                    *existing |= apply_reclaimable_hint;
+                    *existing = apply_reclaimable_hint;
                 }
                 _ => {
                     net.insert(
@@ -1245,6 +1272,55 @@ mod tests {
         client.shutdown().await;
         let _ = shutdown_tx.send(());
         drop(service);
+    }
+
+    #[tokio::test]
+    async fn mixed_netting_preserves_last_insert_origin_per_hash() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
+        let rdma_last_hash = vec![0xa1];
+        let local_last_hash = vec![0xb2];
+        let rdma_last_key = BlockKey::new("ns".to_string(), rdma_last_hash.clone());
+        let local_last_key = BlockKey::new("ns".to_string(), local_last_hash.clone());
+        read_cache.insert_retained_for_test(
+            rdma_last_key.clone(),
+            Arc::new(SealedBlock::from_slots(Vec::new())),
+        );
+        read_cache.insert_retained_for_test(
+            local_last_key.clone(),
+            Arc::new(SealedBlock::from_slots(Vec::new())),
+        );
+        *service.reclaimable_hashes.lock().unwrap() =
+            vec![rdma_last_hash.clone(), local_last_hash.clone()];
+
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Arc::downgrade(&read_cache),
+        );
+
+        // The first hash is local then RDMA, so its final origin must be RDMA.
+        client.try_register_namespace("ns".to_string(), vec![rdma_last_hash.clone()]);
+        client.try_register_namespace_without_reclaim_hint(
+            "ns".to_string(),
+            vec![rdma_last_hash.clone(), local_last_hash.clone()],
+        );
+        // The second hash is RDMA then local, so its final origin must be local.
+        client.try_register_namespace("ns".to_string(), vec![local_last_hash.clone()]);
+        // An unrelated remove switches the drain into per-key last-write netting.
+        client.try_unregister(vec![("other".to_string(), vec![0xc3])]);
+        client.flush().await;
+
+        assert!(
+            !read_cache.is_reclaimable_for_test(&rdma_last_key),
+            "a final RDMA insert must not consume a reclaim hint"
+        );
+        assert!(
+            read_cache.is_reclaimable_for_test(&local_last_key),
+            "a final local insert must consume a reclaim hint"
+        );
+
+        client.shutdown().await;
+        let _ = shutdown_tx.send(());
     }
 
     #[tokio::test]
