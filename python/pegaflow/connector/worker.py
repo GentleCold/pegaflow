@@ -2,7 +2,6 @@
 Worker-side connector logic.
 """
 
-import os
 import pickle
 import queue
 import threading
