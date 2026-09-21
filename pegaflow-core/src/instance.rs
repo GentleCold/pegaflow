@@ -354,53 +354,33 @@ impl GpuContext {
     pub(crate) fn register_direct_memory(
         &self,
         storage: &crate::storage::StorageEngine,
-        imported: Option<&[Arc<pegaflow_transfer::CudaDmaBuf>]>,
+        imported: &[Arc<pegaflow_transfer::CudaDmaBuf>],
     ) -> Result<(), EngineError> {
         let mut registered = self.direct_memory.lock();
         if registered.is_some() {
-            return if imported.is_some() {
-                Err(EngineError::InvalidArgument(
-                    "direct GPU memory already registered".into(),
-                ))
-            } else {
-                Ok(())
-            };
+            return Err(EngineError::InvalidArgument(
+                "direct GPU memory already registered".into(),
+            ));
+        }
+        if imported.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "direct GPU memory requires owner DMA-BUF exports".into(),
+            ));
         }
         self._cuda_ctx
             .bind_to_thread()
             .map_err(|error| EngineError::CudaInit(error.to_string()))?;
-        let mut exported = Vec::new();
-        let regions = if let Some(regions) = imported {
-            regions
-        } else {
-            // Native callers own these pointers. IPC callers must supply an owner export.
-            for layout in self.kv_caches.values() {
-                let (ptr, len) = layout.device_region();
-                let (fd, base, size) = pegaflow_transfer::export_cuda_dma_buf(ptr, len)
-                    .map_err(|error| EngineError::Storage(error.to_string()))?;
-                exported.push(Arc::new(
-                    pegaflow_transfer::CudaDmaBuf::from_import(base, size, fd, Arc::new(()))
-                        .map_err(|error| EngineError::Storage(error.to_string()))?,
-                ));
-            }
-            &exported
-        };
-        for layout in self.kv_caches.values() {
-            let (ptr, len) = layout.device_region();
-            if !regions.iter().any(|region| {
-                ptr >= region.ptr && ptr + len as u64 <= region.ptr + region.len as u64
-            }) {
-                return Err(EngineError::InvalidArgument(
-                    "DMA-BUF exports do not cover every KV layer".into(),
-                ));
-            }
-        }
         *registered = Some(
             storage
-                .register_device_memory(self.device_id, regions)
+                .register_device_memory(self.device_id, imported)
                 .map_err(EngineError::Storage)?,
         );
         Ok(())
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn direct_memory_registered(&self) -> bool {
+        self.direct_memory.lock().is_some()
     }
 
     /// CUDA device ID represented by this shard.

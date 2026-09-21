@@ -60,16 +60,16 @@ pub(crate) struct RdmaFetchStore {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FetchPlanSegment {
-    node: String,
-    start: usize,
-    end: usize,
+pub(crate) struct FetchPlanSegment {
+    pub(crate) node: String,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchPlan {
-    segments: Vec<FetchPlanSegment>,
-    block_count: usize,
+    pub(crate) segments: Vec<FetchPlanSegment>,
+    pub(crate) block_count: usize,
 }
 
 /// Remote-only plan carried by a query lease until the destination GPU is
@@ -78,12 +78,12 @@ pub(crate) struct FetchPlan {
 pub(crate) struct DirectFetchPlan {
     pub(crate) namespace: String,
     pub(crate) hashes: Vec<Vec<u8>>,
-    pub(crate) segments: Vec<(String, usize)>,
+    pub(crate) fetch_plan: FetchPlan,
 }
 
 impl DirectFetchPlan {
     pub(crate) fn block_count(&self) -> usize {
-        self.hashes.len()
+        self.fetch_plan.block_count()
     }
 }
 
@@ -177,11 +177,7 @@ impl FetchPlan {
         DirectFetchPlan {
             namespace: namespace.to_string(),
             hashes: hashes[..covered].to_vec(),
-            segments: self
-                .segments
-                .iter()
-                .map(|segment| (segment.node.clone(), segment.end - segment.start))
-                .collect(),
+            fetch_plan: self.clone(),
         }
     }
 }
@@ -433,13 +429,12 @@ impl RdmaFetchStore {
             }
         }
         let mut offset = 0usize;
-        for (segment_index, (remote_addr, block_count)) in plan.segments.iter().enumerate() {
-            let end = offset
-                .checked_add(*block_count)
-                .ok_or_else(|| "direct plan block count overflows usize".to_string())?;
+        for (segment_index, segment) in plan.fetch_plan.segments.iter().enumerate() {
+            let remote_addr = &segment.node;
+            let end = segment.end;
             let hashes = plan
                 .hashes
-                .get(offset..end)
+                .get(segment.start..end)
                 .ok_or_else(|| format!("direct plan segment {segment_index} exceeds hash list"))?;
 
             ensure_connected(
@@ -478,10 +473,10 @@ impl RdmaFetchStore {
                         if block.block_hash != hashes[local_index] {
                             return Err(format!(
                                 "direct GPU segment {segment_index} block hash mismatch at offset {}",
-                                offset + local_index
+                                segment.start + local_index
                             ));
                         }
-                        let destination_index = offset + local_index;
+                        let destination_index = segment.start + local_index;
                         for target in remote_targets {
                             let Some(destination) = target.destination_block_ids[destination_index]
                             else {
@@ -555,12 +550,20 @@ impl RdmaFetchStore {
             let wait_result = match tokio::time::timeout(transfer_timeout, &mut completions).await {
                 Ok(result) => result,
                 Err(_) => {
-                    // A timeout cannot release source locks or destination memory while READs run.
-                    let _ = completions.await;
-                    Err("direct GPU RDMA transfer timed out (completions drained)".to_string())
+                    // Reset the QPs before releasing the destination blocks. A
+                    // dropped receiver alone would leave accepted READs able to
+                    // write into memory that the caller may immediately reuse.
+                    self.rdma_transport
+                        .engine()
+                        .invalidate_connection(remote_addr);
+                    lock_guard.release();
+                    return Err("direct GPU RDMA transfer timed out".to_string());
                 }
             };
             if let Err(error) = wait_result {
+                self.rdma_transport
+                    .engine()
+                    .invalidate_connection(remote_addr);
                 lock_guard.release();
                 return Err(error);
             }
@@ -936,7 +939,7 @@ async fn fetch_blocks_via_rdma(
     };
 
     let wait_start = Instant::now();
-    tokio::time::timeout(transfer_timeout, async {
+    let wait_result = tokio::time::timeout(transfer_timeout, async {
         for rx in receivers {
             rx.await
                 .map_err(|_| "RDMA transfer channel closed".to_string())?
@@ -944,8 +947,20 @@ async fn fetch_blocks_via_rdma(
         }
         Ok::<(), String>(())
     })
-    .await
-    .map_err(|_| "RDMA transfer timed out".to_string())??;
+    .await;
+    match wait_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            rdma.engine().invalidate_connection(remote_addr);
+            return Err(error);
+        }
+        Err(_) => {
+            // Reset the QPs before dropping host allocations. Accepted READs
+            // must not continue writing into memory that is about to be freed.
+            rdma.engine().invalidate_connection(remote_addr);
+            return Err("RDMA transfer timed out".to_string());
+        }
+    }
     timing.rdma_wait = wait_start.elapsed();
 
     // Build SealedBlocks from allocated memory
@@ -1377,10 +1392,7 @@ mod tests {
         assert_eq!(direct.namespace, "ns");
         assert_eq!(direct.hashes, hashes[..3].to_vec());
         assert_eq!(direct.block_count(), 3);
-        assert_eq!(
-            direct.segments,
-            vec![("node-a".into(), 2), ("node-b".into(), 1)]
-        );
+        assert_eq!(direct.fetch_plan.segments, plan.segments);
     }
 
     #[test]

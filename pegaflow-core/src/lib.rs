@@ -1011,13 +1011,15 @@ impl PegaEngine {
         completion: LoadCompletion,
     ) -> Result<(), EngineError> {
         let metrics = core_metrics();
-        gpu.register_direct_memory(&self.storage, None)
-            .inspect_err(|_| {
-                metrics.direct_gpu_mr_registration_failures.add(1, &[]);
-                metrics
-                    .direct_gpu_load_total
-                    .add(1, &[opentelemetry::KeyValue::new("status", "error")]);
-            })?;
+        if !gpu.direct_memory_registered() {
+            metrics.direct_gpu_mr_registration_failures.add(1, &[]);
+            metrics
+                .direct_gpu_load_total
+                .add(1, &[opentelemetry::KeyValue::new("status", "error")]);
+            return Err(EngineError::InvalidArgument(
+                "direct GPU memory is not registered; owner DMA-BUF import is required".into(),
+            ));
+        }
         let local_completion = if layers.is_empty() {
             None
         } else {
@@ -1085,7 +1087,7 @@ impl PegaEngine {
         let gpu = instance
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
-        gpu.register_direct_memory(&self.storage, Some(regions))
+        gpu.register_direct_memory(&self.storage, regions)
             .inspect_err(|_| {
                 core_metrics()
                     .direct_gpu_mr_registration_failures

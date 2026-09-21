@@ -279,7 +279,21 @@ mod tests {
             let remote = (remote_count > 0).then(|| crate::backing::DirectFetchPlan {
                 namespace: "ns".into(),
                 hashes: vec![vec![1], vec![2]],
-                segments: vec![("node-a".into(), 1), ("node-b".into(), 1)],
+                fetch_plan: crate::backing::rdma_fetch::FetchPlan {
+                    segments: vec![
+                        crate::backing::rdma_fetch::FetchPlanSegment {
+                            node: "node-a".into(),
+                            start: 0,
+                            end: 1,
+                        },
+                        crate::backing::rdma_fetch::FetchPlanSegment {
+                            node: "node-b".into(),
+                            start: 1,
+                            end: 2,
+                        },
+                    ],
+                    block_count: 2,
+                },
             });
             let plan = DirectQueryPlan {
                 local_blocks: vec![Arc::clone(&block); local_count],

@@ -464,12 +464,23 @@ impl RcBackend {
             .map(|c| c.local_nics.clone())
     }
 
-    /// Remove connection state on transfer failure. The connection owns its
-    /// sessions, so in-flight work keeps its QPs alive through their Arcs.
+    /// Remove connection state on transfer failure and reset all of its QPs.
+    /// Resetting prevents accepted work from continuing to access caller-owned
+    /// buffers after a timeout or transport error.
     pub(crate) fn invalidate_connection(&self, remote_addr: &str) {
-        let mut state = self.state.lock();
-        if state.addr_connections.remove(remote_addr).is_some() {
+        let connection = self.state.lock().addr_connections.remove(remote_addr);
+        if let Some(connection) = connection {
             info!("connection invalidated: remote={remote_addr}");
+            for nic in connection.nics {
+                for session in nic.sessions.iter() {
+                    if let Err(error) = session.reset() {
+                        warn!(
+                            "failed to reset invalidated RC session: remote={remote_addr} qpn={} error={error}",
+                            session.local_endpoint.qp_num
+                        );
+                    }
+                }
+            }
         }
     }
 
