@@ -362,15 +362,21 @@ impl RcSession {
                             continue;
                         };
                         if wc.status() != WorkCompletionStatus::Success as u32 {
-                            first_error.get_or_insert_with(|| {
-                                TransferError::Backend(format!(
+                            if first_error.is_none() {
+                                first_error = Some(TransferError::Backend(format!(
                                     "send completion failed: local_qpn={}, status={}, opcode={}, vendor_err={}",
                                     session.local_endpoint.qp_num,
                                     wc.status(),
                                     wc.opcode(),
                                     wc.vendor_err()
-                                ))
-                            });
+                                )));
+                                if let Err(error) = session.reset() {
+                                    warn!(
+                                        "failed to reset RC QP after send completion error: local_qpn={} error={error}",
+                                        session.local_endpoint.qp_num
+                                    );
+                                }
+                            }
                         }
                         if wc.status() == WorkCompletionStatus::Success as u32 {
                             transferred = transferred.saturating_add(bytes);

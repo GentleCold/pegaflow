@@ -599,7 +599,7 @@ impl PegaEngine {
         }
         let instance = self.get_instance(instance_id)?;
         let topology = instance.sealed_topology()?;
-        if topology.num_groups() != 1 || instance.page_first() {
+        if topology.num_groups() != 1 || topology.is_page_first() {
             return Err(EngineError::InvalidArgument(
                 "direct GPU RDMA only supports dense attention group 0".to_string(),
             ));
@@ -845,7 +845,7 @@ impl PegaEngine {
                 }
                 #[cfg(feature = "rdma")]
                 QueryLeasePayload::Direct(plan) => {
-                    if instance.page_first()
+                    if topology.is_page_first()
                         || topology.num_groups() != 1
                         || layer_groups[0].is_empty()
                         || layer_groups.iter().skip(1).any(|group| !group.is_empty())
