@@ -21,7 +21,6 @@ from pegaflow.connector.common import (
     PegaWorkerMetadata,
     SaveIntent,
     logger,
-    parse_env_bool,
     parse_env_int,
 )
 from pegaflow.dma_buf import DmaBufExports
@@ -279,7 +278,7 @@ class WorkerConnector:
         self._registered_layers.clear()
 
     def register_kv_caches(self, kv_caches: dict[str, Any]):
-        direct = parse_env_bool("PEGA_DIRECT_GPU_RDMA")
+        direct = self._ctx.direct_gpu_rdma
         with DmaBufExports() if direct else nullcontext() as exports:
             self._register_kv_caches(kv_caches, exports)
 

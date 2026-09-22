@@ -18,7 +18,6 @@ from pegaflow.connector.common import (
     RecurrentLoadHold,
     SaveIntent,
     logger,
-    parse_env_bool,
     reconcile_hybrid_hit,
 )
 from pegaflow.connector.connector_metrics import PrefetchTracker
@@ -139,9 +138,9 @@ class SchedulerConnector:
             )
         self._tp_shard_client = TpShardQueryClient(engine_clients)
         self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
-        self._direct_gpu_rdma = parse_env_bool("PEGA_DIRECT_GPU_RDMA")
+        self._direct_gpu_rdma = context.direct_gpu_rdma
         if self._direct_gpu_rdma and self._cache_groups.has_recurrent_state:
-            raise ValueError("PEGA_DIRECT_GPU_RDMA only supports dense attention cache group 0")
+            raise ValueError("pegaflow.direct_gpu_rdma only supports dense attention cache group 0")
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
         self._gpu_block_pool = None

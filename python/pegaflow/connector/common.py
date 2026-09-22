@@ -143,6 +143,7 @@ class ConnectorContext:
     pp_size: int = 1
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
     wait_for_full_prefix: bool = False
+    direct_gpu_rdma: bool = False
     tp_shards: TpShardTopology | None = None
     # Token span of one `Request.block_hashes` entry; `None` means one per
     # scheduler block.
@@ -528,14 +529,6 @@ def parse_env_int(name: str, default: int) -> int:
         return default
 
 
-def parse_env_bool(name: str, default: bool = False) -> bool:
-    """Parse a boolean environment flag shared by connector processes."""
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     """Resolve or generate connector instance_id with optional DP rank suffix."""
     instance_id = vllm_config.kv_transfer_config.engine_id
@@ -666,7 +659,6 @@ __all__ = [
     "derive_namespace",
     "detect_mla",
     "logger",
-    "parse_env_bool",
     "parse_env_int",
     "reconcile_hybrid_hit",
     "resolve_instance_id",
