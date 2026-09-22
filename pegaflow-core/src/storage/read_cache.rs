@@ -94,7 +94,7 @@ impl ReadCache {
         let mut inner = self.inner.lock();
         let mut resident_keys = Vec::new();
         for (key, block) in blocks {
-            match insert_block(&mut inner, key.clone(), block, ResidentClass::Retained) {
+            match insert_block(&mut inner, key.clone(), block, ResidentClass::Reclaimable) {
                 CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists => {
                     resident_keys.push(key);
                 }
@@ -486,16 +486,16 @@ mod tests {
         let cache = make_cache();
         let local = BlockKey::new("ns".into(), vec![1]);
         let ssd = BlockKey::new("ns".into(), vec![2]);
-        let rdma = BlockKey::new("ns".into(), vec![3]);
+        let remote = BlockKey::new("ns".into(), vec![3]);
         let local_block = make_block();
 
         cache.batch_insert_refs(&[(local.clone(), local_block)]);
         cache.batch_insert(vec![(ssd.clone(), make_block())]);
-        cache.batch_insert_resident_keys(vec![(rdma.clone(), make_block())]);
+        cache.batch_insert_refs(&[(remote.clone(), make_block())]);
 
         assert_class(&cache, &local, ResidentClass::Retained);
         assert_class(&cache, &ssd, ResidentClass::Retained);
-        assert_class(&cache, &rdma, ResidentClass::Retained);
+        assert_class(&cache, &remote, ResidentClass::Retained);
     }
 
     #[test]
@@ -506,7 +506,6 @@ mod tests {
 
         cache.batch_insert(vec![(retained.clone(), make_block())]);
         cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
-        cache.mark_reclaimable_keys(std::slice::from_ref(&reclaimable));
 
         let evicted = cache.remove_lru_batch(2);
         assert_eq!(
@@ -563,7 +562,7 @@ mod tests {
             inserted_at
         );
         assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
-        assert_class(&cache, &hit, ResidentClass::Retained);
+        assert_class(&cache, &hit, ResidentClass::Reclaimable);
     }
 
     #[test]
@@ -597,7 +596,6 @@ mod tests {
 
         cache.batch_insert_resident_keys(vec![(remote_first.clone(), make_block())]);
         cache.batch_insert_resident_keys(vec![(remote_other.clone(), make_block())]);
-        cache.mark_reclaimable_keys(&[remote_first.clone(), remote_other.clone()]);
         cache.batch_insert(vec![(remote_first.clone(), make_block())]);
         cache.batch_insert(vec![(local_first.clone(), make_block())]);
         cache.batch_insert(vec![(local_other.clone(), make_block())]);
@@ -605,8 +603,9 @@ mod tests {
 
         assert_class(&cache, &remote_first, ResidentClass::Reclaimable);
         assert_class(&cache, &local_first, ResidentClass::Retained);
-        assert_class(&cache, &remote_other, ResidentClass::Reclaimable);
-        assert_class(&cache, &local_other, ResidentClass::Retained);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, remote_other);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, remote_first);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, local_other);
         assert_class(&cache, &local_first, ResidentClass::Retained);
     }
 
@@ -693,7 +692,6 @@ mod tests {
             (other_namespace.clone(), make_block()),
         ]);
         cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
-        cache.mark_reclaimable_keys(std::slice::from_ref(&reclaimable));
         cache.mark_reclaimable_hashes("ns", &[vec![1], vec![2], vec![3]]);
 
         assert_class(&cache, &retained, ResidentClass::Reclaimable);
@@ -827,7 +825,6 @@ mod tests {
                 .is_empty()
         );
         assert!(!cache.inner.lock().reclaimable.contains_key(&cold_key));
-        assert!(!cache.inner.lock().retained.contains_key(&cold_key));
         assert_eq!(cache.get_blocks(&[hot_key]).len(), 1);
         assert_eq!(cache.get_blocks(&[cold_key]).len(), 0);
     }

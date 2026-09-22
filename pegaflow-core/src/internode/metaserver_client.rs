@@ -91,7 +91,6 @@ impl MetaServerClientConfig {
 /// A batch of block hashes grouped by namespace for MetaServer operations.
 struct BlockHashBatch {
     groups: Vec<(String, Vec<Vec<u8>>)>,
-    apply_reclaimable_hint: bool,
 }
 
 impl BlockHashBatch {
@@ -102,21 +101,12 @@ impl BlockHashBatch {
         }
         Self {
             groups: groups.into_iter().collect(),
-            apply_reclaimable_hint: false,
         }
     }
 
     fn single_namespace(namespace: String, hashes: Vec<Vec<u8>>) -> Self {
         Self {
             groups: vec![(namespace, hashes)],
-            apply_reclaimable_hint: true,
-        }
-    }
-
-    fn single_namespace_without_reclaim_hint(namespace: String, hashes: Vec<Vec<u8>>) -> Self {
-        Self {
-            groups: vec![(namespace, hashes)],
-            apply_reclaimable_hint: false,
         }
     }
 
@@ -127,7 +117,10 @@ impl BlockHashBatch {
 
 /// Command sent to the background MetaServer loop.
 enum MetaServerCommand {
-    Insert(BlockHashBatch),
+    Insert {
+        batch: BlockHashBatch,
+        apply_reclaimable_hint: bool,
+    },
     Remove(BlockHashBatch),
     /// Barrier: acked once every insert/remove enqueued before it has been
     /// delivered to the MetaServer (or dropped after a failed attempt).
@@ -224,13 +217,12 @@ impl MetaServerClient {
         if hashes.is_empty() {
             return;
         }
-        let batch = if apply_reclaimable_hint {
-            BlockHashBatch::single_namespace(namespace, hashes)
-        } else {
-            BlockHashBatch::single_namespace_without_reclaim_hint(namespace, hashes)
-        };
+        let batch = BlockHashBatch::single_namespace(namespace, hashes);
         let count = batch.count();
-        match self.command_tx.try_send(MetaServerCommand::Insert(batch)) {
+        match self.command_tx.try_send(MetaServerCommand::Insert {
+            batch,
+            apply_reclaimable_hint,
+        }) {
             Ok(()) => {
                 core_metrics()
                     .metaserver_registration_blocks
@@ -430,17 +422,20 @@ async fn registration_loop(
         // namespace; mixed streams switch to last-write-wins netting.
         for cmd in std::iter::once(cmd).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match cmd {
-                MetaServerCommand::Insert(batch) => {
+                MetaServerCommand::Insert {
+                    batch,
+                    apply_reclaimable_hint,
+                } => {
                     saw_insert = true;
                     if saw_remove {
                         let net = mixed_ops.get_or_insert_with(|| {
                             build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
                         });
-                        insert_groups_into_net(net, batch.groups, batch.apply_reclaimable_hint);
+                        insert_groups_into_net(net, batch.groups, apply_reclaimable_hint);
                     } else {
                         for (namespace, mut hashes) in batch.groups {
                             inserts
-                                .entry((namespace, batch.apply_reclaimable_hint))
+                                .entry((namespace, apply_reclaimable_hint))
                                 .or_default()
                                 .append(&mut hashes);
                         }
@@ -522,15 +517,10 @@ async fn registration_loop(
         let c = client.as_mut().expect("client is Some after lazy-connect");
 
         // Process inserts
-        let insert_namespaces: Vec<(String, bool, Vec<Vec<u8>>)> = inserts
-            .into_iter()
-            .map(|((namespace, apply_reclaimable_hint), hashes)| {
-                (namespace, apply_reclaimable_hint, hashes)
-            })
-            .collect();
+        let insert_namespaces: Vec<_> = inserts.into_iter().collect();
         let mut insert_failed_at: Option<(usize, usize)> = None;
 
-        'insert: for (i, (namespace, apply_reclaimable_hint, hashes)) in
+        'insert: for (i, ((namespace, apply_reclaimable_hint), hashes)) in
             insert_namespaces.iter().enumerate()
         {
             for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
@@ -580,7 +570,7 @@ async fn registration_loop(
         }
 
         if let Some((idx, offset)) = insert_failed_at {
-            let dropped = unsent_after_insert_failure(&insert_namespaces, idx, offset);
+            let dropped = unsent_after_failure(&insert_namespaces, idx, offset);
             core_metrics()
                 .metaserver_registration_failures
                 .add(dropped as u64, &[]);
@@ -659,28 +649,15 @@ fn ack_flushes(acks: Vec<oneshot::Sender<()>>) {
 /// Hashes that did not reach the MetaServer after a chunked send failed at
 /// `failed_offset` within namespace `failed_idx`: the unsent tail of that
 /// namespace (earlier chunks already landed) plus every later namespace.
-fn unsent_after_insert_failure(
-    namespaces: &[(String, bool, Vec<Vec<u8>>)],
-    failed_idx: usize,
-    failed_offset: usize,
-) -> usize {
-    let unsent_in_ns = namespaces[failed_idx].2.len().saturating_sub(failed_offset);
-    let later: usize = namespaces[failed_idx + 1..]
-        .iter()
-        .map(|(_, _, h)| h.len())
-        .sum();
-    unsent_in_ns + later
-}
-
-fn unsent_after_failure(
-    namespaces: &[(String, Vec<Vec<u8>>)],
+fn unsent_after_failure<K>(
+    namespaces: &[(K, Vec<Vec<u8>>)],
     failed_idx: usize,
     failed_offset: usize,
 ) -> usize {
     let unsent_in_ns = namespaces[failed_idx].1.len().saturating_sub(failed_offset);
     let later: usize = namespaces[failed_idx + 1..]
         .iter()
-        .map(|(_, hashes)| hashes.len())
+        .map(|(_, h)| h.len())
         .sum();
     unsent_in_ns + later
 }
@@ -703,7 +680,7 @@ fn build_net(
 ) -> HashMap<(String, Vec<u8>), PendingOperation> {
     let mut net = HashMap::new();
     insert_map_into_net(&mut net, inserts);
-    insert_remove_map_into_net(&mut net, removes);
+    remove_groups_into_net(&mut net, removes);
     net
 }
 
@@ -712,33 +689,15 @@ fn insert_map_into_net(
     grouped: HashMap<(String, bool), Vec<Vec<u8>>>,
 ) {
     for ((namespace, apply_reclaimable_hint), hashes) in grouped {
-        for hash in hashes {
-            net.insert(
-                (namespace.clone(), hash),
-                PendingOperation::Insert {
-                    apply_reclaimable_hint,
-                },
-            );
-        }
+        insert_groups_into_net(net, vec![(namespace, hashes)], apply_reclaimable_hint);
     }
 }
 
 fn remove_groups_into_net(
     net: &mut HashMap<(String, Vec<u8>), PendingOperation>,
-    groups: Vec<(String, Vec<Vec<u8>>)>,
+    groups: impl IntoIterator<Item = (String, Vec<Vec<u8>>)>,
 ) {
     for (namespace, hashes) in groups {
-        for hash in hashes {
-            net.insert((namespace.clone(), hash), PendingOperation::Remove);
-        }
-    }
-}
-
-fn insert_remove_map_into_net(
-    net: &mut HashMap<(String, Vec<u8>), PendingOperation>,
-    grouped: HashMap<String, Vec<Vec<u8>>>,
-) {
-    for (namespace, hashes) in grouped {
         for hash in hashes {
             net.insert((namespace.clone(), hash), PendingOperation::Remove);
         }
@@ -1364,10 +1323,13 @@ mod tests {
         let remove_only = vec![0xc0];
         let insert_only = vec![0xd0];
 
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-first".to_string(),
-            vec![insert_then_remove.clone()],
-        )))
+        tx.try_send(MetaServerCommand::Insert {
+            batch: BlockHashBatch::single_namespace(
+                "ns-first".to_string(),
+                vec![insert_then_remove.clone()],
+            ),
+            apply_reclaimable_hint: true,
+        })
         .unwrap();
         tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
             vec![("ns-first".to_string(), insert_then_remove.clone())],
@@ -1380,15 +1342,21 @@ mod tests {
             ],
         )))
         .unwrap();
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-second".to_string(),
-            vec![remove_then_insert.clone()],
-        )))
+        tx.try_send(MetaServerCommand::Insert {
+            batch: BlockHashBatch::single_namespace(
+                "ns-second".to_string(),
+                vec![remove_then_insert.clone()],
+            ),
+            apply_reclaimable_hint: true,
+        })
         .unwrap();
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-insert".to_string(),
-            vec![insert_only.clone()],
-        )))
+        tx.try_send(MetaServerCommand::Insert {
+            batch: BlockHashBatch::single_namespace(
+                "ns-insert".to_string(),
+                vec![insert_only.clone()],
+            ),
+            apply_reclaimable_hint: true,
+        })
         .unwrap();
 
         let endpoint = metaserver_endpoint(addr.clone());
