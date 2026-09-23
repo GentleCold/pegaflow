@@ -315,7 +315,11 @@ impl RcSession {
 
         let mut next_idx = 0usize;
         let mut next_wr_id = 1_u64;
-        let mut inflight: HashMap<u64, usize> = HashMap::new();
+        // The send window is capped at MAX_SEND_WR, so reserve the complete
+        // window once instead of growing and rehashing while completions are
+        // being tracked.
+        let mut inflight: HashMap<u64, usize> =
+            HashMap::with_capacity(total_ops.min(MAX_SEND_WR as usize));
         let mut transferred = 0usize;
         let mut first_error = None;
 
