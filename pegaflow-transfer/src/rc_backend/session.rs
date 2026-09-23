@@ -24,7 +24,10 @@ use super::runtime::RcRuntime;
 use crate::engine::{RcEndpoint, TransferOp};
 use crate::error::{Result, TransferError};
 
-const MAX_WR_CHAIN_OPS: usize = 4;
+// Keep each post_send chain within the QP's read-atomic window. A longer
+// chain amortizes ibv_post_send setup while the surrounding loop still caps
+// total outstanding WRs at MAX_SEND_WR.
+const MAX_WR_CHAIN_OPS: usize = 16;
 const MAX_SEND_WR: u32 = 128;
 // One QP per CQ; all WRs are signaled, so CQ depth = SQ depth suffices.
 // One-sided RDMA only: no recvs are ever posted, so the send CQ doubles as
