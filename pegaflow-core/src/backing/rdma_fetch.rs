@@ -105,17 +105,32 @@ impl DirectQueryPlan {
 /// The destination layout owns all pointer/range validation. Remote metadata
 /// is checked for the same K/V shape before a WQE is submitted, so a stale or
 /// incompatible owner cannot cause a short or shifted GPU write.
+#[cfg(test)]
 pub(crate) fn build_gpu_read_descs(
     layout: &KVCacheLayout,
     destination_block: usize,
     remote_slot: &pegaflow_proto::proto::engine::TransferSlotInfo,
 ) -> Result<Vec<TransferDesc>, String> {
+    let mut descs = Vec::with_capacity(2);
+    append_gpu_read_descs(layout, destination_block, remote_slot, &mut descs)?;
+    Ok(descs)
+}
+
+/// Append READ descriptors for one remote slot without allocating a temporary
+/// vector. The direct-load path builds one segment-wide descriptor list, so
+/// keeping the small K/V expansion in that list avoids a heap allocation for
+/// every block and layer.
+fn append_gpu_read_descs(
+    layout: &KVCacheLayout,
+    destination_block: usize,
+    remote_slot: &pegaflow_proto::proto::engine::TransferSlotInfo,
+    descs: &mut Vec<TransferDesc>,
+) -> Result<(), String> {
     let copies = layout.block_copies(destination_block)?;
     let remote_k = NonNull::new(remote_slot.k_ptr as *mut u8)
         .ok_or_else(|| "remote K ptr is null".to_string())?;
     let k_size = usize::try_from(remote_slot.k_size)
         .map_err(|_| "remote K size exceeds usize".to_string())?;
-    let mut descs = Vec::with_capacity(2);
     match copies {
         BlockCopies::Contiguous(copy) => {
             if remote_slot.v_ptr != 0 || remote_slot.v_size != 0 || k_size != copy.bytes {
@@ -156,7 +171,23 @@ pub(crate) fn build_gpu_read_descs(
             });
         }
     }
-    Ok(descs)
+    Ok(())
+}
+
+fn flush_gpu_visibility(cuda_context: &cudarc::driver::CudaContext) -> Result<(), String> {
+    cuda_context
+        .bind_to_thread()
+        .map_err(|error| format!("direct GPU CUDA visibility fence failed: {error:?}"))?;
+    let flush = unsafe {
+        cudarc::driver::sys::cuFlushGPUDirectRDMAWrites(
+            cudarc::driver::sys::CUflushGPUDirectRDMAWritesTarget_enum::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+            cudarc::driver::sys::CUflushGPUDirectRDMAWritesScope_enum::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER,
+        )
+    };
+    if flush != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        return Err(format!("direct GPU visibility flush failed: {flush:?}"));
+    }
+    Ok(())
 }
 
 impl FetchPlan {
@@ -412,7 +443,7 @@ impl RdmaFetchStore {
         plan: &DirectFetchPlan,
         req_id: &str,
         remote_targets: &[GpuReadTarget],
-        device_id: i32,
+        cuda_context: &cudarc::driver::CudaContext,
         transfer_timeout: Duration,
     ) -> Result<(), String> {
         if remote_targets.is_empty() {
@@ -428,8 +459,10 @@ impl RdmaFetchStore {
                 ));
             }
         }
-        let mut offset = 0usize;
-        for (segment_index, segment) in plan.fetch_plan.segments.iter().enumerate() {
+        let mut submitted_gpu_transfer = false;
+        let transfer_result = async {
+            let mut offset = 0usize;
+            for (segment_index, segment) in plan.fetch_plan.segments.iter().enumerate() {
             let remote_addr = &segment.node;
             let end = segment.end;
             let hashes = plan
@@ -468,7 +501,11 @@ impl RdmaFetchStore {
             }
             let (receivers, expected_bytes) = {
                 let build_result = (|| {
-                    let mut descs = Vec::new();
+                    let descriptor_capacity = hashes
+                        .len()
+                        .saturating_mul(remote_targets.len())
+                        .saturating_mul(2);
+                    let mut descs = Vec::with_capacity(descriptor_capacity);
                     for (local_index, block) in response.blocks.iter().enumerate() {
                         if block.block_hash != hashes[local_index] {
                             return Err(format!(
@@ -488,7 +525,7 @@ impl RdmaFetchStore {
                                     target.remote_slot_id, target.layer_name
                                 )
                             })?;
-                            descs.extend(build_gpu_read_descs(&target.layout, destination, slot)?);
+                            append_gpu_read_descs(&target.layout, destination, slot, &mut descs)?;
                         }
                     }
                     Ok(descs)
@@ -506,12 +543,15 @@ impl RdmaFetchStore {
                     continue;
                 }
                 let expected_bytes: usize = descs.iter().map(|desc| desc.len).sum();
-                match self.rdma_transport.engine().batch_transfer_async(
+                match self.rdma_transport.engine().batch_transfer_gpu_async(
                     TransferOp::Read,
                     remote_addr,
                     &descs,
                 ) {
-                    Ok(receivers) => (receivers, expected_bytes),
+                    Ok(receivers) => {
+                        submitted_gpu_transfer = true;
+                        (receivers, expected_bytes)
+                    }
                     Err(error) => {
                         lock_guard.release();
                         return Err(format!("direct GPU RDMA submit failed: {error}"));
@@ -567,33 +607,37 @@ impl RdmaFetchStore {
                 lock_guard.release();
                 return Err(error);
             }
-            let cuda_context =
-                cudarc::driver::CudaContext::new(device_id as usize).map_err(|error| {
-                    format!("direct GPU CUDA context visibility fence failed: {error:?}")
-                })?;
-            cuda_context
-                .bind_to_thread()
-                .map_err(|error| format!("direct GPU CUDA visibility fence failed: {error:?}"))?;
-            let flush = unsafe {
-                cudarc::driver::sys::cuFlushGPUDirectRDMAWrites(
-                    cudarc::driver::sys::CUflushGPUDirectRDMAWritesTarget_enum::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
-                    cudarc::driver::sys::CUflushGPUDirectRDMAWritesScope_enum::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER,
-                )
-            };
-            if flush != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                return Err(format!("direct GPU visibility flush failed: {flush:?}"));
-            }
             lock_guard.release();
-            offset = end;
+                offset = end;
+            }
+            if offset != plan.hashes.len() {
+                return Err(format!(
+                    "direct plan covers {} hashes but request has {}",
+                    offset,
+                    plan.hashes.len()
+                ));
+            }
+            Ok(())
         }
-        if offset != plan.hashes.len() {
-            return Err(format!(
-                "direct plan covers {} hashes but request has {}",
-                offset,
-                plan.hashes.len()
-            ));
+        .await;
+        if submitted_gpu_transfer {
+            // RDMA READs complete independently of CUDA's device context. Bind
+            // and flush once after the ordered plan is fully drained instead of
+            // paying the context/visibility cost for every owner segment. This
+            // also runs when a later segment fails after an earlier segment
+            // already wrote to the destination GPU buffer.
+            let visibility_result = flush_gpu_visibility(cuda_context);
+            if transfer_result.is_ok() {
+                return visibility_result;
+            }
+            if let Err(flush_error) = visibility_result {
+                return Err(format!(
+                    "{}; GPU visibility flush also failed: {flush_error}",
+                    transfer_result.expect_err("transfer result is known to be an error")
+                ));
+            }
         }
-        Ok(())
+        transfer_result
     }
 
     /// Fetch `hashes` from `remote_addr`.

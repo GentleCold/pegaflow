@@ -208,6 +208,22 @@ impl TransferEngine {
         self.backend.batch_transfer_async(op, remote_addr, descs)
     }
 
+    /// Submit a batch whose local pointers target CUDA device memory.
+    ///
+    /// Device pointers cannot be classified with the CPU `move_pages(2)` NUMA
+    /// query used by the host staging path. Use the same NIC round-robin
+    /// fallback as an unknown NUMA placement while keeping host transfers
+    /// NUMA-aware.
+    pub fn batch_transfer_gpu_async(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+    ) -> Result<Vec<mea::oneshot::Receiver<Result<usize>>>> {
+        self.backend
+            .batch_transfer_gpu_async(op, remote_addr, descs)
+    }
+
     /// Number of active RC queue pairs across all NICs.
     pub fn num_qps(&self) -> usize {
         self.backend.num_qps()

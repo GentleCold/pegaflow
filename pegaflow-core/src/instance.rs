@@ -408,6 +408,13 @@ impl GpuContext {
         &self.worker_pool
     }
 
+    /// Reuse the instance CUDA context for operations that run outside the
+    /// dedicated GPU worker threads.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn cuda_context(&self) -> Arc<CudaContext> {
+        Arc::clone(&self._cuda_ctx)
+    }
+
     /// Hybrid-cache storage group of a layer; unregistered layers default to
     /// group 0, preserving single-group behavior.
     pub(crate) fn group_of_layer(&self, layer_name: &str) -> u32 {

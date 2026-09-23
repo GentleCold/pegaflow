@@ -5,6 +5,8 @@ pub(crate) mod transfer_lock;
 mod write_path;
 
 use bytesize::ByteSize;
+#[cfg(feature = "rdma")]
+use cudarc::driver::CudaContext;
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
@@ -533,7 +535,7 @@ impl StorageEngine {
         plan: &DirectFetchPlan,
         req_id: &str,
         targets: &[GpuReadTarget],
-        device_id: i32,
+        cuda_context: &CudaContext,
     ) -> Result<(), String> {
         let fetch = self
             .rdma_fetch
@@ -544,7 +546,7 @@ impl StorageEngine {
                 plan,
                 req_id,
                 targets,
-                device_id,
+                cuda_context,
                 self.transfer_lock_timeout(),
             )
             .await

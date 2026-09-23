@@ -986,7 +986,7 @@ impl PegaEngine {
 
         #[cfg(feature = "rdma")]
         if !direct_loads.is_empty() {
-            return self.submit_direct_load(gpu, layers, direct_loads, device_id, completion);
+            return self.submit_direct_load(gpu, layers, direct_loads, completion);
         }
 
         // Complete immediately if no blocks to load
@@ -1007,7 +1007,6 @@ impl PegaEngine {
         gpu: Arc<crate::instance::GpuContext>,
         layers: Vec<LayerTransferData>,
         direct_loads: Vec<(DirectFetchPlan, Vec<GpuReadTarget>)>,
-        device_id: i32,
         completion: LoadCompletion,
     ) -> Result<(), EngineError> {
         let metrics = core_metrics();
@@ -1031,6 +1030,7 @@ impl PegaEngine {
             Some(rx)
         };
         let storage = Arc::clone(&self.storage);
+        let cuda_context = gpu.cuda_context();
         let req_id = format!("direct-load:{}", uuid::Uuid::new_v4());
         let started_at = std::time::Instant::now();
         tokio::spawn(async move {
@@ -1038,7 +1038,7 @@ impl PegaEngine {
             let remote = async {
                 for (plan, targets) in &direct_loads {
                     storage
-                        .direct_load(plan, &req_id, targets, device_id)
+                        .direct_load(plan, &req_id, targets, &cuda_context)
                         .await
                         .map_err(EngineError::Storage)?;
                 }

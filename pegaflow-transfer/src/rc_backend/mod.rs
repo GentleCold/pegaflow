@@ -34,6 +34,10 @@ impl NicGroup {
         let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
         self.nic_indices[idx % self.nic_indices.len()]
     }
+
+    fn next_position(&self) -> usize {
+        self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.nic_indices.len()
+    }
 }
 
 struct NumaRoundRobin {
@@ -495,6 +499,29 @@ impl RcBackend {
         remote_addr: &str,
         descs: &[TransferDesc],
     ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
+        self.batch_transfer_async_inner(op, remote_addr, descs, true)
+    }
+
+    /// Submit a batch whose local pointers are CUDA device addresses.
+    /// `move_pages(2)` only classifies CPU pages and adds overhead (or returns
+    /// UNKNOWN) for GPU mappings, so direct GPU transfers use the same
+    /// round-robin fallback as unknown NUMA placement.
+    pub(crate) fn batch_transfer_gpu_async(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+    ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
+        self.batch_transfer_async_inner(op, remote_addr, descs, false)
+    }
+
+    fn batch_transfer_async_inner(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+        numa_aware: bool,
+    ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
         if descs.is_empty() {
             return Ok(Vec::new());
         }
@@ -503,9 +530,26 @@ impl RcBackend {
 
         // NUMA-aware NIC assignment: query the NUMA node of each descriptor's
         // first page and route to a NIC on the same NUMA node.
-        let mut per_nic: Vec<Vec<TransferDesc>> = (0..nic_count).map(|_| Vec::new()).collect();
-        if self.numa_rr.single_numa {
-            // All NICs on one NUMA node — skip move_pages, plain round-robin.
+        let per_nic_capacity = if numa_aware {
+            0
+        } else {
+            descs.len().div_ceil(nic_count)
+        };
+        let mut per_nic: Vec<Vec<TransferDesc>> = (0..nic_count)
+            .map(|_| Vec::with_capacity(per_nic_capacity))
+            .collect();
+        if !numa_aware {
+            // GPU addresses cannot be classified by move_pages. Reserve one
+            // atomic increment for the whole batch; per-descriptor fetch_add
+            // adds contention without improving distribution.
+            let start = self.numa_rr.fallback.next_position();
+            for (index, &desc) in descs.iter().enumerate() {
+                let nic_idx = self.numa_rr.fallback.nic_indices[(start + index) % nic_count];
+                per_nic[nic_idx].push(desc);
+            }
+        } else if self.numa_rr.single_numa {
+            // All host NICs on one NUMA node — skip move_pages, plain
+            // round-robin as in the original host staging path.
             for &desc in descs {
                 let nic_idx = self.numa_rr.fallback.next();
                 per_nic[nic_idx].push(desc);
