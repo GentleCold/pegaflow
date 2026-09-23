@@ -24,6 +24,39 @@ use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, Transfer
 use crate::error::{Result, TransferError};
 use pegaflow_common::NumaNode;
 
+fn can_coalesce_ops(left: &RdmaOp, right: &RdmaOp) -> bool {
+    left.remote_rkey == right.remote_rkey
+        && Arc::ptr_eq(&left.local_mr, &right.local_mr)
+        && left
+            .local_ptr
+            .checked_add(left.len as u64)
+            .is_some_and(|end| end == right.local_ptr)
+        && left
+            .remote_ptr
+            .checked_add(left.len as u64)
+            .is_some_and(|end| end == right.remote_ptr)
+        && left.len <= u32::MAX as usize
+        && right.len <= u32::MAX as usize
+        && left
+            .len
+            .checked_add(right.len)
+            .is_some_and(|len| len <= u32::MAX as usize)
+}
+
+fn coalesce_ops(ops: Vec<RdmaOp>) -> Vec<RdmaOp> {
+    let mut coalesced = Vec::with_capacity(ops.len());
+    for op in ops {
+        if let Some(previous) = coalesced.last_mut()
+            && can_coalesce_ops(previous, &op)
+        {
+            previous.len += op.len;
+        } else {
+            coalesced.push(op);
+        }
+    }
+    coalesced
+}
+
 struct NicGroup {
     nic_indices: Vec<usize>,
     rr_counter: AtomicUsize,
@@ -606,16 +639,15 @@ impl RcBackend {
 
         // --- Build ops outside the lock ---
         let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
+        let mut prepared_ops = 0usize;
         for nic in nic_snapshots {
             let nic_descs = &per_nic[nic.nic_idx];
             // Per-WQE round-robin across the N sessions per NIC so a single
             // batch can fill all N QPs (per-call RR would leave the rest idle).
             let n = nic.sessions.len();
             let per_bucket = nic_descs.len().div_ceil(n);
-            let mut buckets: Vec<Vec<RdmaOp>> =
-                (0..n).map(|_| Vec::with_capacity(per_bucket)).collect();
-
-            for (i, desc) in nic_descs.iter().enumerate() {
+            let mut ops = Vec::with_capacity(nic_descs.len());
+            for desc in nic_descs {
                 let local_ptr = desc.local_ptr.as_ptr() as u64;
                 let remote_ptr = desc.remote_ptr.as_ptr() as u64;
                 let len = desc.len;
@@ -633,8 +665,7 @@ impl RcBackend {
                     TransferError::InvalidArgument("remote memory not found in handshake snapshot"),
                 )?;
 
-                let bucket = nic.rot.wrapping_add(i) % n;
-                buckets[bucket].push(RdmaOp {
+                ops.push(RdmaOp {
                     local_mr,
                     _owner: owner,
                     local_ptr,
@@ -642,6 +673,15 @@ impl RcBackend {
                     len,
                     remote_rkey,
                 });
+            }
+
+            let ops = coalesce_ops(ops);
+            prepared_ops += ops.len();
+            let mut buckets: Vec<Vec<RdmaOp>> =
+                (0..n).map(|_| Vec::with_capacity(per_bucket)).collect();
+            for (i, op) in ops.into_iter().enumerate() {
+                let bucket = nic.rot.wrapping_add(i) % n;
+                buckets[bucket].push(op);
             }
 
             for (q_idx, prepared) in buckets.into_iter().enumerate() {
@@ -654,11 +694,12 @@ impl RcBackend {
         let lookup_dur = lookup_start.elapsed();
 
         debug!(
-            "batch_transfer_async_{:?}: nics_active={}/{}, chunks={}, lookup_ms={:.3}",
+            "batch_transfer_async_{:?}: nics_active={}/{}, chunks={}, prepared_ops={}, lookup_ms={:.3}",
             op,
             nic_work.len(),
             nic_count,
             descs.len(),
+            prepared_ops,
             lookup_dur.as_secs_f64() * 1000.0,
         );
 
