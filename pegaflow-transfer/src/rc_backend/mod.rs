@@ -624,9 +624,10 @@ impl RcBackend {
                     return Err(TransferError::InvalidArgument("len must be non-zero"));
                 }
 
-                let local_mr = registered
-                    .find_mr(nic.nic_idx, local_ptr, len)
-                    .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+                let (local_mr, owner) =
+                    registered
+                        .find_mr_and_owner(nic.nic_idx, local_ptr, len)
+                        .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
 
                 let remote_rkey = nic.remote_memory.find_rkey(remote_ptr, len).ok_or(
                     TransferError::InvalidArgument("remote memory not found in handshake snapshot"),
@@ -635,9 +636,7 @@ impl RcBackend {
                 let bucket = nic.rot.wrapping_add(i) % n;
                 buckets[bucket].push(RdmaOp {
                     local_mr,
-                    _owner: registered
-                        .find_entry(local_ptr, len)
-                        .and_then(|entry| entry.owner.clone()),
+                    _owner: owner,
                     local_ptr,
                     remote_ptr,
                     len,

@@ -80,15 +80,20 @@ impl LocalMemoryMap {
         self.entries.values()
     }
 
-    /// Find the MR (for `nic_idx`) of the region fully covering `[ptr, ptr+len)`.
-    pub(super) fn find_mr(
+    /// Find the MR (for `nic_idx`) and optional owner of the region fully
+    /// covering `[ptr, ptr+len)`.
+    ///
+    /// The transfer hot path needs both values for every descriptor. Resolve
+    /// the covering B-tree entry once so device batches do not pay for two
+    /// identical predecessor lookups.
+    pub(super) fn find_mr_and_owner(
         &self,
         nic_idx: usize,
         ptr: u64,
         len: usize,
-    ) -> Option<Arc<MemoryRegion>> {
+    ) -> Option<(Arc<MemoryRegion>, Option<Arc<crate::CudaDmaBuf>>)> {
         self.find_entry(ptr, len)
-            .map(|entry| Arc::clone(&entry.mrs[nic_idx]))
+            .map(|entry| (Arc::clone(&entry.mrs[nic_idx]), entry.owner.clone()))
     }
 
     /// Non-overlap makes the predecessor the only possible covering region.
