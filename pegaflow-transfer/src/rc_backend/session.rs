@@ -25,11 +25,13 @@ use crate::engine::{RcEndpoint, TransferOp};
 use crate::error::{Result, TransferError};
 
 // Keep each post_send chain within the QP's read-atomic window. A longer
-// chain amortizes ibv_post_send setup while the surrounding loop still caps
-// total outstanding WRs at MAX_SEND_WR.
+// chain amortizes ibv_post_send setup and lets us signal one completion for
+// the whole chain while the surrounding loop still caps total outstanding
+// WRs at MAX_SEND_WR.
 const MAX_WR_CHAIN_OPS: usize = 16;
 const MAX_SEND_WR: u32 = 128;
-// One QP per CQ; all WRs are signaled, so CQ depth = SQ depth suffices.
+// One QP per CQ; one WR per chain is signaled, so CQ depth = SQ depth
+// continues to provide ample room for completion bursts.
 // One-sided RDMA only: no recvs are ever posted, so the send CQ doubles as
 // the recv CQ and the recv queue stays at the minimal depth drivers accept.
 const SEND_CQ_SIZE: u32 = MAX_SEND_WR;
@@ -285,9 +287,14 @@ impl RcSession {
                     "len exceeds RDMA SGE length limit",
                 ));
             }
+            // RC completion ordering guarantees that a signaled chain tail is
+            // reported only after all preceding unsignaled WRs completed.
+            // Keeping one CQE per chain cuts CQ traffic without weakening the
+            // batch's completion and error-drain contract.
+            let flags = (idx + 1 == ops.len()).then_some(WorkRequestFlags::Signaled);
             let wr = guard.construct_wr(
                 first_wr_id.wrapping_add(idx as u64),
-                WorkRequestFlags::Signaled,
+                flags.unwrap_or_else(WorkRequestFlags::none),
             );
             let handle = match op {
                 TransferOp::Write => wr.setup_write(rdma_op.remote_rkey, rdma_op.remote_ptr),
@@ -318,19 +325,20 @@ impl RcSession {
         // The send window is capped at MAX_SEND_WR, so reserve the complete
         // window once instead of growing and rehashing while completions are
         // being tracked.
-        let mut inflight: HashMap<u64, usize> =
+        let mut inflight: HashMap<u64, (usize, usize)> =
             HashMap::with_capacity(total_ops.min(MAX_SEND_WR as usize));
+        let mut inflight_ops = 0usize;
         let mut transferred = 0usize;
         let mut first_error = None;
 
         // After the first error no new work is posted. Keep polling only to
         // drain completions that were accepted before the error, then return.
-        while (first_error.is_none() && next_idx < total_ops) || !inflight.is_empty() {
+        while (first_error.is_none() && next_idx < total_ops) || inflight_ops > 0 {
             while first_error.is_none()
                 && next_idx < total_ops
-                && inflight.len() < MAX_SEND_WR as usize
+                && inflight_ops < MAX_SEND_WR as usize
             {
-                let available = MAX_SEND_WR as usize - inflight.len();
+                let available = MAX_SEND_WR as usize - inflight_ops;
                 let remaining = total_ops - next_idx;
                 let chain_len = MAX_WR_CHAIN_OPS.min(available).min(remaining);
                 let posted_result = {
@@ -353,10 +361,14 @@ impl RcSession {
                 if posted == 0 {
                     break;
                 }
-                for rdma_op in &ops[next_idx..next_idx + posted] {
-                    inflight.insert(next_wr_id, rdma_op.len);
-                    next_wr_id = next_wr_id.wrapping_add(1);
-                }
+                let chain_bytes = ops[next_idx..next_idx + posted]
+                    .iter()
+                    .map(|rdma_op| rdma_op.len)
+                    .sum();
+                let chain_tail_id = next_wr_id.wrapping_add(posted as u64 - 1);
+                inflight.insert(chain_tail_id, (chain_bytes, posted));
+                next_wr_id = next_wr_id.wrapping_add(posted as u64);
+                inflight_ops += posted;
                 next_idx += posted;
             }
 
@@ -365,9 +377,10 @@ impl RcSession {
                     let mut did_work = false;
                     for wc in &mut poller {
                         did_work = true;
-                        let Some(bytes) = inflight.remove(&wc.wr_id()) else {
+                        let Some((bytes, completed_ops)) = inflight.remove(&wc.wr_id()) else {
                             continue;
                         };
+                        inflight_ops = inflight_ops.saturating_sub(completed_ops);
                         if wc.status() != WorkCompletionStatus::Success as u32
                             && first_error.is_none()
                         {
