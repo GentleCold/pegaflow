@@ -495,13 +495,9 @@ impl RdmaFetchStore {
             }
         }
         let mut submitted_gpu_transfer = false;
-        let fetch_started_at = Instant::now();
-        let mut timing = DirectGpuFetchTiming::default();
-        let mut total_bytes = 0usize;
         let transfer_result = async {
             let mut offset = 0usize;
             for (segment_index, segment) in plan.fetch_plan.segments.iter().enumerate() {
-            let segment_started_at = Instant::now();
             let remote_addr = &segment.node;
             let end = segment.end;
             let hashes = plan
@@ -509,7 +505,6 @@ impl RdmaFetchStore {
                 .get(segment.start..end)
                 .ok_or_else(|| format!("direct plan segment {segment_index} exceeds hash list"))?;
 
-            let connect_started_at = Instant::now();
             ensure_connected(
                 &self.connect_group,
                 &self.rdma_transport,
@@ -518,10 +513,6 @@ impl RdmaFetchStore {
                 &self.advertise_addr,
             )
             .await?;
-            timing.connect += connect_started_at.elapsed();
-            timing.segments += 1;
-            timing.blocks += hashes.len();
-            let query_started_at = Instant::now();
             let (client, mut response) = query_remote_blocks(
                 &self.grpc_channels,
                 remote_addr,
@@ -530,7 +521,6 @@ impl RdmaFetchStore {
                 &self.advertise_addr,
             )
             .await?;
-            timing.query += query_started_at.elapsed();
             let lock_guard = TransferLockGuard::new(
                 client,
                 std::mem::take(&mut response.transfer_session_id),
@@ -544,7 +534,6 @@ impl RdmaFetchStore {
                     hashes.len()
                 ));
             }
-            let build_started_at = Instant::now();
             let (receivers, expected_bytes) = {
                 let build_result = (|| {
                     let descriptor_capacity = hashes
@@ -589,8 +578,6 @@ impl RdmaFetchStore {
                     continue;
                 }
                 let expected_bytes: usize = descs.iter().map(|desc| desc.len).sum();
-                total_bytes = total_bytes.saturating_add(expected_bytes);
-                timing.descriptors += descs.len();
                 match self.rdma_transport.engine().batch_transfer_gpu_async(
                     TransferOp::Read,
                     remote_addr,
@@ -606,8 +593,6 @@ impl RdmaFetchStore {
                     }
                 }
             };
-            timing.build += build_started_at.elapsed();
-            let wait_started_at = Instant::now();
             let completions = async {
                 let mut first_error = None;
                 let mut completed_bytes = 0usize;
@@ -657,9 +642,7 @@ impl RdmaFetchStore {
                 lock_guard.release();
                 return Err(error);
             }
-            timing.wait += wait_started_at.elapsed();
             lock_guard.release();
-                timing.segment_total += segment_started_at.elapsed();
                 offset = end;
             }
             if offset != plan.hashes.len() {
@@ -672,48 +655,23 @@ impl RdmaFetchStore {
             Ok(())
         }
         .await;
-        let transfer_result = if submitted_gpu_transfer {
+        if submitted_gpu_transfer {
             // RDMA READs complete independently of CUDA's device context. Bind
             // and flush once after the ordered plan is fully drained instead of
             // paying the context/visibility cost for every owner segment. This
             // also runs when a later segment fails after an earlier segment
             // already wrote to the destination GPU buffer.
-            let flush_started_at = Instant::now();
             let visibility_result = flush_gpu_visibility(cuda_context);
-            timing.flush += flush_started_at.elapsed();
             if transfer_result.is_ok() {
-                visibility_result
-            } else if let Err(flush_error) = visibility_result {
-                Err(format!(
+                return visibility_result;
+            }
+            if let Err(flush_error) = visibility_result {
+                return Err(format!(
                     "{}; GPU visibility flush also failed: {flush_error}",
                     transfer_result.expect_err("transfer result is known to be an error")
-                ))
-            } else {
-                transfer_result
+                ));
             }
-        } else {
-            transfer_result
-        };
-        info!(
-            "Direct GPU RDMA fetch: req_id={} segments={} blocks={} descriptors={} bytes={} connect_ms={:.3} query_ms={:.3} build_ms={:.3} wait_ms={:.3} segment_ms={:.3} flush_ms={:.3} total_ms={:.3} status={}",
-            req_id,
-            timing.segments,
-            timing.blocks,
-            timing.descriptors,
-            total_bytes,
-            timing.connect.as_secs_f64() * 1000.0,
-            timing.query.as_secs_f64() * 1000.0,
-            timing.build.as_secs_f64() * 1000.0,
-            timing.wait.as_secs_f64() * 1000.0,
-            timing.segment_total.as_secs_f64() * 1000.0,
-            timing.flush.as_secs_f64() * 1000.0,
-            fetch_started_at.elapsed().as_secs_f64() * 1000.0,
-            if transfer_result.is_ok() {
-                "ok"
-            } else {
-                "error"
-            },
-        );
+        }
         transfer_result
     }
 
@@ -1267,19 +1225,6 @@ struct TransferTiming {
     transfer_desc_count: usize,
     slot_count: usize,
     numa_slab_count: usize,
-}
-
-#[derive(Default)]
-struct DirectGpuFetchTiming {
-    connect: Duration,
-    query: Duration,
-    build: Duration,
-    wait: Duration,
-    segment_total: Duration,
-    flush: Duration,
-    segments: usize,
-    blocks: usize,
-    descriptors: usize,
 }
 
 fn get_or_create_channel(
