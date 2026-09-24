@@ -1,6 +1,6 @@
 // RDMA remote block fetch: MetaServer query -> gRPC QueryBlocksForTransfer -> RDMA READ.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -384,9 +384,44 @@ impl RdmaFetchStore {
         namespace: &str,
         hashes: &[Vec<u8>],
     ) -> Option<DirectFetchPlan> {
-        self.query_plan(namespace, hashes)
-            .await
-            .map(|plan| plan.direct_plan(namespace, hashes))
+        let plan = self.query_plan(namespace, hashes).await?;
+        let direct_plan = plan.direct_plan(namespace, hashes);
+        self.warm_direct_connections(&direct_plan.fetch_plan);
+        Some(direct_plan)
+    }
+
+    /// Start RDMA handshakes while the scheduler is still allocating the
+    /// destination GPU blocks. The transfer itself remains ordered and is
+    /// still submitted by `fetch_plan_to_gpu`; this only moves connection
+    /// setup off the load critical path for a cold peer.
+    fn warm_direct_connections(&self, plan: &FetchPlan) {
+        let mut remotes = HashSet::new();
+        for segment in &plan.segments {
+            if !remotes.insert(segment.node.clone()) {
+                continue;
+            }
+            let connect_group = Arc::clone(&self.connect_group);
+            let rdma_transport = Arc::clone(&self.rdma_transport);
+            let grpc_channels = Arc::clone(&self.grpc_channels);
+            let advertise_addr = self.advertise_addr.clone();
+            let remote_addr = segment.node.clone();
+            tokio::spawn(async move {
+                if let Err(error) = ensure_connected(
+                    &connect_group,
+                    &rdma_transport,
+                    &grpc_channels,
+                    &remote_addr,
+                    &advertise_addr,
+                )
+                .await
+                {
+                    debug!(
+                        "Direct GPU RDMA connection warmup failed: remote={} error={}",
+                        remote_addr, error
+                    );
+                }
+            });
+        }
     }
 
     pub(crate) async fn fetch_plan(
