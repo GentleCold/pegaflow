@@ -28,6 +28,9 @@ pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 4096;
 // keep a full chunk near 0.5 MiB, well under tonic's 4 MiB default.
 const MAX_HASHES_PER_RPC: usize = 16_384;
 
+type InsertRegistration = (Vec<u8>, Option<u64>);
+type InsertGroups = HashMap<(String, bool), Vec<InsertRegistration>>;
+
 /// Error type for MetaServer client operations.
 #[cfg(feature = "rdma")]
 #[derive(Debug)]
@@ -120,6 +123,7 @@ enum MetaServerCommand {
     Insert {
         batch: BlockHashBatch,
         apply_reclaimable_hint: bool,
+        generations: HashMap<(String, Vec<u8>), u64>,
     },
     Remove(BlockHashBatch),
     /// Barrier: acked once every insert/remove enqueued before it has been
@@ -191,8 +195,31 @@ impl MetaServerClient {
     ///
     /// Accepts one namespace and its block hashes so callers can preserve their
     /// hot-path grouping and enqueue a single MetaServer command.
+    #[cfg(test)]
     pub(crate) fn try_register_namespace(&self, namespace: String, hashes: Vec<Vec<u8>>) {
-        self.try_register_namespace_with_hint(namespace, hashes, true);
+        self.try_register_namespace_with_hint_and_generations(
+            namespace,
+            hashes,
+            true,
+            HashMap::new(),
+        );
+    }
+
+    pub(crate) fn try_register_namespace_with_generations(
+        &self,
+        namespace: String,
+        registrations: Vec<(Vec<u8>, u64)>,
+    ) {
+        if registrations.is_empty() {
+            return;
+        }
+        let mut hashes = Vec::with_capacity(registrations.len());
+        let mut generations = HashMap::with_capacity(registrations.len());
+        for (hash, generation) in registrations {
+            generations.insert((namespace.clone(), hash.clone()), generation);
+            hashes.push(hash);
+        }
+        self.try_register_namespace_with_hint_and_generations(namespace, hashes, true, generations);
     }
 
     /// Fire-and-forget registration for blocks fetched from a peer.
@@ -205,14 +232,20 @@ impl MetaServerClient {
         namespace: String,
         hashes: Vec<Vec<u8>>,
     ) {
-        self.try_register_namespace_with_hint(namespace, hashes, false);
+        self.try_register_namespace_with_hint_and_generations(
+            namespace,
+            hashes,
+            false,
+            HashMap::new(),
+        );
     }
 
-    fn try_register_namespace_with_hint(
+    fn try_register_namespace_with_hint_and_generations(
         &self,
         namespace: String,
         hashes: Vec<Vec<u8>>,
         apply_reclaimable_hint: bool,
+        generations: HashMap<(String, Vec<u8>), u64>,
     ) {
         if hashes.is_empty() {
             return;
@@ -222,6 +255,7 @@ impl MetaServerClient {
         match self.command_tx.try_send(MetaServerCommand::Insert {
             batch,
             apply_reclaimable_hint,
+            generations,
         }) {
             Ok(()) => {
                 core_metrics()
@@ -409,47 +443,45 @@ async fn registration_loop(
             break;
         }
 
-        let mut inserts: HashMap<(String, bool), Vec<Vec<u8>>> = HashMap::new();
+        let mut net: HashMap<(String, Vec<u8>), PendingOperation> = HashMap::new();
         let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        let mut mixed_ops: Option<HashMap<(String, Vec<u8>), PendingOperation>> = None;
-        let mut saw_insert = false;
-        let mut saw_remove = false;
         // Flush barriers drained in this batch; acked after the sends below, so
         // an ack means "everything enqueued before the flush has been attempted".
         let mut flush_acks: Vec<oneshot::Sender<()>> = Vec::new();
 
-        // Drain all pending commands. Pure insert/remove batches stay grouped by
-        // namespace; mixed streams switch to last-write-wins netting.
+        // Drain all pending commands with per-hash last-write-wins semantics.
+        // The final insert origin and resident generation must survive batching;
+        // grouping by reclaim-hint policy before netting loses that ordering.
         for cmd in std::iter::once(cmd).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match cmd {
                 MetaServerCommand::Insert {
                     batch,
                     apply_reclaimable_hint,
+                    generations,
                 } => {
-                    saw_insert = true;
-                    if saw_remove {
-                        let net = mixed_ops.get_or_insert_with(|| {
-                            build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
-                        });
-                        insert_groups_into_net(net, batch.groups, apply_reclaimable_hint);
-                    } else {
-                        for (namespace, mut hashes) in batch.groups {
-                            inserts
-                                .entry((namespace, apply_reclaimable_hint))
-                                .or_default()
-                                .append(&mut hashes);
+                    for (namespace, hashes) in batch.groups {
+                        for hash in hashes {
+                            let key = (namespace.clone(), hash);
+                            let generation = if apply_reclaimable_hint {
+                                generations.get(&key).copied()
+                            } else {
+                                None
+                            };
+                            net.insert(
+                                key,
+                                PendingOperation::Insert {
+                                    apply_reclaimable_hint,
+                                    generation,
+                                },
+                            );
                         }
                     }
                 }
                 MetaServerCommand::Remove(batch) => {
-                    saw_remove = true;
-                    if saw_insert {
-                        let net = mixed_ops.get_or_insert_with(|| {
-                            build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
-                        });
-                        remove_groups_into_net(net, batch.groups);
-                    } else {
-                        append_groups(&mut removes, batch.groups);
+                    for (namespace, hashes) in batch.groups {
+                        for hash in hashes {
+                            net.insert((namespace.clone(), hash), PendingOperation::Remove);
+                        }
                     }
                 }
                 MetaServerCommand::Flush(done) => {
@@ -471,20 +503,20 @@ async fn registration_loop(
             }
         }
 
-        if let Some(net) = mixed_ops {
-            for ((namespace, hash), operation) in net {
-                match operation {
-                    PendingOperation::Insert {
-                        apply_reclaimable_hint,
-                    } => {
-                        inserts
-                            .entry((namespace, apply_reclaimable_hint))
-                            .or_default()
-                            .push(hash);
-                    }
-                    PendingOperation::Remove => {
-                        removes.entry(namespace).or_default().push(hash);
-                    }
+        let mut inserts: InsertGroups = HashMap::new();
+        for ((namespace, hash), operation) in net {
+            match operation {
+                PendingOperation::Insert {
+                    apply_reclaimable_hint,
+                    generation,
+                } => {
+                    inserts
+                        .entry((namespace, apply_reclaimable_hint))
+                        .or_default()
+                        .push((hash, generation));
+                }
+                PendingOperation::Remove => {
+                    removes.entry(namespace).or_default().push(hash);
                 }
             }
         }
@@ -520,14 +552,15 @@ async fn registration_loop(
         let insert_namespaces: Vec<_> = inserts.into_iter().collect();
         let mut insert_failed_at: Option<(usize, usize)> = None;
 
-        'insert: for (i, ((namespace, apply_reclaimable_hint), hashes)) in
+        'insert: for (i, ((namespace, apply_reclaimable_hint), registrations)) in
             insert_namespaces.iter().enumerate()
         {
-            for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
+            for (chunk_idx, chunk) in registrations.chunks(MAX_HASHES_PER_RPC).enumerate() {
                 let count = chunk.len();
+                let hashes: Vec<Vec<u8>> = chunk.iter().map(|(hash, _)| hash.clone()).collect();
                 let request = InsertBlockHashesRequest {
                     namespace: namespace.clone(),
-                    block_hashes: chunk.to_vec(),
+                    block_hashes: hashes,
                     node: advertise_addr.clone(),
                     node_id: node_id.clone(),
                 };
@@ -535,11 +568,27 @@ async fn registration_loop(
                 match c.insert_block_hashes(request).await {
                     Ok(resp) => {
                         let inner = resp.into_inner();
-                        if *apply_reclaimable_hint
-                            && !inner.reclaimable_hashes.is_empty()
-                            && let Some(cache) = read_cache.upgrade()
-                        {
-                            cache.mark_reclaimable_hashes(namespace, &inner.reclaimable_hashes);
+                        if *apply_reclaimable_hint && !inner.reclaimable_hashes.is_empty() {
+                            let generations: HashMap<Vec<u8>, u64> = chunk
+                                .iter()
+                                .filter_map(|(hash, generation)| {
+                                    generation.map(|generation| (hash.clone(), generation))
+                                })
+                                .collect();
+                            if let Some(cache) = read_cache.upgrade() {
+                                if generations.is_empty() {
+                                    cache.mark_reclaimable_hashes(
+                                        namespace,
+                                        &inner.reclaimable_hashes,
+                                    );
+                                } else {
+                                    cache.mark_reclaimable_hashes_if_generation(
+                                        namespace,
+                                        &inner.reclaimable_hashes,
+                                        &generations,
+                                    );
+                                }
+                            }
                         }
                         debug!(
                             "Registered {} block hashes with MetaServer (namespace={}, inserted={}, reclaimable={})",
@@ -649,8 +698,8 @@ fn ack_flushes(acks: Vec<oneshot::Sender<()>>) {
 /// Hashes that did not reach the MetaServer after a chunked send failed at
 /// `failed_offset` within namespace `failed_idx`: the unsent tail of that
 /// namespace (earlier chunks already landed) plus every later namespace.
-fn unsent_after_failure<K>(
-    namespaces: &[(K, Vec<Vec<u8>>)],
+fn unsent_after_failure<K, V>(
+    namespaces: &[(K, Vec<V>)],
     failed_idx: usize,
     failed_offset: usize,
 ) -> usize {
@@ -662,63 +711,13 @@ fn unsent_after_failure<K>(
     unsent_in_ns + later
 }
 
-fn append_groups(target: &mut HashMap<String, Vec<Vec<u8>>>, groups: Vec<(String, Vec<Vec<u8>>)>) {
-    for (namespace, mut hashes) in groups {
-        target.entry(namespace).or_default().append(&mut hashes);
-    }
-}
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PendingOperation {
-    Insert { apply_reclaimable_hint: bool },
+    Insert {
+        apply_reclaimable_hint: bool,
+        generation: Option<u64>,
+    },
     Remove,
-}
-
-fn build_net(
-    inserts: HashMap<(String, bool), Vec<Vec<u8>>>,
-    removes: HashMap<String, Vec<Vec<u8>>>,
-) -> HashMap<(String, Vec<u8>), PendingOperation> {
-    let mut net = HashMap::new();
-    insert_map_into_net(&mut net, inserts);
-    remove_groups_into_net(&mut net, removes);
-    net
-}
-
-fn insert_map_into_net(
-    net: &mut HashMap<(String, Vec<u8>), PendingOperation>,
-    grouped: HashMap<(String, bool), Vec<Vec<u8>>>,
-) {
-    for ((namespace, apply_reclaimable_hint), hashes) in grouped {
-        insert_groups_into_net(net, vec![(namespace, hashes)], apply_reclaimable_hint);
-    }
-}
-
-fn remove_groups_into_net(
-    net: &mut HashMap<(String, Vec<u8>), PendingOperation>,
-    groups: impl IntoIterator<Item = (String, Vec<Vec<u8>>)>,
-) {
-    for (namespace, hashes) in groups {
-        for hash in hashes {
-            net.insert((namespace.clone(), hash), PendingOperation::Remove);
-        }
-    }
-}
-
-fn insert_groups_into_net(
-    net: &mut HashMap<(String, Vec<u8>), PendingOperation>,
-    groups: Vec<(String, Vec<Vec<u8>>)>,
-    apply_reclaimable_hint: bool,
-) {
-    for (namespace, hashes) in groups {
-        for hash in hashes {
-            net.insert(
-                (namespace.clone(), hash),
-                PendingOperation::Insert {
-                    apply_reclaimable_hint,
-                },
-            );
-        }
-    }
 }
 
 async fn ensure_heartbeat_registered(
@@ -899,7 +898,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::net::TcpListener;
     use tokio::sync::{Notify, oneshot};
@@ -916,12 +915,14 @@ mod tests {
         remove_count: AtomicUsize,
         unregister_count: AtomicUsize,
         fail_insert_with_stale_session: AtomicUsize,
+        block_insert_responses: AtomicBool,
         reclaimable_hashes: Mutex<Vec<Vec<u8>>>,
         insert_requests: RequestLog,
         remove_requests: RequestLog,
         query_requests: Mutex<Vec<QueryPrefixBlocksRequest>>,
         heartbeat_notify: Notify,
         insert_notify: Notify,
+        release_insert_response: Notify,
         remove_notify: Notify,
         unregister_notify: Notify,
     }
@@ -959,6 +960,7 @@ mod tests {
         ) -> Result<Response<InsertBlockHashesResponse>, Status> {
             let request = request.into_inner();
             self.state.insert_count.fetch_add(1, Ordering::SeqCst);
+            self.state.insert_notify.notify_waiters();
             if self
                 .state
                 .fail_insert_with_stale_session
@@ -979,12 +981,14 @@ mod tests {
                 .filter(|hash| request.block_hashes.contains(hash))
                 .cloned()
                 .collect();
+            if self.state.block_insert_responses.load(Ordering::SeqCst) {
+                self.state.release_insert_response.notified().await;
+            }
             self.state
                 .insert_requests
                 .lock()
                 .unwrap()
                 .push((request.namespace, request.block_hashes));
-            self.state.insert_notify.notify_waiters();
             Ok(Response::new(InsertBlockHashesResponse {
                 status: Some(ResponseStatus {
                     ok: true,
@@ -1192,6 +1196,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_netting_preserves_final_p2p_insert_origin() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
+        let local_hash = vec![0xa1];
+        let remote_hash = vec![0xb2];
+        let local_key = BlockKey::new("ns".to_string(), local_hash.clone());
+        let remote_key = BlockKey::new("ns".to_string(), remote_hash.clone());
+        read_cache.insert_retained_for_test(
+            local_key.clone(),
+            Arc::new(SealedBlock::from_slots(Vec::new())),
+        );
+        read_cache.insert_retained_for_test(
+            remote_key.clone(),
+            Arc::new(SealedBlock::from_slots(Vec::new())),
+        );
+        *service.reclaimable_hashes.lock().unwrap() = vec![local_hash.clone(), remote_hash.clone()];
+
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Arc::downgrade(&read_cache),
+        );
+
+        client.try_register_namespace("ns".to_string(), vec![remote_hash.clone()]);
+        client.try_register_namespace_without_reclaim_hint(
+            "ns".to_string(),
+            vec![remote_hash.clone(), local_hash.clone()],
+        );
+        client.try_register_namespace("ns".to_string(), vec![local_hash.clone()]);
+        client.try_unregister(vec![("other".to_string(), vec![0xc3])]);
+        client.flush().await;
+
+        assert!(read_cache.is_reclaimable_for_test(&local_key));
+        assert!(!read_cache.is_reclaimable_for_test(&remote_key));
+
+        client.shutdown().await;
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn stale_local_hint_does_not_demote_reinserted_block() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
+        let hash = vec![0xa1];
+        let key = BlockKey::new("ns".to_string(), hash.clone());
+        read_cache
+            .insert_retained_for_test(key.clone(), Arc::new(SealedBlock::from_slots(Vec::new())));
+        let old_generation = read_cache.resident_generation_for_test(&key);
+        *service.reclaimable_hashes.lock().unwrap() = vec![hash.clone()];
+        service.block_insert_responses.store(true, Ordering::SeqCst);
+
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Arc::downgrade(&read_cache),
+        );
+        client.try_register_namespace_with_generations(
+            "ns".to_string(),
+            vec![(hash.clone(), old_generation)],
+        );
+        wait_for_count(&service.insert_notify, &service.insert_count, 1).await;
+
+        read_cache.remove_lru_batch_for_test(1);
+        read_cache
+            .insert_retained_for_test(key.clone(), Arc::new(SealedBlock::from_slots(Vec::new())));
+        service.release_insert_response.notify_one();
+        client.flush().await;
+
+        assert!(!read_cache.is_reclaimable_for_test(&key));
+        client.shutdown().await;
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
     async fn flush_barrier_acks_even_when_insert_fails() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
         // Fail both the insert attempt and the session-reset retry heartbeat
@@ -1329,6 +1405,7 @@ mod tests {
                 vec![insert_then_remove.clone()],
             ),
             apply_reclaimable_hint: true,
+            generations: HashMap::new(),
         })
         .unwrap();
         tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
@@ -1348,6 +1425,7 @@ mod tests {
                 vec![remove_then_insert.clone()],
             ),
             apply_reclaimable_hint: true,
+            generations: HashMap::new(),
         })
         .unwrap();
         tx.try_send(MetaServerCommand::Insert {
@@ -1356,6 +1434,7 @@ mod tests {
                 vec![insert_only.clone()],
             ),
             apply_reclaimable_hint: true,
+            generations: HashMap::new(),
         })
         .unwrap();
 
