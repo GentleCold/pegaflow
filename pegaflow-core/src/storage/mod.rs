@@ -33,6 +33,9 @@ const RECLAIM_BATCH_SIZE: usize = 512;
 pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
 pub fn lfu_window_budget(capacity_bytes: usize, ratio: f64) -> Result<u64, String> {
+    if capacity_bytes == 0 {
+        return Err("pinned-memory pool capacity must be greater than zero".into());
+    }
     if !ratio.is_finite() || ratio <= 0.0 || ratio >= 100.0 {
         return Err("--lfu-window-ratio must be finite and between 0 and 100 (exclusive)".into());
     }
@@ -672,6 +675,7 @@ mod tests {
     fn lfu_window_budget_uses_pool_percentage() {
         assert_eq!(lfu_window_budget(10_000, 1.0).unwrap(), 100);
         assert_eq!(lfu_window_budget(10_000, 0.001).unwrap(), 1);
+        assert!(lfu_window_budget(0, 1.0).is_err());
         assert!(lfu_window_budget(10_000, 0.0).is_err());
         assert!(lfu_window_budget(10_000, 100.0).is_err());
     }

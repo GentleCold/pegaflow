@@ -72,7 +72,7 @@ impl ReadCache {
                 window_bytes: 0,
                 main_bytes: 0,
                 window_budget,
-                main_budget: capacity_bytes as u64 - window_budget.unwrap_or(0),
+                main_budget: (capacity_bytes as u64).saturating_sub(window_budget.unwrap_or(0)),
                 reclaimable: LruCache::new_unbounded(),
                 retained: LruCache::new_unbounded(),
             }),
@@ -395,33 +395,32 @@ fn overflow_window(inner: &mut ReadCacheInner, evicted_keys: &mut Vec<BlockKey>)
     let Some(budget) = inner.window_budget else {
         return;
     };
-    if inner.window_bytes <= budget || inner.window.len() <= 1 {
-        return;
-    }
-    let Some((candidate, entry)) = inner.window.remove_lru() else {
-        return;
-    };
-    inner.window_bytes = inner.window_bytes.saturating_sub(entry.resident.footprint);
+    while inner.window_bytes > budget {
+        let Some((candidate, entry)) = inner.window.remove_lru() else {
+            break;
+        };
+        inner.window_bytes = inner.window_bytes.saturating_sub(entry.resident.footprint);
 
-    if inner.main_bytes.saturating_add(entry.resident.footprint) <= inner.main_budget {
-        promote_to_main(inner, candidate, entry);
-        return;
-    }
-
-    let victim = oldest_eligible(inner, ResidentClass::Reclaimable)
-        .or_else(|| oldest_eligible(inner, ResidentClass::Retained));
-    if let Some((victim, class)) = victim
-        && inner.cache.admits(&candidate, &victim)
-        && main_replacement_fits(inner, &victim, entry.resident.footprint)
-    {
-        if let Some(removed) = remove_main_key(inner, &victim, class) {
-            record_policy_removal(removed, class, evicted_keys, false);
+        if inner.main_bytes.saturating_add(entry.resident.footprint) <= inner.main_budget {
             promote_to_main(inner, candidate, entry);
+            continue;
+        }
+
+        let victim = oldest_eligible(inner, ResidentClass::Reclaimable)
+            .or_else(|| oldest_eligible(inner, ResidentClass::Retained));
+        if let Some((victim, class)) = victim
+            && inner.cache.admits(&candidate, &victim)
+            && main_replacement_fits(inner, &victim, entry.resident.footprint)
+        {
+            if let Some(removed) = remove_main_key(inner, &victim, class) {
+                record_policy_removal(removed, class, evicted_keys, false);
+                promote_to_main(inner, candidate, entry);
+            } else {
+                reject_window_candidate(inner, candidate, entry, evicted_keys);
+            }
         } else {
             reject_window_candidate(inner, candidate, entry, evicted_keys);
         }
-    } else {
-        reject_window_candidate(inner, candidate, entry, evicted_keys);
     }
 }
 
@@ -1113,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn window_overflow_promotes_only_the_oldest_entry() {
+    fn window_overflow_promotes_entries_until_within_budget() {
         let cache = make_lfu_cache();
         let first = BlockKey::new("ns".into(), vec![1]);
         let second = BlockKey::new("ns".into(), vec![2]);
@@ -1127,14 +1126,38 @@ mod tests {
         }
         cache.batch_insert(vec![(second.clone(), make_block())]);
         assert_class(&cache, &first, ResidentClass::Retained);
-        assert!(!cache.inner.lock().retained.contains_key(&second));
+        assert_class(&cache, &second, ResidentClass::Retained);
 
         {
             let mut inner = cache.inner.lock();
             inner.window_bytes = 1;
         }
         cache.batch_insert(vec![(third.clone(), make_block())]);
-        assert!(cache.inner.lock().window.contains_key(&third));
+        assert_class(&cache, &third, ResidentClass::Retained);
+        assert!(cache.inner.lock().window.is_empty());
+    }
+
+    #[test]
+    fn oversized_window_entry_is_promoted() {
+        let cache = make_lfu_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+        {
+            let mut inner = cache.inner.lock();
+            inner
+                .window
+                .peek_mut(&key)
+                .expect("window entry")
+                .resident
+                .footprint = 2;
+            inner.window_budget = Some(1);
+            inner.window_bytes = 2;
+            overflow_window(&mut inner, &mut Vec::new());
+        }
+
+        assert_class(&cache, &key, ResidentClass::Retained);
+        assert!(!cache.inner.lock().window.contains_key(&key));
     }
 
     #[test]
