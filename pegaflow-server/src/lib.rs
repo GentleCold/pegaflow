@@ -809,6 +809,13 @@ mod tests {
     }
 
     #[test]
+    fn cli_explicit_reclaim_limit_accepts_memory_size() {
+        let cli = Cli::try_parse_from(["pegaflow-server", "--max-reclaim-bytes", "2gb"]).unwrap();
+
+        assert_eq!(cli.max_reclaim_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
     fn cli_explicit_metric_hll_windows_parses_without_panic() {
         let cli =
             Cli::try_parse_from(["pegaflow-server", "--metric-hll-windows", "15m,1h,24h"]).unwrap();

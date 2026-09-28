@@ -595,6 +595,27 @@ mod tests {
     }
 
     #[test]
+    fn bounded_pressure_reclaim_does_not_cross_class_after_byte_limit() {
+        let cache = make_cache();
+        let reclaimable = BlockKey::new("ns".into(), vec![1]);
+        let retained = BlockKey::new("ns".into(), vec![2]);
+        cache.batch_insert_resident_keys(vec![(
+            reclaimable.clone(),
+            Arc::new(SealedBlock::with_footprint_for_test(60)),
+        )]);
+        cache.batch_insert(vec![(
+            retained.clone(),
+            Arc::new(SealedBlock::with_footprint_for_test(60)),
+        )]);
+
+        let evicted = cache.remove_lru_batch_bounded(512, 100);
+
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, reclaimable);
+        assert_eq!(cache.get_blocks(std::slice::from_ref(&retained)).len(), 1);
+    }
+
+    #[test]
     fn bounded_pressure_reclaim_keeps_one_oversized_block_for_progress() {
         let cache = make_cache();
         let oversized = BlockKey::new("ns".into(), vec![1]);
