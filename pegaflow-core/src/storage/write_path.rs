@@ -200,7 +200,8 @@ fn process_insert_batch(
         && let Some(deps) = &deps
     {
         let resident_keys = deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(deps, namespace, &sealed_blocks, resident_keys);
+        let resident_registrations = deps.read_cache.resident_generations(&resident_keys);
+        send_backing_batches(deps, namespace, &sealed_blocks, resident_registrations);
     }
 
     ordered_fast_path_seals
@@ -269,7 +270,7 @@ fn send_backing_batches(
     deps: &InsertDeps,
     namespace: &str,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
-    resident_keys: Vec<BlockKey>,
+    resident_registrations: Vec<(BlockKey, u64)>,
 ) {
     if blocks.is_empty() {
         return;
@@ -287,16 +288,23 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, resident_keys);
+        register_block_hashes(client, namespace, resident_registrations);
     }
 }
 
-fn register_block_hashes(client: &MetaServerClient, namespace: &str, resident_keys: Vec<BlockKey>) {
-    if resident_keys.is_empty() {
+fn register_block_hashes(
+    client: &MetaServerClient,
+    namespace: &str,
+    resident_registrations: Vec<(BlockKey, u64)>,
+) {
+    if resident_registrations.is_empty() {
         return;
     }
-    let hashes = resident_keys.into_iter().map(|key| key.hash).collect();
-    client.try_register_namespace(namespace.to_string(), hashes);
+    let registrations = resident_registrations
+        .into_iter()
+        .map(|(key, generation)| (key.hash, generation))
+        .collect();
+    client.try_register_namespace_with_generations(namespace.to_string(), registrations);
 }
 
 fn gc_inflight(
