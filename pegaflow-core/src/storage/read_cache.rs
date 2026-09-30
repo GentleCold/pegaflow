@@ -176,7 +176,12 @@ impl ReadCache {
                     .window
                     .peek(key)
                     .map(|entry| entry.resident.generation)
-                    .or_else(|| inner.reclaimable.peek(key).map(|metadata| metadata.generation))
+                    .or_else(|| {
+                        inner
+                            .reclaimable
+                            .peek(key)
+                            .map(|metadata| metadata.generation)
+                    })
                     .or_else(|| inner.retained.peek(key).map(|metadata| metadata.generation))?;
                 Some((key.clone(), generation))
             })
