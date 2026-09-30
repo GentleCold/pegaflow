@@ -581,6 +581,7 @@ fn record_policy_removal(
     metrics.cache_resident_blocks.add(-1, class.attributes());
     if rejected {
         metrics.cache_block_admission_rejections.add(1, &[]);
+        evicted_keys.push(removed.key);
         return;
     }
     metrics
@@ -1237,6 +1238,53 @@ mod tests {
         assert!(!cache.inner.lock().reclaimable.contains_key(&cold_key));
         assert_eq!(cache.get_blocks(&[hot_key]).len(), 1);
         assert_eq!(cache.get_blocks(&[cold_key]).len(), 0);
+    }
+
+    #[test]
+    fn rejected_window_resident_reports_key_for_unregistration() {
+        let cache = make_lfu_cache();
+        let hot_key = BlockKey::new("ns".into(), vec![1]);
+        let cold_key = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert_resident_keys(vec![(hot_key.clone(), make_block())]);
+        {
+            let mut inner = cache.inner.lock();
+            let mut entry = inner.window.remove(&hot_key).expect("hot key in window");
+            entry.resident.footprint = 1;
+            inner.reclaimable.insert(hot_key.clone(), entry.resident);
+            inner.main_bytes = 1;
+            inner.main_budget = 0;
+        }
+        for _ in 0..2 {
+            assert_eq!(cache.get_blocks(std::slice::from_ref(&hot_key)).len(), 1);
+        }
+
+        let inserted = cache.batch_insert_refs(&[(cold_key.clone(), make_block())]);
+        assert_eq!(inserted.resident_keys, vec![cold_key.clone()]);
+        assert_eq!(
+            cache
+                .resident_generations(std::slice::from_ref(&cold_key))
+                .len(),
+            1
+        );
+
+        let mut evicted_keys = Vec::new();
+        {
+            let mut inner = cache.inner.lock();
+            inner
+                .window
+                .peek_mut(&cold_key)
+                .expect("cold key in window")
+                .resident
+                .footprint = 1;
+            inner.window_bytes = 1;
+            inner.window_budget = Some(0);
+            overflow_window(&mut inner, &mut evicted_keys);
+        }
+
+        assert_eq!(evicted_keys, vec![cold_key.clone()]);
+        assert!(cache.contains_keys(std::slice::from_ref(&hot_key))[0]);
+        assert!(!cache.contains_keys(std::slice::from_ref(&cold_key))[0]);
     }
 
     #[test]
