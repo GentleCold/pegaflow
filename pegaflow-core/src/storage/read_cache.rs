@@ -121,7 +121,8 @@ impl ReadCache {
         evicted_keys
     }
 
-    pub(super) fn batch_insert_resident_keys(
+    #[cfg(test)]
+    fn batch_insert_resident_keys(
         &self,
         blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
     ) -> CacheInsertResult {
