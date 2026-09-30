@@ -23,12 +23,14 @@ struct ReadCacheInner {
     main_budget: u64,
     reclaimable: LruCache<BlockKey, ResidentMetadata>,
     retained: LruCache<BlockKey, ResidentMetadata>,
+    next_generation: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct ResidentMetadata {
     inserted_at: Instant,
     footprint: u64,
+    generation: u64,
 }
 
 #[derive(Copy, Clone)]
@@ -75,6 +77,7 @@ impl ReadCache {
                 main_budget: (capacity_bytes as u64).saturating_sub(window_budget.unwrap_or(0)),
                 reclaimable: LruCache::new_unbounded(),
                 retained: LruCache::new_unbounded(),
+                next_generation: 0,
             }),
         }
     }
@@ -163,6 +166,21 @@ impl ReadCache {
             .map(|(key, _)| key.clone())
             .collect();
         result
+    }
+
+    pub(super) fn resident_generations(&self, keys: &[BlockKey]) -> Vec<(BlockKey, u64)> {
+        let inner = self.inner.lock();
+        keys.iter()
+            .filter_map(|key| {
+                let generation = inner
+                    .window
+                    .peek(key)
+                    .map(|entry| entry.resident.generation)
+                    .or_else(|| inner.reclaimable.peek(key).map(|metadata| metadata.generation))
+                    .or_else(|| inner.retained.peek(key).map(|metadata| metadata.generation))?;
+                Some((key.clone(), generation))
+            })
+            .collect()
     }
 
     /// Look up specific blocks by key without prefix-scan semantics (does not
@@ -307,11 +325,59 @@ impl ReadCache {
             return;
         }
 
+        let keys: Vec<BlockKey> = hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+        self.mark_reclaimable_keys(&keys);
+    }
+
+    pub(crate) fn mark_reclaimable_hashes_if_generation(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        generations: &HashMap<Vec<u8>, u64>,
+    ) {
+        if hashes.is_empty() {
+            return;
+        }
+
         let mut inner = self.inner.lock();
         let mut moved = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            if mark_reclaimable(&mut inner, &key) {
+            if let Some(&generation) = generations.get(hash)
+                && mark_reclaimable_with_generation(&mut inner, &key, Some(generation))
+            {
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            let metrics = core_metrics();
+            metrics
+                .cache_resident_blocks
+                .add(-moved, &*CACHE_CLASS_RETAINED);
+            metrics
+                .cache_resident_blocks
+                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
+        }
+    }
+
+    /// Move resident blocks to the reclaimable replacement class.
+    ///
+    /// The caller supplies complete keys so serving-side paths can classify
+    /// the exact blocks they exposed without reconstructing namespace/hash
+    /// pairs. Missing blocks and blocks already in the reclaimable class are
+    /// ignored.
+    pub(crate) fn mark_reclaimable_keys(&self, keys: &[BlockKey]) {
+        if keys.is_empty() {
+            return;
+        }
+
+        let mut inner = self.inner.lock();
+        let mut moved = 0;
+        for key in keys {
+            if mark_reclaimable(&mut inner, key) {
                 moved += 1;
             }
         }
@@ -336,6 +402,16 @@ impl ReadCache {
             ResidentClass::Retained,
             &mut Vec::new(),
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_generation_for_test(&self, key: &BlockKey) -> u64 {
+        self.resident_generations(std::slice::from_ref(key))[0].1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_lru_batch_for_test(&self, batch_size: usize) {
+        drop(self.remove_lru_batch(batch_size));
     }
 
     #[cfg(test)]
@@ -369,9 +445,12 @@ fn insert_block(
     let outcome = inner.cache.insert(key.clone(), block);
     match outcome {
         CacheInsertOutcome::InsertedNew => {
+            inner.next_generation = inner.next_generation.wrapping_add(1);
+            let generation = inner.next_generation;
             let resident = ResidentMetadata {
                 inserted_at: Instant::now(),
                 footprint: footprint_bytes,
+                generation,
             };
             let m = core_metrics();
             m.cache_block_insertions.add(1, &[]);
@@ -533,8 +612,29 @@ fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
 }
 
 fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
+    mark_reclaimable_with_generation(inner, key, None)
+}
+
+fn mark_reclaimable_with_generation(
+    inner: &mut ReadCacheInner,
+    key: &BlockKey,
+    expected_generation: Option<u64>,
+) -> bool {
     if !inner.cache.contains_key(key) {
         return false;
+    }
+    if let Some(expected_generation) = expected_generation {
+        let matches_generation = inner
+            .window
+            .peek(key)
+            .is_some_and(|entry| entry.resident.generation == expected_generation)
+            || inner
+                .retained
+                .peek(key)
+                .is_some_and(|metadata| metadata.generation == expected_generation);
+        if !matches_generation {
+            return false;
+        }
     }
     if let Some(entry) = inner.window.peek_mut(key) {
         if entry.class == ResidentClass::Retained {
@@ -761,11 +861,11 @@ mod tests {
 
         cache.batch_insert_refs(&[(local.clone(), local_block)]);
         cache.batch_insert(vec![(ssd.clone(), make_block())]);
-        cache.batch_insert_resident_keys(vec![(remote.clone(), make_block())]);
+        cache.batch_insert_refs(&[(remote.clone(), make_block())]);
 
         assert_class(&cache, &local, ResidentClass::Retained);
         assert_class(&cache, &ssd, ResidentClass::Retained);
-        assert_class(&cache, &remote, ResidentClass::Reclaimable);
+        assert_class(&cache, &remote, ResidentClass::Retained);
     }
 
     #[test]
@@ -782,6 +882,28 @@ mod tests {
             evicted.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
             vec![reclaimable, retained]
         );
+    }
+
+    #[test]
+    fn stale_reclaimable_hint_does_not_demote_reinserted_generation() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.insert_retained_for_test(key.clone(), make_block());
+        let old_generation = cache.resident_generations(std::slice::from_ref(&key))[0].1;
+
+        drop(cache.remove_lru_batch(1));
+        cache.insert_retained_for_test(key.clone(), make_block());
+        let new_generation = cache.resident_generations(std::slice::from_ref(&key))[0].1;
+        assert_ne!(old_generation, new_generation);
+
+        let generations = HashMap::from([(key.hash.clone(), old_generation)]);
+        cache.mark_reclaimable_hashes_if_generation(
+            "ns",
+            std::slice::from_ref(&key.hash),
+            &generations,
+        );
+
+        assert_class(&cache, &key, ResidentClass::Retained);
     }
 
     #[test]

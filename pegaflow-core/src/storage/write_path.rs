@@ -200,7 +200,14 @@ fn process_insert_batch(
         && let Some(deps) = &deps
     {
         let result = deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(deps, namespace, &sealed_blocks, result);
+        let resident_registrations = deps.read_cache.resident_generations(&result.resident_keys);
+        send_backing_batches(
+            deps,
+            namespace,
+            &sealed_blocks,
+            resident_registrations,
+            result.evicted_keys,
+        );
     }
 
     ordered_fast_path_seals
@@ -269,7 +276,8 @@ fn send_backing_batches(
     deps: &InsertDeps,
     namespace: &str,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
-    result: super::read_cache::CacheInsertResult,
+    resident_registrations: Vec<(BlockKey, u64)>,
+    evicted_keys: Vec<BlockKey>,
 ) {
     if blocks.is_empty() {
         return;
@@ -287,25 +295,31 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        if !result.evicted_keys.is_empty() {
+        if !evicted_keys.is_empty() {
             client.try_unregister(
-                result
-                    .evicted_keys
+                evicted_keys
                     .into_iter()
                     .map(|key| (key.namespace, key.hash))
                     .collect(),
             );
         }
-        register_block_hashes(client, namespace, result.resident_keys);
+        register_block_hashes(client, namespace, resident_registrations);
     }
 }
 
-fn register_block_hashes(client: &MetaServerClient, namespace: &str, resident_keys: Vec<BlockKey>) {
-    if resident_keys.is_empty() {
+fn register_block_hashes(
+    client: &MetaServerClient,
+    namespace: &str,
+    resident_registrations: Vec<(BlockKey, u64)>,
+) {
+    if resident_registrations.is_empty() {
         return;
     }
-    let hashes = resident_keys.into_iter().map(|key| key.hash).collect();
-    client.try_register_namespace(namespace.to_string(), hashes);
+    let registrations = resident_registrations
+        .into_iter()
+        .map(|(key, generation)| (key.hash, generation))
+        .collect();
+    client.try_register_namespace_with_generations(namespace.to_string(), registrations);
 }
 
 fn gc_inflight(

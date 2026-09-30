@@ -282,12 +282,14 @@ impl PrefetchScheduler {
         }
 
         // RDMA-fetched blocks that survive cache admission are now resident on
-        // this node. Re-advertise only those resident blocks to the MetaServer
+        // this node. Keep them retained, like local inserts, so a later cache
+        // pressure event does not prefer them over blocks exposed as P2P
+        // sources. Re-advertise only those resident blocks to the MetaServer
         // so peers can discover and fetch from here too. SSD prefetch is
         // skipped: those blocks were already registered by this node's own save
         // path, and eviction explicitly unregisters them.
         let (rdma_registration, evicted_keys) = if result.source == Some(PrefetchSource::Rdma) {
-            let inserted = read_cache.batch_insert_resident_keys(result.cache_inserts);
+            let inserted = read_cache.batch_insert_refs(&result.cache_inserts);
             (
                 rdma_registration_from_resident_keys(result.source, &inserted.resident_keys),
                 inserted.evicted_keys,
@@ -306,7 +308,7 @@ impl PrefetchScheduler {
                 );
             }
             if let Some((namespace, hashes)) = rdma_registration {
-                client.try_register_namespace(namespace, hashes);
+                client.try_register_namespace_without_reclaim_hint(namespace, hashes);
             }
         }
 
