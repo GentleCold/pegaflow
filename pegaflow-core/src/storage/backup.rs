@@ -92,6 +92,12 @@ async fn pull_once(
             .backup_pull_missing_blocks
             .add(missing as u64, &[]);
     }
+    if fetched.is_empty() {
+        // Connect/RDMA failure or a source that evicted the whole batch.
+        // Without pacing, retrying at once would spin through the source's
+        // queue and mark it all in flight against an unreachable peer.
+        return BACKUP_IDLE_SLEEP;
+    }
 
     let Some(cache) = read_cache.upgrade() else {
         return Duration::ZERO;
