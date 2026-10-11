@@ -15,8 +15,7 @@ use crate::metrics::core_metrics;
 
 /// Upper bound on one pulled plan; matches the RDMA staging chunk size.
 const BACKUP_PULL_MAX_BYTES: u64 = 256 * 1024 * 1024;
-/// Sleep when this node is not a target or the MetaServer has nothing queued;
-/// also the cap on a pacing retry hint.
+/// Sleep when this node is not a target or the MetaServer has nothing queued.
 const BACKUP_IDLE_SLEEP: Duration = Duration::from_secs(1);
 
 /// Pull and copy backup plans while the MetaServer names this node a target.
@@ -53,12 +52,7 @@ async fn pull_once(
         }
     };
     if plan.block_hashes.is_empty() {
-        // Pacing tells us when the next plan is due; sleeping the full idle
-        // period instead would cap backup far below the configured rate.
-        return match plan.retry_after_ms {
-            0 => BACKUP_IDLE_SLEEP,
-            ms => Duration::from_millis(ms).min(BACKUP_IDLE_SLEEP),
-        };
+        return BACKUP_IDLE_SLEEP;
     }
 
     // A restarted MetaServer or an expired in-flight entry can re-plan blocks

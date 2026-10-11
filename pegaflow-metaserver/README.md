@@ -82,7 +82,6 @@ cargo run -p pegaflow-metaserver -- --help
 - `--enable-decode-backup`: Let idle nodes back up prefill nodes' retained LRU-tail blocks (default: off; env `PEGAFLOW_METASERVER_ENABLE_DECODE_BACKUP`). See [Decode backup](#decode-backup).
 - `--backup-target-delay-secs <SECONDS>`: A live node with no inference instance for this long becomes a backup target (default: `180`)
 - `--backup-inflight-ttl-secs <SECONDS>`: A dispatched backup block is not re-planned for this long unless a backup owner registers it (default: `180`)
-- `--backup-max-bytes-per-sec <BYTES>`: Planned backup bytes per second per source and per target; `0` disables pacing (default: 2 GiB)
 
 ### Decode backup
 
@@ -103,8 +102,8 @@ demand, so each source has one target and targets share sources evenly.
    once a second when idle. The MetaServer pops blocks from its paired
    sources oldest first, skips blocks that already have a target owner, whose
    source is gone, or that are in flight, and returns one namespace from one
-   source within the byte budget. When pacing holds the pair back it returns
-   an empty plan with `retry_after_ms`.
+   source within the byte budget. Like peer prefix fetches, backup traffic
+   is not rate limited.
 4. The target RDMA-reads the blocks with the regular P2P transfer path,
    inserts them as retained, and registers them. On a completed transfer the
    source demotes its copies to reclaimable, so pressure evicts them first
@@ -292,8 +291,7 @@ remote owner.
 ### 6. PullBackupPlan
 
 Decode backup targets ask for the next batch of blocks to copy. Returns an
-empty response when the node is not a target or nothing is queued, and an
-empty response with `retry_after_ms` when byte pacing holds it back.
+empty response when the node is not a target or nothing is queued.
 
 ```protobuf
 message PullBackupPlanRequest {
@@ -306,7 +304,6 @@ message PullBackupPlanResponse {
   string source_node = 1;
   string namespace = 2;
   repeated bytes block_hashes = 3;
-  uint64 retry_after_ms = 4;
 }
 ```
 

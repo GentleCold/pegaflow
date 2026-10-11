@@ -1,4 +1,4 @@
-use crate::backup::{BackupPlanner, CandidateGroup, PlanOutcome};
+use crate::backup::{BackupPlanner, CandidateGroup};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
@@ -188,8 +188,9 @@ impl MetaServer for GrpcMetaService {
                 return Ok(Response::new(PullBackupPlanResponse::default()));
             };
             let roles = planner.roles(&self.store);
-            let response = match planner.plan(&self.store, &roles, &req.node, req.max_bytes) {
-                PlanOutcome::Plan(plan) => {
+            let plan = planner.plan(&self.store, &roles, &req.node, req.max_bytes);
+            let response = plan
+                .map(|plan| {
                     debug!(
                         "RPC [pull_backup_plan]: target={} source={} namespace={} blocks={}",
                         req.node,
@@ -201,15 +202,9 @@ impl MetaServer for GrpcMetaService {
                         source_node: plan.source.to_string(),
                         namespace: plan.namespace,
                         block_hashes: plan.hashes,
-                        retry_after_ms: 0,
                     }
-                }
-                PlanOutcome::Paced(wait) => PullBackupPlanResponse {
-                    retry_after_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1),
-                    ..PullBackupPlanResponse::default()
-                },
-                PlanOutcome::Idle => PullBackupPlanResponse::default(),
-            };
+                })
+                .unwrap_or_default();
             Ok(Response::new(response))
         }
         .await;

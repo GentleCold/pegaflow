@@ -78,10 +78,6 @@ pub struct Cli {
     /// Seconds before an unfinished backup dispatch may be re-planned.
     #[arg(long, default_value_t = backup::DEFAULT_INFLIGHT_TTL_SECS)]
     pub backup_inflight_ttl_secs: u64,
-
-    /// Backup dispatch budget per node in bytes/s (0 = unlimited).
-    #[arg(long, default_value_t = backup::DEFAULT_MAX_BYTES_PER_SEC)]
-    pub backup_max_bytes_per_sec: u64,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -183,13 +179,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         let config = backup::BackupConfig {
             target_delay: Duration::from_secs(cli.backup_target_delay_secs),
             inflight_ttl: Duration::from_secs(cli.backup_inflight_ttl_secs),
-            max_bytes_per_sec: cli.backup_max_bytes_per_sec,
         };
         info!(
-            "Decode backup enabled: target_delay={}s inflight_ttl={}s max_bytes_per_sec={}",
-            cli.backup_target_delay_secs,
-            cli.backup_inflight_ttl_secs,
-            cli.backup_max_bytes_per_sec
+            "Decode backup enabled: target_delay={}s inflight_ttl={}s",
+            cli.backup_target_delay_secs, cli.backup_inflight_ttl_secs
         );
         let planner = Arc::new(backup::BackupPlanner::new(config));
         metric::register_backup_gauges(&store, &planner);
