@@ -99,7 +99,7 @@ demand, so each source has one target and targets share sources evenly.
 2. Reported blocks that already have a live target owner come back in
    `backed_hashes`; the source moves them to its reclaimable class.
 3. A target calls `PullBackupPlan` back to back while it gets plans, and
-   once a second when idle. The MetaServer pops blocks from its paired
+   once a second when idle or after a pull that fetched nothing. The MetaServer pops blocks from its paired
    sources oldest first, skips blocks that already have a target owner, whose
    source is gone, or that are in flight, and returns one namespace from one
    source within the byte budget. Like peer prefix fetches, backup traffic
