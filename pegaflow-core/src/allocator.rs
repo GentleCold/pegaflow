@@ -46,7 +46,8 @@ impl Display for AllocatorError {
 pub(crate) struct Allocation {
     /// Offset from the start of the managed region, in bytes.
     pub offset_bytes: u64,
-    /// Actual size of the allocation in bytes (rounded up to `unit_size`).
+    /// Actual size of the allocation in bytes (rounded up to `unit_size`, then
+    /// to the allocator's size class).
     pub size_bytes: NonZeroU64,
     raw: RawAllocation,
 }
@@ -92,7 +93,16 @@ impl ScaledOffsetAllocator {
         })
     }
 
-    /// Allocate `size_bytes`, rounded up to the allocator's unit size.
+    /// Allocate `size_bytes`, rounded up to the allocator's unit size and then
+    /// to its size-class boundary.
+    ///
+    /// `offset-allocator` files a freed region under the size class it rounds
+    /// *down* to, but searches for a request from the class it rounds *up* to.
+    /// For a size between two class boundaries those differ, so a hole left by
+    /// an identical allocation is never reused until it merges with a
+    /// neighbour. Requesting the boundary size makes both roundings agree:
+    /// equal-size allocations recycle each other's holes, at the cost of at
+    /// most 1/8 internal waste.
     pub(crate) fn allocate(
         &mut self,
         size_bytes: u64,
@@ -101,13 +111,15 @@ impl ScaledOffsetAllocator {
             return Ok(None);
         }
 
-        let units = size_bytes.div_ceil(self.unit_size.get());
-        let units_u32 = u32::try_from(units).map_err(|_| AllocatorError::RequestTooLarge {
+        let too_large = || AllocatorError::RequestTooLarge {
             requested_bytes: size_bytes,
             unit_size: self.unit_size.get(),
-        })?;
+        };
+        let units = size_bytes.div_ceil(self.unit_size.get());
+        let units_u32 = u32::try_from(units).map_err(|_| too_large())?;
+        let class_units = size_class_units(units_u32).ok_or_else(too_large)?;
 
-        let Some(raw) = self.inner.allocate(units_u32) else {
+        let Some(raw) = self.inner.allocate(class_units) else {
             return Ok(None);
         };
 
@@ -139,6 +151,17 @@ impl ScaledOffsetAllocator {
             largest_free_allocation_bytes: report.largest_free_region as u64 * self.unit_size.get(),
         }
     }
+}
+
+/// Mantissa bits of `offset-allocator`'s size classes (8 classes per power of two).
+const SIZE_CLASS_MANTISSA_BITS: u32 = 3;
+
+/// Smallest `offset-allocator` size-class boundary `>= units`, or `None` if it
+/// does not fit in `u32`. Sizes below `2^MANTISSA_BITS` are exact classes.
+fn size_class_units(units: u32) -> Option<u32> {
+    let shift = (u32::BITS - units.leading_zeros()).saturating_sub(SIZE_CLASS_MANTISSA_BITS + 1);
+    let rounded = u64::from(units).div_ceil(1 << shift) << shift;
+    u32::try_from(rounded).ok()
 }
 
 /// Storage report expressed in bytes.
@@ -236,6 +259,41 @@ mod tests {
         let merged = allocator.allocate(128).unwrap().unwrap();
         assert_eq!(merged.offset_bytes, 0);
         assert_eq!(merged.size_bytes.get(), 128);
+    }
+
+    #[test]
+    fn size_class_units_matches_offset_allocator_bins() {
+        for units in (1..=70_000u32).chain([425_984, 437_248, 1 << 28, (1 << 28) + 1]) {
+            assert_eq!(
+                size_class_units(units),
+                Some(offset_allocator::ext::min_allocator_size(units)),
+                "units={units}"
+            );
+        }
+        assert_eq!(size_class_units(u32::MAX), None);
+    }
+
+    #[test]
+    fn off_class_size_reuses_hole_of_identical_allocation() {
+        // 854 units (~427 KiB pages at 512 B units) sits between the 832 and
+        // 896 size classes. Without class rounding the freed 854-unit hole is
+        // filed under 832 while the request searches from 896, so the second
+        // allocation would fail even though the hole fits exactly.
+        const PAGE: u64 = 854;
+        const CLASS: u64 = 896;
+        let mut allocator =
+            ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(4 * CLASS, 1, 1024).unwrap();
+        let mut pages: Vec<Allocation> = (0..4)
+            .map(|_| allocator.allocate(PAGE).unwrap().unwrap())
+            .collect();
+        assert!(pages.iter().all(|a| a.size_bytes.get() == CLASS));
+        assert!(allocator.allocate(PAGE).unwrap().is_none(), "pool is full");
+
+        let freed = pages.remove(1);
+        let freed_offset = freed.offset_bytes;
+        allocator.free(&freed);
+        let reused = allocator.allocate(PAGE).unwrap().expect("hole is reused");
+        assert_eq!(reused.offset_bytes, freed_offset);
     }
 
     #[test]
