@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 #[cfg(feature = "rdma")]
-use crate::backing::{RdmaFetchStore, RdmaTransport};
+use crate::backing::{AllocateManyFn, RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
@@ -213,6 +213,16 @@ impl StorageEngine {
                 .map(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
             #[cfg(feature = "rdma")]
+            let allocate_many_fn: AllocateManyFn = {
+                let alloc_weak = weak_engine.clone();
+                Arc::new(move |size, count, numa_node| {
+                    alloc_weak.upgrade().and_then(|engine| {
+                        engine.allocate_many(NonZeroU64::new(size)?, count, numa_node)
+                    })
+                })
+            };
+
+            #[cfg(feature = "rdma")]
             let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
                 let ms = metaserver_client.as_ref()?;
                 let advertise = config
@@ -222,7 +232,7 @@ impl StorageEngine {
                 Some(RdmaFetch::new(Arc::new(RdmaFetchStore::new(
                     Arc::clone(ms),
                     Arc::clone(rdma),
-                    allocate_fn.clone(),
+                    allocate_many_fn,
                     advertise,
                 ))))
             });
@@ -327,6 +337,33 @@ impl StorageEngine {
         );
         core_metrics().pool_alloc_failures.add(1, &[]);
         None
+    }
+
+    /// Allocate `count` independent `size`-byte regions on `numa_node`.
+    ///
+    /// Takes as many as the pool has free in one batched pass, then falls back
+    /// to [`Self::allocate`] (which reclaims) for the remainder. All-or-nothing:
+    /// returns `None` and drops the partial batch if the pool cannot satisfy
+    /// every region.
+    #[cfg_attr(
+        not(feature = "rdma"),
+        allow(dead_code, reason = "only RDMA fetch stages batches")
+    )]
+    pub(crate) fn allocate_many(
+        &self,
+        size: NonZeroU64,
+        count: usize,
+        numa_node: Option<NumaNode>,
+    ) -> Option<Vec<Arc<PinnedAllocation>>> {
+        let node = numa_node.unwrap_or(NumaNode::UNKNOWN);
+        let mut out = self.allocator.allocate_many(size, count, node);
+        while out.len() < count {
+            out.push(self.allocate(size, numa_node)?);
+            // Reclaim usually frees far more than one region; take the rest in bulk.
+            let more = self.allocator.allocate_many(size, count - out.len(), node);
+            out.extend(more);
+        }
+        Some(out)
     }
 
     pub(crate) fn send_raw_insert(&self, batch: crate::offload::RawSaveBatch) {
@@ -693,6 +730,37 @@ mod tests {
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
         assert!(result.is_none(), "should fail, not loop forever");
+    }
+
+    #[tokio::test]
+    async fn allocate_many_reclaims_shortfall_and_is_all_or_nothing() {
+        use crate::block::{RawBlock, Segment};
+        const REGION: u64 = 4096;
+        let size = NonZeroU64::new(REGION).unwrap();
+        let storage =
+            StorageEngine::new_with_config(64 * 1024, false, StorageConfig::default(), &[])
+                .unwrap();
+
+        // Fill the pool with 16 cached single-region blocks.
+        let filled = storage.allocate_many(size, 16, None).unwrap();
+        for (i, alloc) in filled.into_iter().enumerate() {
+            let ptr = alloc.as_non_null();
+            let raw = RawBlock::new(vec![Segment::new(ptr, REGION as usize, alloc)]);
+            storage.test_insert_cache(
+                BlockKey::new("ns".into(), vec![i as u8]),
+                Arc::new(SealedBlock::from_slots(vec![(raw, NumaNode::UNKNOWN)])),
+            );
+        }
+        assert_eq!(storage.allocator.usage().0, 16 * REGION);
+
+        // The pool is full, so the batch reclaims cached blocks to cover it.
+        let batch = storage.allocate_many(size, 4, None).unwrap();
+        assert_eq!(batch.len(), 4);
+        drop(batch);
+
+        // More than the whole pool can never be satisfied: nothing is leaked.
+        assert!(storage.allocate_many(size, 17, None).is_none());
+        assert_eq!(storage.allocator.usage().0, 0);
     }
 
     #[tokio::test]

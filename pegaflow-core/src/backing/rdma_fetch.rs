@@ -21,10 +21,11 @@ use pegaflow_common::NumaNode;
 use opentelemetry::KeyValue;
 
 use super::transfer_lock_guard::TransferLockGuard;
-use super::{AllocateFn, PrefetchResult, RdmaTransport};
+use super::{AllocateManyFn, PrefetchResult, RdmaTransport};
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
+use crate::pinned_pool::PinnedAllocation;
 
 /// Minimum usable transfer timeout. If the server's lock timeout minus the
 /// safety margin falls below this, we use this floor to avoid instant timeouts.
@@ -52,7 +53,7 @@ const PER_SLOT_ALLOC_MIN_BYTES: u64 = 256 * 1024;
 pub(crate) struct RdmaFetchStore {
     metaserver_client: Arc<MetaServerClient>,
     rdma_transport: Arc<RdmaTransport>,
-    allocate_fn: AllocateFn,
+    allocate_fn: AllocateManyFn,
     advertise_addr: String,
     /// Lazy gRPC channel cache keyed by remote address. Tonic channels multiplex
     /// requests over a single HTTP/2 connection; cloning is cheap.
@@ -200,7 +201,7 @@ impl RdmaFetchStore {
     pub(crate) fn new(
         metaserver_client: Arc<MetaServerClient>,
         rdma_transport: Arc<RdmaTransport>,
-        allocate_fn: AllocateFn,
+        allocate_fn: AllocateManyFn,
         advertise_addr: String,
     ) -> Self {
         info!("RDMA remote fetch enabled (advertise={})", advertise_addr);
@@ -334,7 +335,7 @@ impl RdmaFetchStore {
 )]
 async fn rdma_fetch_task(
     rdma: &RdmaTransport,
-    allocate_fn: &AllocateFn,
+    allocate_fn: &AllocateManyFn,
     grpc_channels: &DashMap<String, EngineClient<Channel>>,
     connect_group: &Group<String, ()>,
     remote_addr: &str,
@@ -439,12 +440,13 @@ async fn rdma_fetch_task(
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} allocs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} allocs={} alloc_batches={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
         result.len(),
         block_hashes.len(),
         transfer_timing.slot_count,
         transfer_timing.transfer_desc_count,
         transfer_timing.alloc_count,
+        transfer_timing.alloc_batches,
     );
     info!(
         "RDMA fetch stages: req_id={req_id} remote={remote_addr} connect_ms={:.2} query_ms={:.2} build_transfer_tasks_ms={:.2} submit_transfer_ms={:.2} rdma_wait_ms={:.2} rebuild_ms={:.2}",
@@ -524,7 +526,7 @@ type StagedBlock = (Vec<u8>, Vec<StagedSlot>);
 /// Allocate local memory, build TransferDescs, execute RDMA READ, build SealedBlocks.
 async fn fetch_blocks_via_rdma(
     rdma: &RdmaTransport,
-    allocate_fn: &AllocateFn,
+    allocate_fn: &AllocateManyFn,
     namespace: &str,
     remote_addr: &str,
     blocks: &[TransferBlockInfo],
@@ -537,28 +539,30 @@ async fn fetch_blocks_via_rdma(
     // (block_hash, Vec<(slot_segments, slot_numa)>) — for building SealedBlock afterwards.
     // The per-slot NUMA is preserved so a re-served fetched block advertises real topology.
     let mut block_allocs: Vec<StagedBlock> = Vec::new();
-    let mut slot_count = 0usize;
-    let mut alloc_count = 0usize;
+    let slot_count: usize = blocks.iter().map(|b| b.slots.len()).sum();
     let build_start = Instant::now();
+
+    let plans = blocks
+        .iter()
+        .map(|b| plan_block_allocations(&b.slots))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (mut staged, alloc_batches) = allocate_staging(allocate_fn, &plans)?;
+    let alloc_count = staged.len();
+    let mut staged = staged.drain(..);
 
     // Build TransferDescs and submit RDMA READ inside a sync block so that
     // all_descs (which contains NonNull<u8>, !Send) is dropped before any .await.
     let (receivers, mut timing) = {
         let mut all_descs: Vec<TransferDesc> = Vec::new();
 
-        for block_info in blocks {
-            slot_count += block_info.slots.len();
+        for (block_info, plan) in blocks.iter().zip(plans) {
             let mut slot_allocs: Vec<Option<StagedSlot>> =
                 (0..block_info.slots.len()).map(|_| None).collect();
 
-            for group in plan_block_allocations(&block_info.slots)? {
-                let allocation = (allocate_fn)(group.bytes, Some(group.numa)).ok_or_else(|| {
-                    format!(
-                        "failed to allocate fetch staging ({} bytes) on {}",
-                        group.bytes, group.numa
-                    )
-                })?;
-                alloc_count += 1;
+            for group in plan {
+                let allocation = staged
+                    .next()
+                    .expect("allocate_staging returns one region per planned group");
                 let base = allocation.as_non_null();
                 let mut offset = 0usize;
 
@@ -605,6 +609,7 @@ async fn fetch_blocks_via_rdma(
                 build_transfer_tasks: build_start.elapsed(),
                 slot_count,
                 alloc_count,
+                alloc_batches,
                 ..TransferTiming::default()
             };
             return Ok((Vec::new(), timing));
@@ -626,6 +631,7 @@ async fn fetch_blocks_via_rdma(
             transfer_desc_count,
             slot_count,
             alloc_count,
+            alloc_batches,
             ..TransferTiming::default()
         };
         (receivers, timing)
@@ -734,9 +740,50 @@ fn plan_block_allocations(slots: &[TransferSlotInfo]) -> Result<Vec<SlotGroup>, 
     Ok(groups)
 }
 
+/// Allocate every planned group of a fetch, batching same-size requests on the
+/// same NUMA node into one allocator call (one pool lock per shard touched).
+///
+/// Returns the regions flattened in plan order (block order, then group order
+/// within a block) together with the number of batched allocator calls.
+fn allocate_staging(
+    allocate_many_fn: &AllocateManyFn,
+    plans: &[Vec<SlotGroup>],
+) -> Result<(Vec<Arc<PinnedAllocation>>, usize), String> {
+    // (numa, bytes) -> flat indices of the groups that need that size.
+    let mut buckets: HashMap<(NumaNode, u64), Vec<usize>> = HashMap::new();
+    let mut total = 0usize;
+    for group in plans.iter().flatten() {
+        buckets
+            .entry((group.numa, group.bytes))
+            .or_default()
+            .push(total);
+        total += 1;
+    }
+
+    let mut regions: Vec<Option<Arc<PinnedAllocation>>> = (0..total).map(|_| None).collect();
+    let batches = buckets.len();
+    for ((numa, bytes), indices) in buckets {
+        let allocated = (allocate_many_fn)(bytes, indices.len(), Some(numa)).ok_or_else(|| {
+            format!(
+                "failed to allocate fetch staging ({} x {bytes} bytes) on {numa}",
+                indices.len()
+            )
+        })?;
+        debug_assert_eq!(allocated.len(), indices.len());
+        for (idx, region) in indices.into_iter().zip(allocated) {
+            regions[idx] = Some(region);
+        }
+    }
+    let regions = regions
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "allocator returned fewer staging regions than requested".to_string())?;
+    Ok((regions, batches))
+}
+
 struct SegmentAlloc {
     ptr_addr: u64,
-    alloc: Arc<crate::pinned_pool::PinnedAllocation>,
+    alloc: Arc<PinnedAllocation>,
     size: usize,
 }
 
@@ -749,6 +796,7 @@ struct TransferTiming {
     transfer_desc_count: usize,
     slot_count: usize,
     alloc_count: usize,
+    alloc_batches: usize,
 }
 
 fn get_or_create_channel(
@@ -1050,5 +1098,65 @@ mod tests {
         no_v_ptr.v_ptr = 0;
         let plan = plan_block_allocations(&[slot(0, 512, 512), no_v_ptr]).unwrap();
         assert_eq!(plan, vec![group(0, 1536, &[0, 1])]);
+    }
+
+    #[test]
+    fn staging_batches_per_numa_and_size_in_plan_order() {
+        let allocator = Arc::new(crate::pinned_pool::PinnedAllocator::new_global(
+            1 << 20,
+            1,
+            false,
+            false,
+            None,
+        ));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let pool = Arc::clone(&allocator);
+        let allocate_many: AllocateManyFn = Arc::new(move |size, count, numa| {
+            recorded.lock().unwrap().push((numa.unwrap(), size, count));
+            let out =
+                pool.allocate_many(std::num::NonZeroU64::new(size)?, count, NumaNode::UNKNOWN);
+            (out.len() == count).then_some(out)
+        });
+
+        // Two blocks x (NUMA0 4 KiB, NUMA1 4 KiB, NUMA0 8 KiB).
+        let block = || {
+            vec![
+                group(0, 4096, &[0]),
+                group(1, 4096, &[1]),
+                group(0, 8192, &[2]),
+            ]
+        };
+        let plans = vec![block(), block()];
+        let (regions, batches) = allocate_staging(&allocate_many, &plans).unwrap();
+
+        assert_eq!(batches, 3);
+        let mut calls = calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(
+            calls,
+            vec![
+                (NumaNode(0), 4096, 2),
+                (NumaNode(0), 8192, 2),
+                (NumaNode(1), 4096, 2)
+            ]
+        );
+        // Regions follow plan order and are distinct allocations.
+        let sizes: Vec<usize> = regions.iter().map(|r| r.size_bytes()).collect();
+        assert_eq!(sizes, vec![4096, 4096, 8192, 4096, 4096, 8192]);
+        let mut ptrs: Vec<usize> = regions
+            .iter()
+            .map(|r| r.as_non_null().as_ptr() as usize)
+            .collect();
+        ptrs.sort_unstable();
+        ptrs.dedup();
+        assert_eq!(ptrs.len(), regions.len());
+
+        // A pool that cannot supply the whole batch fails the fetch.
+        let starved: AllocateManyFn = Arc::new(|_, _, _| None);
+        let Err(err) = allocate_staging(&starved, &plans) else {
+            panic!("starved allocator must fail the fetch");
+        };
+        assert!(err.contains("failed to allocate fetch staging"), "{err}");
     }
 }

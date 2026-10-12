@@ -36,3 +36,9 @@ pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
 /// Allocator closure for pinned memory, passed to the SSD backing store.
 pub(crate) type AllocateFn =
     Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>;
+
+/// Batched allocator closure: `(size, count, numa)` -> `count` independent
+/// regions of `size` bytes, or `None` if the pool cannot supply all of them.
+#[cfg(feature = "rdma")]
+pub(crate) type AllocateManyFn =
+    Arc<dyn Fn(u64, usize, Option<NumaNode>) -> Option<Vec<Arc<PinnedAllocation>>> + Send + Sync>;
