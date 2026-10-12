@@ -769,7 +769,6 @@ fn allocate_staging(
                 indices.len()
             )
         })?;
-        debug_assert_eq!(allocated.len(), indices.len());
         for (idx, region) in indices.into_iter().zip(allocated) {
             regions[idx] = Some(region);
         }

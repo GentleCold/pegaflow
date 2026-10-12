@@ -19,11 +19,12 @@
 //!     across TP, so the realistic transfer shape is `--tp 1` (one effective
 //!     copy).
 //!
-//! `--page-first` collapses host slots from (layers x tp) to (tp): one
-//! contiguous page per (block, tp_rank) instead of one slot per
-//! (block, layer, tp_rank). This cuts RDMA descriptors and the
-//! QueryBlocksForTransfer response payload by ~num_layers. Page-first requires
-//! single-segment layers (it rejects split K/V).
+//! `--page-first` (with `--mla-replica`) collapses a block's host slots from
+//! one per layer into one contiguous page holding every layer. This cuts RDMA
+//! descriptors and the QueryBlocksForTransfer response payload by
+//! ~num_layers. Page-first requires single-segment layers (it rejects split
+//! K/V) and a replica: the engine folds identical per-rank layer sets into one
+//! page shard, so dense TP would store a single rank's copy.
 //!
 //! Holder (node A):
 //!   p2p_bench --role holder --advertise-ip <A> --nics mlx5_0,...
@@ -121,8 +122,9 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     tp: usize,
 
-    /// Store one contiguous page per (block, tp_rank) instead of one slot per
-    /// (block, layer, tp_rank). Collapses metadata ~num_layers. Single-segment only.
+    /// Store one contiguous page per block instead of one slot per (block,
+    /// layer). Collapses metadata ~num_layers. Single-segment only; requires
+    /// `--mla-replica`.
     #[arg(long)]
     page_first: bool,
 
@@ -706,10 +708,14 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
     }
 
     if churn {
+        // Fetched bytes per block. The denominator is the whole requester
+        // pool, which matches where fetched blocks land only when they spread
+        // across every NUMA pool (mla-replica stripes, or a single NUMA node).
         let block_bytes = shape.set_bytes() / shape.blocks;
         let pool_gib = pool_bytes as f64 / (1u64 << 30) as f64;
         let util = |blocks: usize| (blocks * block_bytes) as f64 / pool_bytes as f64;
         let resident = resident_blocks(cli.sets);
+        let resident_gib = (resident * block_bytes) as f64 / (1u64 << 30) as f64;
         // Steady state: skip the fill phase (samples before the peak).
         let peak_at = resident_samples
             .iter()
@@ -721,7 +727,8 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
         let avg = steady.iter().sum::<usize>() as f64 / steady.len().max(1) as f64;
         println!(
             "CHURN sets={} failed_sets={failed_sets} stride={} resident_blocks={resident} \
-             pool_gib={pool_gib:.2} final_util={:.3} steady_min_util={:.3} \
+             resident_gib={resident_gib:.2} pool_gib={pool_gib:.2} final_util={:.3} \
+             steady_min_util={:.3} \
              steady_avg_util={:.3} steady_sets={}",
             cli.sets,
             cli.churn_touch_stride,
@@ -833,6 +840,13 @@ fn nic_config(cli: &Cli) -> Option<Vec<String>> {
 async fn main() {
     let cli = Cli::parse();
     pegaflow_common::logging::init_stdout_colored("info");
+    // Every dense rank registers the same layer set, which the engine folds
+    // into one page shard: one rank's copy would be stored while set_bytes,
+    // descriptors and verify assume `tp` copies.
+    assert!(
+        !cli.page_first || cli.mla_replica,
+        "--page-first requires --mla-replica"
+    );
 
     let shape = Shape {
         layers: build_layers(&cli),
