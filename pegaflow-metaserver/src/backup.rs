@@ -130,10 +130,6 @@ impl BackupPlanner {
         }
     }
 
-    pub fn config(&self) -> BackupConfig {
-        self.config
-    }
-
     pub fn roles(&self, store: &BlockHashStore) -> NodeRoles {
         store.node_roles(self.config.target_delay)
     }

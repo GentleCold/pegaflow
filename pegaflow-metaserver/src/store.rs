@@ -281,11 +281,6 @@ impl BlockHashStore {
             .unwrap_or_default()
     }
 
-    /// Validate and refresh the node's current session.
-    pub fn touch_node(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
-        self.touch_node_session(node, node_id)
-    }
-
     pub fn unregister_node(&self, node: &str, node_id: Uuid) -> Result<usize, StoreError> {
         match self.nodes.entry(Arc::from(node)) {
             Entry::Vacant(_) => return Err(StoreError::UnknownNode),
@@ -500,7 +495,8 @@ impl BlockHashStore {
         self.retain_owners(|_, _| false);
     }
 
-    fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
+    /// Validate and refresh the node's current session.
+    pub fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
         let Some(mut record) = self.nodes.get_mut(node) else {
             warn!(
                 "MetaServer metadata write rejected unknown node: node={} node_id={}",

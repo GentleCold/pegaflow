@@ -182,7 +182,7 @@ impl MetaServer for GrpcMetaService {
         let result = async {
             let node_id = Self::parse_node_id(&req.node_id)?;
             self.store
-                .touch_node(&req.node, node_id)
+                .touch_node_session(&req.node, node_id)
                 .map_err(Self::store_error_status)?;
             let Some(planner) = &self.backup else {
                 return Ok(Response::new(PullBackupPlanResponse::default()));

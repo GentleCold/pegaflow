@@ -99,11 +99,11 @@ demand, so each source has one target and targets share sources evenly.
 2. Reported blocks that already have a live target owner come back in
    `backed_hashes`; the source moves them to its reclaimable class.
 3. A target calls `PullBackupPlan` back to back while it gets plans, and
-   once a second when idle or after a pull that fetched nothing. The MetaServer pops blocks from its paired
-   sources oldest first, skips blocks that already have a target owner, whose
-   source is gone, or that are in flight, and returns one namespace from one
-   source within the byte budget. Like peer prefix fetches, backup traffic
-   is not rate limited.
+   once a second when idle or after a pull that fetched nothing. The
+   MetaServer pops blocks from its paired sources oldest first, skips blocks
+   that already have a target owner, whose source is gone, or that are in
+   flight, and returns one namespace from one source within the byte budget.
+   Like peer prefix fetches, backup traffic is not rate limited.
 4. The target RDMA-reads the blocks with the regular P2P transfer path,
    inserts them as retained, and registers them. On a completed transfer the
    source demotes its copies to reclaimable, so pressure evicts them first
