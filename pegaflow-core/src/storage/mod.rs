@@ -26,7 +26,7 @@ use pegaflow_common::NumaNode;
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
-pub(crate) use read_cache::{DemotionReason, ReadCache};
+pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 
 // Each reclaim iteration emits one MetaServer removal command; a small batch
@@ -71,6 +71,10 @@ pub struct StorageConfig {
     pub metaserver_queue_depth: usize,
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
     pub pool_shards: usize,
+    /// Share of the cache, in percent, that decode backups keep reclaimable.
+    pub backup_reclaimable_percent: u64,
+    /// Most decode backup candidates one heartbeat reports.
+    pub backup_max_candidates: usize,
 }
 
 impl Default for StorageConfig {
@@ -89,6 +93,8 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
+            backup_reclaimable_percent: DEFAULT_BACKUP_RECLAIMABLE_PERCENT,
+            backup_max_candidates: crate::internode::DEFAULT_BACKUP_MAX_CANDIDATES,
         }
     }
 }
@@ -156,11 +162,10 @@ impl StorageEngine {
         };
 
         // Sub-components
-        let read_cache = Arc::new(ReadCache::new(
-            capacity_bytes,
-            config.enable_lfu_admission,
-            value_size_hint,
-        ));
+        let read_cache = Arc::new(
+            ReadCache::new(capacity_bytes, config.enable_lfu_admission, value_size_hint)
+                .with_backup_reclaimable_percent(config.backup_reclaimable_percent),
+        );
 
         let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
             let advertise = config
@@ -172,7 +177,8 @@ impl StorageEngine {
                 addr, advertise, config.metaserver_queue_depth
             );
             let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
-                .with_queue_depth(config.metaserver_queue_depth);
+                .with_queue_depth(config.metaserver_queue_depth)
+                .with_backup_max_candidates(config.backup_max_candidates);
             Arc::new(MetaServerClient::new(
                 ms_config,
                 Arc::downgrade(&read_cache),
@@ -550,12 +556,14 @@ impl StorageEngine {
         }
 
         if freed_blocks > 0 {
-            // Eviction is eating into retained blocks once reclaimable drops
-            // below its watermark; ask decode backups to refill it early.
+            // The first pressure eviction opens the backup budget; report now
+            // instead of at the next regular heartbeat. Later reports follow
+            // demotion progress (see `record_backup_demotions`).
             if let Some(client) = &self.metaserver_client
+                && client.backup_report_idle()
                 && self.read_cache.backup_report_budget() > 0
             {
-                client.request_backup_refill();
+                client.request_backup_report();
             }
             debug!(
                 "Reclaimed cache blocks toward allocator request: \
@@ -644,8 +652,12 @@ impl StorageEngine {
             let role = if backup_target {
                 &*SERVED_ROLE_BACKUP_TARGET
             } else {
-                self.read_cache
+                let demoted = self
+                    .read_cache
                     .mark_reclaimable_keys(&keys, DemotionReason::TransferRelease);
+                if let Some(client) = &self.metaserver_client {
+                    client.record_backup_demotions(demoted);
+                }
                 &*SERVED_ROLE_SOURCE
             };
             core_metrics()

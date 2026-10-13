@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use log::{debug, error, info, warn};
@@ -57,6 +57,9 @@ const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 1;
 const UNREGISTER_TIMEOUT_SECS: u64 = 3;
 /// Minimum gap between a regular heartbeat and an early backup refill report.
 const BACKUP_REFILL_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Default cap on backup candidates per heartbeat; at 32-byte hashes a full
+/// report is about 0.5 MiB.
+pub const DEFAULT_BACKUP_MAX_CANDIDATES: usize = 16_384;
 
 struct HeartbeatState {
     node_registered: bool,
@@ -87,24 +90,55 @@ struct BackupState {
     enabled: AtomicBool,
     /// The MetaServer currently treats this node as a backup target.
     target: AtomicBool,
+    /// Candidates carried by the last report.
+    reported: AtomicUsize,
+    /// Blocks demoted for backup since the last report.
+    demoted: AtomicUsize,
     /// Wakes the heartbeat loop to report candidates before the next period.
     refill: Notify,
+}
+
+impl BackupState {
+    /// This node reports candidates: backup is on and it is a source.
+    fn is_source(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+            && self.has_instance.load(Ordering::Relaxed)
+            && !self.target.load(Ordering::Relaxed)
+    }
+
+    /// Start counting progress against a report of `reported` candidates.
+    fn start_report(&self, reported: usize) {
+        self.reported.store(reported, Ordering::Relaxed);
+        self.demoted.store(0, Ordering::Relaxed);
+    }
+
+    /// Count blocks demoted after being backed up. Once half of the last
+    /// report has been taken care of, ask for a fresh one: the window has
+    /// moved on, and resending it earlier would mostly repeat stale blocks.
+    fn record_demotions(&self, blocks: usize) {
+        if blocks == 0 {
+            return;
+        }
+        let reported = self.reported.load(Ordering::Relaxed);
+        let demoted = self.demoted.fetch_add(blocks, Ordering::Relaxed) + blocks;
+        if reported > 0 && demoted.saturating_mul(2) >= reported && self.is_source() {
+            self.refill.notify_one();
+        }
+    }
 }
 
 /// What the heartbeat loop needs to report and apply backup state.
 struct BackupReporter {
     read_cache: Weak<ReadCache>,
     state: Arc<BackupState>,
+    /// Most candidates one heartbeat carries.
+    max_candidates: usize,
 }
 
 impl BackupReporter {
     /// Retained LRU-tail candidates grouped by namespace, oldest first.
     fn candidates(&self) -> Vec<BackupCandidates> {
-        let state = &self.state;
-        if !state.enabled.load(Ordering::Relaxed)
-            || !state.has_instance.load(Ordering::Relaxed)
-            || state.target.load(Ordering::Relaxed)
-        {
+        if !self.state.is_source() {
             return Vec::new();
         }
         let Some(cache) = self.read_cache.upgrade() else {
@@ -114,19 +148,25 @@ impl BackupReporter {
         if budget == 0 {
             return Vec::new();
         }
+        // A node serves few namespaces; a linear scan beats hashing each key.
         let mut groups: Vec<(BackupCandidates, u64)> = Vec::new();
-        let mut index: HashMap<String, usize> = HashMap::new();
-        for (key, bytes) in cache.backup_candidates(budget, MAX_HASHES_PER_RPC) {
-            let slot = *index.entry(key.namespace.clone()).or_insert_with(|| {
-                groups.push((
-                    BackupCandidates {
-                        namespace: key.namespace.clone(),
-                        ..Default::default()
-                    },
-                    0,
-                ));
-                groups.len() - 1
-            });
+        for (key, bytes) in cache.backup_candidates(budget, self.max_candidates) {
+            let slot = match groups
+                .iter()
+                .position(|(group, _)| group.namespace == key.namespace)
+            {
+                Some(slot) => slot,
+                None => {
+                    groups.push((
+                        BackupCandidates {
+                            namespace: key.namespace,
+                            ..Default::default()
+                        },
+                        0,
+                    ));
+                    groups.len() - 1
+                }
+            };
             let (group, total) = &mut groups[slot];
             group.block_hashes.push(key.hash);
             *total += bytes;
@@ -165,13 +205,18 @@ impl BackupReporter {
         let Some(cache) = self.read_cache.upgrade() else {
             return;
         };
-        for group in &response.backed_hashes {
-            cache.mark_reclaimable_hashes(
-                &group.namespace,
-                &group.block_hashes,
-                DemotionReason::BackupHint,
-            );
-        }
+        let demoted: usize = response
+            .backed_hashes
+            .iter()
+            .map(|group| {
+                cache.mark_reclaimable_hashes(
+                    &group.namespace,
+                    &group.block_hashes,
+                    DemotionReason::BackupHint,
+                )
+            })
+            .sum();
+        state.record_demotions(demoted);
     }
 }
 
@@ -179,6 +224,7 @@ pub struct MetaServerClientConfig {
     pub metaserver_addr: String,
     pub advertise_addr: String,
     pub queue_depth: usize,
+    pub backup_max_candidates: usize,
 }
 
 impl MetaServerClientConfig {
@@ -187,11 +233,17 @@ impl MetaServerClientConfig {
             metaserver_addr,
             advertise_addr,
             queue_depth: DEFAULT_METASERVER_QUEUE_DEPTH,
+            backup_max_candidates: DEFAULT_BACKUP_MAX_CANDIDATES,
         }
     }
 
     pub fn with_queue_depth(mut self, depth: usize) -> Self {
         self.queue_depth = depth;
+        self
+    }
+
+    pub fn with_backup_max_candidates(mut self, max: usize) -> Self {
+        self.backup_max_candidates = max.max(1);
         self
     }
 }
@@ -286,6 +338,7 @@ impl MetaServerClient {
             BackupReporter {
                 read_cache,
                 state: Arc::clone(&backup),
+                max_candidates: config.backup_max_candidates,
             },
         ));
 
@@ -328,18 +381,22 @@ impl MetaServerClient {
         self.backup.target.load(Ordering::Relaxed)
     }
 
-    /// Ask for an early heartbeat carrying backup candidates.
-    ///
-    /// Called when eviction drains the reclaimable class below its watermark.
-    /// The heartbeat loop rate-limits these to one per second.
-    pub(crate) fn request_backup_refill(&self) {
-        let state = &self.backup;
-        if state.enabled.load(Ordering::Relaxed)
-            && state.has_instance.load(Ordering::Relaxed)
-            && !state.target.load(Ordering::Relaxed)
-        {
-            state.refill.notify_one();
-        }
+    /// Count source blocks demoted after a peer copied them.
+    pub(crate) fn record_backup_demotions(&self, blocks: usize) {
+        self.backup.record_demotions(blocks);
+    }
+
+    /// True when the last report carried no candidates although this node
+    /// is a backup source, so a budget that opens up now waits for the
+    /// next regular heartbeat unless [`Self::request_backup_report`] runs.
+    pub(crate) fn backup_report_idle(&self) -> bool {
+        self.backup.reported.load(Ordering::Relaxed) == 0 && self.backup.is_source()
+    }
+
+    /// Ask for an early heartbeat carrying backup candidates. The heartbeat
+    /// loop keeps it at least one second after the previous heartbeat.
+    pub(crate) fn request_backup_report(&self) {
+        self.backup.refill.notify_one();
     }
 
     /// Ask the MetaServer for the next batch of blocks to back up.
@@ -584,7 +641,7 @@ async fn registration_loop(
             _ = refill_state.refill.notified() => {
                 // Pull the next heartbeat forward, never closer than 1s to the
                 // previous one; a backoff after a failure is left alone.
-                if heartbeat.node_registered {
+                if heartbeat.node_registered && heartbeat.backoff_ms == INITIAL_BACKOFF_MS {
                     let earliest = (heartbeat.last_sent_at + BACKUP_REFILL_MIN_INTERVAL)
                         .max(Instant::now());
                     heartbeat.next_at = heartbeat.next_at.min(earliest);
@@ -971,12 +1028,20 @@ async fn send_heartbeat(
 
     let c = client.as_mut().expect("client is connected");
     heartbeat.last_sent_at = Instant::now();
+    let backup_candidates = backup.candidates();
+    // Demotions from here on count as progress on this report.
+    backup.state.start_report(
+        backup_candidates
+            .iter()
+            .map(|group| group.block_hashes.len())
+            .sum(),
+    );
     match c
         .heartbeat_node(HeartbeatNodeRequest {
             node: advertise_addr.to_string(),
             node_id: node_id.to_string(),
             has_instance: backup.state.has_instance.load(Ordering::Relaxed),
-            backup_candidates: backup.candidates(),
+            backup_candidates,
         })
         .await
     {
@@ -1517,6 +1582,46 @@ mod tests {
         let _ = shutdown_tx.send(());
     }
 
+    #[tokio::test]
+    async fn backup_refill_follows_demotion_progress() {
+        async fn refilled(state: &BackupState) -> bool {
+            tokio::time::timeout(Duration::from_millis(10), state.refill.notified())
+                .await
+                .is_ok()
+        }
+        let source = || {
+            let state = BackupState::default();
+            state.enabled.store(true, Ordering::Relaxed);
+            state.has_instance.store(true, Ordering::Relaxed);
+            state
+        };
+
+        // Half of the last report demoted, in any number of steps.
+        let state = source();
+        state.start_report(100);
+        state.record_demotions(30);
+        assert!(!refilled(&state).await, "30/100 is not enough progress");
+        state.record_demotions(20);
+        assert!(refilled(&state).await, "50/100 asks for a fresh report");
+
+        // A new report restarts the count.
+        state.start_report(100);
+        state.record_demotions(49);
+        assert!(!refilled(&state).await, "count restarts with each report");
+
+        // Nothing reported: demotions (e.g. prefix recalls) never refill.
+        state.start_report(0);
+        state.record_demotions(1_000);
+        assert!(!refilled(&state).await, "empty report has no progress");
+
+        // A target never reports.
+        let state = source();
+        state.target.store(true, Ordering::Relaxed);
+        state.start_report(10);
+        state.record_demotions(10);
+        assert!(!refilled(&state).await, "targets do not refill");
+    }
+
     #[test]
     fn unsent_after_failure_counts_only_unsent_tail() {
         let ns = |name: &str, n: usize| (name.to_string(), vec![vec![0u8]; n]);
@@ -1648,6 +1753,7 @@ mod tests {
             BackupReporter {
                 read_cache: Weak::new(),
                 state: Arc::default(),
+                max_candidates: DEFAULT_BACKUP_MAX_CANDIDATES,
             },
         ));
 

@@ -101,7 +101,6 @@ struct BackupGaugeHandles {
     _nodes: ObservableGauge<u64>,
     _pairs: ObservableGauge<u64>,
     _candidates: ObservableGauge<u64>,
-    _inflight: ObservableGauge<u64>,
 }
 
 static BACKUP_GAUGES: OnceLock<BackupGaugeHandles> = OnceLock::new();
@@ -152,22 +151,10 @@ pub fn register_backup_gauges(store: &Arc<BlockHashStore>, planner: &Arc<BackupP
                 observer.observe(candidates_planner.queued_candidates(), &[]);
             })
             .build();
-        let inflight_planner = Arc::clone(planner);
-        let inflight = meter
-            .u64_observable_gauge("pegaflow_metaserver_backup_inflight_bytes")
-            .with_unit("bytes")
-            .with_description("Backup bytes dispatched to each target within the in-flight TTL")
-            .with_callback(move |observer| {
-                for (target, bytes) in inflight_planner.inflight_bytes() {
-                    observer.observe(bytes, &[KeyValue::new("target", target.to_string())]);
-                }
-            })
-            .build();
         BackupGaugeHandles {
             _nodes: nodes,
             _pairs: pairs,
             _candidates: candidates,
-            _inflight: inflight,
         }
     });
 }

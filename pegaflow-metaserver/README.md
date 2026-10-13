@@ -81,7 +81,6 @@ cargo run -p pegaflow-metaserver -- --help
 - `--min-reclaimable-owner-count <COUNT>`: Return a reclaim hint once this many live owners hold a block (default: `3`, minimum: `2`). `2` reclaims more aggressively than the default; values below `2` are rejected.
 - `--enable-decode-backup`: Let idle nodes back up prefill nodes' retained LRU-tail blocks (default: off; env `PEGAFLOW_METASERVER_ENABLE_DECODE_BACKUP`). See [Decode backup](#decode-backup).
 - `--backup-target-delay-secs <SECONDS>`: A live node with no inference instance for this long becomes a backup target (default: `180`)
-- `--backup-inflight-ttl-secs <SECONDS>`: A dispatched backup block is not re-planned for this long unless a backup owner registers it (default: `180`)
 
 ### Decode backup
 
@@ -93,21 +92,33 @@ demand, so each source has one target and targets share sources evenly.
 
 1. Once its cache is at least 90% full, a source sends its oldest retained
    cache-owned blocks with each heartbeat: enough bytes to bring the
-   reclaimable class back to 10% of capacity. Each report replaces that
-   source's previous snapshot. Eviction that drains the reclaimable class
-   below this watermark sends an extra heartbeat, at most once per second.
+   reclaimable class back to pegaflow-server's `--backup-reclaimable-percent`
+   of capacity (default 10%), at most `--backup-max-candidates` blocks
+   (default 16384). Each report replaces that source's previous snapshot.
+   The source sends the next report early, at most once per second, when
+   targets have copied (or `backed_hashes` covered) half of the previous
+   one, or when the first pressure eviction opens a budget after an empty
+   report.
 2. Reported blocks that already have a live target owner come back in
    `backed_hashes`; the source moves them to its reclaimable class.
 3. A target calls `PullBackupPlan` back to back while it gets plans, and
    once a second when idle or after a pull that fetched nothing. The
    MetaServer pops blocks from its paired sources oldest first, skips blocks
-   that already have a target owner, whose source is gone, or that are in
-   flight, and returns one namespace from one source within the byte budget.
+   that already have a target owner or whose source is gone, and returns one
+   namespace from one source within the byte budget. When several targets
+   share a source, each block belongs to one of them by rendezvous hash.
    Like peer prefix fetches, backup traffic is not rate limited.
 4. The target RDMA-reads the blocks with the regular P2P transfer path,
    inserts them as retained, and registers them. On a completed transfer the
    source demotes its copies to reclaimable, so pressure evicts them first
-   and later prefix queries recall them from the target.
+   and later prefix queries recall them from the target. Planned blocks the
+   target already holds are registered again instead of copied.
+
+The planner keeps no dispatch state. A block under transfer is pinned on the
+source, so it drops out of the next report, and once the transfer completes
+it is no longer retained there. A block re-planned anyway goes to the same
+target, which pulls one plan at a time and skips what it already holds. A
+failed pull is retried from the next report.
 
 A target does not demote blocks it serves, and it only re-pulls blocks that
 are still retained on a source, so evicted backups are not copied again.

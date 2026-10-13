@@ -39,7 +39,8 @@ pub use block::{
 use instance::GpuRegistration;
 pub use instance::{GpuContext, InstanceContext};
 pub use internode::{
-    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig, P2pTransferService,
+    DEFAULT_BACKUP_MAX_CANDIDATES, DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient,
+    MetaServerClientConfig, P2pTransferService,
 };
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;

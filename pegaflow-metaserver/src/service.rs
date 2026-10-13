@@ -95,7 +95,7 @@ impl GrpcMetaService {
         };
         response.backup_enabled = true;
         let roles = planner.roles(&self.store);
-        response.backup_target = roles.targets.iter().any(|n| n.as_ref() == req.node);
+        response.backup_target = roles.is_target(&req.node);
         if !req.has_instance {
             planner.forget_source(&req.node);
             return;
@@ -416,9 +416,9 @@ impl MetaServer for GrpcMetaService {
         if let Some(planner) = &self.backup
             && !segments.is_empty()
         {
-            let targets = planner.roles(&self.store).targets;
+            let roles = planner.roles(&self.store);
             for segment in &segments {
-                if targets.iter().any(|t| t.as_ref() == segment.node) {
+                if roles.is_target(&segment.node) {
                     planner.record_recall(
                         &req.exclude_node,
                         &segment.node,

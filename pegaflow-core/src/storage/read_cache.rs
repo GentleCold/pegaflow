@@ -42,12 +42,16 @@ struct ClassBytes {
 pub(crate) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
     capacity_bytes: u64,
+    /// Reclaimable share of capacity that decode backups keep ready.
+    backup_reclaimable_percent: u64,
 }
 
 /// Backup reporting starts once resident blocks fill this share of capacity.
 const BACKUP_REPORT_USAGE_PERCENT: u64 = 90;
-/// Target reclaimable share of capacity kept ready by decode backups.
-const BACKUP_RECLAIMABLE_PERCENT: u64 = 10;
+/// Default reclaimable share of capacity kept ready by decode backups.
+pub(crate) const DEFAULT_BACKUP_RECLAIMABLE_PERCENT: u64 = 10;
+/// Retained entries a candidate scan may look at per candidate wanted.
+const BACKUP_SCAN_FACTOR: usize = 4;
 
 struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
@@ -100,7 +104,13 @@ impl ReadCache {
                 pressured: false,
             }),
             capacity_bytes: capacity_bytes as u64,
+            backup_reclaimable_percent: DEFAULT_BACKUP_RECLAIMABLE_PERCENT,
         }
+    }
+
+    pub(crate) fn with_backup_reclaimable_percent(mut self, percent: u64) -> Self {
+        self.backup_reclaimable_percent = percent.min(100);
+        self
     }
 
     pub(super) fn contains_keys(&self, keys: &[BlockKey]) -> Vec<bool> {
@@ -303,16 +313,16 @@ impl ReadCache {
         namespace: &str,
         hashes: &[Vec<u8>],
         reason: DemotionReason,
-    ) {
+    ) -> usize {
         if hashes.is_empty() {
-            return;
+            return 0;
         }
 
         let keys: Vec<BlockKey> = hashes
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
-        self.mark_reclaimable_keys(&keys, reason);
+        self.mark_reclaimable_keys(&keys, reason)
     }
 
     pub(crate) fn mark_reclaimable_hashes_if_generation(
@@ -345,10 +355,10 @@ impl ReadCache {
     /// The caller supplies complete keys so serving-side paths can classify
     /// the exact blocks they exposed without reconstructing namespace/hash
     /// pairs. Missing blocks and blocks already in the reclaimable class are
-    /// ignored.
-    pub(crate) fn mark_reclaimable_keys(&self, keys: &[BlockKey], reason: DemotionReason) {
+    /// ignored. Returns the number of blocks moved.
+    pub(crate) fn mark_reclaimable_keys(&self, keys: &[BlockKey], reason: DemotionReason) -> usize {
         if keys.is_empty() {
-            return;
+            return 0;
         }
 
         let mut inner = self.inner.lock();
@@ -356,18 +366,24 @@ impl ReadCache {
         for key in keys {
             moved.add(mark_reclaimable_with_generation(&mut inner, key, None));
         }
-        moved.record(reason);
+        drop(inner);
+        moved.record(reason)
     }
 
     /// Bytes of retained blocks to offer for decode backup right now.
     ///
     /// Zero until the cache is full: pressure eviction has run, or resident
     /// blocks reach 90% of capacity. Then the gap between the reclaimable
-    /// class and its 10% watermark, so a node only asks for as much backup as
+    /// class and its watermark, so a node only asks for as much backup as
     /// it needs to keep cheap eviction victims ready.
     pub(crate) fn backup_report_budget(&self) -> u64 {
         let inner = self.inner.lock();
-        backup_report_budget(self.capacity_bytes, inner.class_bytes, inner.pressured)
+        backup_report_budget(
+            self.capacity_bytes,
+            self.backup_reclaimable_percent,
+            inner.class_bytes,
+            inner.pressured,
+        )
     }
 
     /// Oldest retained blocks, up to `max_bytes` / `max_blocks`, that only
@@ -376,6 +392,8 @@ impl ReadCache {
     /// These are the next retained blocks pressure eviction would take, so a
     /// decode node copying them lets this node drop them first. Blocks pinned
     /// by an in-flight load or transfer are skipped. Does not touch recency.
+    /// Looks at no more than `BACKUP_SCAN_FACTOR * max_blocks` entries, so a
+    /// tail full of pinned blocks cannot hold the lock for a scan of millions.
     pub(crate) fn backup_candidates(
         &self,
         max_bytes: u64,
@@ -384,7 +402,8 @@ impl ReadCache {
         let inner = self.inner.lock();
         let mut candidates = Vec::new();
         let mut total = 0u64;
-        for (key, metadata) in &inner.retained {
+        let scan = max_blocks.saturating_mul(BACKUP_SCAN_FACTOR);
+        for (key, metadata) in inner.retained.iter().take(scan) {
             if total >= max_bytes || candidates.len() >= max_blocks {
                 break;
             }
@@ -479,14 +498,19 @@ fn class_lru(
     }
 }
 
-fn backup_report_budget(capacity_bytes: u64, bytes: ClassBytes, pressured: bool) -> u64 {
+fn backup_report_budget(
+    capacity_bytes: u64,
+    reclaimable_percent: u64,
+    bytes: ClassBytes,
+    pressured: bool,
+) -> u64 {
     let resident = bytes.reclaimable.saturating_add(bytes.retained);
     if !pressured
         && resident.saturating_mul(100) < capacity_bytes.saturating_mul(BACKUP_REPORT_USAGE_PERCENT)
     {
         return 0;
     }
-    (capacity_bytes / 100 * BACKUP_RECLAIMABLE_PERCENT).saturating_sub(bytes.reclaimable)
+    (capacity_bytes / 100 * reclaimable_percent).saturating_sub(bytes.reclaimable)
 }
 
 fn class_bytes(inner: &mut ReadCacheInner, class: ResidentClass) -> &mut u64 {
@@ -511,9 +535,10 @@ impl Demoted {
         }
     }
 
-    fn record(self, reason: DemotionReason) {
+    /// Publish the move to metrics; returns the number of blocks moved.
+    fn record(self, reason: DemotionReason) -> usize {
         if self.blocks == 0 {
-            return;
+            return 0;
         }
         let metrics = core_metrics();
         let (blocks, bytes) = (self.blocks as i64, self.bytes as i64);
@@ -532,6 +557,7 @@ impl Demoted {
         metrics
             .cache_class_demotions
             .add(self.blocks, reason.attributes());
+        self.blocks as usize
     }
 }
 

@@ -104,7 +104,7 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
 
 - **pegaflow_cache_resident_bytes_by_class** (Gauge)
   - Resident block footprint bytes by replacement class (`reclaimable` or `retained`)
-  - Use case: Reclaimable/retained ratio; decode backup keeps reclaimable near 10% of capacity on prefill nodes
+  - Use case: Reclaimable/retained ratio; decode backup keeps reclaimable near `--backup-reclaimable-percent` (default 10%) of capacity on prefill nodes
 
 - **pegaflow_cache_class_demotions_total** (Counter)
   - Blocks moved from retained to reclaimable
@@ -134,9 +134,8 @@ MetaServer (`--http-addr` `/metrics`):
 - `pegaflow_metaserver_backup_nodes{role=source|target}`: live nodes per role
 - `pegaflow_metaserver_backup_pair{source,target}`: current pairing (value `1`), the backup topology
 - `pegaflow_metaserver_backup_candidates`: queued candidate blocks across sources
-- `pegaflow_metaserver_backup_inflight_bytes{target}`: bytes dispatched to a target within the in-flight TTL (a sliding window of planned traffic, not a pending queue)
 - `pegaflow_metaserver_backup_dispatched_blocks_total` / `_bytes_total{source,target}`: planned backup traffic per pair
-- `pegaflow_metaserver_backup_candidates_filtered_total{reason=has_backup|source_gone|inflight}`
+- `pegaflow_metaserver_backup_candidates_filtered_total{reason=has_backup|source_gone}`
 - `pegaflow_metaserver_backup_recall_planned_blocks_total{source,target}`: prefix-query blocks planned from a target back to a source
 
 - **pegaflow_cache_residence_duration_seconds** (Histogram)

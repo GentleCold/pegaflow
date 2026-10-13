@@ -55,9 +55,11 @@ async fn pull_once(
         return BACKUP_IDLE_SLEEP;
     }
 
-    // A restarted MetaServer or an expired in-flight entry can re-plan blocks
-    // this node already holds; skip them instead of copying twice.
-    let wanted: Vec<Vec<u8>> = {
+    // A restarted MetaServer, a dropped registration, or a pairing change can
+    // re-plan blocks this node already holds. Skip copying them, but register
+    // them again: until the MetaServer sees this node as an owner it keeps
+    // planning them and never tells the source they are backed up.
+    let (wanted, present): (Vec<_>, Vec<_>) = {
         let Some(cache) = read_cache.upgrade() else {
             return Duration::ZERO;
         };
@@ -69,9 +71,15 @@ async fn pull_once(
         plan.block_hashes
             .into_iter()
             .zip(cache.contains_keys(&keys))
-            .filter_map(|(hash, present)| (!present).then_some(hash))
-            .collect()
+            .partition(|(_, present)| !present)
     };
+    let wanted: Vec<Vec<u8>> = wanted.into_iter().map(|(hash, _)| hash).collect();
+    if !present.is_empty() {
+        client.try_register_namespace_without_reclaim_hint(
+            plan.namespace.clone(),
+            present.into_iter().map(|(hash, _)| hash).collect(),
+        );
+    }
     if wanted.is_empty() {
         return Duration::ZERO;
     }

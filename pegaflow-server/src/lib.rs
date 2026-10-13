@@ -185,6 +185,28 @@ pub struct Cli {
     /// locked for at most this duration before being force-released (crash recovery).
     #[arg(long, default_value_t = 120)]
     pub transfer_lock_timeout_secs: u64,
+
+    /// Decode backup: share of the RAM cache, in percent, kept as reclaimable
+    /// (backed-up) blocks. Once the cache is full, this node offers its oldest
+    /// retained blocks for backup until the reclaimable class reaches it.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=100))]
+    pub backup_reclaimable_percent: u64,
+
+    /// Decode backup: most candidate blocks one heartbeat reports. Bounds the
+    /// heartbeat size (32 bytes per sha256 hash; the 65536 maximum is 2 MiB,
+    /// under the MetaServer's 4 MiB gRPC limit) and the MetaServer snapshot
+    /// kept per prefill node.
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_BACKUP_MAX_CANDIDATES,
+          value_parser = parse_backup_max_candidates)]
+    pub backup_max_candidates: usize,
+}
+
+fn parse_backup_max_candidates(s: &str) -> Result<usize, String> {
+    let v: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if !(1..=65_536).contains(&v) {
+        return Err(format!("must be in 1..=65536, got {v}"));
+    }
+    Ok(v)
 }
 
 fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
@@ -553,6 +575,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
+        backup_reclaimable_percent: cli.backup_reclaimable_percent,
+        backup_max_candidates: cli.backup_max_candidates,
     };
 
     if cli.pool_shards > 1 {

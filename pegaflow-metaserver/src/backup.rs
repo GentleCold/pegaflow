@@ -6,11 +6,17 @@
 //! blocks with the regular P2P transfer path. The planner only decides who
 //! copies what; it never tracks target capacity, because a full target
 //! replaces its oldest backups through its own LRU.
+//!
+//! The planner keeps no per-dispatch state. A source stops reporting a block
+//! once a target holds its transfer lock and demotes it when the transfer
+//! completes, and each block of a source goes to exactly one of its paired
+//! targets, which pulls one plan at a time. A re-reported block therefore
+//! reaches the same target again, which skips it if already copied.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
@@ -19,23 +25,17 @@ use pegaflow_common::BlockKey;
 use crate::store::{BlockHashStore, NodeRoles};
 
 pub const DEFAULT_TARGET_DELAY_SECS: u64 = 180;
-pub const DEFAULT_INFLIGHT_TTL_SECS: u64 = 180;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupConfig {
     /// How long a node must report no instance before it becomes a target.
     pub target_delay: Duration,
-    /// Dispatched blocks are not re-dispatched until this expires. Must
-    /// outlive the holder's transfer lock timeout so a slow pull finishes and
-    /// registers its owner first.
-    pub inflight_ttl: Duration,
 }
 
 impl Default for BackupConfig {
     fn default() -> Self {
         Self {
             target_delay: Duration::from_secs(DEFAULT_TARGET_DELAY_SECS),
-            inflight_ttl: Duration::from_secs(DEFAULT_INFLIGHT_TTL_SECS),
         }
     }
 }
@@ -62,17 +62,10 @@ struct QueuedGroup {
     hashes: VecDeque<Vec<u8>>,
 }
 
-struct Inflight {
-    dispatched_at: Instant,
-    target: Arc<str>,
-    bytes: u64,
-}
-
 #[derive(Default)]
 struct PlannerState {
     /// Latest candidate snapshot per source; replaced on every report.
     candidates: HashMap<Arc<str>, Vec<QueuedGroup>>,
-    inflight: HashMap<BlockKey, Inflight>,
     /// Round-robin cursor over a target's sources.
     cursor: HashMap<Arc<str>, usize>,
 }
@@ -103,7 +96,7 @@ static METRICS: LazyLock<PlannerMetrics> = LazyLock::new(|| {
             .build(),
         filtered: meter
             .u64_counter("pegaflow_metaserver_backup_candidates_filtered")
-            .with_description("Backup candidates skipped (reason=has_backup|source_gone|inflight)")
+            .with_description("Backup candidates skipped (reason=has_backup|source_gone)")
             .build(),
         recall_planned_blocks: meter
             .u64_counter("pegaflow_metaserver_backup_recall_planned_blocks")
@@ -144,32 +137,37 @@ impl BackupPlanner {
         source: &str,
         groups: Vec<CandidateGroup>,
     ) -> Vec<CandidateGroup> {
-        let source: Arc<str> = Arc::from(source);
         let mut backed = Vec::new();
         let mut queued = Vec::with_capacity(groups.len());
         let mut backed_count = 0u64;
         for group in groups {
             let mut keep = VecDeque::with_capacity(group.hashes.len());
             let mut done = Vec::new();
+            // One lookup key reused across the group, so a report does not
+            // allocate per hash.
+            let mut key = BlockKey::new(group.namespace, Vec::new());
             for hash in group.hashes {
-                let key = BlockKey::new(group.namespace.clone(), hash);
-                if has_backup_owner(store, roles, &key) {
-                    done.push(key.hash);
+                key.hash = hash;
+                let backed_up = owner_roles(store, roles, source, &key).target;
+                let hash = std::mem::take(&mut key.hash);
+                if backed_up {
+                    done.push(hash);
                 } else {
-                    keep.push_back(key.hash);
+                    keep.push_back(hash);
                 }
             }
+            let namespace = key.namespace;
             backed_count += done.len() as u64;
             if !done.is_empty() {
                 backed.push(CandidateGroup {
-                    namespace: group.namespace.clone(),
+                    namespace: namespace.clone(),
                     block_bytes: group.block_bytes,
                     hashes: done,
                 });
             }
             if !keep.is_empty() {
                 queued.push(QueuedGroup {
-                    namespace: group.namespace,
+                    namespace,
                     block_bytes: group.block_bytes,
                     hashes: keep,
                 });
@@ -179,9 +177,9 @@ impl BackupPlanner {
 
         let mut state = self.state.lock().expect("backup planner lock poisoned");
         if queued.is_empty() {
-            state.candidates.remove(&source);
+            state.candidates.remove(source);
         } else {
-            state.candidates.insert(source, queued);
+            state.candidates.insert(Arc::from(source), queued);
         }
         backed
     }
@@ -203,12 +201,7 @@ impl BackupPlanner {
         target: &str,
         max_bytes: u64,
     ) -> Option<BackupPlan> {
-        let now = Instant::now();
         let mut state = self.state.lock().expect("backup planner lock poisoned");
-        let ttl = self.config.inflight_ttl;
-        state
-            .inflight
-            .retain(|_, entry| now.duration_since(entry.dispatched_at) < ttl);
         // A source that died without reporting `has_instance=false` would
         // otherwise keep its snapshot, and a departed target its cursor.
         state
@@ -219,10 +212,11 @@ impl BackupPlanner {
             .retain(|node, _| roles.targets.binary_search(node).is_ok());
 
         let target = roles.targets.iter().find(|node| node.as_ref() == target)?;
-        let sources = pairing(&roles.sources, &roles.targets)
-            .into_iter()
+        let pairs = pairing(&roles.sources, &roles.targets);
+        let sources = pairs
+            .iter()
             .filter(|(_, paired)| paired == target)
-            .map(|(source, _)| source)
+            .map(|(source, _)| Arc::clone(source))
             .collect::<Vec<_>>();
         if sources.is_empty() {
             return None;
@@ -232,23 +226,23 @@ impl BackupPlanner {
         for offset in 0..sources.len() {
             let index = (start + offset) % sources.len();
             let source = &sources[index];
+            // Targets sharing this source; each block belongs to one of them.
+            let peers = pairs
+                .iter()
+                .filter(|(paired, _)| paired == source)
+                .map(|(_, peer)| peer.as_ref())
+                .collect::<Vec<_>>();
+            let shard = Shard {
+                target,
+                peers: &peers,
+            };
             let Some((namespace, block_bytes, hashes)) =
-                take_batch(&mut state, store, roles, source, max_bytes)
+                take_batch(&mut state, store, roles, source, &shard, max_bytes)
             else {
                 continue;
             };
 
             let bytes = block_bytes.saturating_mul(hashes.len() as u64);
-            for hash in &hashes {
-                state.inflight.insert(
-                    BlockKey::new(namespace.clone(), hash.clone()),
-                    Inflight {
-                        dispatched_at: now,
-                        target: Arc::clone(target),
-                        bytes: block_bytes,
-                    },
-                );
-            }
             state.cursor.insert(Arc::clone(target), index + 1);
 
             let pair = [
@@ -288,83 +282,111 @@ impl BackupPlanner {
             .map(|group| group.hashes.len() as u64)
             .sum()
     }
+}
 
-    /// Estimated in-flight bytes per target.
-    pub fn inflight_bytes(&self) -> HashMap<Arc<str>, u64> {
-        let now = Instant::now();
-        let ttl = self.config.inflight_ttl;
-        let state = self.state.lock().expect("backup planner lock poisoned");
-        let mut bytes: HashMap<Arc<str>, u64> = HashMap::new();
-        for entry in state.inflight.values() {
-            if now.duration_since(entry.dispatched_at) < ttl {
-                *bytes.entry(Arc::clone(&entry.target)).or_default() += entry.bytes;
-            }
+/// Which of a source's blocks one target may take.
+struct Shard<'a> {
+    target: &'a Arc<str>,
+    /// All targets paired with the source, `target` included.
+    peers: &'a [&'a str],
+}
+
+impl Shard<'_> {
+    /// Rendezvous hashing on the block hash: stable while the pairing holds,
+    /// and only blocks of a departed target move when it changes.
+    fn owns(&self, hash: &[u8]) -> bool {
+        if self.peers.len() <= 1 {
+            return true;
         }
-        bytes
+        let score = |peer: &str| {
+            let mut hasher = DefaultHasher::new();
+            peer.hash(&mut hasher);
+            hash.hash(&mut hasher);
+            hasher.finish()
+        };
+        self.peers
+            .iter()
+            .max_by_key(|peer| (score(peer), **peer))
+            .is_some_and(|winner| *winner == self.target.as_ref())
     }
 }
 
-/// Pop the oldest dispatchable blocks of one namespace from `source`'s queue.
+/// Take the oldest dispatchable blocks of one namespace from `source`'s queue
+/// that belong to `shard`. Blocks of other targets stay queued for them.
 fn take_batch(
     state: &mut PlannerState,
     store: &BlockHashStore,
     roles: &NodeRoles,
     source: &Arc<str>,
+    shard: &Shard<'_>,
     max_bytes: u64,
 ) -> Option<(String, u64, Vec<Vec<u8>>)> {
-    let PlannerState {
-        candidates,
-        inflight,
-        ..
-    } = state;
-    let groups = candidates.get_mut(source)?;
+    let groups = state.candidates.get_mut(source)?;
     let mut result = None;
-    let (mut skipped_inflight, mut skipped_gone, mut skipped_backed) = (0u64, 0u64, 0u64);
+    let (mut skipped_gone, mut skipped_backed) = (0u64, 0u64);
     for group in groups.iter_mut() {
         let mut taken = Vec::new();
-        let mut bytes = 0u64;
-        while !group.hashes.is_empty() {
-            if !taken.is_empty() && bytes.saturating_add(group.block_bytes) > max_bytes {
-                break;
+        let mut full = false;
+        let block_bytes = group.block_bytes;
+        // One lookup key reused across the queue, so a scan does not allocate.
+        let mut key = BlockKey::new(group.namespace.clone(), Vec::new());
+        group.hashes.retain_mut(|hash| {
+            if full || !shard.owns(hash) {
+                return true;
             }
-            let hash = group.hashes.pop_front().expect("queue is non-empty");
-            let key = BlockKey::new(group.namespace.clone(), hash);
-            if inflight.contains_key(&key) {
-                skipped_inflight += 1;
-                continue;
-            }
-            let owners = store.visible_owners(&key);
-            if !owners.iter().any(|owner| owner == source) {
+            key.hash.clone_from(hash);
+            let owners = owner_roles(store, roles, source, &key);
+            if !owners.source {
                 skipped_gone += 1;
-                continue;
+                return false;
             }
-            if owners.iter().any(|owner| roles.targets.contains(owner)) {
+            if owners.target {
                 skipped_backed += 1;
-                continue;
+                return false;
             }
-            bytes = bytes.saturating_add(group.block_bytes);
-            taken.push(key.hash);
-        }
+            let bytes = block_bytes.saturating_mul(taken.len() as u64);
+            if !taken.is_empty() && bytes.saturating_add(block_bytes) > max_bytes {
+                full = true;
+                return true;
+            }
+            taken.push(std::mem::take(hash));
+            false
+        });
         if !taken.is_empty() {
-            result = Some((group.namespace.clone(), group.block_bytes, taken));
+            result = Some((group.namespace.clone(), block_bytes, taken));
             break;
         }
     }
     groups.retain(|group| !group.hashes.is_empty());
     if groups.is_empty() {
-        candidates.remove(source);
+        state.candidates.remove(source);
     }
-    record_filtered("inflight", skipped_inflight);
     record_filtered("source_gone", skipped_gone);
     record_filtered("has_backup", skipped_backed);
     result
 }
 
-fn has_backup_owner(store: &BlockHashStore, roles: &NodeRoles, key: &BlockKey) -> bool {
-    store
-        .visible_owners(key)
-        .iter()
-        .any(|owner| roles.targets.contains(owner))
+/// Which kinds of live owner a block has.
+#[derive(Default)]
+struct OwnerRoles {
+    /// `source` itself still holds it.
+    source: bool,
+    /// Some backup target holds it.
+    target: bool,
+}
+
+fn owner_roles(
+    store: &BlockHashStore,
+    roles: &NodeRoles,
+    source: &str,
+    key: &BlockKey,
+) -> OwnerRoles {
+    let mut found = OwnerRoles::default();
+    store.for_each_visible_owner(key, |owner| {
+        found.source |= owner == source;
+        found.target |= roles.is_target(owner);
+    });
+    found
 }
 
 fn rendezvous_score(source: &str, target: &str) -> u64 {
@@ -513,7 +535,7 @@ mod tests {
 
     impl Fixture {
         /// `p*` nodes have an instance, `d*` nodes are idle targets.
-        fn new(names: &[&'static str], config: BackupConfig) -> Self {
+        fn new(names: &[&'static str]) -> Self {
             let store = BlockHashStore::with_config(StoreConfig::default());
             let mut ids = HashMap::new();
             for name in names {
@@ -526,7 +548,6 @@ mod tests {
                 store,
                 planner: BackupPlanner::new(BackupConfig {
                     target_delay: Duration::ZERO,
-                    ..config
                 }),
                 ids,
             }
@@ -568,8 +589,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_filters_backed_gone_and_inflight_blocks() {
-        let fx = Fixture::new(&["p0", "d0"], BackupConfig::default());
+    fn plan_filters_backed_and_gone_blocks() {
+        let fx = Fixture::new(&["p0", "d0"]);
         fx.own("p0", &[1, 2, 3, 4]);
         fx.own("d0", &[2]);
 
@@ -577,31 +598,42 @@ mod tests {
         assert_eq!(fx.report("p0", &[1, 2, 3, 4, 5]), vec![2]);
         // 5 is not owned by p0 any more; budget 20 bytes = two 10-byte blocks.
         assert_eq!(fx.plan("d0", 20), Some(("p0".into(), vec![1, 3])));
-        // Re-reporting in-flight blocks does not dispatch them twice.
-        fx.report("p0", &[1, 3, 4, 5]);
         assert_eq!(fx.plan("d0", 100), Some(("p0".into(), vec![4])));
         assert_eq!(fx.plan("d0", 100), None);
+
+        // Once d0 registers a copy, a re-report no longer plans it.
+        fx.own("d0", &[1]);
+        assert_eq!(fx.report("p0", &[1, 3]), vec![1]);
+        assert_eq!(fx.plan("d0", 100), Some(("p0".into(), vec![3])));
     }
 
     #[test]
-    fn plan_redispatches_after_inflight_expiry() {
-        let fx = Fixture::new(
-            &["p0", "d0"],
-            BackupConfig {
-                inflight_ttl: Duration::ZERO,
-                ..BackupConfig::default()
-            },
-        );
-        fx.own("p0", &[1]);
-        fx.report("p0", &[1]);
-        assert_eq!(fx.plan("d0", 100), Some(("p0".into(), vec![1])));
-        fx.report("p0", &[1]);
-        assert_eq!(fx.plan("d0", 100), Some(("p0".into(), vec![1])));
+    fn targets_sharing_a_source_split_its_blocks() {
+        let fx = Fixture::new(&["p0", "d0", "d1", "d2"]);
+        let all: Vec<u8> = (0..60).collect();
+        fx.own("p0", &all);
+
+        let mut seen: HashMap<u8, &str> = HashMap::new();
+        for _ in 0..2 {
+            // Re-reporting the same blocks hands each to the same target.
+            fx.report("p0", &all);
+            for target in ["d0", "d1", "d2"] {
+                while let Some((_, hashes)) = fx.plan(target, u64::MAX) {
+                    for hash in hashes {
+                        assert_eq!(*seen.entry(hash).or_insert(target), target, "block {hash}");
+                    }
+                }
+            }
+        }
+        assert_eq!(seen.len(), all.len(), "every block is planned");
+        for target in ["d0", "d1", "d2"] {
+            assert!(seen.values().any(|t| *t == target), "{target} gets a share");
+        }
     }
 
     #[test]
     fn plan_requires_target_role_and_live_source() {
-        let fx = Fixture::new(&["p0", "d0"], BackupConfig::default());
+        let fx = Fixture::new(&["p0", "d0"]);
         fx.own("p0", &[1, 2]);
         fx.report("p0", &[1, 2]);
         assert_eq!(fx.plan("p0", 100), None, "sources never pull");

@@ -98,6 +98,14 @@ pub struct NodeRoles {
     pub targets: Vec<Arc<str>>,
 }
 
+impl NodeRoles {
+    pub fn is_target(&self, node: &str) -> bool {
+        self.targets
+            .binary_search_by(|target| target.as_ref().cmp(node))
+            .is_ok()
+    }
+}
+
 #[derive(Default)]
 struct RedundancyCounters {
     keys_1: AtomicU64,
@@ -266,19 +274,17 @@ impl BlockHashStore {
         roles
     }
 
-    /// Live owners of `key`, or empty when the key is unknown.
-    pub fn visible_owners(&self, key: &BlockKey) -> Vec<Arc<str>> {
+    /// Call `f` with each live owner of `key`.
+    pub fn for_each_visible_owner(&self, key: &BlockKey, mut f: impl FnMut(&str)) {
+        let Some(owners) = self.blocks.get(key) else {
+            return;
+        };
         let now = Instant::now();
-        self.blocks
-            .get(key)
-            .map(|owners| {
-                owners
-                    .iter()
-                    .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
-                    .map(|(node, _)| Arc::clone(node))
-                    .collect()
-            })
-            .unwrap_or_default()
+        for (node, owner) in owners.iter() {
+            if self.is_owner_visible(node, owner, now) {
+                f(node);
+            }
+        }
     }
 
     pub fn unregister_node(&self, node: &str, node_id: Uuid) -> Result<usize, StoreError> {
