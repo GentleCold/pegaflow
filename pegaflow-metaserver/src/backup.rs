@@ -50,6 +50,7 @@ pub struct BackupPlanner {
 struct PlannerMetrics {
     dispatched_blocks: Counter<u64>,
     dispatched_bytes: Counter<u64>,
+    filtered: Counter<u64>,
     recall_planned_blocks: Counter<u64>,
 }
 
@@ -65,6 +66,10 @@ static METRICS: LazyLock<PlannerMetrics> = LazyLock::new(|| {
             .with_unit("bytes")
             .with_description("Estimated backup bytes dispatched per source/target pair")
             .build(),
+        filtered: meter
+            .u64_counter("pegaflow_metaserver_backup_candidates_filtered")
+            .with_description("Backup candidates dropped (reason=has_backup|source_gone)")
+            .build(),
         recall_planned_blocks: meter
             .u64_counter("pegaflow_metaserver_backup_recall_planned_blocks")
             .with_description(
@@ -73,6 +78,14 @@ static METRICS: LazyLock<PlannerMetrics> = LazyLock::new(|| {
             .build(),
     }
 });
+
+fn record_filtered(reason: &'static str, count: u64) {
+    if count > 0 {
+        METRICS
+            .filtered
+            .add(count, &[KeyValue::new("reason", reason)]);
+    }
+}
 
 impl BackupPlanner {
     pub fn new(target_delay: Duration) -> Self {
@@ -98,6 +111,7 @@ impl BackupPlanner {
     ) -> Vec<BackupCandidates> {
         let mut backed = Vec::new();
         let mut queued = Vec::with_capacity(groups.len());
+        let mut backed_count = 0;
         for group in groups {
             let mut keep = VecDeque::with_capacity(group.block_hashes.len());
             let mut done = Vec::new();
@@ -115,6 +129,7 @@ impl BackupPlanner {
                 }
             }
             let namespace = key.namespace;
+            backed_count += done.len() as u64;
             if !done.is_empty() {
                 backed.push(BackupCandidates {
                     namespace: namespace.clone(),
@@ -130,6 +145,7 @@ impl BackupPlanner {
                 });
             }
         }
+        record_filtered("has_backup", backed_count);
         let mut state = self.state.lock().expect("backup planner lock poisoned");
         if queued.is_empty() {
             state.candidates.remove(source);
@@ -214,6 +230,18 @@ impl BackupPlanner {
         }
         None
     }
+
+    /// Queued candidate blocks across all sources.
+    pub fn queued_candidates(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("backup planner lock poisoned")
+            .candidates
+            .values()
+            .flatten()
+            .map(|group| group.hashes.len() as u64)
+            .sum()
+    }
 }
 
 /// Count prefix-fetch blocks planned from a backup target back to a source.
@@ -260,6 +288,7 @@ fn take_batch(
 ) -> Option<(String, u64, Vec<Vec<u8>>)> {
     let groups = state.candidates.get_mut(source)?;
     let mut result = None;
+    let (mut gone, mut backed) = (0, 0);
     for group in groups.iter_mut() {
         let mut taken = Vec::new();
         let mut full = false;
@@ -274,6 +303,11 @@ fn take_batch(
             // Drop blocks the source no longer holds or a target already has.
             let owners = owner_roles(store, roles, source, &key);
             if !owners.source || owners.target {
+                if owners.source {
+                    backed += 1;
+                } else {
+                    gone += 1;
+                }
                 return false;
             }
             let bytes = block_bytes.saturating_mul(taken.len() as u64);
@@ -293,6 +327,8 @@ fn take_batch(
     if groups.is_empty() {
         state.candidates.remove(source);
     }
+    record_filtered("source_gone", gone);
+    record_filtered("has_backup", backed);
     result
 }
 
@@ -572,7 +608,7 @@ mod tests {
         // p0 stops being a source without a heartbeat clearing its snapshot.
         fx.store.set_node_has_instance("p0", fx.ids["p0"], false);
         assert_eq!(fx.plan("d0", 10), None);
-        assert!(fx.planner.state.lock().unwrap().candidates.is_empty());
+        assert_eq!(fx.planner.queued_candidates(), 0);
     }
 
     #[test]

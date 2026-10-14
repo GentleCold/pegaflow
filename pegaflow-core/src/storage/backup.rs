@@ -8,9 +8,10 @@ use std::time::Duration;
 use log::{debug, warn};
 
 use super::ReadCache;
-use crate::backing::RdmaFetchStore;
+use crate::backing::{FetchPurpose, RdmaFetchStore};
 use crate::block::BlockKey;
 use crate::internode::MetaServerClient;
+use crate::metrics::core_metrics;
 
 /// Upper bound on one pulled plan; matches the RDMA staging chunk size.
 const BACKUP_PULL_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -80,11 +81,21 @@ async fn pull_once(
     }
 
     let req_id = format!("backup:{}", plan.source_node);
-    // Not prefix-only: backup blocks are independent, so a gap on the source
-    // must not stop the rest of the plan.
     let fetched = store
-        .fetch_blocks(&plan.source_node, &req_id, &plan.namespace, &wanted, false)
+        .fetch_blocks(
+            &plan.source_node,
+            &req_id,
+            &plan.namespace,
+            &wanted,
+            FetchPurpose::Backup,
+        )
         .await;
+    let missing = wanted.len() - fetched.len();
+    if missing > 0 {
+        core_metrics()
+            .backup_pull_missing_blocks
+            .add(missing as u64, &[]);
+    }
     if fetched.is_empty() {
         // Connect/RDMA failure or a source that evicted the whole batch.
         // Retrying at once would spin through the source's queue against an

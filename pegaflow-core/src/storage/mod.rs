@@ -19,14 +19,14 @@ use crate::backing::{RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
-use crate::metrics::core_metrics;
+use crate::metrics::{SERVED_ROLE_BACKUP_TARGET, SERVED_ROLE_SOURCE, core_metrics};
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
-pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, ReadCache};
+pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 
 // Each reclaim iteration emits one MetaServer removal command; a small batch
@@ -644,16 +644,27 @@ impl StorageEngine {
     /// prefill nodes is its job, and demoting would turn it into an LRU tier.
     pub(crate) fn release_transfer_lock(&self, session_id: &str, transferred: bool) -> usize {
         let keys = self.transfer_lock.release(session_id);
+        if !transferred || keys.is_empty() {
+            return keys.len();
+        }
         let backup_target = self
             .metaserver_client
             .as_ref()
             .is_some_and(|client| client.is_backup_target());
-        if transferred && !backup_target {
-            let demoted = self.read_cache.mark_reclaimable_keys(&keys);
+        let role = if backup_target {
+            &*SERVED_ROLE_BACKUP_TARGET
+        } else {
+            let demoted = self
+                .read_cache
+                .mark_reclaimable_keys(&keys, DemotionReason::TransferRelease);
             if let Some(client) = &self.metaserver_client {
                 client.record_backup_demotions(demoted);
             }
-        }
+            &*SERVED_ROLE_SOURCE
+        };
+        core_metrics()
+            .transfer_served_blocks
+            .add(keys.len() as u64, role);
         keys.len()
     }
 

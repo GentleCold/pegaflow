@@ -20,7 +20,7 @@ use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
 use crate::metrics::core_metrics;
-use crate::storage::ReadCache;
+use crate::storage::{DemotionReason, ReadCache};
 
 // Shared insert/remove command channel depth. Eviction bursts outrun the single
 // consumer's per-RPC drain, so a shallow queue silently drops removals.
@@ -165,9 +165,14 @@ impl BackupReporter {
             group.block_hashes.push(key.hash);
             group.block_bytes += bytes;
         }
+        let mut reported = 0;
         for group in &mut groups {
+            reported += group.block_hashes.len();
             group.block_bytes /= group.block_hashes.len() as u64;
         }
+        core_metrics()
+            .backup_candidates_reported
+            .add(reported as u64, &[]);
         groups
     }
 
@@ -183,6 +188,9 @@ impl BackupReporter {
                 response.backup_target
             );
         }
+        core_metrics()
+            .backup_role
+            .record(u64::from(response.backup_target), &[]);
         if response.backed_hashes.is_empty() {
             return;
         }
@@ -192,7 +200,13 @@ impl BackupReporter {
         let demoted: usize = response
             .backed_hashes
             .iter()
-            .map(|group| cache.mark_reclaimable_hashes(&group.namespace, &group.block_hashes))
+            .map(|group| {
+                cache.mark_reclaimable_hashes(
+                    &group.namespace,
+                    &group.block_hashes,
+                    DemotionReason::BackupHint,
+                )
+            })
             .sum();
         state.record_demotions(demoted);
     }
@@ -799,6 +813,7 @@ async fn registration_loop(
                                     cache.mark_reclaimable_hashes(
                                         namespace,
                                         &inner.reclaimable_hashes,
+                                        DemotionReason::ReclaimHint,
                                     );
                                 } else {
                                     cache.mark_reclaimable_hashes_if_generation(
