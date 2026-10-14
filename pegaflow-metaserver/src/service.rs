@@ -1,12 +1,11 @@
-use crate::backup::{BackupPlanner, CandidateGroup};
+use crate::backup::{self, BackupPlanner};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
-    BackupCandidates, FetchSegment, HeartbeatNodeRequest, HeartbeatNodeResponse,
-    InsertBlockHashesRequest, InsertBlockHashesResponse, PullBackupPlanRequest,
-    PullBackupPlanResponse, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse,
-    RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeRequest,
-    UnregisterNodeResponse,
+    FetchSegment, HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
+    InsertBlockHashesResponse, PullBackupPlanRequest, PullBackupPlanResponse,
+    QueryPrefixBlocksRequest, QueryPrefixBlocksResponse, RemoveBlockHashesRequest,
+    RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeRequest, UnregisterNodeResponse,
 };
 use crate::store::{BlockHashStore, PrefixEntry, StoreError};
 use log::debug;
@@ -100,24 +99,8 @@ impl GrpcMetaService {
             planner.forget_source(&req.node);
             return;
         }
-        let groups = req
-            .backup_candidates
-            .into_iter()
-            .map(|group| CandidateGroup {
-                namespace: group.namespace,
-                block_bytes: group.block_bytes,
-                hashes: group.block_hashes,
-            })
-            .collect();
-        response.backed_hashes = planner
-            .report(&self.store, &roles, &req.node, groups)
-            .into_iter()
-            .map(|group| BackupCandidates {
-                namespace: group.namespace,
-                block_hashes: group.hashes,
-                block_bytes: group.block_bytes,
-            })
-            .collect();
+        response.backed_hashes =
+            planner.report(&self.store, &roles, &req.node, req.backup_candidates);
     }
 
     fn ok_status() -> ResponseStatus {
@@ -188,24 +171,17 @@ impl MetaServer for GrpcMetaService {
                 return Ok(Response::new(PullBackupPlanResponse::default()));
             };
             let roles = planner.roles(&self.store);
-            let plan = planner.plan(&self.store, &roles, &req.node, req.max_bytes);
-            let response = plan
-                .map(|plan| {
-                    debug!(
-                        "RPC [pull_backup_plan]: target={} source={} namespace={} blocks={}",
-                        req.node,
-                        plan.source,
-                        plan.namespace,
-                        plan.hashes.len()
-                    );
-                    PullBackupPlanResponse {
-                        source_node: plan.source.to_string(),
-                        namespace: plan.namespace,
-                        block_hashes: plan.hashes,
-                    }
-                })
+            let plan = planner
+                .plan(&self.store, &roles, &req.node, req.max_bytes)
                 .unwrap_or_default();
-            Ok(Response::new(response))
+            debug!(
+                "RPC [pull_backup_plan]: target={} source={} namespace={} blocks={}",
+                req.node,
+                plan.source_node,
+                plan.namespace,
+                plan.block_hashes.len()
+            );
+            Ok(Response::new(plan))
         }
         .await;
         record_rpc_result("pull_backup_plan", &result, start);
@@ -419,7 +395,7 @@ impl MetaServer for GrpcMetaService {
             let roles = planner.roles(&self.store);
             for segment in &segments {
                 if roles.is_target(&segment.node) {
-                    planner.record_recall(
+                    backup::record_recall(
                         &req.exclude_node,
                         &segment.node,
                         u64::from(segment.block_count),

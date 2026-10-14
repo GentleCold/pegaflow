@@ -22,39 +22,10 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use pegaflow_common::BlockKey;
 
+use crate::proto::engine::{BackupCandidates, PullBackupPlanResponse};
 use crate::store::{BlockHashStore, NodeRoles};
 
 pub const DEFAULT_TARGET_DELAY_SECS: u64 = 180;
-
-#[derive(Debug, Clone, Copy)]
-pub struct BackupConfig {
-    /// How long a node must report no instance before it becomes a target.
-    pub target_delay: Duration,
-}
-
-impl Default for BackupConfig {
-    fn default() -> Self {
-        Self {
-            target_delay: Duration::from_secs(DEFAULT_TARGET_DELAY_SECS),
-        }
-    }
-}
-
-/// One namespace's candidates reported by a source, oldest first.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CandidateGroup {
-    pub namespace: String,
-    pub block_bytes: u64,
-    pub hashes: Vec<Vec<u8>>,
-}
-
-/// A batch of blocks one target should copy from one source.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackupPlan {
-    pub source: Arc<str>,
-    pub namespace: String,
-    pub hashes: Vec<Vec<u8>>,
-}
 
 struct QueuedGroup {
     namespace: String,
@@ -71,14 +42,14 @@ struct PlannerState {
 }
 
 pub struct BackupPlanner {
-    config: BackupConfig,
+    /// How long a node must report no instance before it becomes a target.
+    target_delay: Duration,
     state: Mutex<PlannerState>,
 }
 
 struct PlannerMetrics {
     dispatched_blocks: Counter<u64>,
     dispatched_bytes: Counter<u64>,
-    filtered: Counter<u64>,
     recall_planned_blocks: Counter<u64>,
 }
 
@@ -94,10 +65,6 @@ static METRICS: LazyLock<PlannerMetrics> = LazyLock::new(|| {
             .with_unit("bytes")
             .with_description("Estimated backup bytes dispatched per source/target pair")
             .build(),
-        filtered: meter
-            .u64_counter("pegaflow_metaserver_backup_candidates_filtered")
-            .with_description("Backup candidates skipped (reason=has_backup|source_gone)")
-            .build(),
         recall_planned_blocks: meter
             .u64_counter("pegaflow_metaserver_backup_recall_planned_blocks")
             .with_description(
@@ -107,24 +74,16 @@ static METRICS: LazyLock<PlannerMetrics> = LazyLock::new(|| {
     }
 });
 
-fn record_filtered(reason: &'static str, count: u64) {
-    if count > 0 {
-        METRICS
-            .filtered
-            .add(count, &[KeyValue::new("reason", reason)]);
-    }
-}
-
 impl BackupPlanner {
-    pub fn new(config: BackupConfig) -> Self {
+    pub fn new(target_delay: Duration) -> Self {
         Self {
-            config,
+            target_delay,
             state: Mutex::new(PlannerState::default()),
         }
     }
 
     pub fn roles(&self, store: &BlockHashStore) -> NodeRoles {
-        store.node_roles(self.config.target_delay)
+        store.node_roles(self.target_delay)
     }
 
     /// Replace `source`'s candidate snapshot. Returns the reported hashes that
@@ -135,18 +94,17 @@ impl BackupPlanner {
         store: &BlockHashStore,
         roles: &NodeRoles,
         source: &str,
-        groups: Vec<CandidateGroup>,
-    ) -> Vec<CandidateGroup> {
+        groups: Vec<BackupCandidates>,
+    ) -> Vec<BackupCandidates> {
         let mut backed = Vec::new();
         let mut queued = Vec::with_capacity(groups.len());
-        let mut backed_count = 0u64;
         for group in groups {
-            let mut keep = VecDeque::with_capacity(group.hashes.len());
+            let mut keep = VecDeque::with_capacity(group.block_hashes.len());
             let mut done = Vec::new();
             // One lookup key reused across the group, so a report does not
             // allocate per hash.
             let mut key = BlockKey::new(group.namespace, Vec::new());
-            for hash in group.hashes {
+            for hash in group.block_hashes {
                 key.hash = hash;
                 let backed_up = owner_roles(store, roles, source, &key).target;
                 let hash = std::mem::take(&mut key.hash);
@@ -157,12 +115,11 @@ impl BackupPlanner {
                 }
             }
             let namespace = key.namespace;
-            backed_count += done.len() as u64;
             if !done.is_empty() {
-                backed.push(CandidateGroup {
+                backed.push(BackupCandidates {
                     namespace: namespace.clone(),
+                    block_hashes: done,
                     block_bytes: group.block_bytes,
-                    hashes: done,
                 });
             }
             if !keep.is_empty() {
@@ -173,8 +130,6 @@ impl BackupPlanner {
                 });
             }
         }
-        record_filtered("has_backup", backed_count);
-
         let mut state = self.state.lock().expect("backup planner lock poisoned");
         if queued.is_empty() {
             state.candidates.remove(source);
@@ -200,7 +155,7 @@ impl BackupPlanner {
         roles: &NodeRoles,
         target: &str,
         max_bytes: u64,
-    ) -> Option<BackupPlan> {
+    ) -> Option<PullBackupPlanResponse> {
         let mut state = self.state.lock().expect("backup planner lock poisoned");
         // A source that died without reporting `has_instance=false` would
         // otherwise keep its snapshot, and a departed target its cursor.
@@ -251,37 +206,25 @@ impl BackupPlanner {
             ];
             METRICS.dispatched_blocks.add(hashes.len() as u64, &pair);
             METRICS.dispatched_bytes.add(bytes, &pair);
-            return Some(BackupPlan {
-                source: Arc::clone(source),
+            return Some(PullBackupPlanResponse {
+                source_node: source.to_string(),
                 namespace,
-                hashes,
+                block_hashes: hashes,
             });
         }
         None
     }
+}
 
-    /// Count prefix-fetch segments planned from a backup target.
-    pub fn record_recall(&self, requester: &str, target: &str, blocks: u64) {
-        METRICS.recall_planned_blocks.add(
-            blocks,
-            &[
-                KeyValue::new("source", requester.to_string()),
-                KeyValue::new("target", target.to_string()),
-            ],
-        );
-    }
-
-    /// Total queued candidate blocks across all sources.
-    pub fn queued_candidates(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("backup planner lock poisoned")
-            .candidates
-            .values()
-            .flatten()
-            .map(|group| group.hashes.len() as u64)
-            .sum()
-    }
+/// Count prefix-fetch blocks planned from a backup target back to a source.
+pub fn record_recall(requester: &str, target: &str, blocks: u64) {
+    METRICS.recall_planned_blocks.add(
+        blocks,
+        &[
+            KeyValue::new("source", requester.to_string()),
+            KeyValue::new("target", target.to_string()),
+        ],
+    );
 }
 
 /// Which of a source's blocks one target may take.
@@ -298,15 +241,9 @@ impl Shard<'_> {
         if self.peers.len() <= 1 {
             return true;
         }
-        let score = |peer: &str| {
-            let mut hasher = DefaultHasher::new();
-            peer.hash(&mut hasher);
-            hash.hash(&mut hasher);
-            hasher.finish()
-        };
         self.peers
             .iter()
-            .max_by_key(|peer| (score(peer), **peer))
+            .max_by_key(|peer| (rendezvous_score(**peer, hash), **peer))
             .is_some_and(|winner| *winner == self.target.as_ref())
     }
 }
@@ -323,7 +260,6 @@ fn take_batch(
 ) -> Option<(String, u64, Vec<Vec<u8>>)> {
     let groups = state.candidates.get_mut(source)?;
     let mut result = None;
-    let (mut skipped_gone, mut skipped_backed) = (0u64, 0u64);
     for group in groups.iter_mut() {
         let mut taken = Vec::new();
         let mut full = false;
@@ -335,13 +271,9 @@ fn take_batch(
                 return true;
             }
             key.hash.clone_from(hash);
+            // Drop blocks the source no longer holds or a target already has.
             let owners = owner_roles(store, roles, source, &key);
-            if !owners.source {
-                skipped_gone += 1;
-                return false;
-            }
-            if owners.target {
-                skipped_backed += 1;
+            if !owners.source || owners.target {
                 return false;
             }
             let bytes = block_bytes.saturating_mul(taken.len() as u64);
@@ -361,8 +293,6 @@ fn take_batch(
     if groups.is_empty() {
         state.candidates.remove(source);
     }
-    record_filtered("source_gone", skipped_gone);
-    record_filtered("has_backup", skipped_backed);
     result
 }
 
@@ -389,10 +319,12 @@ fn owner_roles(
     found
 }
 
-fn rendezvous_score(source: &str, target: &str) -> u64 {
+/// Highest-random-weight score of `node` for `item`. `DefaultHasher::new()`
+/// uses fixed keys, so scores are stable for the life of the process.
+fn rendezvous_score<N: Hash + ?Sized, I: Hash + ?Sized>(node: &N, item: &I) -> u64 {
     let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
-    target.hash(&mut hasher);
+    node.hash(&mut hasher);
+    item.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -546,9 +478,7 @@ mod tests {
             }
             Self {
                 store,
-                planner: BackupPlanner::new(BackupConfig {
-                    target_delay: Duration::ZERO,
-                }),
+                planner: BackupPlanner::new(Duration::ZERO),
                 ids,
             }
         }
@@ -562,15 +492,15 @@ mod tests {
 
         fn report(&self, node: &'static str, hashes: &[u8]) -> Vec<u8> {
             let roles = self.planner.roles(&self.store);
-            let group = CandidateGroup {
+            let group = BackupCandidates {
                 namespace: "ns".into(),
+                block_hashes: hashes.iter().map(|h| vec![*h]).collect(),
                 block_bytes: 10,
-                hashes: hashes.iter().map(|h| vec![*h]).collect(),
             };
             self.planner
                 .report(&self.store, &roles, node, vec![group])
                 .into_iter()
-                .flat_map(|group| group.hashes)
+                .flat_map(|group| group.block_hashes)
                 .map(|hash| hash[0])
                 .collect()
         }
@@ -581,8 +511,8 @@ mod tests {
                 .plan(&self.store, &roles, target, max_bytes)
                 .map(|plan| {
                     (
-                        plan.source.to_string(),
-                        plan.hashes.into_iter().map(|hash| hash[0]).collect(),
+                        plan.source_node,
+                        plan.block_hashes.into_iter().map(|hash| hash[0]).collect(),
                     )
                 })
         }
@@ -642,7 +572,7 @@ mod tests {
         // p0 stops being a source without a heartbeat clearing its snapshot.
         fx.store.set_node_has_instance("p0", fx.ids["p0"], false);
         assert_eq!(fx.plan("d0", 10), None);
-        assert_eq!(fx.planner.queued_candidates(), 0);
+        assert!(fx.planner.state.lock().unwrap().candidates.is_empty());
     }
 
     #[test]

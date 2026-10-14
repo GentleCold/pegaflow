@@ -8,10 +8,9 @@ use std::time::Duration;
 use log::{debug, warn};
 
 use super::ReadCache;
-use crate::backing::{FetchPurpose, RdmaFetchStore};
+use crate::backing::RdmaFetchStore;
 use crate::block::BlockKey;
 use crate::internode::MetaServerClient;
-use crate::metrics::core_metrics;
 
 /// Upper bound on one pulled plan; matches the RDMA staging chunk size.
 const BACKUP_PULL_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -59,51 +58,37 @@ async fn pull_once(
     // re-plan blocks this node already holds. Skip copying them, but register
     // them again: until the MetaServer sees this node as an owner it keeps
     // planning them and never tells the source they are backed up.
-    let (wanted, present): (Vec<_>, Vec<_>) = {
-        let Some(cache) = read_cache.upgrade() else {
-            return Duration::ZERO;
-        };
-        let keys: Vec<BlockKey> = plan
-            .block_hashes
-            .iter()
-            .map(|hash| BlockKey::new(plan.namespace.clone(), hash.clone()))
-            .collect();
-        plan.block_hashes
-            .into_iter()
-            .zip(cache.contains_keys(&keys))
-            .partition(|(_, present)| !present)
+    let Some(cache) = read_cache.upgrade() else {
+        return Duration::ZERO;
     };
-    let wanted: Vec<Vec<u8>> = wanted.into_iter().map(|(hash, _)| hash).collect();
-    if !present.is_empty() {
-        client.try_register_namespace_without_reclaim_hint(
-            plan.namespace.clone(),
-            present.into_iter().map(|(hash, _)| hash).collect(),
-        );
+    let keys: Vec<BlockKey> = plan
+        .block_hashes
+        .iter()
+        .map(|hash| BlockKey::new(plan.namespace.clone(), hash.clone()))
+        .collect();
+    let mut present = cache.contains_keys(&keys).into_iter();
+    drop(cache);
+    let (held, wanted): (Vec<Vec<u8>>, Vec<Vec<u8>>) = plan
+        .block_hashes
+        .into_iter()
+        .partition(|_| present.next().unwrap_or(false));
+    if !held.is_empty() {
+        client.try_register_namespace_without_reclaim_hint(plan.namespace.clone(), held);
     }
     if wanted.is_empty() {
         return Duration::ZERO;
     }
 
     let req_id = format!("backup:{}", plan.source_node);
+    // Not prefix-only: backup blocks are independent, so a gap on the source
+    // must not stop the rest of the plan.
     let fetched = store
-        .fetch_blocks(
-            &plan.source_node,
-            &req_id,
-            &plan.namespace,
-            &wanted,
-            FetchPurpose::Backup,
-        )
+        .fetch_blocks(&plan.source_node, &req_id, &plan.namespace, &wanted, false)
         .await;
-    let missing = wanted.len() - fetched.len();
-    if missing > 0 {
-        core_metrics()
-            .backup_pull_missing_blocks
-            .add(missing as u64, &[]);
-    }
     if fetched.is_empty() {
         // Connect/RDMA failure or a source that evicted the whole batch.
-        // Without pacing, retrying at once would spin through the source's
-        // queue and mark it all in flight against an unreachable peer.
+        // Retrying at once would spin through the source's queue against an
+        // unreachable peer.
         return BACKUP_IDLE_SLEEP;
     }
 

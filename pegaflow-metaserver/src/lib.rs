@@ -172,14 +172,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     metric::register_store_gauges(&store);
 
     let backup = cli.enable_decode_backup.then(|| {
-        let config = backup::BackupConfig {
-            target_delay: Duration::from_secs(cli.backup_target_delay_secs),
-        };
         info!(
             "Decode backup enabled: target_delay={}s",
             cli.backup_target_delay_secs
         );
-        let planner = Arc::new(backup::BackupPlanner::new(config));
+        let planner = Arc::new(backup::BackupPlanner::new(Duration::from_secs(
+            cli.backup_target_delay_secs,
+        )));
         metric::register_backup_gauges(&store, &planner);
         planner
     });

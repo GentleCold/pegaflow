@@ -10,28 +10,6 @@ use crate::metrics::{
     CACHE_RESIDENCE_REASON_PRESSURE, core_metrics,
 };
 
-/// Why a resident block moved from retained to reclaimable.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DemotionReason {
-    /// A peer finished copying the block from this node.
-    TransferRelease,
-    /// The MetaServer reported enough other owners at registration.
-    ReclaimHint,
-    /// The MetaServer reported a live backup owner for a reported candidate.
-    BackupHint,
-}
-
-impl DemotionReason {
-    fn attributes(self) -> &'static [opentelemetry::KeyValue] {
-        use crate::metrics::{DEMOTION_BACKUP_HINT, DEMOTION_RECLAIM_HINT, DEMOTION_TRANSFER};
-        match self {
-            Self::TransferRelease => &*DEMOTION_TRANSFER,
-            Self::ReclaimHint => &*DEMOTION_RECLAIM_HINT,
-            Self::BackupHint => &*DEMOTION_BACKUP_HINT,
-        }
-    }
-}
-
 /// Resident bytes per replacement class.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct ClassBytes {
@@ -295,25 +273,15 @@ impl ReadCache {
             metrics
                 .cache_resident_blocks
                 .add(-retained_blocks, &*CACHE_CLASS_RETAINED);
-            let bytes = std::mem::take(&mut inner.class_bytes);
+            inner.class_bytes = ClassBytes::default();
             inner.pressured = false;
-            metrics
-                .cache_resident_bytes_by_class
-                .add(-(bytes.reclaimable as i64), &*CACHE_CLASS_RECLAIMABLE);
-            metrics
-                .cache_resident_bytes_by_class
-                .add(-(bytes.retained as i64), &*CACHE_CLASS_RETAINED);
             removed
         };
         record_residence_durations(removed, &*CACHE_RESIDENCE_REASON_CLEANUP)
     }
 
-    pub(crate) fn mark_reclaimable_hashes(
-        &self,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-        reason: DemotionReason,
-    ) -> usize {
+    /// Returns the number of blocks moved.
+    pub(crate) fn mark_reclaimable_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) -> usize {
         if hashes.is_empty() {
             return 0;
         }
@@ -322,7 +290,7 @@ impl ReadCache {
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
-        self.mark_reclaimable_keys(&keys, reason)
+        self.mark_reclaimable_keys(&keys)
     }
 
     pub(crate) fn mark_reclaimable_hashes_if_generation(
@@ -336,18 +304,24 @@ impl ReadCache {
         }
 
         let mut inner = self.inner.lock();
-        let mut moved = Demoted::default();
+        let mut moved = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            if let Some(&generation) = generations.get(hash) {
-                moved.add(mark_reclaimable_with_generation(
-                    &mut inner,
-                    &key,
-                    Some(generation),
-                ));
+            if let Some(&generation) = generations.get(hash)
+                && mark_reclaimable_with_generation(&mut inner, &key, Some(generation))
+            {
+                moved += 1;
             }
         }
-        moved.record(DemotionReason::ReclaimHint);
+        if moved > 0 {
+            let metrics = core_metrics();
+            metrics
+                .cache_resident_blocks
+                .add(-moved, &*CACHE_CLASS_RETAINED);
+            metrics
+                .cache_resident_blocks
+                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
+        }
     }
 
     /// Move resident blocks to the reclaimable replacement class.
@@ -356,18 +330,28 @@ impl ReadCache {
     /// the exact blocks they exposed without reconstructing namespace/hash
     /// pairs. Missing blocks and blocks already in the reclaimable class are
     /// ignored. Returns the number of blocks moved.
-    pub(crate) fn mark_reclaimable_keys(&self, keys: &[BlockKey], reason: DemotionReason) -> usize {
+    pub(crate) fn mark_reclaimable_keys(&self, keys: &[BlockKey]) -> usize {
         if keys.is_empty() {
             return 0;
         }
 
         let mut inner = self.inner.lock();
-        let mut moved = Demoted::default();
+        let mut moved = 0;
         for key in keys {
-            moved.add(mark_reclaimable_with_generation(&mut inner, key, None));
+            if mark_reclaimable(&mut inner, key) {
+                moved += 1;
+            }
         }
-        drop(inner);
-        moved.record(reason)
+        if moved > 0 {
+            let metrics = core_metrics();
+            metrics
+                .cache_resident_blocks
+                .add(-moved, &*CACHE_CLASS_RETAINED);
+            metrics
+                .cache_resident_blocks
+                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
+        }
+        moved as usize
     }
 
     /// Bytes of retained blocks to offer for decode backup right now.
@@ -477,8 +461,6 @@ fn insert_block(
             m.cache_block_insertions.add(1, &[]);
             m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
             m.cache_resident_blocks.add(1, class.attributes());
-            m.cache_resident_bytes_by_class
-                .add(footprint_bytes as i64, class.attributes());
         }
         CacheInsertOutcome::AlreadyExists => refresh_recency(inner, &key),
         CacheInsertOutcome::Rejected => {
@@ -520,47 +502,6 @@ fn class_bytes(inner: &mut ReadCacheInner, class: ResidentClass) -> &mut u64 {
     }
 }
 
-/// Blocks and bytes moved by one demotion call.
-#[derive(Default)]
-struct Demoted {
-    blocks: u64,
-    bytes: u64,
-}
-
-impl Demoted {
-    fn add(&mut self, moved: Option<u64>) {
-        if let Some(bytes) = moved {
-            self.blocks += 1;
-            self.bytes += bytes;
-        }
-    }
-
-    /// Publish the move to metrics; returns the number of blocks moved.
-    fn record(self, reason: DemotionReason) -> usize {
-        if self.blocks == 0 {
-            return 0;
-        }
-        let metrics = core_metrics();
-        let (blocks, bytes) = (self.blocks as i64, self.bytes as i64);
-        metrics
-            .cache_resident_blocks
-            .add(-blocks, &*CACHE_CLASS_RETAINED);
-        metrics
-            .cache_resident_blocks
-            .add(blocks, &*CACHE_CLASS_RECLAIMABLE);
-        metrics
-            .cache_resident_bytes_by_class
-            .add(-bytes, &*CACHE_CLASS_RETAINED);
-        metrics
-            .cache_resident_bytes_by_class
-            .add(bytes, &*CACHE_CLASS_RECLAIMABLE);
-        metrics
-            .cache_class_demotions
-            .add(self.blocks, reason.attributes());
-        self.blocks as usize
-    }
-}
-
 fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
     let classified = inner.reclaimable.get(key).is_some() || inner.retained.get(key).is_some();
     debug_assert!(
@@ -569,32 +510,35 @@ fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
     );
 }
 
-/// Move one retained resident to reclaimable; returns its bytes when moved.
+fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
+    mark_reclaimable_with_generation(inner, key, None)
+}
+
 fn mark_reclaimable_with_generation(
     inner: &mut ReadCacheInner,
     key: &BlockKey,
     expected_generation: Option<u64>,
-) -> Option<u64> {
+) -> bool {
     if !inner.cache.contains_key(key) {
-        return None;
+        return false;
     }
     if let Some(expected_generation) = expected_generation {
         match inner.retained.peek(key) {
             Some(metadata) if metadata.generation == expected_generation => {}
-            _ => return None,
+            _ => return false,
         }
     }
     if let Some(metadata) = inner.retained.remove(key) {
         inner.class_bytes.retained -= metadata.bytes;
         inner.class_bytes.reclaimable += metadata.bytes;
         inner.reclaimable.insert(key.clone(), metadata);
-        Some(metadata.bytes)
+        true
     } else {
         debug_assert!(
             inner.reclaimable.contains_key(key),
             "resident block is missing its replacement class"
         );
-        None
+        false
     }
 }
 
@@ -611,9 +555,6 @@ fn remove_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> Option<Remove
         *class_bytes(inner, class) -= metadata.bytes;
         let metrics = core_metrics();
         metrics.cache_resident_blocks.add(-1, class.attributes());
-        metrics
-            .cache_resident_bytes_by_class
-            .add(-(metadata.bytes as i64), class.attributes());
         metrics
             .cache_block_evictions_by_class
             .add(1, class.attributes());
@@ -786,7 +727,7 @@ mod tests {
             [vec![0], vec![2]]
         );
 
-        cache.mark_reclaimable_keys(&keys[..1], DemotionReason::BackupHint);
+        cache.mark_reclaimable_keys(&keys[..1]);
         assert_eq!(
             cache.class_bytes(),
             ClassBytes {
@@ -986,11 +927,7 @@ mod tests {
         cache.batch_insert(vec![(key.clone(), make_block())]);
         let inserted_at = backdate_resident(&cache, &key, Duration::from_secs(60));
 
-        cache.mark_reclaimable_hashes(
-            "ns",
-            std::slice::from_ref(&key.hash),
-            DemotionReason::ReclaimHint,
-        );
+        cache.mark_reclaimable_hashes("ns", std::slice::from_ref(&key.hash));
 
         assert_eq!(
             resident_metadata(&cache, &key).unwrap().inserted_at,
@@ -1050,11 +987,7 @@ mod tests {
             (other_namespace.clone(), make_block()),
         ]);
         cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
-        cache.mark_reclaimable_hashes(
-            "ns",
-            &[vec![1], vec![2], vec![3]],
-            DemotionReason::ReclaimHint,
-        );
+        cache.mark_reclaimable_hashes("ns", &[vec![1], vec![2], vec![3]]);
 
         assert_class(&cache, &retained, ResidentClass::Reclaimable);
         assert_class(&cache, &reclaimable, ResidentClass::Reclaimable);
@@ -1068,7 +1001,7 @@ mod tests {
         cache.batch_insert(vec![(key.clone(), make_block())]);
         cache.remove_lru_batch(1);
 
-        cache.mark_reclaimable_hashes("ns", &[key.hash], DemotionReason::ReclaimHint);
+        cache.mark_reclaimable_hashes("ns", &[key.hash]);
 
         assert!(cache.remove_lru_batch(1).is_empty());
     }

@@ -20,7 +20,7 @@ use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
 use crate::metrics::core_metrics;
-use crate::storage::{DemotionReason, ReadCache};
+use crate::storage::ReadCache;
 
 // Shared insert/remove command channel depth. Eviction bursts outrun the single
 // consumer's per-RPC drain, so a shallow queue silently drops removals.
@@ -149,39 +149,26 @@ impl BackupReporter {
             return Vec::new();
         }
         // A node serves few namespaces; a linear scan beats hashing each key.
-        let mut groups: Vec<(BackupCandidates, u64)> = Vec::new();
+        // `block_bytes` sums footprints here and becomes their mean below.
+        let mut groups: Vec<BackupCandidates> = Vec::new();
         for (key, bytes) in cache.backup_candidates(budget, self.max_candidates) {
-            let slot = match groups
-                .iter()
-                .position(|(group, _)| group.namespace == key.namespace)
-            {
-                Some(slot) => slot,
+            let group = match groups.iter().position(|g| g.namespace == key.namespace) {
+                Some(slot) => &mut groups[slot],
                 None => {
-                    groups.push((
-                        BackupCandidates {
-                            namespace: key.namespace,
-                            ..Default::default()
-                        },
-                        0,
-                    ));
-                    groups.len() - 1
+                    groups.push(BackupCandidates {
+                        namespace: key.namespace,
+                        ..Default::default()
+                    });
+                    groups.last_mut().expect("just pushed")
                 }
             };
-            let (group, total) = &mut groups[slot];
             group.block_hashes.push(key.hash);
-            *total += bytes;
+            group.block_bytes += bytes;
         }
-        let reported: usize = groups.iter().map(|(g, _)| g.block_hashes.len()).sum();
-        core_metrics()
-            .backup_candidates_reported
-            .add(reported as u64, &[]);
+        for group in &mut groups {
+            group.block_bytes /= group.block_hashes.len() as u64;
+        }
         groups
-            .into_iter()
-            .map(|(mut group, total)| {
-                group.block_bytes = total / group.block_hashes.len() as u64;
-                group
-            })
-            .collect()
     }
 
     fn apply(&self, response: &HeartbeatNodeResponse) {
@@ -196,9 +183,6 @@ impl BackupReporter {
                 response.backup_target
             );
         }
-        core_metrics()
-            .backup_role
-            .record(u64::from(response.backup_target), &[]);
         if response.backed_hashes.is_empty() {
             return;
         }
@@ -208,13 +192,7 @@ impl BackupReporter {
         let demoted: usize = response
             .backed_hashes
             .iter()
-            .map(|group| {
-                cache.mark_reclaimable_hashes(
-                    &group.namespace,
-                    &group.block_hashes,
-                    DemotionReason::BackupHint,
-                )
-            })
+            .map(|group| cache.mark_reclaimable_hashes(&group.namespace, &group.block_hashes))
             .sum();
         state.record_demotions(demoted);
     }
@@ -243,7 +221,7 @@ impl MetaServerClientConfig {
     }
 
     pub fn with_backup_max_candidates(mut self, max: usize) -> Self {
-        self.backup_max_candidates = max.max(1);
+        self.backup_max_candidates = max;
         self
     }
 }
@@ -821,7 +799,6 @@ async fn registration_loop(
                                     cache.mark_reclaimable_hashes(
                                         namespace,
                                         &inner.reclaimable_hashes,
-                                        DemotionReason::ReclaimHint,
                                     );
                                 } else {
                                     cache.mark_reclaimable_hashes_if_generation(
