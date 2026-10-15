@@ -1,3 +1,5 @@
+#[cfg(feature = "rdma")]
+mod backup;
 mod prefetch;
 mod read_cache;
 mod tier_attribution;
@@ -17,14 +19,14 @@ use crate::backing::{RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
-use crate::metrics::core_metrics;
+use crate::metrics::{SERVED_ROLE_BACKUP_TARGET, SERVED_ROLE_SOURCE, core_metrics};
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
-pub(crate) use read_cache::ReadCache;
+pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 
 // Each reclaim iteration emits one MetaServer removal command; a small batch
@@ -69,7 +71,22 @@ pub struct StorageConfig {
     pub metaserver_queue_depth: usize,
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
     pub pool_shards: usize,
+    /// Share of the cache, in percent, that decode backups keep reclaimable.
+    pub backup_reclaimable_percent: u64,
+    /// Most decode backup candidates one heartbeat reports.
+    pub backup_max_candidates: usize,
+    /// Most bytes one decode backup plan copies (backup targets only).
+    pub backup_pull_max_bytes: u64,
+    /// Decode backup copy bandwidth limit in bytes per second, `0` for
+    /// unlimited (backup targets only).
+    pub backup_max_bandwidth: u64,
 }
+
+/// Default decode backup plan size: short enough that one pull holds the
+/// target's NICs for only a few milliseconds.
+pub const DEFAULT_BACKUP_PULL_MAX_BYTES: u64 = 64 << 20;
+/// Default decode backup bandwidth limit, 1 GiB/s.
+pub const DEFAULT_BACKUP_MAX_BANDWIDTH: u64 = 1 << 30;
 
 impl Default for StorageConfig {
     fn default() -> Self {
@@ -87,6 +104,10 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
+            backup_reclaimable_percent: DEFAULT_BACKUP_RECLAIMABLE_PERCENT,
+            backup_max_candidates: crate::internode::DEFAULT_BACKUP_MAX_CANDIDATES,
+            backup_pull_max_bytes: DEFAULT_BACKUP_PULL_MAX_BYTES,
+            backup_max_bandwidth: DEFAULT_BACKUP_MAX_BANDWIDTH,
         }
     }
 }
@@ -154,11 +175,10 @@ impl StorageEngine {
         };
 
         // Sub-components
-        let read_cache = Arc::new(ReadCache::new(
-            capacity_bytes,
-            config.enable_lfu_admission,
-            value_size_hint,
-        ));
+        let read_cache = Arc::new(
+            ReadCache::new(capacity_bytes, config.enable_lfu_admission, value_size_hint)
+                .with_backup_reclaimable_percent(config.backup_reclaimable_percent),
+        );
 
         let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
             let advertise = config
@@ -170,7 +190,8 @@ impl StorageEngine {
                 addr, advertise, config.metaserver_queue_depth
             );
             let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
-                .with_queue_depth(config.metaserver_queue_depth);
+                .with_queue_depth(config.metaserver_queue_depth)
+                .with_backup_max_candidates(config.backup_max_candidates);
             Arc::new(MetaServerClient::new(
                 ms_config,
                 Arc::downgrade(&read_cache),
@@ -213,19 +234,34 @@ impl StorageEngine {
                 .map(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
             #[cfg(feature = "rdma")]
-            let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
+            let rdma_fetch_store = rdma_transport.as_ref().and_then(|rdma| {
                 let ms = metaserver_client.as_ref()?;
                 let advertise = config
                     .advertise_addr
                     .clone()
                     .unwrap_or_else(|| "127.0.0.1:50055".to_string());
-                Some(RdmaFetch::new(Arc::new(RdmaFetchStore::new(
+                Some(Arc::new(RdmaFetchStore::new(
                     Arc::clone(ms),
                     Arc::clone(rdma),
                     allocate_fn.clone(),
                     advertise,
-                ))))
+                )))
             });
+            #[cfg(feature = "rdma")]
+            if let (Some(store), Some(ms)) = (&rdma_fetch_store, &metaserver_client) {
+                // Idle until the MetaServer names this node a backup target.
+                tokio::spawn(backup::backup_loop(
+                    Arc::downgrade(&read_cache),
+                    Arc::clone(store),
+                    Arc::clone(ms),
+                    backup::BackupPull {
+                        max_bytes: config.backup_pull_max_bytes,
+                        bytes_per_sec: config.backup_max_bandwidth,
+                    },
+                ));
+            }
+            #[cfg(feature = "rdma")]
+            let rdma_fetch = rdma_fetch_store.map(RdmaFetch::new);
             #[cfg(not(feature = "rdma"))]
             let rdma_fetch = None;
 
@@ -537,6 +573,15 @@ impl StorageEngine {
         }
 
         if freed_blocks > 0 {
+            // The first pressure eviction opens the backup budget; report now
+            // instead of at the next regular heartbeat. Later reports follow
+            // demotion progress (see `record_backup_demotions`).
+            if let Some(client) = &self.metaserver_client
+                && client.backup_report_idle()
+                && self.read_cache.backup_report_budget() > 0
+            {
+                client.request_backup_report();
+            }
             debug!(
                 "Reclaimed cache blocks toward allocator request: \
                  freed_blocks={} freed_bytes={} largest_free={} required={}",
@@ -612,12 +657,40 @@ impl StorageEngine {
     ///
     /// Source copies are demoted only after the requester reports a completed
     /// transfer; failed, cancelled, and expired sessions keep their class.
+    /// A decode backup target keeps its copies retained: serving them back to
+    /// prefill nodes is its job, and demoting would turn it into an LRU tier.
     pub(crate) fn release_transfer_lock(&self, session_id: &str, transferred: bool) -> usize {
         let keys = self.transfer_lock.release(session_id);
-        if transferred {
-            self.read_cache.mark_reclaimable_keys(&keys);
+        if !transferred || keys.is_empty() {
+            return keys.len();
         }
+        let backup_target = self
+            .metaserver_client
+            .as_ref()
+            .is_some_and(|client| client.is_backup_target());
+        let role = if backup_target {
+            &*SERVED_ROLE_BACKUP_TARGET
+        } else {
+            let demoted = self
+                .read_cache
+                .mark_reclaimable_keys(&keys, DemotionReason::TransferRelease);
+            if let Some(client) = &self.metaserver_client {
+                client.record_backup_demotions(demoted);
+            }
+            &*SERVED_ROLE_SOURCE
+        };
+        core_metrics()
+            .transfer_served_blocks
+            .add(keys.len() as u64, role);
         keys.len()
+    }
+
+    /// Tell the MetaServer whether this node serves an inference instance;
+    /// it decides the decode backup role from this.
+    pub(crate) fn set_has_instance(&self, has_instance: bool) {
+        if let Some(client) = &self.metaserver_client {
+            client.set_has_instance(has_instance);
+        }
     }
 
     /// GC expired transfer lock sessions. Returns the number of sessions expired.

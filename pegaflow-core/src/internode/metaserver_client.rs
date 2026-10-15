@@ -1,22 +1,26 @@
 use std::collections::HashMap;
-use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use log::{debug, error, info, warn};
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
-#[cfg(feature = "rdma")]
-use pegaflow_proto::proto::engine::{FetchSegment, QueryPrefixBlocksRequest};
 use pegaflow_proto::proto::engine::{
-    HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
+    BackupCandidates, HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
+    RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
-use tokio::sync::{mpsc, oneshot};
+#[cfg(feature = "rdma")]
+use pegaflow_proto::proto::engine::{
+    FetchSegment, PullBackupPlanRequest, PullBackupPlanResponse, QueryPrefixBlocksRequest,
+};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
 use crate::metrics::core_metrics;
-use crate::storage::ReadCache;
+use crate::storage::{DemotionReason, ReadCache};
 
 // Shared insert/remove command channel depth. Eviction bursts outrun the single
 // consumer's per-RPC drain, so a shallow queue silently drops removals.
@@ -51,22 +55,160 @@ const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 30_000;
 const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 1;
 const UNREGISTER_TIMEOUT_SECS: u64 = 3;
+/// Minimum gap between a regular heartbeat and an early backup refill report.
+const BACKUP_REFILL_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Default cap on backup candidates per heartbeat; at 32-byte hashes a full
+/// report is about 0.5 MiB.
+pub const DEFAULT_BACKUP_MAX_CANDIDATES: usize = 16_384;
 
 struct HeartbeatState {
     node_registered: bool,
     backoff_ms: u64,
     period: Duration,
     next_at: Instant,
+    last_sent_at: Instant,
 }
 
 impl HeartbeatState {
     fn new() -> Self {
+        let now = Instant::now();
         Self {
             node_registered: false,
             backoff_ms: INITIAL_BACKOFF_MS,
             period: Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS),
-            next_at: Instant::now(),
+            next_at: now,
+            last_sent_at: now,
         }
+    }
+}
+
+/// Decode-backup state learned from heartbeats and read by the storage engine.
+#[derive(Default)]
+struct BackupState {
+    has_instance: AtomicBool,
+    /// The MetaServer runs with decode backup enabled.
+    enabled: AtomicBool,
+    /// The MetaServer currently treats this node as a backup target.
+    target: AtomicBool,
+    /// Candidates carried by the last report.
+    reported: AtomicUsize,
+    /// Blocks demoted for backup since the last report.
+    demoted: AtomicUsize,
+    /// Wakes the heartbeat loop to report candidates before the next period.
+    refill: Notify,
+}
+
+impl BackupState {
+    /// This node reports candidates: backup is on and it is a source.
+    fn is_source(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+            && self.has_instance.load(Ordering::Relaxed)
+            && !self.target.load(Ordering::Relaxed)
+    }
+
+    /// Start counting progress against a report of `reported` candidates.
+    fn start_report(&self, reported: usize) {
+        self.reported.store(reported, Ordering::Relaxed);
+        self.demoted.store(0, Ordering::Relaxed);
+    }
+
+    /// Count blocks demoted after being backed up. Once half of the last
+    /// report has been taken care of, ask for a fresh one: the window has
+    /// moved on, and resending it earlier would mostly repeat stale blocks.
+    fn record_demotions(&self, blocks: usize) {
+        if blocks == 0 {
+            return;
+        }
+        let reported = self.reported.load(Ordering::Relaxed);
+        let demoted = self.demoted.fetch_add(blocks, Ordering::Relaxed) + blocks;
+        if reported > 0 && demoted.saturating_mul(2) >= reported && self.is_source() {
+            self.refill.notify_one();
+        }
+    }
+}
+
+/// What the heartbeat loop needs to report and apply backup state.
+struct BackupReporter {
+    read_cache: Weak<ReadCache>,
+    state: Arc<BackupState>,
+    /// Most candidates one heartbeat carries.
+    max_candidates: usize,
+}
+
+impl BackupReporter {
+    /// Retained LRU-tail candidates grouped by namespace, oldest first.
+    fn candidates(&self) -> Vec<BackupCandidates> {
+        if !self.state.is_source() {
+            return Vec::new();
+        }
+        let Some(cache) = self.read_cache.upgrade() else {
+            return Vec::new();
+        };
+        let budget = cache.backup_report_budget();
+        if budget == 0 {
+            return Vec::new();
+        }
+        // A node serves few namespaces; a linear scan beats hashing each key.
+        // `block_bytes` sums footprints here and becomes their mean below.
+        let mut groups: Vec<BackupCandidates> = Vec::new();
+        for (key, bytes) in cache.backup_candidates(budget, self.max_candidates) {
+            let group = match groups.iter().position(|g| g.namespace == key.namespace) {
+                Some(slot) => &mut groups[slot],
+                None => {
+                    groups.push(BackupCandidates {
+                        namespace: key.namespace,
+                        ..Default::default()
+                    });
+                    groups.last_mut().expect("just pushed")
+                }
+            };
+            group.block_hashes.push(key.hash);
+            group.block_bytes += bytes;
+        }
+        let mut reported = 0;
+        for group in &mut groups {
+            reported += group.block_hashes.len();
+            group.block_bytes /= group.block_hashes.len() as u64;
+        }
+        core_metrics()
+            .backup_candidates_reported
+            .add(reported as u64, &[]);
+        groups
+    }
+
+    fn apply(&self, response: &HeartbeatNodeResponse) {
+        let state = &self.state;
+        state
+            .enabled
+            .store(response.backup_enabled, Ordering::Relaxed);
+        let was_target = state.target.swap(response.backup_target, Ordering::Relaxed);
+        if was_target != response.backup_target {
+            info!(
+                "Decode backup role changed: backup_target={}",
+                response.backup_target
+            );
+        }
+        core_metrics()
+            .backup_role
+            .record(u64::from(response.backup_target), &[]);
+        if response.backed_hashes.is_empty() {
+            return;
+        }
+        let Some(cache) = self.read_cache.upgrade() else {
+            return;
+        };
+        let demoted: usize = response
+            .backed_hashes
+            .iter()
+            .map(|group| {
+                cache.mark_reclaimable_hashes(
+                    &group.namespace,
+                    &group.block_hashes,
+                    DemotionReason::BackupHint,
+                )
+            })
+            .sum();
+        state.record_demotions(demoted);
     }
 }
 
@@ -74,6 +216,7 @@ pub struct MetaServerClientConfig {
     pub metaserver_addr: String,
     pub advertise_addr: String,
     pub queue_depth: usize,
+    pub backup_max_candidates: usize,
 }
 
 impl MetaServerClientConfig {
@@ -82,11 +225,17 @@ impl MetaServerClientConfig {
             metaserver_addr,
             advertise_addr,
             queue_depth: DEFAULT_METASERVER_QUEUE_DEPTH,
+            backup_max_candidates: DEFAULT_BACKUP_MAX_CANDIDATES,
         }
     }
 
     pub fn with_queue_depth(mut self, depth: usize) -> Self {
         self.queue_depth = depth;
+        self
+    }
+
+    pub fn with_backup_max_candidates(mut self, max: usize) -> Self {
+        self.backup_max_candidates = max;
         self
     }
 }
@@ -154,6 +303,12 @@ pub struct MetaServerClient {
     /// Lazy-connect query client
     #[cfg(feature = "rdma")]
     query_client: MetaServerGrpcClient<Channel>,
+    #[cfg(feature = "rdma")]
+    advertise_addr: String,
+    /// Session id announced by heartbeats; fixed for this client's lifetime.
+    #[cfg(feature = "rdma")]
+    node_id: String,
+    backup: Arc<BackupState>,
 }
 
 impl MetaServerClient {
@@ -163,13 +318,20 @@ impl MetaServerClient {
     pub(crate) fn new(config: MetaServerClientConfig, read_cache: Weak<ReadCache>) -> Self {
         let endpoint = metaserver_endpoint(config.metaserver_addr.clone());
         let (command_tx, rx) = mpsc::channel(config.queue_depth);
+        let node_id = Uuid::new_v4().to_string();
+        let backup = Arc::new(BackupState::default());
 
         tokio::spawn(registration_loop(
             rx,
             config.metaserver_addr.clone(),
             endpoint.clone(),
-            config.advertise_addr,
-            read_cache,
+            config.advertise_addr.clone(),
+            node_id.clone(),
+            BackupReporter {
+                read_cache,
+                state: Arc::clone(&backup),
+                max_candidates: config.backup_max_candidates,
+            },
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
@@ -184,11 +346,68 @@ impl MetaServerClient {
             config.queue_depth, config.metaserver_addr
         );
 
+        #[cfg(not(feature = "rdma"))]
+        let _ = node_id;
+
         Self {
             command_tx,
             #[cfg(feature = "rdma")]
             query_client,
+            #[cfg(feature = "rdma")]
+            advertise_addr: config.advertise_addr,
+            #[cfg(feature = "rdma")]
+            node_id,
+            backup,
         }
+    }
+
+    /// Record whether an inference instance is registered on this node.
+    pub(crate) fn set_has_instance(&self, has_instance: bool) {
+        self.backup
+            .has_instance
+            .store(has_instance, Ordering::Relaxed);
+    }
+
+    /// True while the MetaServer treats this node as a decode backup target.
+    pub(crate) fn is_backup_target(&self) -> bool {
+        self.backup.target.load(Ordering::Relaxed)
+    }
+
+    /// Count source blocks demoted after a peer copied them.
+    pub(crate) fn record_backup_demotions(&self, blocks: usize) {
+        self.backup.record_demotions(blocks);
+    }
+
+    /// True when the last report carried no candidates although this node
+    /// is a backup source, so a budget that opens up now waits for the
+    /// next regular heartbeat unless [`Self::request_backup_report`] runs.
+    pub(crate) fn backup_report_idle(&self) -> bool {
+        self.backup.reported.load(Ordering::Relaxed) == 0 && self.backup.is_source()
+    }
+
+    /// Ask for an early heartbeat carrying backup candidates. The heartbeat
+    /// loop keeps it at least one second after the previous heartbeat.
+    pub(crate) fn request_backup_report(&self) {
+        self.backup.refill.notify_one();
+    }
+
+    /// Ask the MetaServer for the next batch of blocks to back up.
+    #[cfg(feature = "rdma")]
+    pub(crate) async fn pull_backup_plan(
+        &self,
+        max_bytes: u64,
+    ) -> Result<PullBackupPlanResponse, ClientError> {
+        let request = PullBackupPlanRequest {
+            node: self.advertise_addr.clone(),
+            node_id: self.node_id.clone(),
+            max_bytes,
+        };
+        self.query_client
+            .clone()
+            .pull_backup_plan(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| ClientError::RpcFailed(format!("MetaServer pull_backup_plan failed: {e}")))
     }
 
     /// Fire-and-forget registration of block hashes.
@@ -395,11 +614,13 @@ async fn registration_loop(
     metaserver_addr: String,
     endpoint: Endpoint,
     advertise_addr: String,
-    read_cache: Weak<ReadCache>,
+    node_id: String,
+    backup: BackupReporter,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
-    let node_id = Uuid::new_v4().to_string();
     let mut heartbeat = HeartbeatState::new();
+    let read_cache = backup.read_cache.clone();
+    let refill_state = Arc::clone(&backup.state);
 
     loop {
         let heartbeat_sleep = tokio::time::sleep_until(heartbeat.next_at);
@@ -409,6 +630,16 @@ async fn registration_loop(
                 Some(cmd) => cmd,
                 None => break,
             },
+            _ = refill_state.refill.notified() => {
+                // Pull the next heartbeat forward, never closer than 1s to the
+                // previous one; a backoff after a failure is left alone.
+                if heartbeat.node_registered && heartbeat.backoff_ms == INITIAL_BACKOFF_MS {
+                    let earliest = (heartbeat.last_sent_at + BACKUP_REFILL_MIN_INTERVAL)
+                        .max(Instant::now());
+                    heartbeat.next_at = heartbeat.next_at.min(earliest);
+                }
+                continue;
+            }
             _ = &mut heartbeat_sleep => {
                 match send_heartbeat(
                     &mut client,
@@ -417,6 +648,7 @@ async fn registration_loop(
                     &endpoint,
                     &advertise_addr,
                     &node_id,
+                    &backup,
                 ).await {
                     Ok(next_period) => {
                         heartbeat.period = next_period;
@@ -530,6 +762,7 @@ async fn registration_loop(
             &advertise_addr,
             &node_id,
             &mut heartbeat,
+            &backup,
         )
         .await
         .is_err()
@@ -580,6 +813,7 @@ async fn registration_loop(
                                     cache.mark_reclaimable_hashes(
                                         namespace,
                                         &inner.reclaimable_hashes,
+                                        DemotionReason::ReclaimHint,
                                     );
                                 } else {
                                     cache.mark_reclaimable_hashes_if_generation(
@@ -727,6 +961,7 @@ async fn ensure_heartbeat_registered(
     advertise_addr: &str,
     node_id: &str,
     heartbeat: &mut HeartbeatState,
+    backup: &BackupReporter,
 ) -> Result<(), ()> {
     if heartbeat.node_registered && client.is_some() {
         return Ok(());
@@ -743,6 +978,7 @@ async fn ensure_heartbeat_registered(
         endpoint,
         advertise_addr,
         node_id,
+        backup,
     )
     .await
     {
@@ -765,6 +1001,7 @@ async fn send_heartbeat(
     endpoint: &Endpoint,
     advertise_addr: &str,
     node_id: &str,
+    backup: &BackupReporter,
 ) -> Result<Duration, Duration> {
     if client.is_none() {
         match connect_metaserver_client(endpoint).await {
@@ -782,16 +1019,28 @@ async fn send_heartbeat(
     }
 
     let c = client.as_mut().expect("client is connected");
+    heartbeat.last_sent_at = Instant::now();
+    let backup_candidates = backup.candidates();
+    // Demotions from here on count as progress on this report.
+    backup.state.start_report(
+        backup_candidates
+            .iter()
+            .map(|group| group.block_hashes.len())
+            .sum(),
+    );
     match c
         .heartbeat_node(HeartbeatNodeRequest {
             node: advertise_addr.to_string(),
             node_id: node_id.to_string(),
+            has_instance: backup.state.has_instance.load(Ordering::Relaxed),
+            backup_candidates,
         })
         .await
     {
         Ok(resp) => {
-            let heartbeat_period =
-                heartbeat_period_from_stale_after(resp.into_inner().stale_after_secs);
+            let resp = resp.into_inner();
+            backup.apply(&resp);
+            let heartbeat_period = heartbeat_period_from_stale_after(resp.stale_after_secs);
             if !heartbeat.node_registered {
                 info!(
                     "MetaServer heartbeat established: node={advertise_addr} node_id={node_id} next_in={:?}",
@@ -890,9 +1139,9 @@ mod tests {
     use crate::block::{BlockKey, SealedBlock};
     use pegaflow_proto::proto::engine::meta_server_server::{MetaServer, MetaServerServer};
     use pegaflow_proto::proto::engine::{
-        HeartbeatNodeResponse, InsertBlockHashesResponse, QueryPrefixBlocksRequest,
-        QueryPrefixBlocksResponse, RemoveBlockHashesResponse, ResponseStatus,
-        UnregisterNodeResponse,
+        HeartbeatNodeResponse, InsertBlockHashesResponse, PullBackupPlanRequest,
+        PullBackupPlanResponse, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse,
+        RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeResponse,
     };
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
@@ -942,6 +1191,7 @@ mod tests {
             self.state.heartbeat_notify.notify_waiters();
             Ok(Response::new(HeartbeatNodeResponse {
                 stale_after_secs: 2,
+                ..Default::default()
             }))
         }
 
@@ -1033,6 +1283,13 @@ mod tests {
             Ok(Response::new(QueryPrefixBlocksResponse {
                 segments: vec![],
             }))
+        }
+
+        async fn pull_backup_plan(
+            &self,
+            _request: Request<PullBackupPlanRequest>,
+        ) -> Result<Response<PullBackupPlanResponse>, Status> {
+            Ok(Response::new(PullBackupPlanResponse::default()))
         }
     }
 
@@ -1317,6 +1574,46 @@ mod tests {
         let _ = shutdown_tx.send(());
     }
 
+    #[tokio::test]
+    async fn backup_refill_follows_demotion_progress() {
+        async fn refilled(state: &BackupState) -> bool {
+            tokio::time::timeout(Duration::from_millis(10), state.refill.notified())
+                .await
+                .is_ok()
+        }
+        let source = || {
+            let state = BackupState::default();
+            state.enabled.store(true, Ordering::Relaxed);
+            state.has_instance.store(true, Ordering::Relaxed);
+            state
+        };
+
+        // Half of the last report demoted, in any number of steps.
+        let state = source();
+        state.start_report(100);
+        state.record_demotions(30);
+        assert!(!refilled(&state).await, "30/100 is not enough progress");
+        state.record_demotions(20);
+        assert!(refilled(&state).await, "50/100 asks for a fresh report");
+
+        // A new report restarts the count.
+        state.start_report(100);
+        state.record_demotions(49);
+        assert!(!refilled(&state).await, "count restarts with each report");
+
+        // Nothing reported: demotions (e.g. prefix recalls) never refill.
+        state.start_report(0);
+        state.record_demotions(1_000);
+        assert!(!refilled(&state).await, "empty report has no progress");
+
+        // A target never reports.
+        let state = source();
+        state.target.store(true, Ordering::Relaxed);
+        state.start_report(10);
+        state.record_demotions(10);
+        assert!(!refilled(&state).await, "targets do not refill");
+    }
+
     #[test]
     fn unsent_after_failure_counts_only_unsent_tail() {
         let ns = |name: &str, n: usize| (name.to_string(), vec![vec![0u8]; n]);
@@ -1444,7 +1741,12 @@ mod tests {
             addr,
             endpoint,
             "node-a:50055".to_string(),
-            Weak::new(),
+            Uuid::new_v4().to_string(),
+            BackupReporter {
+                read_cache: Weak::new(),
+                state: Arc::default(),
+                max_candidates: DEFAULT_BACKUP_MAX_CANDIDATES,
+            },
         ));
 
         wait_for_count(&service.insert_notify, &service.insert_count, 2).await;

@@ -80,11 +80,30 @@ struct OwnerRecord {
 }
 
 /// Authoritative current session for a node URL. `last_seen` is bumped on
-/// heartbeat/insert/remove and gates query visibility.
+/// heartbeat/insert/remove and gates query visibility. `idle_since` is when
+/// the node last reported no inference instance (`None` while it has one).
 #[derive(Debug, Clone)]
 struct NodeRecord {
     node_id: Uuid,
     last_seen: Instant,
+    idle_since: Option<Instant>,
+}
+
+/// Live nodes split by decode-backup role.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NodeRoles {
+    /// Nodes with an inference instance: their blocks may be backed up.
+    pub sources: Vec<Arc<str>>,
+    /// Nodes idle for at least the role delay: they pull backups.
+    pub targets: Vec<Arc<str>>,
+}
+
+impl NodeRoles {
+    pub fn is_target(&self, node: &str) -> bool {
+        self.targets
+            .binary_search_by(|target| target.as_ref().cmp(node))
+            .is_ok()
+    }
 }
 
 #[derive(Default)]
@@ -183,6 +202,7 @@ impl BlockHashStore {
                 entry.insert(NodeRecord {
                     node_id,
                     last_seen: now,
+                    idle_since: Some(now),
                 });
                 Ok(())
             }
@@ -199,6 +219,10 @@ impl BlockHashStore {
                             node, record.node_id, node_id
                         );
                     }
+                    if !same_session {
+                        // A new process starts without instances.
+                        record.idle_since = Some(now);
+                    }
                     record.node_id = node_id;
                     record.last_seen = now;
                     return Ok(());
@@ -208,6 +232,57 @@ impl BlockHashStore {
                     node, record.node_id, node_id
                 );
                 Err(StoreError::StaleSession)
+            }
+        }
+    }
+
+    /// Record whether the node's current session has an inference instance.
+    pub fn set_node_has_instance(&self, node: &str, node_id: Uuid, has_instance: bool) {
+        let Some(mut record) = self.nodes.get_mut(node) else {
+            return;
+        };
+        if record.node_id != node_id {
+            return;
+        }
+        if has_instance {
+            record.idle_since = None;
+        } else if record.idle_since.is_none() {
+            record.idle_since = Some(Instant::now());
+        }
+    }
+
+    /// Split live nodes into backup sources and targets. A node becomes a
+    /// target only after reporting no instance for `target_delay`; nodes
+    /// still inside the delay belong to neither side.
+    pub fn node_roles(&self, target_delay: Duration) -> NodeRoles {
+        let now = Instant::now();
+        let mut roles = NodeRoles::default();
+        for node in &self.nodes {
+            if now.duration_since(node.last_seen) > self.config.node_stale_after {
+                continue;
+            }
+            match node.idle_since {
+                None => roles.sources.push(Arc::clone(node.key())),
+                Some(since) if now.duration_since(since) >= target_delay => {
+                    roles.targets.push(Arc::clone(node.key()));
+                }
+                Some(_) => {}
+            }
+        }
+        roles.sources.sort();
+        roles.targets.sort();
+        roles
+    }
+
+    /// Call `f` with each live owner of `key`.
+    pub fn for_each_visible_owner(&self, key: &BlockKey, mut f: impl FnMut(&str)) {
+        let Some(owners) = self.blocks.get(key) else {
+            return;
+        };
+        let now = Instant::now();
+        for (node, owner) in owners.iter() {
+            if self.is_owner_visible(node, owner, now) {
+                f(node);
             }
         }
     }
@@ -426,7 +501,8 @@ impl BlockHashStore {
         self.retain_owners(|_, _| false);
     }
 
-    fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
+    /// Validate and refresh the node's current session.
+    pub fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
         let Some(mut record) = self.nodes.get_mut(node) else {
             warn!(
                 "MetaServer metadata write rejected unknown node: node={} node_id={}",
