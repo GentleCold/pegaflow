@@ -782,6 +782,27 @@ mod tests {
     }
 
     #[test]
+    fn cli_backup_pacing_flags() {
+        // The CLI defaults are strings; keep them in step with the core defaults.
+        let cli = Cli::try_parse_from(["pegaflow-server"]).unwrap();
+        assert_eq!(
+            cli.backup_pull_max_bytes as u64,
+            pegaflow_core::DEFAULT_BACKUP_PULL_MAX_BYTES
+        );
+        assert_eq!(
+            cli.backup_max_bandwidth as u64,
+            pegaflow_core::DEFAULT_BACKUP_MAX_BANDWIDTH
+        );
+
+        let cli = Cli::try_parse_from(["pegaflow-server", "--backup-max-bandwidth", "0"]).unwrap();
+        assert_eq!(cli.backup_max_bandwidth, 0, "0 is unlimited");
+        assert!(
+            Cli::try_parse_from(["pegaflow-server", "--backup-pull-max-bytes", "0"]).is_err(),
+            "an empty plan budget is rejected"
+        );
+    }
+
+    #[test]
     fn cli_nics_accepts_comma_separated_values() {
         let cli =
             Cli::try_parse_from(["pegaflow-server", "--nics", "mlx5_0,mlx5_1,mlx5_2"]).unwrap();
