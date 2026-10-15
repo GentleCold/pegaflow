@@ -39,7 +39,8 @@ pub use block::{
 use instance::GpuRegistration;
 pub use instance::{GpuContext, InstanceContext};
 pub use internode::{
-    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig, P2pTransferService,
+    DEFAULT_BACKUP_MAX_CANDIDATES, DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient,
+    MetaServerClientConfig, P2pTransferService,
 };
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
@@ -47,7 +48,10 @@ pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
+pub use storage::{
+    DEFAULT_BACKUP_MAX_BANDWIDTH, DEFAULT_BACKUP_PULL_MAX_BYTES, DEFAULT_RDMA_QPS_PER_PEER,
+    MemoryCacheCleanupStats, StorageConfig,
+};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 pub use transfer::TransferMode;
@@ -214,6 +218,7 @@ impl PegaEngine {
 
         let instance = Arc::new(instance);
         instances.insert(instance_id.to_string(), Arc::clone(&instance));
+        self.storage.set_has_instance(true);
         Ok(instance)
     }
 
@@ -441,11 +446,15 @@ impl PegaEngine {
 
     /// Unregister an instance and release all associated resources.
     pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
-        let removed = self
+        let mut instances = self
             .instances
             .write()
-            .expect("instances write lock poisoned")
-            .remove(instance_id);
+            .expect("instances write lock poisoned");
+        let removed = instances.remove(instance_id);
+        if instances.is_empty() {
+            self.storage.set_has_instance(false);
+        }
+        drop(instances);
 
         if removed.is_none() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
@@ -463,6 +472,8 @@ impl PegaEngine {
             .expect("instances write lock poisoned");
         let ids: Vec<String> = instances.keys().cloned().collect();
         instances.clear();
+        // Under the lock, so a concurrent registration cannot be overwritten.
+        self.storage.set_has_instance(false);
         drop(instances);
         for id in &ids {
             self.query_leases.release_instance(id);
@@ -956,13 +967,14 @@ impl PegaEngine {
         namespace: &str,
         block_hashes: &[Vec<u8>],
         requester_id: &str,
+        prefix_only: bool,
     ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
             .collect();
 
-        let found = self.storage.get_blocks_for_transfer(&keys);
+        let found = self.storage.get_blocks_for_transfer(&keys, prefix_only);
         let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
 
         debug!(
@@ -979,8 +991,9 @@ impl PegaEngine {
     }
 
     /// Release a transfer lock session. Returns the number of blocks released.
-    pub fn release_transfer_lock(&self, session_id: &str) -> usize {
-        self.storage.release_transfer_lock(session_id)
+    /// `transferred` demotes the released source copies to reclaimable.
+    pub fn release_transfer_lock(&self, session_id: &str, transferred: bool) -> usize {
+        self.storage.release_transfer_lock(session_id, transferred)
     }
 
     /// GC expired transfer lock sessions.

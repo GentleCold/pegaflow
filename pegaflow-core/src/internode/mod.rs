@@ -4,6 +4,7 @@ pub(crate) mod metaserver_client;
 pub(crate) mod p2p_service;
 
 pub use metaserver_client::{
-    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig,
+    DEFAULT_BACKUP_MAX_CANDIDATES, DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient,
+    MetaServerClientConfig,
 };
 pub use p2p_service::P2pTransferService;

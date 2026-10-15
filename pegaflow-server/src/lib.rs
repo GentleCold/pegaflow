@@ -185,6 +185,48 @@ pub struct Cli {
     /// locked for at most this duration before being force-released (crash recovery).
     #[arg(long, default_value_t = 120)]
     pub transfer_lock_timeout_secs: u64,
+
+    /// Decode backup: share of the RAM cache, in percent, kept as reclaimable
+    /// (backed-up) blocks. Once the cache is full, this node offers its oldest
+    /// retained blocks for backup until the reclaimable class reaches it.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=100))]
+    pub backup_reclaimable_percent: u64,
+
+    /// Decode backup: most candidate blocks one heartbeat reports. Bounds the
+    /// heartbeat size (32 bytes per sha256 hash; the 65536 maximum is 2 MiB,
+    /// under the MetaServer's 4 MiB gRPC limit) and the MetaServer snapshot
+    /// kept per prefill node.
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_BACKUP_MAX_CANDIDATES,
+          value_parser = parse_backup_max_candidates)]
+    pub backup_max_candidates: usize,
+
+    /// Decode backup: most bytes one pulled plan copies on a backup target
+    /// (e.g. 64mb). Smaller plans hold the NICs for shorter bursts, leaving
+    /// room for KV transfers between them.
+    #[arg(long, default_value = "64mb", value_parser = parse_backup_pull_max_bytes)]
+    pub backup_pull_max_bytes: usize,
+
+    /// Decode backup: copy bandwidth limit per second on a backup target
+    /// (e.g. 1gb); `0` is unlimited. Backup traffic shares the target's NICs
+    /// with KV transfers, so unlimited pulls add latency to them.
+    #[arg(long, default_value = "1gb", value_parser = parse_memory_size)]
+    pub backup_max_bandwidth: usize,
+}
+
+fn parse_backup_pull_max_bytes(s: &str) -> Result<usize, String> {
+    let v = parse_memory_size(s)?;
+    if v == 0 {
+        return Err("must be greater than 0".to_string());
+    }
+    Ok(v)
+}
+
+fn parse_backup_max_candidates(s: &str) -> Result<usize, String> {
+    let v: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if !(1..=65_536).contains(&v) {
+        return Err(format!("must be in 1..=65536, got {v}"));
+    }
+    Ok(v)
 }
 
 fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
@@ -553,6 +595,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
+        backup_reclaimable_percent: cli.backup_reclaimable_percent,
+        backup_max_candidates: cli.backup_max_candidates,
+        backup_pull_max_bytes: cli.backup_pull_max_bytes as u64,
+        backup_max_bandwidth: cli.backup_max_bandwidth as u64,
     };
 
     if cli.pool_shards > 1 {
@@ -733,6 +779,27 @@ mod tests {
             expected_hll_windows()
         );
         assert_eq!(cli.metric_hll_bucket_bits, 16);
+    }
+
+    #[test]
+    fn cli_backup_pacing_flags() {
+        // The CLI defaults are strings; keep them in step with the core defaults.
+        let cli = Cli::try_parse_from(["pegaflow-server"]).unwrap();
+        assert_eq!(
+            cli.backup_pull_max_bytes as u64,
+            pegaflow_core::DEFAULT_BACKUP_PULL_MAX_BYTES
+        );
+        assert_eq!(
+            cli.backup_max_bandwidth as u64,
+            pegaflow_core::DEFAULT_BACKUP_MAX_BANDWIDTH
+        );
+
+        let cli = Cli::try_parse_from(["pegaflow-server", "--backup-max-bandwidth", "0"]).unwrap();
+        assert_eq!(cli.backup_max_bandwidth, 0, "0 is unlimited");
+        assert!(
+            Cli::try_parse_from(["pegaflow-server", "--backup-pull-max-bytes", "0"]).is_err(),
+            "an empty plan budget is rejected"
+        );
     }
 
     #[test]

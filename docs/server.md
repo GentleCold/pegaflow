@@ -49,6 +49,10 @@ pegaflow-server
 - `--metaserver-addr`: MetaServer gRPC address for cross-node block hash registry (e.g., `http://10.0.0.100:50056`). When set, saved block hashes are inserted to the metaserver for cross-node discovery. Requires `--addr` to be a routable IP (not `0.0.0.0` or `127.0.0.1`).
 - `--transfer-lock-timeout-secs`: Transfer lock timeout in seconds (default: `120`). Blocks held for cross-node RDMA transfer are locked for at most this duration before being force-released (crash recovery).
 - `--metaserver-queue-depth`: MetaServer registration queue depth, max pending registration batches
+- `--backup-reclaimable-percent`: Decode backup: share of the RAM cache, in percent, kept as reclaimable (backed-up) blocks (default: `10`, range `0..=100`). Once the cache is full, this node offers its oldest retained blocks for backup until the reclaimable class reaches this share. Only used when the MetaServer runs with `--enable-decode-backup`.
+- `--backup-max-candidates`: Decode backup: most candidate blocks one heartbeat reports (default: `16384`, range `1..=65536`). Bounds the heartbeat size (32 bytes per sha256 hash) and the MetaServer's per-node snapshot; the next report follows as soon as targets copy half of the current one.
+- `--backup-pull-max-bytes`: Decode backup: most bytes one pulled plan copies on a backup target (default: `64mb`, must be > 0; a plan always carries at least one block). Smaller plans hold the NICs for shorter bursts.
+- `--backup-max-bandwidth`: Decode backup: copy bandwidth limit per second on a backup target (default: `1gb`, `0` = unlimited). Backup copies share the target's NICs with KV transfers; the next pull starts `copied bytes / bandwidth` after the previous one started, and idle time does not bank a burst.
 
 ## MetaServer
 
@@ -67,5 +71,10 @@ pegaflow-server --metaserver-addr http://<metaserver-host>:50056
 ### Options
 
 - `--addr`: Bind address (default: `127.0.0.1:50056`)
+- `--http-addr`: HTTP address for health, Prometheus metrics, and manual cleanup (default: `0.0.0.0:9092`)
 - `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
-- `--ttl-minutes`: Cache entry TTL in minutes (default: `120`)
+- `--node-stale-secs`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
+- `--ttl-minutes`: Delete nodes and their owners after this many minutes without node activity (default: `120`); does not expire blocks by registration age
+- `--sweep-interval-secs`: Run the lifecycle sweep at this interval (default: `600`)
+- `--min-reclaimable-owner-count`: Return a reclaim hint once this many live owners hold a block (default: `3`, minimum: `2`). `2` reclaims more aggressively than the default; values below `2` are rejected. Overridable with `PEGAFLOW_METASERVER_MIN_RECLAIMABLE_OWNER_COUNT`, and the CLI flag takes precedence.
+- `--enable-decode-backup`: Let nodes without an inference instance (for example decode nodes that use only NIXL) back up prefill nodes' retained LRU-tail blocks and serve them back over P2P (default: off; env `PEGAFLOW_METASERVER_ENABLE_DECODE_BACKUP`). pegaflow-server needs only `--nics` and `--metaserver-addr` (optionally `--backup-reclaimable-percent`, `--backup-max-candidates`). Tuning: `--backup-target-delay-secs` (default `180`). See `pegaflow-metaserver/README.md`.

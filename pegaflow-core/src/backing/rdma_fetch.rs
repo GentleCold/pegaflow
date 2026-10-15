@@ -46,6 +46,31 @@ const LOCK_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
 /// still fixed-size per model and keeps the allocation count bounded.
 const PER_SLOT_ALLOC_MIN_BYTES: u64 = 256 * 1024;
 
+/// Why a node pulls blocks from a peer; selects holder semantics and labels.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FetchPurpose {
+    /// Serve a request's missing prefix; the holder stops at the first gap.
+    Prefix,
+    /// Copy a decode-backup plan; the holder returns every block it still has.
+    Backup,
+}
+
+impl FetchPurpose {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prefix => "prefix",
+            Self::Backup => "backup",
+        }
+    }
+
+    fn attributes(self, status: &'static str) -> [KeyValue; 2] {
+        [
+            KeyValue::new("status", status),
+            KeyValue::new("purpose", self.label()),
+        ]
+    }
+}
+
 /// RDMA remote block fetch backing store.
 ///
 /// When all requested blocks are missing locally, queries MetaServer for their
@@ -161,7 +186,13 @@ struct RdmaSegmentFetcher<'a> {
 impl SegmentFetcher for RdmaSegmentFetcher<'_> {
     async fn fetch_segment(&self, remote_addr: &str, hashes: &[Vec<u8>]) -> PrefetchResult {
         self.store
-            .fetch_blocks(remote_addr, self.req_id, self.namespace, hashes)
+            .fetch_blocks(
+                remote_addr,
+                self.req_id,
+                self.namespace,
+                hashes,
+                FetchPurpose::Prefix,
+            )
             .await
     }
 }
@@ -169,7 +200,6 @@ impl SegmentFetcher for RdmaSegmentFetcher<'_> {
 async fn execute_fetch_plan<F: SegmentFetcher>(
     fetcher: &F,
     plan: &FetchPlan,
-    namespace: &str,
     hashes: &[Vec<u8>],
 ) -> (PrefetchResult, usize, Option<(usize, usize, usize)>) {
     let mut fetched = Vec::with_capacity(plan.block_count);
@@ -178,17 +208,14 @@ async fn execute_fetch_plan<F: SegmentFetcher>(
 
     for (index, segment) in plan.segments.iter().enumerate() {
         let expected = &hashes[segment.start..segment.end];
+        // The holder answers with `prefix_only`, so `returned` is a prefix of
+        // `expected`; a short segment ends the contiguous remote prefix.
         let returned = fetcher.fetch_segment(&segment.node, expected).await;
-        let contiguous = returned
-            .iter()
-            .zip(expected)
-            .take_while(|((key, _), hash)| key.namespace == namespace && key.hash == **hash)
-            .count();
         let returned_count = returned.len();
-        fetched.extend(returned.into_iter().take(contiguous));
+        fetched.extend(returned);
 
-        if contiguous != expected.len() || returned_count != expected.len() {
-            failed_segment = Some((index, expected.len(), contiguous));
+        if returned_count != expected.len() {
+            failed_segment = Some((index, expected.len(), returned_count));
             break;
         }
         completed_segments += 1;
@@ -269,7 +296,7 @@ impl RdmaFetchStore {
             namespace,
         };
         let (fetched, completed_segments, failure) =
-            execute_fetch_plan(&fetcher, plan, namespace, hashes).await;
+            execute_fetch_plan(&fetcher, plan, hashes).await;
         let metrics = core_metrics();
         metrics
             .rdma_fetch_plan_segments
@@ -307,6 +334,7 @@ impl RdmaFetchStore {
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
+        purpose: FetchPurpose,
     ) -> PrefetchResult {
         rdma_fetch_task(
             &self.rdma_transport,
@@ -318,6 +346,7 @@ impl RdmaFetchStore {
             &self.advertise_addr,
             namespace,
             hashes,
+            purpose,
         )
         .await
     }
@@ -343,8 +372,10 @@ async fn rdma_fetch_task(
     advertise_addr: &str,
     namespace: &str,
     block_hashes: &[Vec<u8>],
+    purpose: FetchPurpose,
 ) -> PrefetchResult {
     let t0 = Instant::now();
+    let error_attributes = purpose.attributes("error");
 
     // 1. Ensure RDMA connection (singleflight: at most one handshake per remote_addr)
     let connect_start = Instant::now();
@@ -358,9 +389,7 @@ async fn rdma_fetch_task(
     .await
     {
         warn!("RDMA connect to {remote_addr} failed: {e}");
-        core_metrics()
-            .rdma_fetch_total
-            .add(1, &[KeyValue::new("status", "error")]);
+        core_metrics().rdma_fetch_total.add(1, &error_attributes);
         return Vec::new();
     }
     let connect_elapsed = connect_start.elapsed();
@@ -373,15 +402,14 @@ async fn rdma_fetch_task(
         namespace,
         block_hashes,
         advertise_addr,
+        purpose == FetchPurpose::Prefix,
     )
     .await
     {
         Ok(cr) => cr,
         Err(e) => {
             warn!("Remote query to {remote_addr} failed: {e}");
-            core_metrics()
-                .rdma_fetch_total
-                .add(1, &[KeyValue::new("status", "error")]);
+            core_metrics().rdma_fetch_total.add(1, &error_attributes);
             return Vec::new();
         }
     };
@@ -420,16 +448,15 @@ async fn rdma_fetch_task(
         Err(e) => {
             warn!("RDMA transfer from {remote_addr} failed: {e}");
             rdma.engine().invalidate_connection(remote_addr);
-            lock_guard.release();
-            core_metrics()
-                .rdma_fetch_total
-                .add(1, &[KeyValue::new("status", "error")]);
+            lock_guard.release(false);
+            core_metrics().rdma_fetch_total.add(1, &error_attributes);
             return Vec::new();
         }
     };
 
-    // 4. Release transfer lock (fire-and-forget: spawns a detached task)
-    lock_guard.release();
+    // 4. Release transfer lock (fire-and-forget: spawns a detached task) and
+    // let the holder demote its now-replicated source copies.
+    lock_guard.release(true);
 
     let elapsed = t0.elapsed();
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
@@ -440,7 +467,8 @@ async fn rdma_fetch_task(
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} allocs={} alloc_batches={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} purpose={} blocks={}/{} slots={} descs={} allocs={} alloc_batches={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        purpose.label(),
         result.len(),
         block_hashes.len(),
         transfer_timing.slot_count,
@@ -458,7 +486,7 @@ async fn rdma_fetch_task(
         transfer_timing.rebuild.as_secs_f64() * 1000.0,
     );
     let m = core_metrics();
-    let ok = &[KeyValue::new("status", "ok")];
+    let ok = &purpose.attributes("ok");
     m.rdma_fetch_total.add(1, ok);
     m.rdma_fetch_duration_seconds
         .record(elapsed.as_secs_f64(), ok);
@@ -832,6 +860,7 @@ async fn query_remote_blocks(
     namespace: &str,
     block_hashes: &[Vec<u8>],
     advertise_addr: &str,
+    prefix_only: bool,
 ) -> Result<(EngineClient<Channel>, QueryBlocksForTransferResponse), String> {
     let mut client = get_or_create_channel(grpc_channels, remote_addr)?;
 
@@ -839,6 +868,9 @@ async fn query_remote_blocks(
         namespace: namespace.to_string(),
         block_hashes: block_hashes.to_vec(),
         requester_id: advertise_addr.to_string(),
+        // Prefix fetch keeps only the contiguous prefix; never lock blocks past a gap.
+        // Backup copies are independent blocks, so a gap must not stop the rest.
+        prefix_only,
     };
 
     let response = client
@@ -1007,8 +1039,7 @@ mod tests {
         };
         let hashes = vec![vec![1], vec![2], vec![3]];
 
-        let (fetched, completed, failure) =
-            execute_fetch_plan(&fetcher, &plan, "ns", &hashes).await;
+        let (fetched, completed, failure) = execute_fetch_plan(&fetcher, &plan, &hashes).await;
 
         assert_eq!(fetched.len(), 3);
         assert_eq!(completed, 2);
@@ -1045,8 +1076,7 @@ mod tests {
         };
         let hashes = vec![vec![1], vec![2], vec![3]];
 
-        let (fetched, completed, failure) =
-            execute_fetch_plan(&fetcher, &plan, "ns", &hashes).await;
+        let (fetched, completed, failure) = execute_fetch_plan(&fetcher, &plan, &hashes).await;
 
         assert_eq!(fetched.len(), 1);
         assert_eq!(completed, 1);
