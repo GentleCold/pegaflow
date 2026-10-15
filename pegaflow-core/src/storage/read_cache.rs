@@ -118,6 +118,13 @@ impl ReadCache {
         keys.iter().map(|k| inner.cache.contains_key(k)).collect()
     }
 
+    /// Position-aligned resident blocks without touching recency. A held
+    /// `Arc` keeps the block out of pressure eviction until it is dropped.
+    pub(super) fn peek_blocks(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
+        let inner = self.inner.lock();
+        keys.iter().map(|k| inner.cache.peek(k)).collect()
+    }
+
     /// Scan cache for a prefix of `keys`, stopping at the first miss.
     pub(super) fn get_prefix_blocks(&self, keys: &[BlockKey]) -> (usize, Vec<Arc<SealedBlock>>) {
         let mut hit = 0usize;
@@ -837,6 +844,42 @@ mod tests {
             evicted.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
             vec![reclaimable, retained]
         );
+    }
+
+    #[test]
+    fn peeked_blocks_stay_out_of_pressure_eviction_while_held() {
+        // A backup target re-registers blocks it already holds; holding the
+        // peeked Arc until that insert is queued keeps eviction from queuing a
+        // removal ahead of it.
+        let cache = make_cache();
+        let held = BlockKey::new("ns".into(), vec![1]);
+        let other = BlockKey::new("ns".into(), vec![2]);
+        let missing = BlockKey::new("ns".into(), vec![3]);
+        cache.batch_insert(vec![
+            (held.clone(), make_block()),
+            (other.clone(), make_block()),
+        ]);
+
+        let peeked = cache.peek_blocks(&[held.clone(), missing]);
+        assert!(peeked[0].is_some() && peeked[1].is_none());
+        // `held` is the LRU victim, but the reference keeps it resident.
+        let evicted = cache.remove_lru_batch(2);
+        assert_eq!(
+            evicted.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![other]
+        );
+        drop(peeked);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, held);
+
+        // Peeking does not refresh recency.
+        let first = BlockKey::new("ns".into(), vec![4]);
+        let second = BlockKey::new("ns".into(), vec![5]);
+        cache.batch_insert(vec![
+            (first.clone(), make_block()),
+            (second.clone(), make_block()),
+        ]);
+        drop(cache.peek_blocks(std::slice::from_ref(&first)));
+        assert_eq!(cache.remove_lru_batch(1)[0].0, first);
     }
 
     #[test]

@@ -98,15 +98,25 @@ async fn pull_once(
         .iter()
         .map(|hash| BlockKey::new(plan.namespace.clone(), hash.clone()))
         .collect();
-    let mut present = cache.contains_keys(&keys).into_iter();
+    // Hold the resident blocks until the registration is queued, like the
+    // save and prefetch paths: pressure eviction skips referenced blocks, so
+    // an eviction's removal cannot be queued ahead of this insert and leave a
+    // stale owner on the MetaServer.
+    let resident = cache.peek_blocks(&keys);
     drop(cache);
-    let (held, wanted): (Vec<Vec<u8>>, Vec<Vec<u8>>) = plan
-        .block_hashes
-        .into_iter()
-        .partition(|_| present.next().unwrap_or(false));
+    let mut held = Vec::new();
+    let mut wanted = Vec::new();
+    for (hash, block) in plan.block_hashes.into_iter().zip(&resident) {
+        if block.is_some() {
+            held.push(hash);
+        } else {
+            wanted.push(hash);
+        }
+    }
     if !held.is_empty() {
         client.try_register_namespace_without_reclaim_hint(plan.namespace.clone(), held);
     }
+    drop(resident);
     if wanted.is_empty() {
         return Some(0);
     }
