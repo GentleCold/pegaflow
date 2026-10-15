@@ -5,7 +5,9 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use log::{debug, warn};
+use bytesize::ByteSize;
+use log::{debug, info, warn};
+use tokio::time::Instant;
 
 use super::ReadCache;
 use crate::backing::{FetchPurpose, RdmaFetchStore};
@@ -13,10 +15,17 @@ use crate::block::BlockKey;
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
 
-/// Upper bound on one pulled plan; matches the RDMA staging chunk size.
-const BACKUP_PULL_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Sleep when this node is not a target or the MetaServer has nothing queued.
 const BACKUP_IDLE_SLEEP: Duration = Duration::from_secs(1);
+
+/// How a backup target paces its pulls.
+#[derive(Clone, Copy)]
+pub(super) struct BackupPull {
+    /// Most bytes one plan copies.
+    pub(super) max_bytes: u64,
+    /// Most bytes copied per second; `0` is unlimited.
+    pub(super) bytes_per_sec: u64,
+}
 
 /// Pull and copy backup plans while the MetaServer names this node a target.
 ///
@@ -25,43 +34,65 @@ pub(super) async fn backup_loop(
     read_cache: Weak<ReadCache>,
     store: Arc<RdmaFetchStore>,
     client: Arc<MetaServerClient>,
+    pull: BackupPull,
 ) {
+    info!(
+        "Decode backup pulls: max_bytes={} bandwidth={}",
+        ByteSize(pull.max_bytes),
+        match pull.bytes_per_sec {
+            0 => "unlimited".to_string(),
+            rate => format!("{}/s", ByteSize(rate)),
+        }
+    );
     while read_cache.strong_count() > 0 {
-        let pause = if client.is_backup_target() {
-            pull_once(&read_cache, &store, &client).await
-        } else {
-            BACKUP_IDLE_SLEEP
-        };
-        if !pause.is_zero() {
-            tokio::time::sleep(pause).await;
+        if !client.is_backup_target() {
+            tokio::time::sleep(BACKUP_IDLE_SLEEP).await;
+            continue;
+        }
+        let start = Instant::now();
+        match pull_once(&read_cache, &store, &client, pull.max_bytes).await {
+            Some(bytes) => {
+                tokio::time::sleep_until(start + pull_pause(bytes, pull.bytes_per_sec)).await;
+            }
+            None => tokio::time::sleep(BACKUP_IDLE_SLEEP).await,
         }
     }
 }
 
-/// Copy one plan. Returns how long to wait before the next pull.
+/// Time `bytes` of copying cost against the bandwidth limit. The next pull
+/// starts this long after the previous one started, so a fast pull waits out
+/// the rest of its slot and idle time never banks a burst.
+fn pull_pause(bytes: u64, bytes_per_sec: u64) -> Duration {
+    if bytes_per_sec == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(bytes as f64 / bytes_per_sec as f64)
+}
+
+/// Copy one plan. Returns the bytes copied, or `None` when there was nothing
+/// to copy and the loop should idle.
 async fn pull_once(
     read_cache: &Weak<ReadCache>,
     store: &RdmaFetchStore,
     client: &MetaServerClient,
-) -> Duration {
-    let plan = match client.pull_backup_plan(BACKUP_PULL_MAX_BYTES).await {
+    max_bytes: u64,
+) -> Option<u64> {
+    let plan = match client.pull_backup_plan(max_bytes).await {
         Ok(plan) => plan,
         Err(e) => {
             warn!("Decode backup plan pull failed: {e}");
-            return BACKUP_IDLE_SLEEP;
+            return None;
         }
     };
     if plan.block_hashes.is_empty() {
-        return BACKUP_IDLE_SLEEP;
+        return None;
     }
 
     // A restarted MetaServer, a dropped registration, or a pairing change can
     // re-plan blocks this node already holds. Skip copying them, but register
     // them again: until the MetaServer sees this node as an owner it keeps
     // planning them and never tells the source they are backed up.
-    let Some(cache) = read_cache.upgrade() else {
-        return Duration::ZERO;
-    };
+    let cache = read_cache.upgrade()?;
     let keys: Vec<BlockKey> = plan
         .block_hashes
         .iter()
@@ -77,7 +108,7 @@ async fn pull_once(
         client.try_register_namespace_without_reclaim_hint(plan.namespace.clone(), held);
     }
     if wanted.is_empty() {
-        return Duration::ZERO;
+        return Some(0);
     }
 
     let req_id = format!("backup:{}", plan.source_node);
@@ -100,12 +131,14 @@ async fn pull_once(
         // Connect/RDMA failure or a source that evicted the whole batch.
         // Retrying at once would spin through the source's queue against an
         // unreachable peer.
-        return BACKUP_IDLE_SLEEP;
+        return None;
     }
+    let bytes = fetched
+        .iter()
+        .map(|(_, block)| block.memory_footprint())
+        .sum();
 
-    let Some(cache) = read_cache.upgrade() else {
-        return Duration::ZERO;
-    };
+    let cache = read_cache.upgrade()?;
     // Backups enter retained like local saves, so this node's own LRU decides
     // what it drops, and they are advertised so prefill nodes can recall them.
     let resident = cache.batch_insert_refs(&fetched);
@@ -121,5 +154,26 @@ async fn pull_once(
         plan.namespace,
         resident.into_iter().map(|key| key.hash).collect(),
     );
-    Duration::ZERO
+    Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_pause_spreads_bytes_over_the_limit() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let us = Duration::from_micros;
+        let cases = [
+            ("unlimited", 64 * MIB, 0, Duration::ZERO),
+            ("nothing copied", 0, GIB, Duration::ZERO),
+            ("full plan", 64 * MIB, GIB, us(62_500)),
+            ("partial plan", 16 * MIB, GIB, us(15_625)),
+        ];
+        for (name, bytes, rate, want) in cases {
+            assert_eq!(pull_pause(bytes, rate), want, "{name}");
+        }
+    }
 }

@@ -199,6 +199,26 @@ pub struct Cli {
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_BACKUP_MAX_CANDIDATES,
           value_parser = parse_backup_max_candidates)]
     pub backup_max_candidates: usize,
+
+    /// Decode backup: most bytes one pulled plan copies on a backup target
+    /// (e.g. 64mb). Smaller plans hold the NICs for shorter bursts, leaving
+    /// room for KV transfers between them.
+    #[arg(long, default_value = "64mb", value_parser = parse_backup_pull_max_bytes)]
+    pub backup_pull_max_bytes: usize,
+
+    /// Decode backup: copy bandwidth limit per second on a backup target
+    /// (e.g. 1gb); `0` is unlimited. Backup traffic shares the target's NICs
+    /// with KV transfers, so unlimited pulls add latency to them.
+    #[arg(long, default_value = "1gb", value_parser = parse_memory_size)]
+    pub backup_max_bandwidth: usize,
+}
+
+fn parse_backup_pull_max_bytes(s: &str) -> Result<usize, String> {
+    let v = parse_memory_size(s)?;
+    if v == 0 {
+        return Err("must be greater than 0".to_string());
+    }
+    Ok(v)
 }
 
 fn parse_backup_max_candidates(s: &str) -> Result<usize, String> {
@@ -577,6 +597,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pool_shards: cli.pool_shards,
         backup_reclaimable_percent: cli.backup_reclaimable_percent,
         backup_max_candidates: cli.backup_max_candidates,
+        backup_pull_max_bytes: cli.backup_pull_max_bytes as u64,
+        backup_max_bandwidth: cli.backup_max_bandwidth as u64,
     };
 
     if cli.pool_shards > 1 {

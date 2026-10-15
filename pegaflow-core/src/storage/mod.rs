@@ -75,7 +75,18 @@ pub struct StorageConfig {
     pub backup_reclaimable_percent: u64,
     /// Most decode backup candidates one heartbeat reports.
     pub backup_max_candidates: usize,
+    /// Most bytes one decode backup plan copies (backup targets only).
+    pub backup_pull_max_bytes: u64,
+    /// Decode backup copy bandwidth limit in bytes per second, `0` for
+    /// unlimited (backup targets only).
+    pub backup_max_bandwidth: u64,
 }
+
+/// Default decode backup plan size: short enough that one pull holds the
+/// target's NICs for only a few milliseconds.
+pub const DEFAULT_BACKUP_PULL_MAX_BYTES: u64 = 64 << 20;
+/// Default decode backup bandwidth limit, 1 GiB/s.
+pub const DEFAULT_BACKUP_MAX_BANDWIDTH: u64 = 1 << 30;
 
 impl Default for StorageConfig {
     fn default() -> Self {
@@ -95,6 +106,8 @@ impl Default for StorageConfig {
             pool_shards: 1,
             backup_reclaimable_percent: DEFAULT_BACKUP_RECLAIMABLE_PERCENT,
             backup_max_candidates: crate::internode::DEFAULT_BACKUP_MAX_CANDIDATES,
+            backup_pull_max_bytes: DEFAULT_BACKUP_PULL_MAX_BYTES,
+            backup_max_bandwidth: DEFAULT_BACKUP_MAX_BANDWIDTH,
         }
     }
 }
@@ -241,6 +254,10 @@ impl StorageEngine {
                     Arc::downgrade(&read_cache),
                     Arc::clone(store),
                     Arc::clone(ms),
+                    backup::BackupPull {
+                        max_bytes: config.backup_pull_max_bytes,
+                        bytes_per_sec: config.backup_max_bandwidth,
+                    },
                 ));
             }
             #[cfg(feature = "rdma")]
