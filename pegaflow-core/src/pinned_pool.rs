@@ -80,6 +80,11 @@ impl PinnedAllocation {
         self.ptr
     }
 
+    #[cfg(all(test, feature = "rdma"))]
+    pub(crate) fn size_bytes(&self) -> usize {
+        self.allocation.size_bytes.get() as usize
+    }
+
     pub(crate) fn mapped_ptr(&self) -> MappedPinnedPtr {
         MappedPinnedPtr::new(self.ptr, self.device_ptr)
     }
@@ -227,23 +232,54 @@ impl PinnedMemoryPool {
     /// Returns a RAII guard that automatically frees the allocation when dropped.
     fn allocate(self: &Arc<Self>, size: NonZeroU64) -> Option<PinnedAllocation> {
         // Allocation is done under lock, metrics and pointer computation outside lock
-        let allocation = {
-            let mut allocator = self.allocator.lock();
-            match allocator.allocate(size.get()) {
-                Ok(Some(allocation)) => allocation,
-                Ok(None) => return None, // Pool exhausted, caller can retry after eviction
-                Err(err) => {
-                    error!(
-                        "Pinned memory allocation error: {} (requested {}): requested_bytes={}",
-                        err,
-                        ByteSize(size.get()),
-                        size.get()
-                    );
-                    return None;
-                }
-            }
-        };
+        let allocation = Self::allocate_locked(&mut self.allocator.lock(), size)?;
+        let size_bytes = allocation.size_bytes.get();
+        if let Ok(size_i64) = i64::try_from(size_bytes) {
+            core_metrics().pool_used_bytes.add(size_i64, &[]);
+        }
+        Some(self.wrap(allocation))
+    }
 
+    /// Allocate up to `count` independent `size`-byte regions under one lock
+    /// acquisition and one metrics update. Each region is freed on its own.
+    /// Stops at the first region the pool cannot satisfy, so the result may be
+    /// shorter than `count`.
+    fn allocate_many(self: &Arc<Self>, size: NonZeroU64, count: usize) -> Vec<PinnedAllocation> {
+        let allocations: Vec<Allocation> = {
+            let mut allocator = self.allocator.lock();
+            std::iter::from_fn(|| Self::allocate_locked(&mut allocator, size))
+                .take(count)
+                .collect()
+        };
+        let total: u64 = allocations.iter().map(|a| a.size_bytes.get()).sum();
+        if let Ok(total_i64) = i64::try_from(total)
+            && total_i64 > 0
+        {
+            core_metrics().pool_used_bytes.add(total_i64, &[]);
+        }
+        allocations.into_iter().map(|a| self.wrap(a)).collect()
+    }
+
+    fn allocate_locked(
+        allocator: &mut ScaledOffsetAllocator,
+        size: NonZeroU64,
+    ) -> Option<Allocation> {
+        match allocator.allocate(size.get()) {
+            Ok(allocation) => allocation, // None: pool exhausted, caller can retry after eviction
+            Err(err) => {
+                error!(
+                    "Pinned memory allocation error: {} (requested {}): requested_bytes={}",
+                    err,
+                    ByteSize(size.get()),
+                    size.get()
+                );
+                None
+            }
+        }
+    }
+
+    /// Turn an allocator range into an RAII guard. Does not touch metrics.
+    fn wrap(self: &Arc<Self>, allocation: Allocation) -> PinnedAllocation {
         let size_bytes = allocation.size_bytes.get();
         let backing_size = self.backing.size() as u64;
         let allocation_end = allocation.offset_bytes.checked_add(size_bytes);
@@ -262,16 +298,12 @@ impl PinnedMemoryPool {
         let device_ptr =
             NonNull::new(device_ptr).expect("PinnedMemoryPool returned null device pointer");
 
-        if let Ok(size_i64) = i64::try_from(size_bytes) {
-            core_metrics().pool_used_bytes.add(size_i64, &[]);
-        }
-
-        Some(PinnedAllocation {
+        PinnedAllocation {
             allocation,
             ptr,
             device_ptr,
             pool: Arc::clone(self),
-        })
+        }
     }
 
     /// Internal method to free a pinned memory allocation.
@@ -409,6 +441,23 @@ impl ShardedPinnedPool {
             }
         }
         None
+    }
+
+    /// Allocate up to `count` regions, filling from one shard per lock
+    /// acquisition and moving to the next shard when it runs out. Returns
+    /// fewer than `count` only when every shard is exhausted.
+    fn allocate_many(&self, size: NonZeroU64, count: usize) -> Vec<PinnedAllocation> {
+        let n = self.shards.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..n {
+            if out.len() == count {
+                break;
+            }
+            let idx = (start + i) % n;
+            out.extend(self.shards[idx].allocate_many(size, count - out.len()));
+        }
+        out
     }
 
     /// Aggregate usage across all shards.
@@ -570,6 +619,24 @@ impl NumaAwarePinnedPools {
         self.pools.get(&numa_node.0)?.allocate(size).map(Arc::new)
     }
 
+    fn allocate_many(
+        &self,
+        numa_node: NumaNode,
+        size: NonZeroU64,
+        count: usize,
+    ) -> Vec<Arc<PinnedAllocation>> {
+        if numa_node.is_unknown() {
+            error!("UNEXPECTED: allocate_many called with UNKNOWN NUMA node");
+            return Vec::new();
+        }
+        self.pools.get(&numa_node.0).map_or_else(Vec::new, |pool| {
+            pool.allocate_many(size, count)
+                .into_iter()
+                .map(Arc::new)
+                .collect()
+        })
+    }
+
     /// Largest contiguous free region for a specific NUMA node.
     fn largest_free_allocation_for_node(&self, numa_node: NumaNode) -> u64 {
         if numa_node.is_unknown() {
@@ -681,6 +748,29 @@ impl PinnedAllocator {
         }
     }
 
+    /// Allocate up to `count` independent `size`-byte regions with one lock
+    /// acquisition per shard touched. Shorter than `count` when the target
+    /// pool runs out; callers reclaim and retry for the remainder.
+    #[cfg_attr(
+        not(feature = "rdma"),
+        allow(dead_code, reason = "only RDMA fetch stages batches")
+    )]
+    pub(crate) fn allocate_many(
+        &self,
+        size: NonZeroU64,
+        count: usize,
+        numa_node: NumaNode,
+    ) -> Vec<Arc<PinnedAllocation>> {
+        match self {
+            Self::Global(pool) => pool
+                .allocate_many(size, count)
+                .into_iter()
+                .map(Arc::new)
+                .collect(),
+            Self::Numa(pools) => pools.allocate_many(numa_node, size, count),
+        }
+    }
+
     /// Get aggregate usage: (used_bytes, total_bytes)
     pub(crate) fn usage(&self) -> (u64, u64) {
         match self {
@@ -769,6 +859,34 @@ mod tests {
 
         assert_eq!(global_min, 512);
         assert_eq!(node1_largest, 4096);
+    }
+
+    #[test]
+    fn allocate_many_spans_shards_and_frees_each_region() {
+        // Two 4 KiB shards of 1 KiB units: up to 8 regions in total.
+        let pool = ShardedPinnedPool::new(
+            8192,
+            2,
+            false,
+            false,
+            NonZeroU64::new(1024),
+            NumaNode::UNKNOWN,
+        );
+        let size = NonZeroU64::new(1024).unwrap();
+
+        let mut batch = pool.allocate_many(size, 6);
+        assert_eq!(batch.len(), 6, "batch fills one shard then the next");
+        assert_eq!(pool.usage().0, 6 * 1024);
+
+        // Asking for more than remains returns only what fits.
+        let rest = pool.allocate_many(size, 5);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(pool.usage().0, 8 * 1024);
+
+        // Regions are independent: dropping one frees exactly its range.
+        batch.swap_remove(0);
+        assert_eq!(pool.usage().0, 7 * 1024);
+        assert_eq!(pool.allocate_many(size, 3).len(), 1);
     }
 
     #[test]
