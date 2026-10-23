@@ -49,6 +49,12 @@ class Policy:
     # Hits of at most this many tokens load before the step's forward (where the
     # layout allows it), longer ones asynchronously between steps.
     sync_load_tokens: int = 256
+    # Merge consecutive steps' saves into one save RPC: send when the oldest
+    # held step has seen save_batch_steps steps or waited save_batch_ms,
+    # whichever comes first (<= 0 disables that bound). Preemption flushes
+    # and shutdown send at once.
+    save_batch_steps: int = 1
+    save_batch_ms: float = 0.0
 
     def accept(self, p: int, present: Sequence[frozenset[int]]) -> int:
         """Hit length to use, <= ``p``; ``present[sid]`` = blocks the server has."""

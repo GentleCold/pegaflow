@@ -126,6 +126,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
 
         self._scheduler: Scheduler | None = None
         self._worker: Worker | None = None
+        profile = extra.get("model_profile") or getattr(mc, "architecture", None)
         if role == KVConnectorRole.SCHEDULER:
             if getattr(self._kv_transfer_config, "kv_load_failure_policy", None) == "fail":
                 # vLLM's scheduler reads the TOP-LEVEL kv_transfer_config. Under
@@ -137,7 +138,6 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                     "policy is the top-level kv_transfer_config's. Under fail, a failed "
                     "load (e.g. an expired lease) errors the request: use recompute"
                 )
-            profile = extra.get("model_profile") or getattr(mc, "architecture", None)
             # vLLM maps a failed synchronous load (invalid_block_ids) back to
             # requests only with one KV cache group, and zeroes new blocks on
             # the compute stream, unordered against the server's copy.
@@ -169,7 +169,13 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             from pegaflow import PyLoadState
 
             sync_saves = may_zero_or_copy_blocks(kv_cache_config)
-            logger.info("[PegaKVConnectorV2] saves=%s", "sync" if sync_saves else "async")
+            policy = load_policy(profile)
+            logger.info(
+                "[PegaKVConnectorV2] saves=%s batch_steps=%d batch_ms=%s",
+                "sync" if sync_saves else "async",
+                policy.save_batch_steps,
+                policy.save_batch_ms,
+            )
             self._worker = Worker(
                 self._layout,
                 self._rpc,
@@ -180,6 +186,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 PyLoadState,
                 _mark_compute,
                 sync_saves=sync_saves,
+                batch_steps=policy.save_batch_steps,
+                batch_ms=policy.save_batch_ms,
             )
 
     @property

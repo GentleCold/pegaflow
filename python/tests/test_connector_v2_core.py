@@ -977,6 +977,85 @@ def test_async_save_holds_blocks_until_copied(outcome):
     worker.shutdown()
 
 
+class StepClock:
+    """Reads the time the test set; ``tick`` advances it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+# Steps: block id saved that step (None = a step without saves), then the
+# step's clock advance in ms. Expected: block ids per save RPC, in order.
+@pytest.mark.parametrize(
+    "batch_steps,batch_ms,steps,expected",
+    [
+        pytest.param(1, 0, [(1, 0), (2, 0), (3, 0)], [[1], [2], [3]], id="off"),
+        pytest.param(3, 0, [(1, 0), (2, 0), (3, 0), (4, 0)], [[1, 2, 3]], id="steps"),
+        # Steps without saves still age the held jobs (vLLM calls
+        # wait_for_save every engine step).
+        pytest.param(3, 0, [(1, 0), (None, 0), (None, 0)], [[1]], id="idle-steps-count"),
+        # The step that finds the batch due joins it (sent at 12 ms).
+        pytest.param(0, 10, [(1, 4), (2, 4), (3, 4), (4, 0), (5, 0)], [[1, 2, 3, 4]], id="time"),
+        # Whichever bound comes first.
+        pytest.param(8, 10, [(1, 6), (2, 6), (3, 0)], [[1, 2, 3]], id="time-before-steps"),
+        pytest.param(2, 100, [(1, 0), (2, 0), (3, 0)], [[1, 2]], id="steps-before-time"),
+    ],
+)
+def test_save_batching(batch_steps, batch_ms, steps, expected):
+    """Policy save_batch_*: consecutive steps' saves go out as one save RPC
+    per layer list, released by a step or time bound; nothing is lost."""
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    clock = StepClock()
+    worker = Worker(
+        _layout(StubSemantics, StubFullSpec()),
+        rpc,
+        "inst",
+        Parallel(),
+        0,
+        lambda t: b"ipc",
+        lambda: None,
+        FakeMark,
+        clock=clock,
+        batch_steps=batch_steps,
+        batch_ms=batch_ms,
+    )
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    for block, advance_ms in steps:
+        saves = [] if block is None else [GroupSave(0, [block], [b"h%d" % block])]
+        worker.save(StepPlan(saves=saves))
+        clock.now += advance_ms / 1e3
+    worker._jobs.put(None)  # stop the saver after what was released so far
+    worker._saver.join(5)
+    assert [[ids for _, ids, _ in c] for c in calls] == [[e] for e in expected]
+    assert all(c[0][2] == [b"h%d" % b for b in e] for c, e in zip(calls, expected, strict=True))
+    assert worker.save_stats.rpcs == len(expected)
+
+
+def test_save_batching_flush_and_finish_fence():
+    """A held job counts as submitted: a request finishing after it is held
+    until the batch is sent and copied, and flush (preemption, shutdown)
+    sends held jobs at once instead of waiting for the batch bound."""
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
+    worker._batch_steps = 100  # never released by the bound in this test
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
+    worker.start(StepPlan(finished=["r"]))
+    worker.save(StepPlan())
+    assert worker.poll()[0] == set() and calls == []
+    assert worker.flush(5)
+    assert len(calls) == 1 and worker.poll()[0] == {"r"}
+    assert worker.save_stats.sent == 1
+    worker.shutdown()
+
+
 @pytest.mark.parametrize(
     "fields,sync",
     [
