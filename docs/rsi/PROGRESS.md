@@ -540,6 +540,15 @@ names, magic constants that only exist in the old code).
   NOT stand for the final code: official rerun `qwen3-4b-p3-it2d` (GPU4, with
   old + native arms) after the fix. Qwen3-4B acceptance waits for it.
 
+- G5 re-review: APPROVE-WITH-FIXES, merge after: (1) `G2.digest_self.cap`
+  could not catch wrong loads (reference built from undigested timed passes is
+  never exhaustive; 79 corrupted blocks passed as `uncertain`), (2) a vacuous
+  cap digest must fail for the arm under test. Same change: E_C must not credit
+  the arm's own local-cache variance; replicated MLA bytes were doubled at TP2;
+  `cap_convs` auto-scales until C(0.5) >= 2x GPU KV (fixed 64x12 gives
+  DSV2-Lite only 1.87x); GPU KV bytes from distinct tensors, not per group.
+  Verified: G3 identical on 125 probe dirs, M1/M2/S1/S2/S3 fixed in code.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
