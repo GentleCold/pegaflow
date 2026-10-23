@@ -148,11 +148,6 @@ pub struct Cli {
     #[arg(long, default_value_t = 1)]
     pub pool_shards: usize,
 
-    /// Allocate each block separately instead of contiguous batch allocation.
-    /// Reduces memory fragmentation when blocks are freed in different order.
-    #[arg(long, default_value_t = false)]
-    pub blockwise_alloc: bool,
-
     /// RDMA NIC names for inter-node transfer (e.g. --nics mlx5_0,mlx5_1 or --nics mlx5_0 mlx5_1).
     /// When set, pinned memory is registered for RDMA access on these NICs.
     #[arg(long, value_delimiter = ',', value_parser = parse_nic_name, num_args = 1..)]
@@ -589,7 +584,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rdma_nic_names: cli.nics.clone(),
         rdma_qps_per_peer: cli.qps_per_peer,
         enable_numa_affinity: !cli.disable_numa_affinity,
-        blockwise_alloc: cli.blockwise_alloc,
         transfer_lock_timeout: Duration::from_secs(cli.transfer_lock_timeout_secs),
         metaserver_addr: cli.metaserver_addr.clone(),
         advertise_addr,

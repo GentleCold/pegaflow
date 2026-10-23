@@ -61,9 +61,6 @@ pub struct StorageConfig {
     pub rdma_qps_per_peer: usize,
     /// Enable NUMA-aware memory allocation.
     pub enable_numa_affinity: bool,
-    /// Allocate each block separately instead of contiguous batch allocation.
-    /// Reduces fragmentation when blocks are freed in different order.
-    pub blockwise_alloc: bool,
     /// Transfer lock timeout for cross-node RDMA transfers.
     pub transfer_lock_timeout: Duration,
     /// MetaServer address for p2p block discovery + registration (None = disabled).
@@ -102,7 +99,6 @@ impl Default for StorageConfig {
             rdma_nic_names: None,
             rdma_qps_per_peer: DEFAULT_RDMA_QPS_PER_PEER,
             enable_numa_affinity: true,
-            blockwise_alloc: false,
             transfer_lock_timeout: Duration::from_secs(120),
             metaserver_addr: None,
             advertise_addr: None,
@@ -124,7 +120,6 @@ pub(crate) struct StorageEngine {
     ssd_store: Option<Arc<SsdBackingStore>>,
     #[cfg(feature = "rdma")]
     rdma_transport: Option<Arc<RdmaTransport>>,
-    blockwise_alloc: bool,
     metaserver_client: Option<Arc<MetaServerClient>>,
     transfer_lock: Arc<transfer_lock::TransferLockManager>,
 }
@@ -143,12 +138,7 @@ impl StorageEngine {
         let rdma_nic_names = config.rdma_nic_names;
         #[cfg(feature = "rdma")]
         let rdma_qps_per_peer = config.rdma_qps_per_peer;
-        let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
-
-        if blockwise_alloc {
-            info!("Blockwise allocation enabled for batch_save");
-        }
 
         let ssd_enabled = ssd_cache_config.is_some();
         let pool_shards = config.pool_shards;
@@ -298,7 +288,6 @@ impl StorageEngine {
                 ssd_store,
                 #[cfg(feature = "rdma")]
                 rdma_transport,
-                blockwise_alloc,
                 metaserver_client,
                 transfer_lock,
             }
@@ -333,11 +322,6 @@ impl StorageEngine {
 
     pub(crate) fn is_numa_enabled(&self) -> bool {
         self.allocator.is_numa()
-    }
-
-    /// Returns true if blockwise allocation is enabled.
-    pub(crate) fn blockwise_alloc(&self) -> bool {
-        self.blockwise_alloc
     }
 
     /// Allocate pinned memory, returning `None` if the pool is exhausted after eviction.
@@ -780,6 +764,11 @@ impl StorageEngine {
     /// Insert a block directly into the in-memory cache (test only).
     pub(crate) fn test_insert_cache(&self, key: BlockKey, block: Arc<SealedBlock>) {
         self.read_cache.batch_insert(vec![(key, block)]);
+    }
+
+    /// Bytes currently allocated from the pinned pool (test only).
+    pub(crate) fn pool_used_bytes_for_test(&self) -> u64 {
+        self.allocator.usage().0
     }
 }
 

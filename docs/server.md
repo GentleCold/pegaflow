@@ -15,7 +15,6 @@ pegaflow-server
 - `--use-hugepages`: Use huge pages for pinned memory (default: `false`, requires pre-configured `/proc/sys/vm/nr_hugepages`)
 - `--enable-lfu-admission`: Enable TinyLFU cache admission policy (default: plain LRU)
 - `--disable-numa-affinity`: Disable NUMA-aware memory allocation (default: enabled)
-- `--blockwise-alloc`: Allocate each block separately instead of contiguous batch allocation. Reduces memory fragmentation when blocks are freed in different order (default: `false`)
 - `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
 
 ### HTTP & Metrics

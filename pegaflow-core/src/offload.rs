@@ -169,6 +169,77 @@ fn filter_new_hashes_per_group(
     survivors
 }
 
+/// Layer-first save targets: one pinned region per saved block, shared by
+/// every layer (and K/V segment) this call saves for that block.
+///
+/// A sealed block is evicted as a unit, so its region frees exactly when the
+/// block goes. A region per save batch instead frees only after the batch's
+/// last block is evicted: on the G5 capacity trace that left up to 19% of the
+/// pool held by already-evicted blocks, and reclaim evicted live blocks to
+/// make up for it.
+fn alloc_block_targets(
+    storage: &crate::storage::StorageEngine,
+    layer_contexts: &[LayerContext],
+    numa_node: Option<NumaNode>,
+) -> Result<Vec<LayerTransferData>, EngineError> {
+    // Keyed per group: groups seal the same content hash as separate blocks.
+    let mut index: HashMap<(u32, &[u8]), usize> = HashMap::new();
+    let mut region_bytes: Vec<usize> = Vec::new();
+    for ctx in layer_contexts {
+        for (_, hash) in &ctx.blocks_to_save {
+            let i = *index
+                .entry((ctx.group, hash.as_slice()))
+                .or_insert_with(|| {
+                    region_bytes.push(0);
+                    region_bytes.len() - 1
+                });
+            region_bytes[i] += ctx.layout.padded_block_bytes();
+        }
+    }
+
+    // (region, next free offset), in first-seen block order.
+    let mut regions: Vec<(Arc<PinnedAllocation>, usize)> = Vec::with_capacity(region_bytes.len());
+    for bytes in region_bytes {
+        let size = NonZeroU64::new(bytes as u64)
+            .ok_or_else(|| EngineError::Storage("block buffer size is zero".into()))?;
+        let region = storage.allocate(size, numa_node).ok_or_else(|| {
+            EngineError::Storage("pinned pool exhausted while allocating block buffer".into())
+        })?;
+        regions.push((region, 0));
+    }
+
+    // Strides are padded (SSD-aligned); GPU copies later use actual
+    // (unpadded) sizes, leaving the padding tail unused.
+    let mut layers = Vec::with_capacity(layer_contexts.len());
+    for ctx in layer_contexts {
+        let layout = &ctx.layout;
+        let mut blocks = Vec::with_capacity(ctx.blocks_to_save.len());
+        for (block_idx, hash) in &ctx.blocks_to_save {
+            let (region, offset) = &mut regions[index[&(ctx.group, hash.as_slice())]];
+            let segment = |at: usize, size: usize| {
+                Segment::new(region.mapped_ptr().add(at).host(), size, Arc::clone(region))
+            };
+            let block = if layout.is_split() {
+                let stride = layout.padded_segment_bytes();
+                RawBlock::two_segments(segment(*offset, stride), segment(*offset + stride, stride))
+            } else {
+                RawBlock::single_segment(segment(*offset, layout.padded_block_bytes()))
+            };
+            *offset += layout.padded_block_bytes();
+            blocks.push(TransferBlock {
+                block_idx: *block_idx,
+                block: HostBlock::Owned(block),
+            });
+        }
+        layers.push(LayerTransferData {
+            layer_name: ctx.layer_name.clone(),
+            layout: layout.clone(),
+            blocks,
+        });
+    }
+    Ok(layers)
+}
+
 // ============================================================================
 // Save methods on PegaEngine (moved from lib.rs)
 // ============================================================================
@@ -428,7 +499,6 @@ impl PegaEngine {
         trace_scope!("save.pinned_alloc", _s);
         let save_numa_node = gpu_context.preferred_numa();
         let numa_node = Some(save_numa_node);
-        let blockwise = self.storage.blockwise_alloc();
         let page_first = topology.is_page_first();
 
         let mut gpu_save_layers: Vec<LayerTransferData> = Vec::with_capacity(layer_contexts.len());
@@ -447,83 +517,7 @@ impl PegaEngine {
                 &mut gpu_save_layers,
             )?;
         } else {
-            for ctx in &mut layer_contexts {
-                let layout = &ctx.layout;
-                let num_blocks = ctx.blocks_to_save.len();
-
-                // Blockwise: allocate once per block; Batch: allocate once for all blocks
-                let alloc_count = if blockwise { num_blocks } else { 1 };
-                let blocks_per_alloc = if blockwise { 1 } else { num_blocks };
-
-                let alloc_pinned = |stride: usize, what: &str| {
-                    let alloc_size = (stride as u64)
-                        .checked_mul(blocks_per_alloc as u64)
-                        .and_then(NonZeroU64::new)
-                        .ok_or_else(|| {
-                            EngineError::Storage(format!("allocation size overflow for {what}"))
-                        })?;
-                    self.storage.allocate(alloc_size, numa_node).ok_or_else(|| {
-                        EngineError::Storage(format!(
-                            "pinned pool exhausted while allocating {what}"
-                        ))
-                    })
-                };
-
-                // Allocate pinned memory and construct the host-side RawBlocks in
-                // save order. Strides are padded (SSD-aligned); GPU copies later
-                // use actual (unpadded) sizes, leaving the padding tail unused.
-                let mut raw_blocks: Vec<RawBlock> = Vec::with_capacity(num_blocks);
-                for _ in 0..alloc_count {
-                    if layout.is_split() {
-                        let stride = layout.padded_segment_bytes();
-                        let k_alloc = alloc_pinned(stride, "K segment buffer")?;
-                        let v_alloc = alloc_pinned(stride, "V segment buffer")?;
-                        for i in 0..blocks_per_alloc {
-                            let offset = i * stride;
-                            // Safety: offsets are within the just-made allocations.
-                            raw_blocks.push(RawBlock::two_segments(
-                                Segment::new(
-                                    k_alloc.mapped_ptr().add(offset).host(),
-                                    stride,
-                                    Arc::clone(&k_alloc),
-                                ),
-                                Segment::new(
-                                    v_alloc.mapped_ptr().add(offset).host(),
-                                    stride,
-                                    Arc::clone(&v_alloc),
-                                ),
-                            ));
-                        }
-                    } else {
-                        let stride = layout.padded_block_bytes();
-                        let alloc = alloc_pinned(stride, "block buffer")?;
-                        for i in 0..blocks_per_alloc {
-                            // Safety: offset is within the just-made allocation.
-                            raw_blocks.push(RawBlock::single_segment(Segment::new(
-                                alloc.mapped_ptr().add(i * stride).host(),
-                                stride,
-                                Arc::clone(&alloc),
-                            )));
-                        }
-                    }
-                }
-
-                let save_blocks: Vec<TransferBlock> = ctx
-                    .blocks_to_save
-                    .iter()
-                    .zip(raw_blocks)
-                    .map(|((block_idx, _), block)| TransferBlock {
-                        block_idx: *block_idx,
-                        block: HostBlock::Owned(block),
-                    })
-                    .collect();
-
-                gpu_save_layers.push(LayerTransferData {
-                    layer_name: ctx.layer_name.clone(),
-                    layout: layout.clone(),
-                    blocks: save_blocks,
-                });
-            }
+            gpu_save_layers = alloc_block_targets(&self.storage, &layer_contexts, numa_node)?;
         }
         trace_drop!(_s);
 
@@ -656,5 +650,70 @@ impl PegaEngine {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{StorageConfig, StorageEngine};
+
+    fn ctx(name: &str, group: u32, layout: KVCacheLayout, hashes: &[&[u8]]) -> LayerContext {
+        LayerContext {
+            layer_name: name.into(),
+            layout,
+            slot_id: 0,
+            group,
+            blocks_to_save: hashes
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (i, h.to_vec()))
+                .collect(),
+            raw_blocks: Vec::new(),
+        }
+    }
+
+    fn allocation_ids(block: &RawBlock) -> Vec<usize> {
+        (0..block.num_segments())
+            .map(|i| block.segment_allocation_id(i).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_saved_block_owns_one_region_across_layers() {
+        const SEG: usize = 512;
+        let storage =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap();
+        let contiguous = KVCacheLayout::new(0x1000, 4 * 2 * SEG, 4, 2 * SEG, 0, 1).unwrap();
+        let split = KVCacheLayout::new(0x10_0000, 2 * 4 * SEG, 4, SEG, 4 * SEG, 2).unwrap();
+        assert!(split.is_split());
+        // Group 1 keys the same content hash `a` as a block of its own.
+        let contexts = vec![
+            ctx("l0", 0, contiguous.clone(), &[b"a", b"b"]),
+            ctx("l1", 0, split, &[b"a", b"b"]),
+            ctx("l2", 1, contiguous, &[b"a"]),
+        ];
+
+        let layers = alloc_block_targets(&storage, &contexts, None).unwrap();
+        let ids = |layer: usize, block: usize| match &layers[layer].blocks[block].block {
+            HostBlock::Owned(raw) => allocation_ids(raw),
+            HostBlock::Cached { .. } => unreachable!(),
+        };
+
+        let a = ids(0, 0)[0];
+        let b = ids(0, 1)[0];
+        let a_group1 = ids(2, 0)[0];
+        assert_eq!(ids(1, 0), vec![a, a], "K and V of block a share its region");
+        assert_eq!(ids(1, 1), vec![b, b]);
+        assert!(a != b && a != a_group1 && b != a_group1);
+        // a: 1024 contiguous + 1024 split, b: same, a in group 1: 1024.
+        assert_eq!(storage.pool_used_bytes_for_test(), 5 * 2 * SEG as u64);
+
+        // Dropping every slot of one block returns its whole region.
+        let [l0, l1, _l2] = <[_; 3]>::try_from(layers).ok().unwrap();
+        let mut l0 = l0.blocks;
+        let mut l1 = l1.blocks;
+        drop((l0.remove(1), l1.remove(1)));
+        assert_eq!(storage.pool_used_bytes_for_test(), 3 * 2 * SEG as u64);
     }
 }
