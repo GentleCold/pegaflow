@@ -118,7 +118,12 @@ so such stranded bytes are possible today.
   (`pegaflow-core/src/storage/mod.rs`), so on a small pool each eviction
   burst drops about half of `C` (Qwen3-4B: 512 x 2.25 MiB = 1.13 GiB of a
   2.24 GiB pool) and only ~0.5 C stays resident. LFU admission is off
-  (all saves inserted). Fixing it is a server change (own PR).
+  (all saves inserted). The server LRU is also not prefix-aware: a chain's
+  head blocks, served from vLLM's local cache and never re-read from the
+  server, age out first and strand the chain's tail for any lookup that
+  starts at block 0 (`old` slice: 0 server hits in every cap pass, pool =
+  C, no alloc failure or admission reject). Fixing either is a server
+  change (own PR).
 
 ## Run record
 
