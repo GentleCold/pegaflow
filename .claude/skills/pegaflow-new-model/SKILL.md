@@ -187,4 +187,18 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   beats baseline vLLM on warm replay (TTFT p50 and req/s) and costs at most 2%
   on cold replay and gsm8k. Read every `G4.*` verdict, not only warm TTFT;
   the save path's cost shows up in the cold and gsm8k checks.
-
+- Async saves in vLLM 0.32 need three hooks, not one: `wait_for_save` only
+  queues (CUDA event + saver thread); `request_finished` returns True and
+  `get_transfer_results.finished_sending` releases the blocks after the copy;
+  `handle_preemptions` (runs before block zeroing and the forward) flushes
+  when the plan saw `preempted_req_ids`. Report a request in
+  `finished_sending` even when its save failed, or vLLM leaks its blocks.
+- On short-prefix workloads the async load round trip, not the copy, is the
+  cost: a warm gsm8k request waited ~7.6 steps from admission to its first
+  computed step for a ~1 ms load. Read the probe's `episodes` vs first
+  `progress` step and vLLM's TTFT sum before blaming saves. A sync load
+  (`load_kv_async=False`, wait in `start_load_kv`) fixes it, but vLLM only
+  recovers failed sync loads via `invalid_block_ids` with one KV cache group
+  and no block zeroing.
+- A 64-question gsm8k slice cannot resolve a 2% bound (~10 s of wall time);
+  use the full 1319 questions in slices when a G4 gsm8k check is the target.

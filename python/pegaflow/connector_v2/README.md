@@ -36,6 +36,14 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   - If vLLM allocates a shorter hit than planned, and that hit is still a legal
     resume point, the load is re-planned. Otherwise the load is reported failed.
   - Each request gets its own `load` RPC, so one bad lease fails one request.
+  - Short hits (at most `sync_load_tokens`, default 256) are loaded
+    synchronously: vLLM schedules the request at once and `start_load_kv`
+    waits for the copy before the forward (~1 ms). Longer hits load
+    asynchronously between steps, so one big copy does not stall the batch.
+    A failed sync load is reported as `invalid_block_ids` (the blocks holding
+    the hit's tokens), which vLLM recomputes. Sync loads are only used when
+    vLLM can recover them: one KV cache group and no block zeroing
+    (`needs_kv_cache_zeroing`); otherwise every load is asynchronous.
 - **Saves.** Each step, `semantics.saveable(g, before, after)` gives the blocks
   that became storable. `policy.choose_saves` filters them. The saves are
   asynchronous: `wait_for_save` records a CUDA event on the compute stream and

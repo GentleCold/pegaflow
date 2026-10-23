@@ -96,7 +96,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | it1b fails the new hard G4 (cold/gsm8k overhead); it2 (async save) in progress |
+| P3 | onboard Qwen3-4B | it2 slice passes every verdict incl. hard G4 (async saves + sync short loads); official run + review pending |
 | P4 | onboard DeepSeek-V2-Lite-Chat | todo |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -417,6 +417,28 @@ names, magic constants that only exist in the old code).
   first when exceeded; simplification is a valid iteration; held-out replay
   slice against tuning to the trace; growing policy logic means it belongs in
   semantics (new Kind) or the server (separate PR).
+
+- P3 it2 (isolated onboarding agent, `ITERATIONS.md` it2), two measured
+  connector-core changes, no semantics or server change:
+  - it2a (0bb44bf) async saves: `wait_for_save` records a CUDA event and a
+    saver thread issues the save RPC after it. Finished requests with saves
+    return `request_finished=True` and are released via `finished_sending`
+    once their jobs land; preemption (and any window-group layout) flushes
+    pending saves in `handle_preemptions`. Slice1 (full gsm8k + 8x6 replay,
+    GPU2): all pass except gsm8k warm +2.9%; cold +1.1% (was +8.3%), replay
+    cold TTFT within 0.5%. Save step-thread cost 10.4 s -> 15 ms per 500 steps.
+  - it2b (2ff447e) sync short loads: warm gsm8k paid the async load round
+    trip (7.6 steps admission -> first compute; TTFT sum 282 s vs 179 s).
+    Hits <= `sync_load_tokens` (new knob, 256) load before the forward;
+    failures go through `invalid_block_ids`. Enabled only for one KV group
+    without block zeroing.
+  - Slice2 `~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2-slice2` (rev 2ff447e):
+    every verdict passes. G4: replay warm TTFT 0.091 vs 0.210 s, req/s 6.85
+    vs 5.51; replay cold TTFT 0.208 vs 0.210 s, req/s 5.07 vs 5.08; gsm8k
+    164.6 vs 163.1 s cold (+0.9%), 163.5 vs 163.1 s warm (+0.3%). Hits: gsm8k
+    warm local 0.916 / external 0.077 / total 0.992 = H* 0.992, E_ext 1.0;
+    replay warm 0.730 / 0.268 / 0.998 = H* 0.998, E_ext 1.0. G2 digests 0
+    mismatched. NEXT (orchestrator): review agent + official run.
 
 ## Semantics changelog
 

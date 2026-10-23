@@ -239,11 +239,179 @@ synchronous wait in `Worker.save` explains the gsm8k overhead; it2 removes it.
 Reference: the black-box `old` arm (p0-final) is within +0.4% of baseline on
 gsm8k cold, so the 2% bound is reachable.
 
-## it2 (plan): no synchronous save wait
+## it2 (2026-10-23): asynchronous saves, synchronous short loads
 
-Hypothesis: the `wait_for_save` path blocks the step on a full device sync
-(3.2 s of a 13.8 s gsm8k window, rpc only 77 ms), so cold steps pay the copy
-inline. Making the save asynchronous with respect to the model step should
-bring cold replay and gsm8k within 2% of baseline without touching warm hits.
-Accept only if every G2/G3 check still passes and the full G4 set passes.
+Written in isolation (vLLM 0.32 source on the remote venv, `connector_v2`,
+`pegaflow.pyi`, the generic save/load RPC path in `pegaflow-server/src/service.rs`
+`save` and `pegaflow-core/src/gpu_worker.rs`). Two measured changes, each
+fixing one per-step overhead the gate showed.
+
+### it2a: asynchronous saves (commit 0bb44bf)
+
+Hypothesis: `Worker.save` blocks the step on `torch.cuda.current_stream().synchronize()`
+(~10 s of every ~19 s gsm8k window in the official it1 run), so every step
+that saves pays its forward twice.
+
+Change:
+- `wait_for_save` records a CUDA event on the compute stream and queues the
+  job. A saver thread waits on the event (`Event.synchronize` releases the GIL;
+  checked on .44) and then issues the save RPC. The server copies with its own
+  stream and only returns after the copy, so "RPC returned" means the bytes
+  are in PegaFlow. The event covers the step's forward, so the saver never
+  reads KV that is not yet written.
+- Block lifetime (vLLM 0.32):
+  - `request_finished` returns True for a request that had saves since its
+    blocks were last freed. vLLM keeps its blocks (`_free_request` with delay)
+    until every worker reports it in `finished_sending`. The worker reports it
+    once every job submitted before vLLM told it about the finish is done,
+    whether the job stored or failed. The plan's `finished` list carries the
+    ids; `start_load_kv` runs before `wait_for_save` of the same step, so the
+    fence is "jobs submitted so far". A request with no saves returns False
+    (no extra step of block hold).
+  - Preemption frees blocks without `request_finished`. The scheduler sees
+    `preempted_req_ids` in `build_connector_meta` and sets `plan.flush`; the
+    worker waits for every pending job in `handle_preemptions`, which vLLM
+    calls before the step zeroes or writes any block (both model runners).
+  - Window groups free blocks that slide out while the request runs, so any
+    layout with a window group flushes before every step (not Qwen3-4B;
+    keeps the core safe for P4-P6 until a cheaper rule is measured).
+  - Shutdown flushes (30 s bound) before stopping the thread.
+- `save stats` now splits step-thread cost (`submit_ms`, `flushes`,
+  `flush_ms`) from saver-thread cost (`wait_ms`, `rpc_ms`, `max_job_ms`,
+  `max_pending`).
+
+Slice1 (`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2-slice1`, rev 0bb44bf,
+full gsm8k 1319 + replay 8x6, GPU2): every verdict passes except
+`G4.gsm8k_warm.seconds` 167.5 vs 162.7 s (+2.9%). gsm8k cold 164.4 vs 162.6 s
+(+1.1%, was +8.3% in the official it1 run). Replay cold TTFT 0.211 vs 0.210 s
+(was +26% in the it1b slice).
+
+Save stats, gsm8k, 500-step windows (official it1 vs slice1):
+
+| | window | save steps | step thread | saver wait | rpc |
+|---|---|---|---|---|---|
+| it1 (sync) | 19.5 s | 446 | sync 10382 ms | - | 749 ms |
+| it2a | 18.2 s | 450 | submit 14 ms, 0 flushes | 10301 ms | 750 ms |
+
+The saver's wait is now off the step thread; `max_pending` stayed at 3 jobs,
+so the saver keeps up. 0 failed saves.
+
+### it2b: synchronous short loads (commit 2ff447e)
+
+Why warm gsm8k still failed: the remaining cost was not saves (warm stores
+2 new blocks) but the async load round trip. The probe trace shows a warm
+gsm8k request (it loads ~5 blocks, p50 64 tokens) waits 7.6 steps on average
+(max 15) between admission and its first computed step: one step to plan the
+load, the load completes off-step, `finished_recving` arrives with the next
+step's output, then vLLM schedules it. vLLM's warm TTFT sum was 282 s vs
+179 s for baseline, and vLLM ran 4596 iterations vs 4505. A 5-block load
+takes ~1 ms on the server (`pegaflow_load_duration_seconds` 1.39 s / 1319).
+
+Change: hits of at most `sync_load_tokens` (new policy knob, default 256) are
+returned as synchronous (`load_kv_async=False`). vLLM schedules the request
+in the same step and calls `start_load_kv` before the forward
+(`has_sync_kv_loads`); the worker issues the load and spins on the load state
+before returning. Failure handling: vLLM already counts the tokens as
+computed, so a failed sync load (RPC error, bad state, 30 s timeout, failed
+plan) reports the GPU blocks holding the hit's tokens through
+`get_block_ids_with_load_errors`, and vLLM rewinds and recomputes them
+(`kv_load_failure_policy=recompute`). vLLM can only map invalid blocks back
+to requests with one KV cache group, and worker-side block zeroing is not
+ordered against the server's copy, so the core enables sync loads only for
+layouts with one group and `needs_kv_cache_zeroing == False` (Qwen3-4B);
+every other layout keeps async loads. Knob evidence (policy rules): the
+gsm8k warm check fails without it (slice1) and passes with it (slice2);
+replay warm hits are longer than 256 tokens for most requests (p50 720) and
+stay async, so a big copy does not stall a whole batch.
+
+### Slice2 result (all verdicts pass)
+
+Run `~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2-slice2`, rev 2ff447e, GPU2,
+full gsm8k (1319) + replay 8 convs x 6 turns, 3 replay passes. Not official
+(replay size). Every verdict passes (`pass: true`).
+
+| Check | it2 | baseline | verdict |
+|---|---|---|---|
+| G0.spec | 0 diffs | | pass |
+| G2 digest gsm8k (self / vs baseline) | external 7033/7033 matched, local 169788/169788, 0 mismatched | | pass |
+| G2 digest replay (self) | external 617/617, local 3195/3195, 0 mismatched | | pass |
+| G2 gsm8k accuracy | 0.8582 cold = warm | 0.8582 | pass (0 pp) |
+| G2 gsm8k outputs | 0 cold / 0 warm differ | | pass |
+| G3 gsm8k warm | E_ext 1.0, excess 0, 0 load errors | | pass |
+| G3 replay warm | E_ext 1.0, excess 0, 0 load errors | | pass |
+| G3 no_eviction | 0 in every pass | | pass |
+| G4 replay warm TTFT p50 (warm2/3) | 0.0910 / 0.0904 s | 0.2096 / 0.2102 s | pass (2.3x) |
+| G4 replay warm req/s (warm2/3) | 6.853 / 6.850 | 5.513 / 5.506 | pass (+24%) |
+| G4 replay cold TTFT p50 | 0.2080 s | 0.2095 s | pass (-0.7%) |
+| G4 replay cold req/s | 5.073 | 5.084 | pass (-0.2%) |
+| G4 gsm8k cold seconds | 164.6 | 163.1 | pass (+0.9%) |
+| G4 gsm8k warm seconds | 163.5 | 163.1 | pass (+0.3%) |
+
+Hit rates (prompt tokens; local = vLLM GPU cache, external = loaded by the
+connector, total = local + external, H* = oracle hit rate, E_ext from G3):
+
+| arm | pass | local | external | total | H* | E_ext |
+|---|---|---|---|---|---|---|
+| baseline | gsm8k cold | 0.933 | 0 | 0.933 | 0.933 | - |
+| baseline | gsm8k warm | 0.933 | 0 | 0.933 | 0.992 | 0.0 |
+| baseline | replay cold | 0.791 | 0 | 0.791 | 0.791 | - |
+| baseline | replay warm/2/3 | 0.791 | 0 | 0.791 | 0.998 | 0.0 |
+| v2 | gsm8k cold | 0.933 | 0 | 0.933 | 0.933 | - |
+| v2 | gsm8k warm | 0.916 | 0.077 | 0.992 | 0.992 | 1.0 |
+| v2 | replay cold | 0.791 | 0 | 0.791 | 0.782 | - |
+| v2 | replay warm/2/3 | 0.730 | 0.268 | 0.998 | 0.998 | 1.0 |
+
+External hit rate H (of non-local prompt tokens): gsm8k warm 0.911, replay
+warm 0.991, unchanged from it1b. At-capacity numbers (H*_C, H_lru, E_C) are
+not produced by this gate version (unlimited pool, `G3.no_eviction`).
+
+vLLM metrics, gsm8k (sum over 1319 requests):
+
+| | TTFT sum | iterations |
+|---|---|---|
+| baseline warm | 178.9 s | 4505 |
+| it2a warm (async loads) | 282.3 s | 4596 |
+| it2b warm (sync short loads) | 175.1 s | 4499 |
+
+Save stats (slice2, 500-step windows): gsm8k ~18.3 s windows, 440-451 save
+steps, submit 15 ms, 0 flushes, saver wait ~10 s, rpc ~0.8 s, max_pending 3,
+0 failed; replay ~14 s windows, 151 save steps, submit ~5 ms, wait ~3 s, rpc
+~0.1 s, 0 failed. No `sync load failed` lines.
+
+### Tests
+
+`test_connector_v2_core.py`: the worker fake now injects a compute mark;
+new contract tests:
+- `test_async_save_holds_blocks_until_copied[saved|save-failed]`: `save`
+  returns before the compute mark, a finished request with saves is held and
+  reported in `finished_sending` only after its job is done (stored or
+  failed), a request without saves is not held.
+- `test_save_flush_before_block_reuse`: flush on preemption and always with a
+  window group; a preempted request's saves are covered by the flush.
+- `test_sync_loads`: short hit is sync and reports nothing on success; a
+  failed sync load reports exactly the hit's GPU blocks as invalid; long
+  hits and layouts without sync support stay async.
+Remote (.44, shared venv): 156 passed (`test_connector_v2_core.py` +
+`test_semantics_bindings.py`); ruff format/check clean.
+
+### Open risks
+
+- **Slice, not official.** Replay is 8x6; the official 32x12 run (which also
+  exercises GPU-cache pressure and preemption) is the orchestrator's next
+  step. `flushes=0` here: the preemption flush path is unit-tested only.
+- **Margins.** gsm8k cold +0.9% and warm +0.3% vs the 2% bound; run-to-run
+  noise between baselines is ~0.5 s (162.6 vs 163.1 s). The remaining ~1%
+  on cold is most likely the saver's D2H copies sharing the GPU with the
+  forward (not profiled; inter-token latency sum is +1.0% vs baseline).
+- **Held blocks.** A finished request's blocks stay held for one to a few
+  steps after finish (until its last save lands). Under heavy memory pressure
+  this can cause extra preemption; not seen in the slice. The old arm (black
+  box) is the reference to compare in the official run.
+- **Sync load stall.** A sync load spins the step thread up to 30 s if the
+  server never signals; the policy bound keeps normal loads ~1 ms. Long hits
+  remain async.
+- **Window groups flush every step** (P4-P6 safety rule, unmeasured cost):
+  revisit with data when the first window model is onboarded.
+- **Held-out replay slice** (policy rule): not run; `sync_load_tokens` was
+  chosen from gsm8k load sizes (p90 96 tokens), not tuned to the replay trace.
 
