@@ -82,8 +82,11 @@ LRU (`pegaflow-core/src/cache.rs`) evicts each (hash, group) key on its own,
 so such stranded bytes are possible today.
 
 - Workload `cap`: its own multi-turn replay, larger than `replay` so the
-  store matters: `--cap-convs 64 x --cap-turns 12` conversations from the same
-  r2egym file (official). The baseline arm runs it first (`cap_cold`,
+  store matters: `--cap-convs auto x --cap-turns 12` conversations from the
+  same r2egym file (official; `auto` = the fewest conversations, at least
+  64, whose `C(0.5)` clears the capacity floor below, chosen before the
+  baseline cap stage and recorded as `summary.cap_plan`; Qwen3-4B 64,
+  DeepSeek-V2-Lite TP2 76). The baseline arm runs it first (`cap_cold`,
   `cap_warm`, no store) to fix `U` and the per-request reference local hits.
   Each store arm (under test, `old`, `native`, `lmcache`) then runs `cap_cold`,
   `cap_warm`, `cap_warm2..N` once per capacity fraction, each on a fresh vLLM
@@ -109,9 +112,9 @@ so such stranded bytes are possible today.
   policies are from the bar.
 - Score over the timed cap warm passes, against the baseline's local hit for
   the same request (`ref`), so an arm cannot raise its own score by keeping
-  less in vLLM's local cache: `ext = max(0, min(actual, oracle) - ref)`
-  (capped by the unlimited oracle), `ext*_C = max(0, oracle_C - ref)`,
-  `E_C = Σext / Σext*_C`.
+  less in vLLM's local cache, nor gain from keeping more:
+  `ext = max(0, min(actual, oracle) - max(ref, own local))` (capped by the
+  unlimited oracle), `ext*_C = max(0, oracle_C - ref)`, `E_C = Σext / Σext*_C`.
 - Diagnostics, per group (not gated): resident bytes and stranded bytes at the
   end of each pass (resident blocks that lie on no resolvable prefix of any
   request in the trace), evictions, saved / loaded bytes. Implemented for the
@@ -217,7 +220,7 @@ Exit code 0 only for an **official** run in which every required verdict passes.
 A run is official only with the constants of `run_gate.OFFICIAL` (full gsm8k, 8
 shots, 32 x 12 replay, 3 replay passes, pinned scheduler flags), the arms
 `plain`, `baseline` and one connector under test, all three workloads
-(`gsm8k`, `replay`, `cap`; cap 64 x 12 at fractions 0.25,0.5,0.75), the G5
+(`gsm8k`, `replay`, `cap`; cap `auto` x 12 at fractions 0.25,0.5,0.75), the G5
 capacity floor (`C(0.5) >= 2 x` GPU KV bytes), no
 `--num-gpu-blocks`/`--vllm-arg` override, and committed
 `docs/rsi/models/<model>/{gate.json,spec.json}`. `summary.json` lists
@@ -349,11 +352,29 @@ the last accepted run record by hand until `--accepted` exists.
   - Store events, visibility and scoring are G3's; per (group, key) block
     bytes = `real_page_size_bytes` (unpadded, as digested; `page_size_bytes`
     if absent) x the group's `num_layers` (`UniformTypeKVCacheSpecs` already
-    sums its layers: x 1) x TP ranks. Skipped groups (no kv transfer, eagle)
-    hold no bytes. GPU KV bytes = spec `num_blocks` x Σ block bytes over all
-    groups.
-  - Trace: `--cap-convs` x `--cap-turns` (official 64 x 12) conversations of
-    `--replay-file`, `--replay-out-tokens` outputs, `--concurrency` workers.
+    sums its layers: x 1) x distinct TP copies `tp / kv_tp_replicas`
+    (`KVCacheConfig.kv_tp_replicas`: ranks holding identical bytes; MLA's one
+    latent head at TP2 = 2, so one copy). Stores keep one copy of replicated
+    bytes: PegaFlow on DeepSeek-V2-Lite TP2 (2026-10-23) reported
+    `pegaflow_save_bytes_total` 5,799,278,592 = 11,653 insertions x 497,664 B
+    (18,432 page x 27 layers, one copy); vLLM's offloading CPU spec stores
+    one copy under `replicated_layout` and `cpu_bytes_to_use` is the total
+    over workers (`v1/kv_offload/cpu/spec.py`), so `native` gets `C` as is.
+    Skipped groups (no kv transfer, eagle) hold no bytes. GPU KV bytes = Σ
+    `kv_cache_config.tensors[].size` of one rank (not host-resident; groups
+    sharing a tensor count once) x the same TP copies (Qwen3-4B:
+    11,161,829,376 = `num_blocks x` block bytes; DeepSeek-V2-Lite TP2:
+    3,096,465,408).
+  - Trace: `--cap-convs` x `--cap-turns` (official `auto` x 12) conversations
+    of `--replay-file`, `--replay-out-tokens` outputs, `--concurrency` workers.
+    `auto`: before the baseline cap stage, from the baseline's spec dump,
+    conversations are added from the file start (at least 64) until the
+    estimated `U` (distinct prompt-prefix blocks per group plus each
+    request's generated complete blocks, at block bytes) reaches
+    `1.1 x 2 x GPU KV / 0.5`; the estimate equals the measured `U` exactly
+    on the recorded Qwen3-4B 32 x 12 and 8 x 6 traces. If the whole file is
+    not enough every conversation is used and the measured floor fails the
+    run closed (`capacity below 2x GPU KV (whole replay file used)`).
     Every replay request carries `vllm_xargs.rsi_conv` / `rsi_turn`; the probe
     records them as `conv` / `turn`. Pass `cap_cold` starts conversations in
     order 0..n-1; warm pass `j` (`cap_warm` = 1, `cap_warmK` = K) starts them
@@ -374,9 +395,11 @@ the last accepted run record by hand until `--accepted` exists.
     otherwise: fresh vLLM and (except `native` / `lmcache`, CPU bytes =
     `C`) a fresh PegaFlow server with `--pool-size C`
     `--disable-numa-affinity`, `C = int(f x U)`; passes `cap_cold`,
-    `cap_warm` (digested: every conversation, not every 4th as in replay,
-    so an evicting store's few external loads fall in the sample),
-    `cap_warm2..N` (timed), the replay
+    `cap_warm`, `cap_warm2..N` (timed), all digested (every request of
+    every pass: the timed passes are where `E_C` is scored, so their loads
+    must be judged too, and with nothing undigested the reference is
+    exhaustive; cap timing is not gated, the digest cost is accepted), the
+    replay
     settle / reset / poison protocol. `pool_capacity_bytes` = the server's
     `pegaflow_pool_capacity_bytes` at start; the server allocates the whole
     pool up front and rounds allocations to 512-byte units and
@@ -400,7 +423,9 @@ the last accepted run record by hand until `--accepted` exists.
     - Hits: `resolve` over resident blocks plus each group's `needed` range
       at `ref`, capped at `max(unlimited oracle, ref)`.
   - Scores per segment (`warm_timed` = `cap_warm2..N`, and per pass):
-    `ext = max(0, min(actual, oracle) - ref)` (unlimited oracle),
+    `ext = max(0, min(actual, oracle) - max(ref, own))` (unlimited oracle;
+    `own` = the arm's own local hit: tokens vLLM held locally are never store
+    credit, also when the arm's vLLM kept more than the baseline did),
     `ext*_C = max(0, oracle_C - ref)`, `E_C = Σ ext / Σ ext*_C` (`None` when
     `Σ ext*_C = 0`: fails). Reported: `lru_vs_oracle_c` and
     `freeze_vs_oracle_c` (`Σ max(0, H - ref) / Σ ext*_C`),
@@ -416,11 +441,8 @@ the last accepted run record by hand until `--accepted` exists.
     `pegaflow_load_bytes_total` delta of the pass.
   - `G5.replay_warm` (gated fraction 0.5): `E_C >= 0.9` on `warm_timed`,
     `excess <= one block per request` (unlimited oracle, own local, as G3),
-    no load errors, `unmatched_requests == 0`, `G2.digest_self.cap` passes
-    (as `G2.digest_self.replay` over the cap probe dir, except that a sample
-    with no external block passes flagged `vacuous`: a store that loads
-    nothing at C is not a KV error, its E_C scores it; slice 2026-10-23 had
-    `old` and `native` fail only for that reason), and for a
+    no load errors, `unmatched_requests == 0`, `G2.digest_self.cap` passes,
+    and for a
     PegaFlow arm `pool_capacity_bytes` present and `<= C` and Σ
     `loaded_bytes >= Σ external_hit_bytes` over `warm_timed` (`native` / `lmcache`: no
     server, pool and load proof not applicable). Reported with it: `U`, `C`,
@@ -429,6 +451,20 @@ the last accepted run record by hand until `--accepted` exists.
     `external_hit_bytes`) and end-of-pass resident / used bytes, per-group
     stored / not-admitted / evicted counts and bytes and per-pass resident /
     stranded bytes for `H*_C` and `H_lru`.
+  - `G2.digest_self.cap` (cap probe dir against itself, every request
+    digested): 0 mismatched and 0 unreferenced (local and external), and
+    exhaustive: every loaded block judged. The only allowance is a block
+    whose undigested computations are all preempted (non-last) episodes of
+    digested requests (`*_uncertain_preempted`), at most 1% of the loaded
+    blocks, reported as `preempted_uncertain`; any other `uncertain` fails.
+    The connector under test must have external blocks (`judged > 0`: a
+    passing G5 needs loads, and they must be judged); a reference arm
+    (`old`, `native`, `lmcache`) with none passes flagged `vacuous`. Before
+    2026-10-24 cap digested only every 4th conversation of `cap_warm` and no
+    timed pass: undigested computations in `cap_warm2..N` made every key
+    non-exhaustive, so wrong external bytes counted as `uncertain` and one
+    match passed (re-review: 79 of 158 blocks corrupted, verdict passed).
+    Baseline: the same, with no external block required.
   - `G5.curve`: the same evaluation at each other fraction (`E_C`, oracle_C,
     LRU, freeze, evictions, load proof, digests); never gated.
   - Why rotate: with identical warm passes a store that fills once and never

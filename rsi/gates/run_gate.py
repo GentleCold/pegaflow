@@ -72,7 +72,7 @@ OFFICIAL = {
     "replay_out_tokens": 64,
     "replay_repeats": 3,
     "replay_digest_every": 4,
-    "cap_convs": 64,
+    "cap_convs": "auto",  # >= CAP_MIN_CONVS, grown until the capacity floor holds
     "cap_turns": 12,
     "cap_fractions": "0.25,0.5,0.75",
     "concurrency": 32,
@@ -94,6 +94,11 @@ MAX_OVERHEAD = 0.02
 CAPACITY_FRACTION = 0.5
 MIN_EFFICIENCY_C = 0.9
 MIN_CAPACITY_GPU_KV = 2.0  # official: gated C >= 2 x vLLM GPU KV bytes
+CAP_MIN_CONVS = 64
+CAP_FLOOR_MARGIN = 1.1  # the auto size aims 10% above the floor (estimate vs measured U)
+# Cap digests every request: a loaded block may stay unjudged only when the
+# key's undigested computations are preempted episodes, at most this share.
+MAX_PREEMPTED_UNCERTAIN = 0.01
 WORKLOADS = ("gsm8k", "replay", "cap")
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 
@@ -142,7 +147,10 @@ def launched(cmd: list[str], env: dict[str, str], log: Path, health: str, timeou
             if not _group_gone(proc.pid, 120):
                 with suppress(ProcessLookupError):
                     os.killpg(proc.pid, signal.SIGKILL)
-                _group_gone(proc.pid, 60)
+                if not _group_gone(proc.pid, 60):
+                    raise RuntimeError(
+                        f"process group {proc.pid} ({cmd[0]}) still alive after SIGKILL"
+                    )
 
 
 def _group_gone(pgid: int, timeout: float) -> bool:
@@ -408,8 +416,12 @@ def parse_fractions(s: str) -> list[float]:
 
 
 def gpu_kv_bytes(spec: dict[str, Any]) -> int:
-    """vLLM's GPU KV bytes: ``num_blocks`` x per-block bytes over all groups."""
-    return spec["kv_cache_config"]["num_blocks"] * sum(oracle.block_bytes(spec))
+    """vLLM's GPU KV bytes in ``U``'s units: the allocated KV tensors of one
+    rank (``KVCacheTensor.size``; groups sharing a tensor count once, host
+    tensors not at all) x distinct copies over the TP ranks."""
+    kc = spec["kv_cache_config"]
+    per_rank = sum(t["size"] for t in kc["tensors"] if not t.get("host_resident"))
+    return per_rank * oracle.tp_copies(spec)
 
 
 def _pos(r: dict[str, Any]) -> tuple[Any, Any, Any] | None:
@@ -503,7 +515,7 @@ def run_arm_workload(
             convs = workloads.build_turns(
                 Path(args.replay_file),
                 args.model,
-                args.cap_convs if cap else args.replay_convs,
+                args.cap_plan["cap_convs"] if cap else args.replay_convs,
                 args.max_model_len - args.replay_out_tokens - 8,
                 args.cap_turns if cap else args.replay_turns,
             )
@@ -530,11 +542,12 @@ def run_arm_workload(
                 )
                 (out / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
             else:
-                # Digest a conversation sample in the untimed passes; all turns
-                # of a sampled conversation, so its references are digested too.
-                # Cap digests every conversation: an evicting store's few
-                # external loads must not all fall outside the sample.
-                timed = stage not in ("cold", "warm")
+                # Replay: digest a conversation sample in the untimed passes;
+                # all turns of a sampled conversation, so its references are
+                # digested too. Cap: every request of every pass, so every
+                # scored load is judged and the reference is exhaustive (no
+                # undigested computation of any key; cap timing is not gated).
+                timed = stage not in ("cold", "warm") and not cap
                 every = 1 if cap else args.replay_digest_every
                 xs = [
                     {"rsi_pass": name} | ({} if timed or c % every else {"rsi_digest": "full"})
@@ -685,13 +698,19 @@ def _differ(ref: list[str] | None, got: list[str] | None) -> int | None:
 
 
 def _digest_verdict(
-    d: dict[str, Any] | None, min_judged: float | None, vacuous_ok: bool = False
+    d: dict[str, Any] | None,
+    min_judged: float | None,
+    vacuous_ok: bool = False,
+    exhaustive: bool = False,
 ) -> dict[str, Any]:
     """``min_judged``: fraction of loaded external blocks that must be judged
     (matched or mismatched, not uncertain); None = no external load required.
-    ``vacuous_ok``: no external block in the digested sample is a (flagged)
-    pass, not a fail; for cap, where a store at small C may load nothing in
-    the sampled conversations and its hit rate is scored by G5 instead."""
+    ``vacuous_ok``: no external block at all is a (flagged) pass, not a fail
+    (cap, reference arms only: a store at small C may load nothing; G5 scores
+    that). ``exhaustive`` (cap: every request digested): every loaded block
+    must be judged; the only allowance, flagged, is a block whose undigested
+    computations are all preempted episodes (``*_uncertain_preempted``), at
+    most ``MAX_PREEMPTED_UNCERTAIN`` of the loaded blocks."""
     if d is None:
         return {"pass": False, "reason": "not evaluated"}
     judged = d["external_matched"] + d["external_mismatched"]
@@ -705,12 +724,22 @@ def _digest_verdict(
     )
     if min_judged is not None and not vacuous:
         ok = ok and judged > 0 and judged >= min_judged * seen
+    preempted = 0
+    if exhaustive:
+        loaded = 0
+        for t in ("local", "external"):
+            unc, pre = d[f"{t}_uncertain"], d.get(f"{t}_uncertain_preempted", 0)
+            ok = ok and unc == pre
+            preempted += pre
+            loaded += d[f"{t}_compared"] + unc + d[f"{t}_unreferenced"]
+        ok = ok and preempted <= MAX_PREEMPTED_UNCERTAIN * loaded
     if d["invariant"]:
         ok = ok and d["computed_exact"] == d["computed_compared"]
     keys = [k for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)]
     return {
         "pass": ok,
         **({"vacuous": "no external block in the digested sample"} if vacuous else {}),
+        **({"preempted_uncertain": preempted} if preempted else {}),
         **{k: d[k] for k in keys},
         "first_bad": next((g["first_bad"] for g in d["groups"].values() if g["first_bad"]), None),
     }
@@ -913,7 +942,9 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
             "invariant": invariant,
         },
         "G2.digest_self.gsm8k": _digest_verdict(base.get("gsm8k", {}).get("digest_self"), None),
-        "G2.digest_self.cap": _digest_verdict(base.get("cap", {}).get("digest_self"), None)
+        "G2.digest_self.cap": _digest_verdict(
+            base.get("cap", {}).get("digest_self"), None, exhaustive=True
+        )
         if "cap" in base
         else {"pass": True, "na": "no cap workload"},
     }
@@ -996,7 +1027,13 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
         )
         cap = per_wl.get("cap")
         pegaflow = kind not in _OFFLOAD
-        g["G2.digest_self.cap"] = _digest_verdict(cap and cap.get("digest_self"), 0.0, True)
+        # The arm under test must load in the cap passes (a passing G5 needs
+        # E_C >= 0.9) and every load is judged; only reference arms may load
+        # nothing.
+        ref_arm = kind in _RECORD_ONLY
+        g["G2.digest_self.cap"] = _digest_verdict(
+            cap and cap.get("digest_self"), 0.0, vacuous_ok=ref_arm, exhaustive=True
+        )
         g["G5.replay_warm"] = _capacity_verdict(cap, pegaflow, gated=True)
         if not g["G2.digest_self.cap"]["pass"]:
             g["G5.replay_warm"]["pass"] = False
@@ -1005,7 +1042,9 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
         for wl in sorted(per_wl):
             if wl.startswith("cap") and wl != "cap":
                 cv = _capacity_verdict(per_wl[wl], pegaflow, gated=False)
-                dv = _digest_verdict(per_wl[wl].get("digest_self"), 0.0, True)
+                dv = _digest_verdict(
+                    per_wl[wl].get("digest_self"), 0.0, vacuous_ok=ref_arm, exhaustive=True
+                )
                 cv["digest_self"] = dv["pass"]
                 curve[wl] = {
                     k: cv.get(k)
@@ -1066,14 +1105,98 @@ def capacity_floor(base_cap: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+class UniqueEstimate:
+    """``U`` of a cap trace before running it, accumulated per conversation:
+    distinct prompt-prefix blocks per group (the trace's shared history) plus
+    each request's generated complete blocks, at ``oracle.block_bytes``. For
+    sizing only; the floor is checked on the measured ``U``."""
+
+    def __init__(self, spec: dict[str, Any], out_tokens: int):
+        kinds = [(label, bt) for label, g, bt in oracle.group_kinds(spec) if g is not None]
+        sizes = oracle.block_bytes(spec)
+        self._groups = [
+            (bt, sizes[gi], set()) for gi, (label, bt) in enumerate(kinds) if label != "scratch"
+        ]
+        self._out = out_tokens
+        self._gen = 0
+
+    def add(self, turns: list[list[int]]) -> None:
+        for bt, size, seen in self._groups:
+            for ids in turns:
+                h = 0
+                for b in range(len(ids) // bt):
+                    h = hash((h, tuple(ids[b * bt : (b + 1) * bt])))
+                    seen.add(h)
+                self._gen += size * ((len(ids) + self._out - 1) // bt - len(ids) // bt)
+
+    @property
+    def bytes(self) -> int:
+        return self._gen + sum(size * len(seen) for _, size, seen in self._groups)
+
+
+def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
+    """Resolve ``--cap-convs auto``: the fewest conversations (from
+    ``CAP_MIN_CONVS``, all turns up to ``--cap-turns``) whose estimated
+    ``C(0.5)`` is ``>= CAP_FLOOR_MARGIN x MIN_CAPACITY_GPU_KV x`` GPU KV.
+    Fails closed: if the whole file is not enough, all of it is used and the
+    measured floor marks the run not official."""
+    if args.cap_convs != "auto":
+        return {"cap_convs": int(args.cap_convs), "mode": "fixed"}
+    if spec is None:
+        return {"cap_convs": CAP_MIN_CONVS, "mode": "auto", "reason": "no baseline spec"}
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    budget = args.max_model_len - args.replay_out_tokens - 8
+    lines = Path(args.replay_file).read_text().splitlines()
+    need = CAP_FLOOR_MARGIN * MIN_CAPACITY_GPU_KV * gpu_kv_bytes(spec) / CAPACITY_FRACTION
+    est = UniqueEstimate(spec, args.replay_out_tokens)
+    used = 0
+    for line in lines:
+        used += 1
+        est.add(workloads.conv_turns(tok, json.loads(line), budget, args.cap_turns))
+        if used >= CAP_MIN_CONVS and est.bytes >= need:
+            break
+    return {
+        "cap_convs": used,
+        "mode": "auto",
+        "estimated_unique_bytes": est.bytes,
+        "needed_unique_bytes": int(need),
+        "enough": est.bytes >= need,
+        "available_convs": len(lines),
+    }
+
+
+def g5_problems(v: dict[str, Any], floor: dict[str, Any], plan: dict[str, Any] | None) -> list[str]:
+    """Why a run's G5 cannot be official: the gated store is below the
+    capacity floor (a smaller store measures vLLM's GPU cache), or the trace
+    does not separate a store frozen after its first fill from ``H*_C``."""
+    out = []
+    if not floor["pass"]:
+        why = " (whole replay file used)" if (plan or {}).get("enough") is False else ""
+        out.append(f"capacity below {MIN_CAPACITY_GPU_KV:g}x GPU KV{why}")
+    for label, g in v.items():
+        if label in _REFERENCE or label.startswith("selftest-"):
+            continue
+        fz = g.get("G5.replay_warm", {}).get("freeze_vs_oracle_c")
+        if fz is None or fz >= MIN_EFFICIENCY_C:
+            out.append("G5 trace does not separate freeze from H*_C")
+    return out
+
+
 def official_problems(
     args, arms: list[str], wls: list[str], gate_file: Path, committed: Path
 ) -> list[str]:
-    out = [
-        f"{k}={getattr(args, k)} (official {v})"
-        for k, v in OFFICIAL.items()
-        if getattr(args, k) != v
-    ]
+    def same(k: str, v: Any) -> bool:
+        got = getattr(args, k)
+        if k == "cap_fractions":
+            try:
+                return parse_fractions(got) == parse_fractions(v)
+            except ValueError:
+                return False
+        return got == v
+
+    out = [f"{k}={getattr(args, k)} (official {v})" for k, v in OFFICIAL.items() if not same(k, v)]
     kinds = {arm_kind(a) for a in arms}
     for need in ("plain", "baseline", "under_test"):
         if need not in kinds:
@@ -1135,7 +1258,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--replay-out-tokens", type=int, default=OFFICIAL["replay_out_tokens"])
     ap.add_argument("--replay-repeats", type=int, default=OFFICIAL["replay_repeats"])
     ap.add_argument("--replay-digest-every", type=int, default=OFFICIAL["replay_digest_every"])
-    ap.add_argument("--cap-convs", type=int, default=OFFICIAL["cap_convs"])
+    ap.add_argument(
+        "--cap-convs",
+        default=OFFICIAL["cap_convs"],
+        help="int, or auto: the fewest conversations (>= 64) whose estimated "
+        "C(0.5) clears the capacity floor (needs an earlier baseline stage)",
+    )
     ap.add_argument("--cap-turns", type=int, default=OFFICIAL["cap_turns"])
     ap.add_argument(
         "--cap-fractions",
@@ -1186,6 +1314,18 @@ def main(argv: list[str] | None = None) -> int:
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
                 continue
             if kind == "baseline":
+                spec_file = next(
+                    (
+                        run_dir / label / w / "probe" / "spec.json"
+                        for w in wls
+                        if (run_dir / label / w / "probe" / "spec.json").exists()
+                    ),
+                    None,
+                )
+                args.cap_plan = plan_cap_convs(
+                    args, json.loads(spec_file.read_text()) if spec_file else None
+                )
+                print(f"[cap] plan {args.cap_plan}", flush=True)
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
                 continue
             base_cap = results.get("baseline", {}).get("cap", {})
@@ -1217,15 +1357,7 @@ def main(argv: list[str] | None = None) -> int:
         # Not a verdict: a store smaller than this measures vLLM's GPU cache,
         # so the run cannot be official (G5 is then a flow + digest smoke).
         floor = capacity_floor(results.get("baseline", {}).get("cap"))
-        if not floor["pass"]:
-            problems.append(f"capacity below {MIN_CAPACITY_GPU_KV:g}x GPU KV")
-        # The bar must separate a store frozen after its first fill.
-        for label, g in v.items():
-            if label in _REFERENCE or label.startswith("selftest-"):
-                continue
-            fz = g.get("G5.replay_warm", {}).get("freeze_vs_oracle_c")
-            if fz is None or fz >= MIN_EFFICIENCY_C:
-                problems.append("G5 trace does not separate freeze from H*_C")
+        problems += g5_problems(v, floor, getattr(args, "cap_plan", None))
     summary = {
         "tag": args.tag,
         "rev": git_rev(),
@@ -1234,6 +1366,7 @@ def main(argv: list[str] | None = None) -> int:
         "official": not problems,
         "not_official_because": problems,
         "capacity_floor": floor,
+        "cap_plan": getattr(args, "cap_plan", None),
         "results": {a: {w: strip(r) for w, r in per.items()} for a, per in results.items()},
         "verdicts": v,
     }

@@ -449,6 +449,23 @@ names, magic constants that only exist in the old code).
   Under the old rule the pre-fix official run had all three passing (old
   541/541, native 8567/8585 + 18 uncertain, v2 1375/1375 matched).
 
+- G5 re-review (APPROVE-WITH-FIXES on 20e6b58..6510116) applied:
+  `G2.digest_self.cap` accepted wrong loads (undigested timed passes made
+  the reference non-exhaustive; the reviewer's 79/158 corruption passed):
+  cap now digests every request of every pass and requires every loaded
+  block judged (only preempted-episode uncertainty, <= 1%, flagged);
+  vacuous passes only for reference arms. `ext` subtracts
+  `max(ref, own local)` (slice: connector_v2 / old E_C 0.0775 -> 0 with 0
+  server load bytes). Block / GPU KV bytes count `tp / kv_tp_replicas`
+  copies (PegaFlow saves one MLA copy at TP2: 5,799,278,592 B = 11,653 x
+  497,664) and GPU KV = Σ KV tensor sizes. `--cap-convs auto` (Qwen3-4B 64,
+  est. C/GPU-KV 2.44; DeepSeek-V2-Lite TP2 76, 2.22; a fixed 64 x 12 gives
+  it ~1.87). Re-scored offline: pre-fix official E_C unchanged (v2 0.216,
+  old 0.124, native 0.558) but its `G2.digest_self.cap` now fails for
+  native (18 external + 1 local unjudged, all from undigested requests):
+  old-sampling records cannot pass the exhaustive rule; a rerun is needed.
+  G3 `summarize` identical on all 153 recorded probe dirs.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

@@ -203,7 +203,9 @@ def test_cap_order_rotates_deterministically():
 def _digest_ok() -> dict:
     keys = ("local_mismatched", "external_mismatched", "local_unreferenced",
             "external_unreferenced", "external_compared", "external_uncertain",
-            "computed_exact", "computed_compared")  # fmt: skip
+            "computed_exact", "computed_compared", "local_compared", "local_matched",
+            "local_uncertain", "local_uncertain_preempted",
+            "external_uncertain_preempted")  # fmt: skip
     return {**dict.fromkeys(keys, 0), "external_matched": 1, "invariant": False, "groups": {}}
 
 
@@ -258,6 +260,7 @@ def test_capacity_verdict_requires_pool_and_load_proof():
 
 def test_verdicts_reference_arms_not_required_and_errors_isolated(tmp_path):
     good = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    good["digest_self"] |= {"external_compared": 1}
     results = {
         "baseline": {},
         "old": {"gsm8k": {"arm": "old", "workload": "gsm8k", "error": "RuntimeError: boom"}},
@@ -298,6 +301,181 @@ def test_lmcache_cpu_size_is_exact_bytes(cpu_bytes):
 )
 def test_digest_verdict_vacuous_sample(external, vacuous_ok, ok):
     d = _digest_ok() | {"external_matched": 0} | external
-    v = run_gate._digest_verdict(d, 0.0, vacuous_ok)
+    v = run_gate._digest_verdict(d, 0.0, vacuous_ok=vacuous_ok)
     assert v["pass"] is ok
     assert ("vacuous" in v) is (ok and vacuous_ok)
+
+
+# --------------------------------------------- G2.digest_self.cap (exhaustive)
+
+
+def _probe(tmp_path, reqs: list[dict], digests: list[dict]):
+    import json
+
+    d = tmp_path / "probe"
+    d.mkdir()
+    (d / "requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reqs))
+    (d / "digest-pp0-tp0.jsonl").write_text("".join(json.dumps(x) + "\n" for x in digests))
+    return d
+
+
+def _cap_probe(tmp_path, corrupt: int, timed_untagged: bool):
+    """Cap self-trace: cold computes 4 convs x 4 blocks, warm loads them all
+    (``corrupt`` of the 16 external blocks carry wrong bytes); with
+    ``timed_untagged`` a third pass recomputes every key undigested, the
+    pre-fix cap sampling that made the reference non-exhaustive."""
+    reqs, digests, step = [], [], 1
+
+    def block(c: int, j: int, bad: bool = False) -> dict:
+        return {"key": f"c{c}:{j}", "covered": (j + 1) * BT, "exact": ["bad" if bad else f"d{c}{j}"], "l1": [1.0]}  # fmt: skip
+
+    passes = [("cap_cold", "full"), ("cap_warm", "full")]
+    if timed_untagged:
+        passes.append(("cap_warm2", None))
+    n = 0
+    for name, tag in passes:
+        for c in range(4):
+            rid = f"{name}-{c}"
+            r = _req(f"c{c}", 4, step, name, c) | {"req_id": rid, "digest": tag}
+            if name == "cap_warm":
+                r["episodes"] = [[step, 0, 4 * BT]]  # all 4 blocks loaded
+                r["progress"] = [[step, 4 * BT + 1]]
+            else:
+                r["episodes"] = [[step, 0, 0]]
+            r["keys"] = [f"c{c}:{j}" for j in range(4)]
+            reqs.append(r)
+            if tag:
+                blocks = []
+                for j in range(4):
+                    bad = name == "cap_warm" and n < corrupt
+                    n += name == "cap_warm"
+                    blocks.append(block(c, j, bad))
+                digests.append({"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": blocks})  # fmt: skip
+            step += 2
+    return _probe(tmp_path, reqs, digests)
+
+
+@pytest.mark.parametrize(
+    "corrupt,timed_untagged,ok",
+    [(0, False, True), (8, False, False), (1, False, False), (8, True, False)],
+    ids=["clean", "half-corrupt", "one-corrupt", "half-corrupt-untagged-later-pass"],
+)
+def test_digest_self_cap_catches_partially_corrupt_loads(tmp_path, corrupt, timed_untagged, ok):
+    """Some external blocks match, others are wrong: the cap verdict must fail
+    (the reviewer's 79/158 corruption passed when undigested later passes
+    made the reference non-exhaustive and wrong blocks went ``uncertain``)."""
+    from rsi.gates import digest_compare
+
+    probe = _cap_probe(tmp_path, corrupt, timed_untagged)
+    d = digest_compare.compare(probe, probe, invariant=False)
+    v = run_gate._digest_verdict(d, 0.0, vacuous_ok=False, exhaustive=True)
+    assert v["pass"] is ok, d
+    if corrupt and not timed_untagged:
+        assert d["external_mismatched"] == corrupt
+
+
+@pytest.mark.parametrize(
+    "uncertain,preempted,loaded,ok",
+    [(0, 0, 100, True), (1, 1, 100, True), (2, 2, 100, False), (1, 0, 100, False)],
+    ids=["judged", "one-preempted", "over-allowance", "untagged-uncertain"],
+)
+def test_digest_self_cap_exhaustive_allowance(uncertain, preempted, loaded, ok):
+    d = _digest_ok() | {
+        "external_compared": loaded - uncertain,
+        "external_matched": loaded - uncertain,
+        "external_uncertain": uncertain,
+        "external_uncertain_preempted": preempted,
+    }
+    v = run_gate._digest_verdict(d, 0.0, vacuous_ok=False, exhaustive=True)
+    assert v["pass"] is ok
+    assert v.get("preempted_uncertain", 0) == preempted
+
+
+def test_vacuous_cap_digest_only_for_reference_arms(tmp_path):
+    """No external block judged: a reference arm passes flagged vacuous, the
+    arm under test fails (a passing G5 needs loads, and they must be judged)."""
+    empty = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    empty["digest_self"] |= {"external_matched": 0}
+    v = run_gate.verdicts({"baseline": {}, "old": {"cap": empty}, "UnderTest": {"cap": empty}}, tmp_path, tmp_path / "spec.json")  # fmt: skip
+    assert v["old"]["G2.digest_self.cap"]["pass"] and v["old"]["G2.digest_self.cap"]["vacuous"]
+    assert not v["UnderTest"]["G2.digest_self.cap"]["pass"]
+    assert not v["UnderTest"]["G5.replay_warm"]["pass"]
+
+
+# ------------------------------------------------------------ S1 / bytes / floor
+
+
+def test_own_local_above_reference_earns_no_ext():
+    """An arm whose vLLM happens to keep more locally than the baseline did
+    (variance) gets no store credit for those tokens."""
+    spec, reqs = CYCLIC
+    reqs = [dict(r) for r in reqs]
+    for r in reqs:
+        if r["pass"] != "a":
+            r["local_hit"] = r["first_computed"] = 2 * BT  # all local, no store load
+    out = oracle.summarize_capacity(spec, reqs, 8 * PAGE * LAYERS, {"b": {"b"}}, [0] * len(reqs))
+    assert out["b"]["ext_tokens"] == 0 and out["b"]["efficiency_c"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "tp,replicas,copies", [(1, 1, 1), (2, 1, 2), (2, 2, 1), (4, 2, 2)], ids=str
+)
+def test_block_and_gpu_kv_bytes_count_distinct_tp_copies(tp, replicas, copies):
+    spec = _spec(FULL) | {"parallel": {"tp": tp}}
+    spec["kv_cache_config"] |= {"kv_tp_replicas": replicas, "tensors": [{"size": 7000}, {"size": 3000, "host_resident": True}]}  # fmt: skip
+    assert oracle.block_bytes(spec) == [PAGE * LAYERS * copies]
+    assert run_gate.gpu_kv_bytes(spec) == 7000 * copies
+
+
+def test_gpu_kv_bytes_counts_shared_tensors_once():
+    """Hybrid groups sharing one tensor: the allocation counts once (the old
+    num_blocks x Σ group block bytes formula counted it per group)."""
+    spec = _spec(FULL, CKPT)
+    spec["kv_cache_config"]["tensors"] = [{"size": 4 * PAGE * LAYERS}]
+    assert run_gate.gpu_kv_bytes(spec) == 4 * PAGE * LAYERS
+    assert spec["kv_cache_config"]["num_blocks"] * sum(oracle.block_bytes(spec)) == 2 * run_gate.gpu_kv_bytes(spec)  # fmt: skip
+
+
+def test_capacity_floor_fails_closed_and_g5_problems():
+    assert not run_gate.capacity_floor(None)["pass"]
+    assert not run_gate.capacity_floor({"gpu_kv_bytes": 1})["pass"]
+    low = run_gate.capacity_floor({"unique_bytes": 3, "gpu_kv_bytes": 1})
+    high = run_gate.capacity_floor({"unique_bytes": 4, "gpu_kv_bytes": 1})
+    assert not low["pass"] and high["pass"]
+    sep = {"G5.replay_warm": {"freeze_vs_oracle_c": 0.7}}
+    flat = {"G5.replay_warm": {"freeze_vs_oracle_c": 0.95}}
+    assert run_gate.g5_problems({"X": sep, "old": flat}, high, None) == []
+    assert run_gate.g5_problems({"X": flat}, high, None) == ["G5 trace does not separate freeze from H*_C"]  # fmt: skip
+    assert run_gate.g5_problems({"X": {}}, high, None)  # freeze not evaluated: not official
+    assert run_gate.g5_problems({"X": sep}, low, {"enough": False}) == ["capacity below 2x GPU KV (whole replay file used)"]  # fmt: skip
+
+
+def test_reference_locals_unmatched_path():
+    ref = run_gate.reference_locals(
+        [{"pass": "cap_cold", "conv": 0, "turn": 1, "local_hit": 32},
+         {"pass": "cap_warm", "conv": 0, "turn": 1, "local_hit": None},
+         {"pass": "cap_warm", "conv": None, "turn": 0, "local_hit": 5}]
+    )  # fmt: skip
+    assert ref == {"cap_cold/0/1": 32, "cap_warm/0/1": 0}
+    reqs = [{"pass": "cap_cold", "conv": 0, "turn": 1}, {"pass": "cap_warm3", "conv": 0, "turn": 1},
+            {"pass": "cap_warm2", "conv": 9, "turn": 0}, {"pass": "cap_warm2", "turn": 0}]  # fmt: skip
+    assert run_gate.match_locals(reqs, ref) == [32, 0, None, None]
+    assert run_gate.match_locals(reqs, None) == [None] * 4
+
+
+def test_unique_estimate_counts_shared_prefix_once():
+    spec = _spec(FULL)
+    # vLLM computes prompt + out - 1 tokens: out = BT + 1 completes one block.
+    est = run_gate.UniqueEstimate(spec, out_tokens=BT + 1)
+    a = list(range(3 * BT))
+    est.add([a[: 2 * BT], a])  # turn 2 extends turn 1: 3 distinct blocks + 2 generated
+    assert est.bytes == (3 + 2) * PAGE * LAYERS
+
+
+@pytest.mark.parametrize("given,ok", [("0.75,0.5,0.25", True), ("0.5,0.25,0.75,0.5", True), ("0.25,0.5", False)])  # fmt: skip
+def test_official_cap_fractions_compare_as_sets(tmp_path, given, ok):
+    import argparse
+
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"cap_fractions": given, "num_gpu_blocks": 0, "vllm_arg": []}))  # fmt: skip
+    probs = run_gate.official_problems(args, ["plain", "baseline", "m:C"], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
+    assert any(p.startswith("cap_fractions") for p in probs) is not ok

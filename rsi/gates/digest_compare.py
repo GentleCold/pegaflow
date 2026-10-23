@@ -19,6 +19,8 @@ in REF. A local or external block is
   the connector saved is among the references;
 - ``uncertain`` otherwise: no invariance and some computation of the key in
   REF was not digested (an untagged request or a preempted episode);
+  ``uncertain_preempted`` counts those whose only undigested computations
+  are preempted episodes of digested requests (no untagged computation);
 - ``unreferenced`` when REF never computed the key.
 
 Computed blocks are compared against the other computed copies: ``exact``
@@ -101,11 +103,21 @@ class Reference:
                 self.copies[key].setdefault(exact, [0, l1])[0] += 1
         # prefix key -> number of (request, episode) that computed its block end
         self.computers: Counter[str] = Counter()
+        # Of those, computations whose bytes were never digested: a preempted
+        # (non-last) episode of a digested request, or an untagged request.
+        self.preempted: Counter[str] = Counter()
+        self.untagged: Counter[str] = Counter()
         for r in _requests(probe_dir):
             kt = r["key_tokens"]
-            for start, end in computed_ranges(r):
+            ranges = computed_ranges(r)
+            for k, (start, end) in enumerate(ranges):
                 for e in range((start // kt + 1) * kt, end + 1, kt):
-                    self.computers[r["keys"][e // kt - 1]] += 1
+                    key = r["keys"][e // kt - 1]
+                    self.computers[key] += 1
+                    if r.get("digest") is None:
+                        self.untagged[key] += 1
+                    elif k + 1 < len(ranges):
+                        self.preempted[key] += 1
 
     def occurrences(self, key: Key) -> int:
         return sum(c[0] for c in self.copies.get(key, {}).values())
@@ -114,7 +126,14 @@ class Reference:
 def _group() -> dict[str, Any]:
     g: dict[str, Any] = {}
     for t in _LOADED:
-        for k in ("compared", "matched", "mismatched", "uncertain", "unreferenced"):
+        for k in (
+            "compared",
+            "matched",
+            "mismatched",
+            "uncertain",
+            "uncertain_preempted",
+            "unreferenced",
+        ):
             g[f"{t}_{k}"] = 0
     g |= {"computed_compared": 0, "computed_exact": 0, "max_rel_l1": 0.0, "first_bad": None}
     return g
@@ -122,6 +141,13 @@ def _group() -> dict[str, Any]:
 
 def _rel_l1(a: list[float], b: list[float]) -> float:
     return max(abs(x - y) / max(abs(x), 1e-9) for x, y in zip(a, b, strict=True))
+
+
+def _uncertain(g: dict[str, Any], tag: str, ref: Reference, key: Key) -> None:
+    g[f"{tag}_uncertain"] += 1
+    k = key[2]
+    if not ref.untagged[k] and ref.occurrences(key) + ref.preempted[k] >= ref.computers[k]:
+        g[f"{tag}_uncertain_preempted"] += 1
 
 
 def compare(ref_dir: Path, cand_dir: Path, invariant: bool) -> dict[str, Any]:
@@ -142,7 +168,10 @@ def compare(ref_dir: Path, cand_dir: Path, invariant: bool) -> dict[str, Any]:
                 g["max_rel_l1"] = max(g["max_rel_l1"], rel)
             continue
         if not copies:
-            g[f"{tag}_uncertain" if ref.computers[key[2]] else f"{tag}_unreferenced"] += 1
+            if ref.computers[key[2]]:
+                _uncertain(g, tag, ref, key)
+            else:
+                g[f"{tag}_unreferenced"] += 1
             continue
         g[f"{tag}_compared"] += 1
         if exact in copies:
@@ -160,7 +189,7 @@ def compare(ref_dir: Path, cand_dir: Path, invariant: bool) -> dict[str, Any]:
                     "bad_layers": bad,
                 }
         else:
-            g[f"{tag}_uncertain"] += 1
+            _uncertain(g, tag, ref, key)
     counters = [k for k, v in _group().items() if isinstance(v, int)]
     total: dict[str, Any] = {k: sum(g[k] for g in groups.values()) for k in counters}
     total["max_rel_l1"] = max((g["max_rel_l1"] for g in groups.values()), default=0.0)

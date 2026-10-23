@@ -135,20 +135,27 @@ def build_turns(
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     convs = []
     for line in convs_file.read_text().splitlines()[skip : skip + n_convs]:
-        msgs = json.loads(line)
-        turns: list[list[int]] = []
-        for k, m in enumerate(msgs):
-            if m["role"] != "user":
-                continue
-            ids = tok.apply_chat_template(msgs[: k + 1], add_generation_prompt=True, tokenize=True)
-            if hasattr(ids, "input_ids"):
-                ids = ids["input_ids"]
-            if len(ids) > budget or len(turns) >= max_turns:
-                break
-            turns.append(list(ids))
+        turns = conv_turns(tok, json.loads(line), budget, max_turns)
         if turns:
             convs.append(turns)
     return convs
+
+
+def conv_turns(
+    tok: Any, msgs: list[dict[str, str]], budget: int, max_turns: int
+) -> list[list[int]]:
+    """Token-id prompts of one conversation (``build_turns``)."""
+    turns: list[list[int]] = []
+    for k, m in enumerate(msgs):
+        if m["role"] != "user":
+            continue
+        ids = tok.apply_chat_template(msgs[: k + 1], add_generation_prompt=True, tokenize=True)
+        if hasattr(ids, "input_ids"):
+            ids = ids["input_ids"]
+        if len(ids) > budget or len(turns) >= max_turns:
+            break
+        turns.append(list(ids))
+    return turns
 
 
 def _pct(xs: list[float], q: float) -> float:

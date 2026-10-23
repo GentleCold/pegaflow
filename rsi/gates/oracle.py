@@ -217,15 +217,29 @@ def summarize(
 # ------------------------------------------------------------ G5 capacity
 
 
+def tp_copies(spec: dict[str, Any]) -> int:
+    """Distinct KV copies over the TP ranks: ``tp / kv_tp_replicas``."""
+    tp = int(spec.get("parallel", {}).get("tp", 1) or 1)
+    replicas = int(spec["kv_cache_config"].get("kv_tp_replicas", 1) or 1)
+    if tp % replicas:
+        raise ValueError(f"kv_tp_replicas {replicas} does not divide tp {tp}")
+    return tp // replicas
+
+
 def block_bytes(spec: dict[str, Any]) -> list[int]:
     """Bytes of one (group, key) block per non-skipped group, all ranks.
 
     Unpadded page bytes (``real_page_size_bytes``, as digested) x layers in
-    the group x TP ranks. ``UniformTypeKVCacheSpecs`` already sums its
-    per-layer pages, so it is not multiplied by the layer count. TP > 1
-    assumes every rank holds a distinct shard (no replicated-layout dedupe).
+    the group x distinct copies over the TP ranks: ``tp / kv_tp_replicas``
+    (vLLM's ``KVCacheConfig.kv_tp_replicas``: ranks holding the same bytes,
+    e.g. MLA's single latent head at TP2 = 2). A store keeps one copy of
+    replicated bytes: PegaFlow's save bytes on a TP2 MLA run equal
+    ``insertions x page x layers`` (DeepSeek-V2-Lite, 2026-10-23), and vLLM's
+    offloading spec stores one copy under ``replicated_layout``.
+    ``UniformTypeKVCacheSpecs`` already sums its per-layer pages, so it is
+    not multiplied by the layer count.
     """
-    tp = int(spec.get("parallel", {}).get("tp", 1) or 1)
+    copies = tp_copies(spec)
     out = []
     for g in spec["kv_cache_config"]["groups"]:
         if not g.get("enable_kv_transfer", True) or g.get("is_eagle_group"):
@@ -235,7 +249,7 @@ def block_bytes(spec: dict[str, Any]) -> list[int]:
         if not isinstance(page, int):
             page = s["page_size_bytes"]
         layers = 1 if "UniformTypeKVCacheSpecs" in s["mro"] else g["num_layers"]
-        out.append(page * layers * tp)
+        out.append(page * layers * copies)
     return out
 
 
@@ -525,9 +539,10 @@ def summarize_capacity(
     unlimited oracle, ``oc`` / ``lr`` / ``fz`` = Belady / LRU / freeze at
     capacity (all simulated with ``ref`` as the local hit).
 
-    - ``ext = max(0, min(a, o) - ref)`` (capped by the unlimited oracle, so a
-      connector cannot score above what an unlimited store could serve; a
-      lower own local hit only raises what it has to load)
+    - ``ext = max(0, min(a, o) - max(ref, own))`` (capped by the unlimited
+      oracle, so a connector cannot score above what an unlimited store could
+      serve; a lower own local hit only raises what it has to load, a higher
+      one is vLLM's cache, not the store's, and earns nothing)
     - ``ext*_C = max(0, oc - ref)``; ``efficiency_c`` (``E_C``) = Σext / Σext*_C
     - ``lru_vs_oracle_c`` / ``freeze_vs_oracle_c`` = Σmax(0, lr|fz - ref) / Σext*_C
     - ``efficiency_c_own_local``: the same ratio with the arm's own local hit
@@ -574,7 +589,7 @@ def summarize_capacity(
             t["oc"] += belady[i]
             t["lr"] += lru[i]
             t["fz"] += freeze[i]
-            t["ext"] += max(0, min(a, o) - rl)
+            t["ext"] += max(0, min(a, o) - max(rl, lo))
             t["ext_c"] += max(0, belady[i] - rl)
             t["ext_lru"] += max(0, lru[i] - rl)
             t["ext_fz"] += max(0, freeze[i] - rl)
