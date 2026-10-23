@@ -48,11 +48,12 @@ names, magic constants that only exist in the old code).
 
 ## Environment
 
-- Remote: 10.121.196.3 (8x4090, CUDA 13.0, driver 580); everything under `~/kexi/`.
+- Remote: 10.1.0.44 since 2026-10-23 (8x4090, driver 595, `LD_LIBRARY_PATH=~/kexi/cuda13-lib`);
+  before that 10.121.196.3 (CUDA 13.0, driver 580). Everything under `~/kexi/`.
 - Shared venv `~/kexi/pegaflow/python/.venv` (py3.12, vLLM 0.32.0, torch 2.13.0,
   flashinfer-python 0.7.0.post1). No per-branch venv.
 - Feature dir `~/kexi/pegaflow-semantics-rsi`, sync via
-  `.local/bin/pegaflow-remote-sync.sh --ip 10.121.196.3 --feature semantics-rsi`.
+  `.local/bin/pegaflow-remote-sync.sh --ip 10.1.0.44 --feature semantics-rsi`.
 - Build: maturin with `cuda-13,rdma`, `PYO3_PYTHON` = shared venv python.
 - Models: `/root/kexi/models/{Qwen3-4B,DeepSeek-V2-Lite-Chat,Qwen3.5-4B,gemma-4-E4B-it}`.
 - Logs `~/kexi/logs`, run records `~/kexi/rsi-runs`.
@@ -281,6 +282,36 @@ names, magic constants that only exist in the old code).
   run 69 passed, 43 skipped; ruff clean. .3 still "No route to host". NEXT: the
   same as it1 (sync, native units, slice gate on GPU 1 after checking GPU 0 is
   not running the P0 final run), then read `save stats` for the S5 decision.
+
+- Host move (user, 2026-10-23): .3/.2 stayed "No route to host"; the 4090
+  host is now `10.1.0.44` (8x4090, driver 595 / CUDA 13.2, 1 TiB RAM,
+  8 NUMA nodes, fresh box). Rebuilt from scratch under `~/kexi/`:
+  - apt build deps (protobuf, ibverbs/rdmacm, numa, clang); rustup with the
+    default dist server (the tuna rustup mirror 404s on 1.97.0), crates via
+    the tuna sparse index in `~/.cargo/config.toml`.
+  - Shared venv `~/kexi/pegaflow/python/.venv`: py3.12, vLLM 0.32.0,
+    torch 2.13.0+cu130 (tuna). `maturin develop --uv` (the uv venv has no pip).
+  - pegaflow-server must be built with `PYO3_PYTHON` = venv python (otherwise
+    it links the system libpython3.10). The system toolkit is CUDA 12.2 and
+    cudarc dlopens `libcudart.so` unversioned, so the server picked 12.2 and
+    failed the preflight. Fix: `~/kexi/cuda13-lib` symlinks the venv's
+    `nvidia/cu13/lib` with unversioned names; every gate run on .44 uses
+    `LD_LIBRARY_PATH=~/kexi/cuda13-lib` (replaces the .3 cuda-13.0 path).
+  - Data: gsm8k from the same OSS mirror (7473/1319); R2EGym parquet from
+    hf-mirror, `r2egym-256.jsonl` regenerated with `prep-r2egym --n 256`.
+    Models via modelscope into `~/kexi/models/`.
+  - Remote checks: `test_connector_v2_core.py` + `test_semantics_bindings.py`
+    147 passed (native included); server smoke healthy.
+  - First launch died in vLLM startup: flashinfer JIT (sampling) used the
+    system nvcc 12.2 (`--compress-mode` unknown). Fix: pin venv
+    `nvidia-cuda-nvcc`/`nvidia-cuda-crt`/`nvidia-nvvm` to 13.0.x (13.4 nvcc
+    rejects the 13.0 headers; 13.4 cicc emits PTX 9.4 that ptxas 13.0
+    refuses), and `~/kexi/cuda13` = CUDA_HOME (bin/include/nvvm from the
+    venv, lib -> cuda13-lib). Gate env on .44:
+    `CUDA_HOME=~/kexi/cuda13 PATH=$VENV/bin:~/kexi/cuda13/bin:$PATH LD_LIBRARY_PATH=~/kexi/cuda13-lib`.
+  - The .3 p0-final record is lost with the host, so p0-final is rerun from
+    scratch on .44 GPU0 (`p0-final.log`). P3 it1 slice on GPU1
+    (`p3-it1-slice.log`), rev 41fb158.
 
 ## Semantics changelog
 

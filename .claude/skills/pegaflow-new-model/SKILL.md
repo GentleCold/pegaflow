@@ -73,9 +73,18 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 
 - vLLM 0.32 + flashinfer-python 0.7.0.post1: remove stale `flashinfer-cubin`
   (version check aborts startup; no 0.7 cubin on PyPI).
-- On .3, ldconfig resolves `libcudart.so` to CUDA 12.5; a cuda-13 server build
-  aborts in preflight. Export
-  `LD_LIBRARY_PATH=/usr/local/cuda-13.0/targets/x86_64-linux/lib` for gate runs.
+- A cuda-13 server build aborts in preflight when the unversioned
+  `libcudart.so` resolves to CUDA 12.x (cudarc dlopens it by that name). On
+  .44 (current 4090 host, system toolkit 12.2) export
+  `LD_LIBRARY_PATH=~/kexi/cuda13-lib` (symlinks to the venv's
+  `nvidia/cu13/lib` with unversioned names); on the old .3 it was
+  `/usr/local/cuda-13.0/targets/x86_64-linux/lib`.
+- vLLM's flashinfer JIT needs a CUDA 13.0 toolchain matching the 13.0
+  headers. On a host whose system toolkit is 12.x use the venv wheels
+  (`nvidia-cuda-nvcc`, `nvidia-cuda-crt`, `nvidia-nvvm` pinned to 13.0.x) with
+  `CUDA_HOME=~/kexi/cuda13` and the venv `bin` (ninja) on PATH.
+- Build pegaflow-server with `PYO3_PYTHON` = the venv python, else it links
+  the system libpython; a uv venv has no pip, so use `maturin develop --uv`.
 - `pegaflow-server` (PyO3-linked) needs the venv's libpython: `run_gate` adds
   `sysconfig LIBDIR` to `LD_LIBRARY_PATH` and sets `PYO3_PYTHON`/`PYTHONHOME`.
   Start it by hand the same way.

@@ -90,10 +90,11 @@ output, they do not edit it.
 
 | `selftest/connector.py` | gate self-test connector: `honest` / `liar` / `bitflip` / `offbyone` |
 
-Usage (on .3, from the feature dir, shared venv):
+Usage (on the 4090 host 10.1.0.44, from the feature dir, shared venv):
 
 ```bash
-LD_LIBRARY_PATH=/usr/local/cuda-13.0/targets/x86_64-linux/lib \
+CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python/.venv/bin:~/kexi/cuda13/bin:$PATH \
+LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 ~/kexi/pegaflow/python/.venv/bin/python -m rsi.gates.run_gate \
   --model ~/kexi/models/<model> --tag <model>-it<N> \
   --arms plain,baseline,old,<module>:<Class> --workloads gsm8k,replay --gpu 0
