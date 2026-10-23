@@ -348,3 +348,92 @@ costs more with the connector. Candidates: vLLM's per-step connector
 overhead (outputs gathered from every TP rank), the step thread's
 `wait_for_save` / `build_connector_meta`, and the server's D2H copies
 competing with prefill on the same GPU.
+
+## Qwen3-4B non-regression for it2 (`2026-10-23-qwen3-4b-p4-it2-nonreg`, rev 3d1de18, GPU 0)
+
+`--model ~/kexi/models/Qwen3-4B --gsm8k-limit 1319 --replay-convs 8
+--replay-turns 6 --gpu 0`, arms plain, baseline, v2. All v2 verdicts pass,
+judged against the in-run baseline:
+
+| check | it2-nonreg (GPU 0) | reference it2c-slice1 (GPU 1, rev 056eb4b) |
+|---|---|---|
+| digest gsm8k self / vs baseline | ext 6123 / local 170698 matched, 0 mismatched; computed_exact 16652/16652, 22126/22126 | ext 6578 / local 170243, 0 mismatched; 16652/16652, 22125/22125 |
+| gsm8k_outputs, accuracy | 0 / 0 differ; 0.8582 = baseline | 0 / 0; 0.8582 |
+| E_ext gsm8k / replay | 1.0 / 1.0, excess 0 | 1.0 / 1.0 |
+| replay warm TTFT p50 v2 / baseline | 0.095, 0.092 / 0.218, 0.220 | 0.094, 0.096 / 0.210, 0.210 |
+| replay warm req/s | 6.79, 6.79 / 5.37, 5.38 | 6.87, 6.79 / 5.52, 5.52 |
+| replay cold TTFT p50 | 0.217 / 0.218 (-0.5%) | 0.208 / 0.211 |
+| replay cold req/s | 5.00 / 5.01 | 5.09 / 5.09 |
+| gsm8k cold / warm s | 172.1 / 170.8 vs 170.8 / 171.6 (+0.7%, -0.5%) | 163.8 / 162.3 vs 175.6 / 162.0 |
+| hits warm gsm8k (local / ext / total) | 0.926 / 0.067 / 0.992 | 0.921 / 0.072 / 0.992 |
+
+Relative to the in-run baseline, every delta is the same as the reference
+run's. Absolute times are about 4% higher on GPU 0 for both arms. So the
+storage-rank change (identity at TP1) does not regress Qwen3-4B.
+
+## it3a (2026-10-23): what makes cold prefill slower (probe arms, no code change)
+
+Single-writer did not fix cold, so this iteration measures before changing
+code. The probe arms live in a remote-only module,
+`~/kexi/tmp/dsv2-p4/p4probe.py` (not in the repo, on PYTHONPATH for the
+run only), as subclasses of `PegaKVConnectorV2` at rev 3d1de18:
+
+- `NoSaveV2`: `wait_for_save` does nothing. Queries and loads as v2.
+- `NullV2`: registers with the server, returns no hit, plans nothing, saves
+  nothing. vLLM still runs its connector plumbing.
+- `DeferV2`: same saves as v2, but a step's save job is handed to the saver
+  thread only at the start of the first later step without prefill tokens
+  (or after 8 steps), so the D2H copies overlap decode steps, not
+  prefill. The log shows 147 to 297 decode-only releases per window, 1
+  forced.
+
+How saves are issued today (pegaflow-core, read-only): the worker's saver
+thread waits on a CUDA event recorded on vLLM's compute stream after the
+step's forward, then sends one `save` RPC per step. The server's per-GPU
+save thread copies with one `cuMemcpyDtoHAsync_v2` per coalesced range
+(`TransferMode::Direct`, the DMA copy engines; MLA uses `direct`) on a
+cudarc `new_stream()` stream (`CU_STREAM_NON_BLOCKING`, default priority),
+then synchronizes an event. No kernel is involved and no stream priority
+is set. The 4090s on .44 have no GPU P2P (vLLM: "Custom allreduce is
+disabled ... lacks GPU P2P"), so TP all-reduce goes through NCCL over PCIe
+host memory. The server's D2H copies cross the same PCIe link.
+
+Cold replay, replay-only, 8x6, same rev:
+
+| run (GPU) | arm | TTFT p50 | vs baseline | req/s | prefill sum s | queue sum s | decode sum s |
+|---|---|---|---|---|---|---|---|
+| probe-23 (2,3) | baseline | 0.1892 | | 5.689 | 5.65 | 2.19 | 32.61 |
+| | v2 | 0.1997 | +5.5% | 5.510 | 6.37 | 2.62 | 33.23 |
+| | NoSaveV2 | 0.1909 | +0.9% | 5.687 | 5.78 | 2.17 | 32.53 |
+| | NullV2 | 0.1923 | +1.6% | 5.556 | 5.82 | 2.01 | 33.39 |
+| defer-01 (0,1) | baseline | 0.1858 | | 5.723 | 5.73 | 2.35 | 32.37 |
+| | v2 | 0.1998 | +7.5% | 5.584 | 6.25 | 2.58 | 32.86 |
+| | DeferV2 | 0.1951 | +5.0% | 5.626 | 5.98 | 2.29 | 32.96 |
+| defer-23 (2,3) | baseline | 0.1872 | | 5.714 | 5.58 | 2.14 | 32.45 |
+| | v2 | 0.2004 | +7.1% | 5.568 | 6.29 | 2.60 | 32.96 |
+| | DeferV2 | 0.1969 | +5.2% | 5.594 | 5.92 | 2.14 | 33.19 |
+
+Warm replay (warm2 / warm3 TTFT p50): v2 0.098 to 0.114 s, DeferV2 0.100 to
+0.118 s, NoSaveV2 and NullV2 0.164 to 0.177 s (no saves, so no external
+hits, as expected). DeferV2's loaded-block checks pass (external 1382 /
+local 7094 matched, 0 mismatched; E_ext 1.0).
+
+Findings:
+- The cold cost is the save path. NoSaveV2 (queries, leases, connector
+  plumbing) is within 1% of baseline, and NullV2 within 1.6%. Per-step
+  scheduler-side cost (query RPC, plan building) is not it: NullV2 drops
+  them and is no faster than NoSaveV2.
+- Moving the copies off prefill steps buys back only a third (+7% to +5%).
+  So the cost is not only GPU contention between the D2H copy and the
+  prefill kernels. The rest moves with the save job, not with its timing.
+- What a save job does besides the copy, on tp0 (saver thread): it waits
+  for the compute event (`Event.synchronize`, releases the GIL), builds
+  the RPC arguments (27 layer names x block ids x hashes, about 2.3k
+  blocks per cold pass), and runs the blocking gRPC call (GIL released in
+  `py.detach`). Building the arguments holds the GIL while vLLM's
+  worker step thread needs it. Next probe: NoRpcV2 (the full worker save
+  path without the RPC) splits Python-side cost from the server copy.
+
+Process note: these runs are stopped only by their own gate. Their
+run_gate pgids were recorded at launch (probe-23 1647263, defer-01
+1689145, defer-23 1689150).
