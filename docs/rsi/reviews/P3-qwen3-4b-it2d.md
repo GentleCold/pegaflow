@@ -201,3 +201,16 @@ checked against `summary.json` / `result.json`):
 Not verified: runtime behaviour of a failed sync load (none occurred), the
 teardown test (S3/nit), and E_ext / excess numbers beyond the passing G3
 verdicts.
+
+## Resolution
+
+Resolved in it2e, one commit on `feat/semantics-rsi`; see `models/Qwen3-4B/ITERATIONS.md` it2e. None of the changes touches the Qwen3-4B success path, so G0-G4 stay accepted at 8a05b7c. The next official run (it3 or the G5 rerun) covers the final code.
+
+| ID | Resolution |
+|---|---|
+| S1 | Fixed. `hit.sync` also requires `not _saves_disabled`, so every load is async after the first reported failure (a failed async load is never cached). The README records the residual vLLM-side output risk until the rewound holder recomputes. Test: `test_lifecycle_after_saves_disabled[later-loads-async]`. |
+| S2 | Fixed. `test_lifecycle_after_saves_disabled[preempted-still-flushes\|finished-still-held]`: a request that saved before the failure still gets `plan.flush` on preemption and `plan.finished` + hold on finish. Mutants run on .44: (a) early return above the preemption loop, 1 failed; (b) `request_finished` False once disabled, 1 failed; dropping the S1 condition, 1 failed. |
+| S3 | Fixed. The ITERATIONS it2d sentence now cites the `.pyc` mtime + md5 evidence. The connector logs `from=<import dir>` at init, the same hunk as P4's branch. |
+| S4 | No action. The exit code is 1 only because of the reference `old` arm (G4.gsm8k_warm +3.4%). Every baseline and v2 verdict passes. |
+| S5 | `min_hit_tokens` deleted (policy, default.toml, test row). `loading_wait_ms` kept, with the evidence gap recorded: no SSD/RDMA tier, so no `QueryLoading` and 0 `prefetch wait expired` lines in it2d. Deleting it would turn a Loading answer into an immediate miss once a tier exists. |
+| nits | Not changed. The empty sync `LoadPlan` is unreachable today; the `run_gate` items are gate-owned; the `getattr` fallback is kept, being conservative and the same as P4. The teardown test passed on .44 (`PYTHONPATH=. pytest rsi/gates/test_teardown.py`: 1 passed at df01403). |

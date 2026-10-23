@@ -143,7 +143,8 @@ class Scheduler:
         # Fail closed after a failed sync load: vLLM (recompute policy) keeps
         # the invalid blocks and every block computed on them in its prefix
         # cache under their correct hashes, so any later request may extend
-        # bad KV. No save is planned once vLLM reported one (``on_load_errors``).
+        # bad KV. No save is planned once vLLM reported one (``on_load_errors``),
+        # and later loads are async so no further bad block enters that cache.
         self._saves_disabled = False
         self._plan = StepPlan()
 
@@ -188,8 +189,12 @@ class Scheduler:
         self._release_unkept(lookup.leases, hit.leases)
         n = hit.p - num_computed
         # A short load costs about a millisecond; waiting for it before the
-        # forward beats the two scheduler round trips of an async load.
-        hit.sync = self._sync_loads and n <= self._policy.sync_load_tokens
+        # forward beats the two scheduler round trips of an async load. After
+        # a failed sync load every load is async: vLLM keeps a failed sync
+        # load's blocks prefix-cached, a failed async load's never.
+        hit.sync = (
+            self._sync_loads and not self._saves_disabled and n <= self._policy.sync_load_tokens
+        )
         self._hits[req_id] = hit
         return n, not hit.sync
 
@@ -391,7 +396,7 @@ class Scheduler:
             self._saves_disabled = True
             logger.error(
                 "[PegaKVConnectorV2] sync load failed (%d GPU blocks): vLLM may reuse KV "
-                "computed on them, saves disabled for this process",
+                "computed on them, saves and sync loads disabled for this process",
                 len(block_ids),
             )
 

@@ -96,7 +96,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | G0-G4 accepted pending review: it2d official run (`2026-10-23-qwen3-4b-p3-it2d`, rev 8a05b7c) passes every v2 verdict; it2d review running; G5 waits for the gate rerun |
+| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 pending (G5 r3 official) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -584,6 +584,29 @@ names, magic constants that only exist in the old code).
   Save stats: 0 failed, 0 flushes, max 3 pending, step-thread submit 13-16 ms.
   Qwen3-4B: G0-G4 accepted pending the it2d review; G5 waits for the gate
   rerun.
+
+- it2d review: ACCEPT-WITH-FIXES, no must-fix. Qwen3-4B G0-G4 accepted at
+  8a05b7c; G5 pending r3. it2e (review fixes, no success-path change):
+  - S1: every load is async once saves are disabled;
+  - S2: lifecycle tests pin the two surviving mutants;
+  - S3: provenance sentence fixed, and the connector logs its import dir;
+  - S5: `min_hit_tokens` deleted, `loading_wait_ms` kept with the evidence
+    gap recorded;
+  - S4: exit 1 is the reference `old` arm only.
+- Native reference (vLLM OffloadingConnector), record only and noisy (four
+  gate runs on the host at once), `2026-10-23-qwen3-4b-p3-it2d-native`:
+  - gsm8k cold/warm +7.5% / +4.0% vs the same run's baseline (G4 fail);
+  - replay warm2/3 TTFT 0.505 / 0.459 s, req/s 9.63 / 9.76;
+  - E_ext 1.0, excess 1170 / 195 (same as `old`);
+  - G0/G2 digest fail because it runs LBHNC, not LBNHC (accuracy and
+    outputs match).
+
+  The first attempt died to the gate's aiohttp keep-alive race (fixed by
+  8462ed9). The same-run v2 vs native comparison waits for G5 r3. ITERATIONS
+  has an "it3 candidate" on load-path cost: native submits one batched
+  `cuMemcpyBatchAsync` per load, v2 one `cuMemcpyAsync` per merged run;
+  14.2 vs 21.9 GB/s effective H2D on replay warm2. Both copy 64 KiB
+  per-layer pages.
 
 ## Semantics changelog
 
