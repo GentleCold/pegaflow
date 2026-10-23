@@ -7,6 +7,8 @@ knowledge lives in ``adapters``.
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import os
 import pickle
 from dataclasses import dataclass, field
@@ -37,6 +39,26 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _route_package_logs() -> None:
+    """Emit ``pegaflow.connector_v2.*`` INFO lines (e.g. worker ``save stats``).
+
+    vLLM 0.32 configures only the ``vllm`` logger (propagate=False). Loggers
+    outside it have no handler, so Python's last-resort handler drops
+    everything below WARNING.
+    """
+    pkg = logging.getLogger(__package__)
+    if pkg.handlers or logging.getLogger().handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s %(asctime)s [%(name)s] %(message)s"))
+    pkg.addHandler(handler)
+    pkg.setLevel(logging.INFO)
+    pkg.propagate = False
+
+
+_route_package_logs()
+
+
 @dataclass
 class PegaConnectorMetadata(KVConnectorMetadata):
     plan: StepPlan = field(default_factory=StepPlan)
@@ -63,6 +85,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             dcp_size=pc.decode_context_parallel_size,
             dcp_interleave=pc.cp_kv_cache_interleave_size,
             world_size=pc.world_size,
+            kv_tp_replicas=getattr(kv_cache_config, "kv_tp_replicas", 1) or 1,
         )
         if role == KVConnectorRole.WORKER:
             par = _with_worker_ranks(par)
@@ -94,9 +117,14 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         self._worker: Worker | None = None
         if role == KVConnectorRole.SCHEDULER:
             if getattr(self._kv_transfer_config, "kv_load_failure_policy", None) == "fail":
-                logger.warning(
-                    "[PegaKVConnectorV2] kv_load_failure_policy=fail: a failed load "
-                    "(e.g. an expired lease) errors the request; use recompute"
+                # vLLM's scheduler reads the TOP-LEVEL kv_transfer_config. Under
+                # MultiConnector this child config always shows the default
+                # "fail" (vLLM 0.32 builds it from the child dict), so this
+                # cannot tell whether recompute is in effect.
+                logger.info(
+                    "[PegaKVConnectorV2] own kv_load_failure_policy=fail; the effective "
+                    "policy is the top-level kv_transfer_config's. Under fail, a failed "
+                    "load (e.g. an expired lease) errors the request: use recompute"
                 )
             profile = extra.get("model_profile") or getattr(mc, "architecture", None)
             self._scheduler = Scheduler(
@@ -218,6 +246,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
     def shutdown(self) -> None:
         if self._scheduler is not None:
             self._scheduler.shutdown()
+        if self._worker is not None:
+            self._worker.report_save_stats()
 
 
 def _with_worker_ranks(par: Parallel) -> Parallel:
@@ -228,15 +258,11 @@ def _with_worker_ranks(par: Parallel) -> Parallel:
     )
 
     _, dcp_rank = get_dcp_world_size_and_rank()
-    return Parallel(
+    return dataclasses.replace(
+        par,
         tp_rank=get_tp_group().rank_in_group,
-        tp_size=par.tp_size,
         pp_rank=get_pp_group().rank_in_group,
-        pp_size=par.pp_size,
         dcp_rank=dcp_rank,
-        dcp_size=par.dcp_size,
-        dcp_interleave=par.dcp_interleave,
-        world_size=par.world_size,
     )
 
 

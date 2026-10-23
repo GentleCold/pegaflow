@@ -22,7 +22,6 @@ import pytest
 from pegaflow.connector_v2 import adapters
 from pegaflow.connector_v2.adapters import LayerDecl, LayerView, Parallel, Unsupported
 from pegaflow.connector_v2.core import Scheduler, StepPlan, Worker, build_layout
-from pegaflow.connector_v2.core.layout import _tp_ranks
 from pegaflow.connector_v2.core.scheduler import GroupSave, LoadPlan
 from pegaflow.connector_v2.policy import Policy, SaveItem, load_policy
 
@@ -703,7 +702,13 @@ def test_worker_save_by_storage_group():
         {"layers.0.attn": StubWindowSpec(), "layers.1.attn": StubFullSpec()},
     )
     worker.save(StepPlan(saves=[GroupSave(1, [21], [b"h1"]), GroupSave(0, [11], [b"h1"])]))
+    worker.save(StepPlan())
     assert saved == [[("layers.0.attn", [21], [b"h1"]), ("layers.1.attn", [11], [b"h1"])]]
+    # S2: the gate log attributes G4 to save cost; 2 x (64 + 64) B segments.
+    stats = worker.save_stats
+    assert (stats.steps, stats.save_steps, stats.blocks, stats.bytes) == (2, 1, 2, 256)
+    worker.report_save_stats()
+    assert worker.save_stats.steps == 0
 
 
 # --------------------------------------------------------------------- layout
@@ -833,6 +838,7 @@ class FullAttentionSpec:  # duck-typed vLLM 0.32 spec; the registry keys on the 
     state_content_bytes: int | None = None
     tokens_per_state: int = 1
     kv_quant_mode: int = 0
+    non_causal: bool = False
 
 
 @dataclass
@@ -872,6 +878,9 @@ def full_attention(monkeypatch, sem):
         pytest.param(FakeKV((10, 8, 16, 256), (32768, 4096, 256, 1)), 10, id="LBHNC"),
         # Kernel blocks of 8 tokens split each 16-token manager block in two.
         pytest.param(FakeKV((20, 8, 8, 256), (16384, 256, 2048, 1)), 10, id="kernel-split"),
+        # M1: a split [H, N, C] page is stored as 2 x [H, N/2, C], which the
+        # namespace (kv_cache_layout) does not tell apart from the unsplit page.
+        pytest.param(FakeKV((20, 8, 8, 256), (16384, 2048, 256, 1)), None, id="LBHNC-split"),
         # Block-outer layouts put the other layers' pages between our blocks.
         pytest.param(FakeKV((10, 8, 16, 256), (36 * 32768, 256, 2048, 1)), None, id="BLNHC"),
         pytest.param(FakeKV((10, 8, 16, 256), (32768, 256, 4096, 1)), None, id="holes"),
@@ -894,71 +903,90 @@ def test_full_attention_view(sem, full_attention, kv, num_blocks):
     assert view.tensor is kv
 
 
+def _attn_cfg(spec, n_layers, kv_cache_layout="LBNHC"):
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(n_layers)]
+    group = types.SimpleNamespace(kv_cache_spec=spec, layer_names=names)
+    return names, types.SimpleNamespace(
+        transfer_group_ids=(0,),
+        kv_cache_groups=[group],
+        hash_block_size=16,
+        kv_cache_layout=kv_cache_layout,
+    )
+
+
+# Per-rank page for 4 of the 8 kv heads (TP2, or TP4 over 2 head shards).
+HALF_SPEC = FullAttentionSpec(num_kv_heads=4, page_size_bytes=32768)
+HALF_KV = FakeKV((QWEN3_BLOCKS, 4, 16, 256), (16384, 256, 1024, 1))
+
+
 @BOTH
 @pytest.mark.parametrize(
-    "spec,par,shards",
+    "spec,par,kv,shards",
     [
-        pytest.param(FullAttentionSpec(), Parallel(), [(0, 1)], id="tp1"),
-        pytest.param(FullAttentionSpec(), Parallel(tp_size=2), [(0, 2), (1, 2)], id="tp2"),
+        # Qwen3-4B as run by the gate: 36 layers, TP1, LBNHC.
+        pytest.param(FullAttentionSpec(), Parallel(), QWEN3_KV, [(0, 1)], id="tp1"),
+        pytest.param(HALF_SPEC, Parallel(tp_size=2), HALF_KV, [(0, 2), (1, 2)], id="tp2"),
         # 4 ranks over 2 head shards: consecutive ranks hold replicas.
         pytest.param(
-            FullAttentionSpec(max_tp_shards=2),
-            Parallel(tp_size=4),
+            dataclasses.replace(HALF_SPEC, max_tp_shards=2),
+            Parallel(tp_size=4, kv_tp_replicas=2),
+            HALF_KV,
             [(0, 2), (0, 2), (1, 2), (1, 2)],
             id="tp4-replicas",
         ),
     ],
 )
-def test_full_attention_layout(sem, full_attention, spec, par, shards):
-    names = [f"model.layers.{i}.self_attn.attn" for i in range(3)]
-    cfg = types.SimpleNamespace(
-        transfer_group_ids=(0,),
-        kv_cache_groups=[types.SimpleNamespace(kv_cache_spec=spec, layer_names=names)],
-        hash_block_size=16,
-    )
+def test_full_attention_layout(sem, full_attention, spec, par, kv, shards):
+    names, cfg = _attn_cfg(spec, 36)
     layout = build_layout(cfg, par, {"model": "Qwen3-4B"}, semantics=sem)  # runs seal_plan
     assert [(g.sem.kind, g.sem.block_tokens, g.hash_scale) for g in layout.groups] == [
         ("full", 16, 1)
     ]
-    decls = [full_attention.layer(spec, names[0], r) for r in _tp_ranks(par)]
-    assert {d.segments for d in decls} == {(65536,)}
+    ranks = [dataclasses.replace(par, tp_rank=r) for r in range(par.tp_size)]
+    decls = [full_attention.layer(spec, names[0], r) for r in ranks]
     assert [d.shard for d in decls] == [sem.Shard.heads(i, n) for i, n in shards]
+    # Rank 0 registration as the server sees it: one page-sized segment per layer.
+    rpc = FakeRpc()
+    _worker(sem, rpc, [], layout=layout).register(
+        dict.fromkeys(names, kv), dict.fromkeys(names, spec)
+    )
+    reg = rpc.registered
+    page = spec.page_size_bytes
+    assert reg["names"] == names
+    assert set(reg["segments"]) == {1}
+    assert set(reg["bytes_per_block"]) == set(reg["kv_strides"]) == {page}
+    assert set(reg["num_blocks"]) == {QWEN3_BLOCKS}
+    assert (reg["backend"], reg["page_first"], set(reg["group_ids"])) == ("direct", False, {0})
 
 
 @BOTH
 @pytest.mark.parametrize(
-    "field,value",
+    "field,value,par",
     [
-        ("sliding_window", 4096),
-        ("page_size_padded", 69632),
-        ("kv_quant_mode", 1),
-        ("num_head_slots", 4),
-        ("has_layer_views", False),
+        ("sliding_window", 4096, Parallel()),
+        ("page_size_padded", 69632, Parallel()),
+        ("kv_quant_mode", 1, Parallel()),
+        ("num_head_slots", 4, Parallel()),
+        ("non_causal", True, Parallel()),
+        ("has_layer_views", False, Parallel()),
+        # vLLM says ranks replicate (kv_tp_replicas) but the spec declares none.
+        ("max_tp_shards", None, Parallel(tp_size=4, kv_tp_replicas=2)),
     ],
 )
-def test_full_attention_rejects_unvalidated_specs(sem, full_attention, field, value):
+def test_full_attention_rejects_unvalidated_specs(sem, full_attention, field, value, par):
     spec = dataclasses.replace(FullAttentionSpec(), **{field: value})
     with pytest.raises(Unsupported):
-        full_attention.group(spec)
+        _layout_of(sem, spec, par)
 
 
-@BOTH
-def test_full_attention_registers_one_page_segment(sem, full_attention):
-    """Qwen3-4B worker registration as the server sees it (TP1, 36 layers)."""
-    spec = FullAttentionSpec()
-    names = [f"model.layers.{i}.self_attn.attn" for i in range(36)]
-    cfg = types.SimpleNamespace(
-        transfer_group_ids=(0,),
-        kv_cache_groups=[types.SimpleNamespace(kv_cache_spec=spec, layer_names=names)],
-        hash_block_size=16,
-    )
-    layout = build_layout(cfg, Parallel(), {"model": "Qwen3-4B"}, semantics=sem)
-    rpc = FakeRpc()
-    worker = _worker(sem, rpc, [], layout=layout)
-    worker.register(dict.fromkeys(names, QWEN3_KV), dict.fromkeys(names, spec))
-    reg = rpc.registered
-    assert reg["names"] == names
-    assert set(reg["segments"]) == {1}
-    assert set(reg["bytes_per_block"]) == set(reg["kv_strides"]) == {65536}
-    assert set(reg["num_blocks"]) == {QWEN3_BLOCKS}
-    assert (reg["backend"], reg["page_first"], set(reg["group_ids"])) == ("direct", False, {0})
+def _layout_of(sem, spec, par=None, kv_cache_layout="LBNHC"):
+    _, cfg = _attn_cfg(spec, 2, kv_cache_layout)
+    return build_layout(cfg, par or Parallel(), {"model": "Qwen3-4B"}, semantics=sem)
+
+
+def test_namespace_covers_page_byte_order(sem, full_attention):
+    """M1: [N, H, C] and [H, N, C] pages hold different bytes for one declaration."""
+    nhc = _layout_of(sem, FullAttentionSpec(), kv_cache_layout="LBNHC")
+    hnc = _layout_of(sem, FullAttentionSpec(), kv_cache_layout="LBHNC")
+    assert nhc.namespace != hnc.namespace
+    assert nhc.namespace == _layout_of(sem, FullAttentionSpec()).namespace

@@ -39,11 +39,27 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
 - **Saves.** Each step, `semantics.saveable(g, before, after)` gives the blocks
   that became storable. `policy.choose_saves` filters them, and the worker saves
   them after the forward pass.
-- **Namespace.** It is a hash of the adapters' declarations (group kinds, block
-  sizes, per-rank segments and shards, transfer backend, page_first), the
-  parallel shape, the model (path, revision, quantization), the dtypes and
-  vLLM's prefix hash algorithm. Any layout change gives a new namespace
-  automatically.
+- **Namespace.** It is a hash of:
+  - the adapters' declarations: group kinds, block sizes, per-rank segments
+    and shards, transfer backend, page_first;
+  - vLLM's `kv_cache_layout` (the page byte order, e.g. LBNHC `[N, H, C]` vs
+    LBHNC `[H, N, C]`);
+  - the parallel shape;
+  - the model: path, revision, quantization;
+  - the dtypes and vLLM's prefix hash algorithm.
+
+  Declarations carry sizes, not byte order. So an adapter must reject any byte
+  order that neither its declaration nor `kv_cache_layout` names. For example,
+  `full_attention` rejects kernel-split HNC pages.
+- **Save cost.** Every 500 `wait_for_save` calls (and at shutdown) each worker
+  logs `save stats`:
+  - steps, and steps with a save;
+  - blocks and bytes;
+  - sync and RPC ms;
+  - average and max save-step ms;
+  - failed saves.
+
+  Saves are synchronous today; these numbers decide whether to make them async.
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;
   - so are checkpoint groups, until the core handles vLLM's
@@ -65,7 +81,7 @@ Registered adapters:
 
 | Spec class | Module | Declares | Onboarded by |
 |---|---|---|---|
-| `FullAttentionSpec` | `full_attention` | `Group.full(block_size)`; one segment = the whole page (K/V interleaved per cell); `Heads` shard, replicas beyond `max_tp_shards`; dense layer-compact pages only | Qwen3-4B (`docs/rsi/models/Qwen3-4B/ITERATIONS.md`) |
+| `FullAttentionSpec` | `full_attention` | `Group.full(block_size)`; one segment = the whole page (K/V interleaved per cell); `Heads` shard, replicas beyond `max_tp_shards` (checked against `kv_tp_replicas`); dense layer-compact pages only, no kernel-split HNC pages; rejects window, chunked, padded, packed, quantized and `non_causal` specs | Qwen3-4B (`docs/rsi/models/Qwen3-4B/ITERATIONS.md`) |
 
 The shared rules live in the semantics crate, so an adapter only declares
 facts: the dependency kind, the tokens per block, the bytes per segment, and

@@ -30,6 +30,8 @@ class Parallel:
     dcp_size: int = 1
     dcp_interleave: int = 1
     world_size: int = 1
+    # vLLM KVCacheConfig.kv_tp_replicas: consecutive TP ranks holding identical KV.
+    kv_tp_replicas: int = 1
 
 
 # RegisterContext transfer backends (``python/src/lib.rs`` register_context_batch).

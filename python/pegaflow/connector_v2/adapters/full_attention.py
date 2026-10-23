@@ -10,6 +10,12 @@ Supported geometry: every layer view stores its blocks as dense pages
 ``page_size_bytes`` apart (layer-compact layouts such as LBNHC / LBHNC). The
 server's register path addresses block ``b`` at ``data_ptr + b * page``, so a
 block-outer layout (e.g. BLNHC, cross-layer pages) is ``Unsupported`` here.
+
+Page byte order: the core puts vLLM's ``kv_cache_layout`` (NHC vs HNC pages)
+in the namespace. The one byte-order variation that name does not capture is
+kernel-block splitting: a split ``[H, N, C]`` page is stored as
+``ratio x [H, N/ratio, C]``, so an HNC page split for the attention backend is
+rejected. A split ``[N, H, C]`` page is byte-identical to the unsplit one.
 """
 
 from __future__ import annotations
@@ -45,14 +51,24 @@ class FullAttentionAdapter:
         if par.dcp_size > 1 and getattr(spec, "dcp_sharded", True):
             raise Unsupported("FullAttentionSpec: DCP token sharding is not declared yet")
         # vLLM splits KV heads across TP; ranks beyond max_tp_shards hold
-        # replicas of consecutive ranks (KVCacheConfig.kv_tp_replicas).
+        # replicas of consecutive ranks. None means "not replicated" (vLLM's
+        # own reading), so every rank is its own head shard.
         shards = min(par.tp_size, spec.max_tp_shards or par.tp_size)
         if par.tp_size % shards:
             raise Unsupported(
                 f"FullAttentionSpec: tp_size {par.tp_size} not a multiple of "
                 f"max_tp_shards {spec.max_tp_shards}"
             )
-        return self.sem.Shard.heads(par.tp_rank // (par.tp_size // shards), shards)
+        replicas = par.tp_size // shards
+        # KVCacheConfig.kv_tp_replicas is the gcd of every layer's replica
+        # count, so a consistent declaration is always a multiple of it.
+        if replicas % par.kv_tp_replicas:
+            raise Unsupported(
+                f"FullAttentionSpec: {replicas} replicas per head shard (max_tp_shards="
+                f"{spec.max_tp_shards}, tp {par.tp_size}) disagree with vLLM "
+                f"kv_tp_replicas={par.kv_tp_replicas}"
+            )
+        return self.sem.Shard.heads(par.tp_rank // replicas, shards)
 
     # ------------------------------------------------------------------- view
     def view(self, spec: Any, layer_name: str, kv: Any) -> LayerView:
@@ -78,6 +94,14 @@ class FullAttentionAdapter:
             raise Unsupported(
                 f"{layer_name}: {ratio} x {cells} B kernel blocks != page_size_bytes {page}"
             )
+        # Kernel blocks keep the manager page's bytes only when N is outside H
+        # ([N, H, C]: N stride == H * H stride); fail closed otherwise.
+        if ratio > 1 and shape[1] > 1 and stride[2] != shape[1] * stride[1]:
+            raise Unsupported(
+                f"{layer_name}: an [H, N, C] page split into {ratio} kernel blocks is "
+                f"stored as {ratio} x [H, N/{ratio}, C], which kv_cache_layout does not "
+                f"name; use an NHC layout (e.g. VLLM_KV_CACHE_LAYOUT=LBNHC)"
+            )
         if stride[0] * elem != cells or shape[0] % ratio:
             raise Unsupported(
                 f"{layer_name}: blocks are {stride[0] * elem} B apart, need dense "
@@ -96,7 +120,12 @@ _DEFAULT_FIELDS = {
     "num_head_slots": None,
     "state_content_bytes": None,
     "tokens_per_state": 1,
+    # vLLM KVQuantMode is an IntEnum and NONE == 0: compare by value (``!=``),
+    # an identity check would reject the enum member.
     "kv_quant_mode": 0,
+    # Bidirectional (prefix-LM) spans: a block's K/V depends on later tokens,
+    # so prefix-keyed reuse is not exact even though the bytes are well formed.
+    "non_causal": False,
 }
 
 

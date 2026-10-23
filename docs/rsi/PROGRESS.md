@@ -66,7 +66,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | it1 code done, GPU validation pending (.3 unreachable) |
+| P3 | onboard Qwen3-4B | it1b review fixes done, GPU validation pending (.3 unreachable) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | todo |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -274,6 +274,13 @@ names, magic constants that only exist in the old code).
   semantics or policy change. .3 still "No route to host" at the end. NEXT on
   resume: sync, native unit run, then the it1 slice gate (command in
   ITERATIONS.md), then the official run only if the slice passes.
+- P3 it1b: review `docs/rsi/reviews/P3-qwen3-4b-it1.md` (APPROVE-WITH-FIXES) addressed;
+  Resolution table appended there. M1: `kv_cache_layout` in the namespace, plus
+  kernel-split HNC pages rejected. S1: `non_causal` fails closed. S2: worker
+  `save stats` log line every 500 steps and at shutdown. n1-n6 fixed. Local stub
+  run 69 passed, 43 skipped; ruff clean. .3 still "No route to host". NEXT: the
+  same as it1 (sync, native units, slice gate on GPU 1 after checking GPU 0 is
+  not running the P0 final run), then read `save stats` for the S5 decision.
 
 ## Semantics changelog
 

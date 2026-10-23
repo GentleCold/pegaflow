@@ -121,3 +121,49 @@ generic `pegaflow-core/src/layout.rs` / `pegaflow-server/src/registry.rs`.
 ### Gate concerns (not edited; for the gate owner)
 
 - See the MultiConnector child-config note above. G3 is unaffected.
+
+## it1b (2026-10-23): review fixes
+
+Review: `docs/rsi/reviews/P3-qwen3-4b-it1.md` (APPROVE-WITH-FIXES). Its
+Resolution table has the per-finding detail.
+
+### Changes
+
+- **M1:**
+  - the namespace now includes vLLM's `kv_cache_layout` (`core/layout.py`);
+  - `full_attention.view` rejects kernel-split HNC pages, the one byte order
+    the layout name does not capture;
+  - README namespace text corrected.
+- **S1:** `non_causal` specs fail closed.
+- **S2:** `Worker.save_stats`, logged as `save stats` every 500 steps and at
+  shutdown. This is the it2 input for the async-save decision. `connector.py`
+  routes `pegaflow.connector_v2.*` INFO to stderr: vLLM only configures its own
+  `vllm` logger, so core INFO lines were silently dropped before.
+- **n1:** the child-config recompute warning is now an accurate INFO line.
+- **n2:** `Parallel.kv_tp_replicas`, cross-checked by the adapter.
+- **n3:** registration assertions merged into `test_full_attention_layout`.
+- **n4:** per-rank pages in the TP fixtures.
+- **n5:** the test no longer imports `_tp_ranks`.
+- **n6:** comment on the `kv_quant_mode` comparison.
+
+### Evidence
+
+- Local stub run: 69 passed, 43 skipped. ruff clean.
+- .3 is still unreachable, so there is no GPU verdict yet.
+
+### What to read from the first slice run
+
+- **Save cost:** `grep "save stats" <arm>/<workload>/vllm.log`. A high
+  `avg_save_step_ms` relative to the decode step time, or `save_steps`
+  approaching `steps` on replay, means async saves (S5) are it2.
+- **Load-failure policy:** the line "own kv_load_failure_policy=fail; the
+  effective policy is the top-level ..." is expected under the gate's
+  MultiConnector and is not an error.
+
+### Open risks (delta)
+
+- The `kv_cache_layout` namespace input relies on vLLM 0.32 setting it on both
+  roles (verified in source: `engine/core.py` sets it on every config before
+  the scheduler copy). If a future vLLM leaves it None on one role, the
+  scheduler and worker namespaces diverge and registration or queries mismatch
+  loudly (no hits), not silently.

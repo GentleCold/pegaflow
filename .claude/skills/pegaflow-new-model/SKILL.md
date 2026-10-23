@@ -129,3 +129,10 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   `block_size / N`.
 - Local default gate without uv: `python3 -m venv /tmp/rsi-venv && /tmp/rsi-venv/bin/pip install pytest ruff`.
   This runs the stub cases only; the native cases need the remote venv.
+- Adapter declarations carry sizes, not byte order. Two layouts with equal
+  sizes share a namespace unless something names the difference. The core
+  hashes `kv_cache_layout`; an adapter must reject any other byte-order
+  variation it accepts but cannot name (e.g. kernel-split HNC pages). Add a
+  "different bytes give a different namespace" test with each new adapter.
+- Make costs you defer observable in the first gate run (e.g. the worker
+  `save stats` line), so the next iteration decides from data.

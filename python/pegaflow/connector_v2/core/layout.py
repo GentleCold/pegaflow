@@ -129,6 +129,10 @@ def build_layout(
             step = math.lcm(step, g.sem.block_tokens)
     doc = {
         "groups": fingerprint,
+        # Page byte order (e.g. LBNHC pages are [N, H, C], LBHNC [H, N, C]):
+        # adapters declare sizes only, so two orders would otherwise share a
+        # namespace and load transposed bytes. Set on both roles in vLLM 0.32.
+        "kv_cache_layout": getattr(kv_cache_config, "kv_cache_layout", None),
         "parallel": [par.tp_size, par.pp_size, par.dcp_size, par.dcp_interleave],
         "transfer": [backend, page_first],
         **identity,

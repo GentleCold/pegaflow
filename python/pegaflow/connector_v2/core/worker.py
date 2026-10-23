@@ -8,8 +8,9 @@ compute stream before saving), so unit tests can drive it with fakes.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..adapters import Parallel, Unsupported, adapter_for
@@ -25,7 +26,25 @@ class _Batch:
     req_ids: list[str]
 
 
+@dataclass
+class SaveStats:
+    """Save cost since the last report (S2: data for the async-save decision)."""
+
+    steps: int = 0  # wait_for_save calls
+    save_steps: int = 0  # steps that issued a save RPC
+    blocks: int = 0  # (layer, block) copies requested
+    bytes: int = 0
+    sync_s: float = 0.0  # compute-stream sync before the RPC
+    rpc_s: float = 0.0  # blocking save RPC (server copies GPU->CPU inside it)
+    max_step_s: float = 0.0
+    failed: int = 0  # save RPCs that returned an error
+    _since: float = field(default=0.0, repr=False)
+
+
 class Worker:
+    # wait_for_save calls between save-cost log lines.
+    SAVE_LOG_EVERY = 500
+
     def __init__(
         self,
         layout: Layout,
@@ -36,6 +55,7 @@ class Worker:
         wrap: Callable[[Any], bytes],
         new_load_state: Callable[[], Any],
         sync: Callable[[], None],
+        clock: Callable[[], float] = time.perf_counter,
     ):
         self._layout = layout
         self._rpc = rpc
@@ -45,6 +65,9 @@ class Worker:
         self._wrap = wrap
         self._new_load_state = new_load_state
         self._sync = sync
+        self._clock = clock
+        self._layer_bytes: dict[str, int] = {}  # bytes one block of a layer stores
+        self.save_stats = SaveStats(_since=clock())
         # Registered layer names per storage group (index into layout.groups).
         self._layers: list[list[str]] = [[] for _ in layout.groups]
         self._batches: list[_Batch] = []
@@ -88,6 +111,7 @@ class Worker:
                 segments.append(len(decl.segments))
                 group_ids.append(sid)
                 self._layers[sid].append(name)
+                self._layer_bytes[name] = view.bytes_per_block * len(decl.segments)
         if not names:
             raise Unsupported("no transferable KV cache layer on this worker")
         par = self._par
@@ -154,23 +178,59 @@ class Worker:
         self._batches.append(_Batch(state, [req_id]))
 
     def save(self, plan: StepPlan) -> None:
+        stats = self.save_stats
+        stats.steps += 1
         saves: list[tuple[str, list[int], list[bytes]]] = []
         for gs in plan.saves:
             for name in self._layers[gs.sid]:
                 saves.append((name, gs.block_ids, gs.block_hashes))
-        if not saves:
-            return
-        # The server copies with its own stream: this step's KV must be written.
-        self._sync()
-        try:
-            ok, msg = self._rpc.save(
-                self._instance_id, self._par.tp_rank, self._par.pp_rank, self._device_id, saves
+        if saves:
+            t0 = self._clock()
+            # The server copies with its own stream: this step's KV must be written.
+            self._sync()
+            t1 = self._clock()
+            try:
+                ok, msg = self._rpc.save(
+                    self._instance_id, self._par.tp_rank, self._par.pp_rank, self._device_id, saves
+                )
+            except Exception as e:
+                ok, msg = False, repr(e)
+            t2 = self._clock()
+            stats.save_steps += 1
+            stats.blocks += sum(len(ids) for _, ids, _ in saves)
+            stats.bytes += sum(len(ids) * self._layer_bytes[name] for name, ids, _ in saves)
+            stats.sync_s += t1 - t0
+            stats.rpc_s += t2 - t1
+            stats.max_step_s = max(stats.max_step_s, t2 - t0)
+            if not ok:
+                stats.failed += 1
+                # Best effort: a dropped save is a future miss, not a wrong hit.
+                logger.warning("[PegaKVConnectorV2] save failed: %s", msg)
+        if stats.steps >= self.SAVE_LOG_EVERY:
+            self.report_save_stats()
+
+    def report_save_stats(self) -> None:
+        """Log and reset the save-cost window (grep "save stats" in vllm.log)."""
+        s, now = self.save_stats, self._clock()
+        if s.steps:
+            n = max(s.save_steps, 1)
+            logger.info(
+                "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
+                "blocks=%d bytes=%d sync_ms=%.1f rpc_ms=%.1f avg_save_step_ms=%.2f "
+                "max_save_step_ms=%.2f failed=%d",
+                self._par.tp_rank,
+                now - s._since,
+                s.steps,
+                s.save_steps,
+                s.blocks,
+                s.bytes,
+                s.sync_s * 1e3,
+                s.rpc_s * 1e3,
+                (s.sync_s + s.rpc_s) * 1e3 / n,
+                s.max_step_s * 1e3,
+                s.failed,
             )
-        except Exception as e:
-            ok, msg = False, repr(e)
-        if not ok:
-            # Best effort: a dropped save is a future miss, not a wrong hit.
-            logger.warning("[PegaKVConnectorV2] save failed: %s", msg)
+        self.save_stats = SaveStats(_since=now)
 
     def poll(self) -> tuple[set[str], set[str]]:
         """Returns (finished_recving, failed_recving); failed ids are in both."""
