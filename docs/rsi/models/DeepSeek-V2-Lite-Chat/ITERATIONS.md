@@ -236,3 +236,115 @@ above baseline in the repeats (17% in the slice), and the old arm is 15%
 above. Cold replay saves every block it computes, so the save path costs
 cold TTFT. it1 verdict: fail on G4 replay cold TTFT; the rest of the
 judged checks pass.
+
+## it2 (2026-10-23): one storage rank, one writer per replicated part
+
+Hypothesis: `Shard.replicated()` should cost one copy, not one per TP rank.
+Registering both MLA replicas as one server rank halves D2H bytes and host
+memory, and fixes the cold replay TTFT regression if that is save
+bandwidth.
+
+### Design
+
+- `core/layout.py`: `StorageRanks`, derived from the `seal_plan` that
+  `build_layout` already runs. It applies when every layer has the same
+  part count and each TP rank holds one part throughout, either as that
+  part's writer for all its layers or for none. Ranks that hold the same
+  part then share one storage rank. The server sees `tp_size = parts`; for
+  MLA at TP2 that is `tp_size 1`, with both devices registering
+  `tp_rank 0`. This is the registration contract pegaflow-core's
+  `mla_replica_registration_seals` test covers: one slot per layer, sealed
+  once both devices have registered. Every other layout gets the identity
+  mapping (Qwen3-4B TP1: unchanged).
+- `core/worker.py`: register, save and load use the storage rank. Only the
+  writer (`Fragment.writer`, the first holder) saves. Every holder loads
+  into its own GPU from the same slot.
+- `connector.py`: the session watcher announces the storage `tp_size`.
+- The namespace includes the storage `tp_size` (`storage_tp`), so blocks
+  stored with another slot count never share a namespace. Otherwise a
+  load would fail the server's slot-count check.
+- No semantics, server or proto change.
+
+Rebased onto `feat/semantics-rsi` df01403 (8a05b7c: saves stop for the
+process after a failed sync load). That gate runs in the scheduler before
+any save is planned, so the worker's writer filter only applies to plans
+that already passed it. A run at the pre-rebase rev 71f2090 was stopped by
+its own PIDs and kept as `2026-10-23-dsv2-lite-p4-it2-slice-aborted-71f2090`.
+
+Tests: `test_mla_attention_layout[tp1|tp2|tp4]` now checks that every rank
+registers `(tp_rank 0, tp_size 1)`, that only rank 0's save RPC carries the
+27 layers, and that every rank issues its load against storage rank 0.
+`test_full_attention_layout` checks one storage rank per head shard, with
+the first holder writing (tp4-replicas: ranks 1 and 3 do not save).
+StubSemantics' `seal_plan` now returns fragments and holders. 200 passed;
+ruff clean.
+
+### Slice (`~/kexi/rsi-runs/2026-10-23-dsv2-lite-p4-it2-slice`, rev 3d1de18, GPU 0,1)
+
+Same command as it1 (`--tag dsv2-lite-p4-it2-slice`). vLLM log:
+`registered 27 layers ... device=0 storage_rank=0 writer=True` and
+`device=1 storage_rank=0 writer=False`; no load failures, no
+`saves disabled`.
+
+Verdicts (v2), loaded-block and other hard checks:
+
+| verdict | result | numbers |
+|---|---|---|
+| G0.spec | pass | |
+| digest gsm8k, loaded blocks (self and vs baseline) | pass | external 10526 matched / 0 mismatched / 0 unreferenced; local 357952 / 0 |
+| G2.digest_self.replay | pass | external 1382 / local 7094 matched, 0 mismatched |
+| G2.gsm8k | pass | 0.6725 cold / 0.6778 warm vs 0.6725 |
+| G3.gsm8k_warm / replay_warm | pass | E_ext 1.0 / 1.0, excess 0, load errors 0 |
+| G3.no_eviction | pass | 0 |
+| G4 | FAIL | replay cold TTFT p50, cold req/s |
+
+Split-affected (re-judge under `split_invariant`): gsm8k_outputs warm 647
+differ (cold 0); computed_exact 0 / 23032 (self), 27526 / 39042 (vs
+baseline). Same as it1: loaded bytes are unchanged.
+
+G4:
+
+| metric | baseline | v2 it2 | v2 it1 (slice) | verdict |
+|---|---|---|---|---|
+| replay warm TTFT p50 (s) | 0.164 / 0.165 | 0.102 / 0.110 | 0.098 / 0.115 | pass |
+| replay warm req/s | 5.94 / 5.94 | 7.45 / 7.31 | 7.41 / 7.34 | pass |
+| replay cold TTFT p50 (s) | 0.188 | 0.200 (+6.4%) | 0.218 | FAIL |
+| replay cold req/s | 5.68 | 5.55 (-2.3%) | 3.29 | FAIL |
+| gsm8k cold s | 194.1 | 194.4 (+0.2%) | 194.6 | pass |
+| gsm8k warm s | 193.9 | 189.4 | 189.6 | pass |
+
+Hits (local / external / total / H* / E_ext): gsm8k cold 0.940 / 0 /
+0.940 / 0.940 / -; gsm8k warm 0.937 / 0.055 / 0.993 / 0.993 / 1.0; replay
+cold 0.769 / 0 / 0.769 / 0.760 / -; replay warm, warm2, warm3 0.705 /
+0.293 / 0.998 / 0.998 / 1.0. Baseline: gsm8k warm 0.940 local, H* 0.993;
+replay warm 0.769 local, H* 0.998.
+
+Save bytes:
+
+| | tp0 | tp1 | server gsm8k cold | server replay cold |
+|---|---|---|---|---|
+| it1 | 11.18 GB / 1.385 GB | 11.18 GB / 1.385 GB | 13.68 GB (995328 B/block) | 2.334 GB |
+| it2 | 11.18 GB / 1.385 GB | 0 / 0 | 6.84 GB, 13742 blocks (497664 B/block = 27 x 18432) | 1.167 GB, 2345 blocks |
+
+Write amplification is gone. The server stores the same bytes as the old
+arm, and the same block counts as it1.
+
+Cold TTFT did not improve, so save bytes are not the cause. vLLM's own
+histograms for cold replay (sums over 37 requests):
+
+| run | arm | wall s | TTFT sum | prefill sum | queue sum | decode sum |
+|---|---|---|---|---|---|---|
+| it2 slice | baseline | 6.51 | 9.32 | 5.71 | 2.20 | 32.60 |
+| it2 slice | v2 | 6.66 | 10.14 | 6.35 | 2.62 | 32.99 |
+| it1 repeat 0,1 | baseline | 6.50 | 8.92 | 5.36 | 2.10 | 32.91 |
+| it1 repeat 0,1 | v2 | 6.69 | 9.94 | 6.30 | 2.56 | 33.15 |
+
+On the same GPUs, v2 adds 11 to 17% prefill time and about 20% queue
+time, while decode is within 1%. Server-side cold RPCs total 303 ms of
+save (138 calls) and 9 ms of query_prefetch (37 calls), all off the step
+thread. it2 verdict: keep (one writer is what `Shard.replicated` means),
+G4 cold still fails. Next hypothesis (it3): what in a cold prefill step
+costs more with the connector. Candidates: vLLM's per-step connector
+overhead (outputs gathered from every TP rank), the step thread's
+`wait_for_save` / `build_connector_meta`, and the server's D2H copies
+competing with prefill on the same GPU.
