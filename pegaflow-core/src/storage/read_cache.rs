@@ -113,6 +113,11 @@ impl ReadCache {
         self
     }
 
+    pub(super) fn resident_blocks(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.reclaimable.len() + inner.retained.len()
+    }
+
     pub(super) fn contains_keys(&self, keys: &[BlockKey]) -> Vec<bool> {
         let inner = self.inner.lock();
         keys.iter().map(|k| inner.cache.contains_key(k)).collect()

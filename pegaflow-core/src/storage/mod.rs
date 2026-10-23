@@ -29,9 +29,13 @@ use prefetch::RdmaFetch;
 pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 
-// Each reclaim iteration emits one MetaServer removal command; a small batch
-// turns an eviction burst into a command flood that overflows the removal queue.
+// Most blocks one reclaim round evicts. Rounds stop as soon as the allocator
+// can serve the request, so the round size only bounds the overshoot.
 const RECLAIM_BATCH_SIZE: usize = 512;
+// A round evicts at most 1/N of the resident blocks: a fixed 512-block round
+// left a 1019-block pool about half empty after every reclaim. Pools of at
+// least 512 * N blocks keep the full batch.
+const RECLAIM_RESIDENT_DIVISOR: usize = 64;
 pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -568,23 +572,27 @@ impl StorageEngine {
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0u64;
         let mut largest_free = self.allocator.largest_free_allocation_for_node(target_node);
+        // MetaServer removals for the whole call go out as one command: one
+        // command per round would turn an eviction burst into a command flood
+        // that overflows the removal queue.
+        let mut unregister: Vec<(String, Vec<u8>)> = Vec::new();
 
         while largest_free < required_bytes {
             let used_before = self.allocator.usage().0;
 
-            let evicted = self.read_cache.remove_lru_batch(RECLAIM_BATCH_SIZE);
+            let batch_size = reclaim_batch_size(self.read_cache.resident_blocks());
+            let evicted = self.read_cache.remove_lru_batch(batch_size);
 
             if evicted.is_empty() {
                 break;
             }
 
-            // Notify MetaServer that evicted blocks are no longer available for RDMA fetch.
-            if let Some(client) = &self.metaserver_client {
-                let entries: Vec<(String, Vec<u8>)> = evicted
-                    .iter()
-                    .map(|(key, _)| (key.namespace.clone(), key.hash.clone()))
-                    .collect();
-                client.try_unregister(entries);
+            if self.metaserver_client.is_some() {
+                unregister.extend(
+                    evicted
+                        .iter()
+                        .map(|(key, _)| (key.namespace.clone(), key.hash.clone())),
+                );
             }
 
             let mut batch_bytes = 0u64;
@@ -607,6 +615,11 @@ impl StorageEngine {
             }
 
             largest_free = self.allocator.largest_free_allocation_for_node(target_node);
+        }
+
+        // Evicted blocks are no longer available for RDMA fetch.
+        if let Some(client) = &self.metaserver_client {
+            client.try_unregister(unregister);
         }
 
         if freed_blocks > 0 {
@@ -757,6 +770,11 @@ impl StorageEngine {
     }
 }
 
+/// Blocks one reclaim round evicts with `resident` blocks in the cache.
+fn reclaim_batch_size(resident: usize) -> usize {
+    (resident / RECLAIM_RESIDENT_DIVISOR).clamp(1, RECLAIM_BATCH_SIZE)
+}
+
 #[cfg(test)]
 impl StorageEngine {
     /// Insert a block directly into the in-memory cache (test only).
@@ -843,6 +861,40 @@ mod tests {
         // More than the whole pool can never be satisfied: nothing is leaked.
         assert!(storage.allocate_many(size, 17, None).is_none());
         assert_eq!(storage.allocator.usage().0, 0);
+    }
+
+    #[tokio::test]
+    async fn reclaim_frees_what_the_allocation_needs_not_a_fixed_batch() {
+        use crate::block::{RawBlock, Segment};
+        const REGION: u64 = 4096;
+        const BLOCKS: usize = 64;
+        let size = NonZeroU64::new(REGION).unwrap();
+        let storage = StorageEngine::new_with_config(
+            BLOCKS * REGION as usize,
+            false,
+            StorageConfig::default(),
+            &[],
+        )
+        .unwrap();
+        for i in 0..BLOCKS {
+            let alloc = storage.allocate(size, None).unwrap();
+            let ptr = alloc.as_non_null();
+            let raw = RawBlock::new(vec![Segment::new(ptr, REGION as usize, alloc)]);
+            storage.test_insert_cache(
+                BlockKey::new("ns".into(), vec![i as u8]),
+                Arc::new(SealedBlock::from_slots(vec![(raw, NumaNode::UNKNOWN)])),
+            );
+        }
+
+        // A full pool: one more block evicts one resident block, not the
+        // whole cache (a fixed 512-block round would empty it).
+        let extra = storage.allocate(size, None).unwrap();
+        assert_eq!(storage.read_cache.resident_blocks(), BLOCKS - 1);
+        drop(extra);
+
+        for (resident, batch) in [(0, 1), (64, 1), (1019, 15), (32768, 512), (1 << 20, 512)] {
+            assert_eq!(reclaim_batch_size(resident), batch, "resident={resident}");
+        }
     }
 
     #[tokio::test]
