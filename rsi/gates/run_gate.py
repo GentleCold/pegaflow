@@ -352,6 +352,10 @@ def vllm_server(
         env["PEGAFLOW_PORT"] = str(pf_port)  # contract: the connector under test reads it
     for k in [k for k in env if k.startswith("LMCACHE_")]:
         del env[k]
+    if arm_kind(arm) == "under_test" and args.under_test_path:
+        # The connector under test (and its native extension) from another
+        # tree; reference arms keep the venv's pegaflow.
+        env["PYTHONPATH"] = f"{args.under_test_path}:{env['PYTHONPATH']}"
     if arm_kind(arm) == "lmcache":
         # LMCache lives in an overlay (its pins would downgrade the shared
         # venv); only this arm's vLLM sees it.
@@ -1243,12 +1247,12 @@ def verdicts(
     return v
 
 
-def git_rev() -> str:
+def git_rev(root: Path = REPO) -> str:
     with suppress(Exception):
         return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=REPO, text=True, stderr=subprocess.DEVNULL
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL
         ).strip()
-    return (REPO / ".rsi-rev").read_text().strip() if (REPO / ".rsi-rev").exists() else "unknown"
+    return (root / ".rsi-rev").read_text().strip() if (root / ".rsi-rev").exists() else "unknown"
 
 
 def capacity_floor(base_cap: dict[str, Any] | None) -> dict[str, Any]:
@@ -1407,6 +1411,12 @@ def main(argv: list[str] | None = None) -> int:
         default=str(LMCACHE_OVERLAY),
         help="dir with lmcache + its missing pure deps, on PYTHONPATH of the lmcache arm only",
     )
+    ap.add_argument(
+        "--under-test-path",
+        default="",
+        help="python dir put first on PYTHONPATH of the connector-under-test arm only "
+        "(e.g. another tree's python/); its rev (.rsi-rev / git) is recorded",
+    )
     ap.add_argument("--concurrency", type=int, default=OFFICIAL["concurrency"])
     ap.add_argument("--settle", type=float, default=5.0)
     ap.add_argument("--gsm8k-dir", default=str(Path.home() / "kexi" / "datasets" / "gsm8k-main"))
@@ -1523,6 +1533,9 @@ def main(argv: list[str] | None = None) -> int:
     summary = {
         "tag": args.tag,
         "rev": git_rev(),
+        "under_test_rev": git_rev(Path(args.under_test_path).resolve().parent)
+        if args.under_test_path
+        else None,
         "args": vars(args),
         "gate": gate,
         "official": not problems,
