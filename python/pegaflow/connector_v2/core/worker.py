@@ -1,13 +1,27 @@
 """Worker-side glue: register KV caches, run the step's loads and saves.
 
 vLLM- and torch-free: tensors are opaque, and the connector injects ``wrap``
-(tensor -> CUDA IPC bytes), ``new_load_state`` and ``sync`` (wait for the
-compute stream before saving), so unit tests can drive it with fakes.
+(tensor -> CUDA IPC bytes), ``new_load_state`` and ``mark_compute`` (returns a
+handle whose ``synchronize()`` waits until the work enqueued so far on the
+compute stream is done, e.g. a recorded CUDA event), so unit tests can drive it
+with fakes.
+
+Saves are asynchronous: ``save`` only marks the compute stream and queues the
+job; a saver thread waits for the mark and then issues the save RPC (the server
+copies GPU->CPU on its own stream). The source blocks must stay untouched until
+the copy is done, so:
+
+- finished requests that had saves are held by vLLM (``request_finished``
+  returns True) until ``poll`` reports them in ``finished_sending``, which
+  happens once every job submitted before vLLM told us they finished is done;
+- a step that reuses a preempted request's blocks first calls ``flush``.
 """
 
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -27,23 +41,35 @@ class _Batch:
 
 
 @dataclass
+class _SaveJob:
+    seq: int
+    ready: Any  # mark_compute() handle
+    saves: list[tuple[str, list[int], list[bytes]]]
+
+
+@dataclass
 class SaveStats:
-    """Save cost since the last report (S2: data for the async-save decision)."""
+    """Save cost since the last report (grep "save stats" in vllm.log)."""
 
     steps: int = 0  # wait_for_save calls
-    save_steps: int = 0  # steps that issued a save RPC
+    save_steps: int = 0  # steps that queued a save job
     blocks: int = 0  # (layer, block) copies requested
     bytes: int = 0
-    sync_s: float = 0.0  # compute-stream sync before the RPC
-    rpc_s: float = 0.0  # blocking save RPC (server copies GPU->CPU inside it)
-    max_step_s: float = 0.0
-    failed: int = 0  # save RPCs that returned an error
+    submit_s: float = 0.0  # step thread: building and queueing jobs (on the critical path)
+    flushes: int = 0  # preemption flushes that had to wait
+    flush_s: float = 0.0  # step thread: blocked in flush (on the critical path)
+    wait_s: float = 0.0  # saver thread: waiting for the compute stream
+    rpc_s: float = 0.0  # saver thread: save RPC (server copies GPU->CPU inside it)
+    max_job_s: float = 0.0  # saver thread: wait + rpc of one job
+    max_pending: int = 0  # jobs queued or running at submit time
+    failed: int = 0  # jobs that did not store their blocks
     _since: float = field(default=0.0, repr=False)
 
 
 class Worker:
     # wait_for_save calls between save-cost log lines.
     SAVE_LOG_EVERY = 500
+    SHUTDOWN_FLUSH_S = 30.0
 
     def __init__(
         self,
@@ -54,7 +80,7 @@ class Worker:
         device_id: int,
         wrap: Callable[[Any], bytes],
         new_load_state: Callable[[], Any],
-        sync: Callable[[], None],
+        mark_compute: Callable[[], Any],
         clock: Callable[[], float] = time.perf_counter,
     ):
         self._layout = layout
@@ -64,7 +90,7 @@ class Worker:
         self._device_id = device_id
         self._wrap = wrap
         self._new_load_state = new_load_state
-        self._sync = sync
+        self._mark_compute = mark_compute
         self._clock = clock
         self._layer_bytes: dict[str, int] = {}  # bytes one block of a layer stores
         self.save_stats = SaveStats(_since=clock())
@@ -73,6 +99,17 @@ class Worker:
         self._batches: list[_Batch] = []
         self._failed: set[str] = set()  # failed, not yet reported
         self._done: set[str] = set()  # finished without a load batch, not yet reported
+        # Async saves. Jobs complete in submit order (one saver thread), so a
+        # sequence number is enough to know what has landed.
+        self._cv = threading.Condition()
+        self._submitted = 0  # step thread only
+        self._completed = 0  # saver thread, under _cv
+        self._finishing: dict[str, int] = {}  # req -> last job that may read its blocks
+        self._jobs: queue.SimpleQueue[_SaveJob | None] = queue.SimpleQueue()
+        self._saver = threading.Thread(
+            target=self._save_loop, name="pegaflow-v2-saver", daemon=True
+        )
+        self._saver.start()
 
     def register(self, kv_caches: dict[str, Any], specs: dict[str, Any]) -> None:
         """``specs``: layer name -> vLLM KVCacheSpec for every transferable layer."""
@@ -143,7 +180,18 @@ class Worker:
             self._device_id,
         )
 
-    def start_loads(self, plan: StepPlan) -> None:
+    def start(self, plan: StepPlan) -> None:
+        """Start this step's loads and track requests vLLM holds for our saves.
+
+        Called before ``save`` of the same step, so every job that can read a
+        finished request's blocks (it was scheduled at most in the previous
+        step) is already submitted: its fence is ``_submitted``.
+        """
+        for req_id in plan.finished:
+            self._finishing[req_id] = self._submitted
+        self._start_loads(plan)
+
+    def _start_loads(self, plan: StepPlan) -> None:
         """One ``load`` RPC per request.
 
         The server consumes leases one by one and fails the whole call on the
@@ -177,63 +225,128 @@ class Worker:
             return
         self._batches.append(_Batch(state, [req_id]))
 
+    # ----------------------------------------------------------------- saves
     def save(self, plan: StepPlan) -> None:
-        stats = self.save_stats
-        stats.steps += 1
+        """Queue this step's saves behind a mark on the compute stream; never blocks."""
+        t0 = self._clock()
         saves: list[tuple[str, list[int], list[bytes]]] = []
         for gs in plan.saves:
             for name in self._layers[gs.sid]:
                 saves.append((name, gs.block_ids, gs.block_hashes))
         if saves:
+            # The mark covers this step's forward (and draft forward): the
+            # saver only reads the blocks after the KV writes completed.
+            ready = self._mark_compute()
+            self._submitted += 1
+            self._jobs.put(_SaveJob(self._submitted, ready, saves))
+        t1 = self._clock()
+        with self._cv:
+            stats = self.save_stats
+            stats.steps += 1
+            stats.submit_s += t1 - t0
+            if saves:
+                stats.save_steps += 1
+                stats.blocks += sum(len(ids) for _, ids, _ in saves)
+                stats.bytes += sum(len(ids) * self._layer_bytes[name] for name, ids, _ in saves)
+                stats.max_pending = max(stats.max_pending, self._submitted - self._completed)
+            report = stats.steps >= self.SAVE_LOG_EVERY
+        if report:
+            self.report_save_stats()
+
+    def flush(self, timeout: float | None = None) -> bool:
+        """Block until every submitted save job is done; False on timeout."""
+        target = self._submitted
+        t0 = self._clock()
+        with self._cv:
+            if self._completed >= target:
+                return True
+            done = self._cv.wait_for(lambda: self._completed >= target, timeout)
+            self.save_stats.flushes += 1
+            self.save_stats.flush_s += self._clock() - t0
+        return done
+
+    def _save_loop(self) -> None:
+        while (job := self._jobs.get()) is not None:
             t0 = self._clock()
-            # The server copies with its own stream: this step's KV must be written.
-            self._sync()
-            t1 = self._clock()
+            t1 = t0
             try:
-                ok, msg = self._rpc.save(
-                    self._instance_id, self._par.tp_rank, self._par.pp_rank, self._device_id, saves
-                )
-            except Exception as e:
-                ok, msg = False, repr(e)
+                job.ready.synchronize()
+            except Exception as e:  # the forward failed: its KV is not valid
+                ok, msg = False, f"compute wait failed: {e!r}"
+            else:
+                t1 = self._clock()
+                try:
+                    ok, msg = self._rpc.save(
+                        self._instance_id,
+                        self._par.tp_rank,
+                        self._par.pp_rank,
+                        self._device_id,
+                        job.saves,
+                    )
+                except Exception as e:
+                    ok, msg = False, repr(e)
             t2 = self._clock()
-            stats.save_steps += 1
-            stats.blocks += sum(len(ids) for _, ids, _ in saves)
-            stats.bytes += sum(len(ids) * self._layer_bytes[name] for name, ids, _ in saves)
-            stats.sync_s += t1 - t0
-            stats.rpc_s += t2 - t1
-            stats.max_step_s = max(stats.max_step_s, t2 - t0)
             if not ok:
-                stats.failed += 1
                 # Best effort: a dropped save is a future miss, not a wrong hit.
                 logger.warning("[PegaKVConnectorV2] save failed: %s", msg)
-        if stats.steps >= self.SAVE_LOG_EVERY:
-            self.report_save_stats()
+            with self._cv:
+                stats = self.save_stats
+                stats.wait_s += t1 - t0
+                stats.rpc_s += t2 - t1
+                stats.max_job_s = max(stats.max_job_s, t2 - t0)
+                stats.failed += not ok
+                # Always advance, failed or not: held blocks must be released.
+                self._completed = job.seq
+                self._cv.notify_all()
 
     def report_save_stats(self) -> None:
         """Log and reset the save-cost window (grep "save stats" in vllm.log)."""
-        s, now = self.save_stats, self._clock()
-        if s.steps:
-            n = max(s.save_steps, 1)
-            logger.info(
-                "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
-                "blocks=%d bytes=%d sync_ms=%.1f rpc_ms=%.1f avg_save_step_ms=%.2f "
-                "max_save_step_ms=%.2f failed=%d",
-                self._par.tp_rank,
-                now - s._since,
-                s.steps,
-                s.save_steps,
-                s.blocks,
-                s.bytes,
-                s.sync_s * 1e3,
-                s.rpc_s * 1e3,
-                (s.sync_s + s.rpc_s) * 1e3 / n,
-                s.max_step_s * 1e3,
-                s.failed,
-            )
-        self.save_stats = SaveStats(_since=now)
+        now = self._clock()
+        with self._cv:
+            s, self.save_stats = self.save_stats, SaveStats(_since=now)
+        if not s.steps:
+            return
+        logger.info(
+            "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
+            "blocks=%d bytes=%d submit_ms=%.1f flushes=%d flush_ms=%.1f wait_ms=%.1f "
+            "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d",
+            self._par.tp_rank,
+            now - s._since,
+            s.steps,
+            s.save_steps,
+            s.blocks,
+            s.bytes,
+            s.submit_s * 1e3,
+            s.flushes,
+            s.flush_s * 1e3,
+            s.wait_s * 1e3,
+            s.rpc_s * 1e3,
+            s.max_job_s * 1e3,
+            s.max_pending,
+            s.failed,
+        )
 
-    def poll(self) -> tuple[set[str], set[str]]:
-        """Returns (finished_recving, failed_recving); failed ids are in both."""
+    def shutdown(self) -> None:
+        if not self.flush(self.SHUTDOWN_FLUSH_S):
+            logger.warning("[PegaKVConnectorV2] saves still pending at shutdown")
+        self._jobs.put(None)
+        self._saver.join(timeout=1.0)
+        self.report_save_stats()
+
+    # ------------------------------------------------------------------ poll
+    def poll(self) -> tuple[set[str], set[str], set[str]]:
+        """Returns (finished_sending, finished_recving, failed_recving).
+
+        Failed receives are in both receive sets. A finished request is
+        reported as sent once every job that could read its blocks is done.
+        """
+        sending: set[str] = set()
+        if self._finishing:
+            with self._cv:
+                completed = self._completed
+            sending = {r for r, fence in self._finishing.items() if fence <= completed}
+            for r in sending:
+                del self._finishing[r]
         finished, self._done = self._done, set()
         pending: list[_Batch] = []
         for b in self._batches:
@@ -247,4 +360,4 @@ class Worker:
                 self._failed.update(b.req_ids)
         self._batches = pending
         failed, self._failed = self._failed, set()
-        return finished | failed, failed
+        return sending, finished | failed, failed

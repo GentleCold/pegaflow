@@ -147,7 +147,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 _server_device_id(),
                 _ipc_bytes,
                 PyLoadState,
-                lambda: torch.cuda.current_stream().synchronize(),
+                _mark_compute,
             )
 
     @property
@@ -191,7 +191,9 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         )
         block_state = scheduler_output.kv_connector_block_state
         self._scheduler.plan_saves(
-            scheduled, block_state.get_block_ids if block_state is not None else lambda _: None
+            scheduled,
+            block_state.get_block_ids if block_state is not None else lambda _: None,
+            scheduler_output.preempted_req_ids or (),
         )
         return PegaConnectorMetadata(self._scheduler.take_plan())
 
@@ -199,14 +201,13 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         self, request: Request, block_ids: list[int]
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self._scheduler is not None
-        self._scheduler.request_finished(request.request_id)
-        return False, None
+        # True while a save of the request's blocks may be pending: vLLM keeps
+        # the blocks until the workers report the request in finished_sending.
+        return self._scheduler.request_finished(request.request_id), None
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
-        # Saves complete inside the step that wrote the blocks, so nothing
-        # holds the blocks past finish.
         return self.request_finished(request, [])
 
     # ------------------------------------------------------------- worker side
@@ -218,11 +219,19 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             specs.update(layer_specs(kv_group.kv_cache_spec, list(kv_group.layer_names)))
         self._worker.register(kv_caches, specs)
 
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        # Runs before the step zeroes or writes any KV block: blocks vLLM freed
+        # (preemption) may be reused by this step while a save still reads them.
+        assert self._worker is not None
+        assert isinstance(kv_connector_metadata, PegaConnectorMetadata)
+        if kv_connector_metadata.plan.flush:
+            self._worker.flush()
+
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
         assert self._worker is not None
         meta = self._get_connector_metadata()
         assert isinstance(meta, PegaConnectorMetadata)
-        self._worker.start_loads(meta.plan)
+        self._worker.start(meta.plan)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return  # loads are async (between steps), never layer-pipelined
@@ -240,14 +249,16 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
 
     def get_transfer_results(self, finished_req_ids: set[str]) -> KVConnectorTransferResults:
         assert self._worker is not None
-        finished, failed = self._worker.poll()
-        return KVConnectorTransferResults(finished_recving=finished, failed_recving=failed)
+        sending, finished, failed = self._worker.poll()
+        return KVConnectorTransferResults(
+            finished_sending=sending, finished_recving=finished, failed_recving=failed
+        )
 
     def shutdown(self) -> None:
         if self._scheduler is not None:
             self._scheduler.shutdown()
         if self._worker is not None:
-            self._worker.report_save_stats()
+            self._worker.shutdown()
 
 
 def _with_worker_ranks(par: Parallel) -> Parallel:
@@ -284,6 +295,17 @@ def _server_device_id() -> int:
             f"{visible!r} to the server's ordinal; use plain GPU indices"
         )
     return int(entries[local])
+
+
+def _mark_compute() -> torch.cuda.Event:
+    """Event after the work enqueued so far on the compute stream.
+
+    The saver thread waits on it (``Event.synchronize`` releases the GIL), so
+    the step thread never blocks on the GPU for a save.
+    """
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream())
+    return event
 
 
 def _ipc_bytes(tensor: torch.Tensor) -> bytes:

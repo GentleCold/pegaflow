@@ -49,8 +49,20 @@ class GroupSave:
 
 @dataclass
 class StepPlan:
+    """One step's work for every worker.
+
+    Saves are asynchronous on the worker, so the plan also carries the block
+    lifecycle the worker must respect: ``finished`` lists requests whose blocks
+    vLLM holds for our saves (report them in ``finished_sending`` once every
+    save that may read them is done), and ``flush`` asks the worker to finish
+    every pending save before this step touches any KV (vLLM freed blocks a
+    pending save may still read, e.g. on preemption).
+    """
+
     loads: list[LoadPlan] = field(default_factory=list)
     saves: list[GroupSave] = field(default_factory=list)
+    finished: list[str] = field(default_factory=list)
+    flush: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,6 +108,10 @@ class Scheduler:
         self._hits: dict[str, _Hit] = {}  # leased, waiting for allocation
         self._loading_since: dict[str, float] = {}
         self._saved_upto: dict[str, int] = {}  # token count already offered for saving
+        self._saving: set[str] = set()  # requests with saves since their blocks were last freed
+        # vLLM frees window blocks that slide out while the request runs, which a
+        # pending save may still read: such layouts flush before every step.
+        self._flush_always = any(g.sem.kind == "window" for g in layout.groups)
         self._plan = StepPlan()
 
     # ------------------------------------------------------------------ hits
@@ -311,13 +327,22 @@ class Scheduler:
         self,
         scheduled: list[tuple[str, int, int]],
         block_ids_of: Callable[[str], tuple[list[int], ...] | None],
+        preempted: Iterable[str] = (),
     ) -> None:
         """``scheduled``: (req_id, num_computed_before_step, num_scheduled_tokens).
+
+        ``preempted``: requests vLLM preempted (and whose blocks it freed) since
+        the last plan. Their blocks may be reallocated in this very step, so
+        the workers must finish pending saves before the step runs.
 
         Raises ValueError if the policy returns an item it was not offered: a
         forged (block, hash) pair would poison the store for every reader.
         """
         layout = self._layout
+        for req_id in preempted:
+            self._plan.flush = True
+            self._saving.discard(req_id)  # the flush covers its old blocks
+        self._plan.flush |= self._flush_always
         items: list[SaveItem] = []
         for req_id, computed, n_sched in scheduled:
             request = self._requests.get(req_id)
@@ -365,6 +390,7 @@ class Scheduler:
             if item in seen:
                 continue
             seen.add(item)
+            self._saving.add(item.req_id)
             sid = sid_of[item.group]
             save = by_sid.setdefault(sid, GroupSave(sid, [], []))
             save.block_ids.append(item.block_id)
@@ -387,11 +413,18 @@ class Scheduler:
         return plan
 
     # ------------------------------------------------------------- lifecycle
-    def request_finished(self, req_id: str) -> None:
+    def request_finished(self, req_id: str) -> bool:
+        """True if vLLM must hold the request's blocks until the workers report
+        it in ``finished_sending`` (a save of its blocks may still be pending)."""
         self._drop_hit(req_id)
         self._loading_since.pop(req_id, None)
         self._saved_upto.pop(req_id, None)
         self._requests.pop(req_id, None)
+        if req_id not in self._saving:
+            return False
+        self._saving.discard(req_id)
+        self._plan.finished.append(req_id)
+        return True
 
     def shutdown(self) -> None:
         for req_id in list(self._hits):

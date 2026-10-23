@@ -37,8 +37,18 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     resume point, the load is re-planned. Otherwise the load is reported failed.
   - Each request gets its own `load` RPC, so one bad lease fails one request.
 - **Saves.** Each step, `semantics.saveable(g, before, after)` gives the blocks
-  that became storable. `policy.choose_saves` filters them, and the worker saves
-  them after the forward pass.
+  that became storable. `policy.choose_saves` filters them. The saves are
+  asynchronous: `wait_for_save` records a CUDA event on the compute stream and
+  queues the job; a saver thread waits on the event, then issues the save RPC.
+  The step thread never waits on the GPU. Block lifetime:
+  - a finished request with saves returns `True` from `request_finished`;
+    vLLM keeps its blocks until every worker reports it in `finished_sending`,
+    i.e. until every save job submitted before its finish is done (stored or
+    failed);
+  - a step whose plan has `flush` (vLLM preempted a request and freed its
+    blocks, or the layout has window groups whose blocks are freed while the
+    request runs) waits for all pending saves in `handle_preemptions`, before
+    the step zeroes or writes any block.
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first;
@@ -55,11 +65,10 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   logs `save stats`:
   - steps, and steps with a save;
   - blocks and bytes;
-  - sync and RPC ms;
-  - average and max save-step ms;
+  - on the step thread: `submit_ms` and preemption `flushes` / `flush_ms`;
+  - on the saver thread: `wait_ms` (compute event), `rpc_ms`, `max_job_ms`,
+    `max_pending` jobs;
   - failed saves.
-
-  Saves are synchronous today; these numbers decide whether to make them async.
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;
   - so are checkpoint groups, until the core handles vLLM's

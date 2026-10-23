@@ -627,7 +627,18 @@ class FakeLoadState:
         return self.state
 
 
-def _worker(sem, rpc, states, layout=None):
+class FakeMark:
+    """Compute-stream mark: ``synchronize`` blocks until the test releases it."""
+
+    def __init__(self, gate=None):
+        self.gate = gate
+
+    def synchronize(self):
+        if self.gate is not None:
+            assert self.gate.wait(5), "test never released the compute mark"
+
+
+def _worker(sem, rpc, states, layout=None, mark=FakeMark):
     it = iter(states)
     return Worker(
         layout or _layout(sem),
@@ -637,7 +648,7 @@ def _worker(sem, rpc, states, layout=None):
         0,
         lambda t: b"ipc",
         lambda: next(it),
-        lambda: None,
+        mark,
     )
 
 
@@ -658,14 +669,14 @@ def test_worker_loads_and_poll():
             LoadPlan("later", [(b"L3", [[4]])]),
         ]
     )
-    worker.start_loads(plan)
+    worker.start(plan)
     assert len(rpc.loads) == 4  # one RPC per request with something to load
-    finished, failed = worker.poll()
+    _, finished, failed = worker.poll()
     assert failed == {"fail", "bad-lease", "gpu-error"}
     assert finished == {"fail", "empty", "ok", "bad-lease", "gpu-error"}
     pending.ready = True
-    assert worker.poll() == ({"later"}, set())
-    assert worker.poll() == (set(), set())
+    assert worker.poll() == (set(), {"later"}, set())
+    assert worker.poll() == (set(), set(), set())
 
 
 @pytest.mark.parametrize(
@@ -703,12 +714,81 @@ def test_worker_save_by_storage_group():
     )
     worker.save(StepPlan(saves=[GroupSave(1, [21], [b"h1"]), GroupSave(0, [11], [b"h1"])]))
     worker.save(StepPlan())
+    assert worker.flush(5)
     assert saved == [[("layers.0.attn", [21], [b"h1"]), ("layers.1.attn", [11], [b"h1"])]]
     # S2: the gate log attributes G4 to save cost; 2 x (64 + 64) B segments.
     stats = worker.save_stats
     assert (stats.steps, stats.save_steps, stats.blocks, stats.bytes) == (2, 1, 2, 256)
     worker.report_save_stats()
     assert worker.save_stats.steps == 0
+    worker.shutdown()
+
+
+@pytest.mark.parametrize("rpc_ok", [True, False], ids=["saved", "save-failed"])
+def test_async_save_holds_blocks_until_copied(rpc_ok):
+    """vLLM may reuse a finished request's blocks only after its saves landed.
+
+    The step thread never waits on the GPU: the save RPC runs after the
+    compute mark. A request that had saves is held at finish and reported in
+    finished_sending only once every job submitted before its finish is done,
+    whether or not the server stored the blocks.
+    """
+    import threading
+
+    gate = threading.Event()
+    rpc = FakeRpc()
+    calls = []
+    rpc.save = lambda *args: calls.append(args[-1]) or (rpc_ok, "")
+    layout = _layout(StubSemantics, StubFullSpec())
+    worker = _worker(StubSemantics, rpc, [], layout=layout, mark=lambda: FakeMark(gate))
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+
+    sched, _ = _sched(StubSemantics, {}, layout=layout)
+    sched.on_new_request(_req(req_id="saver"))
+    sched.on_new_request(_req(req_id="idle"))
+    sched.plan_saves([("saver", 0, 13), ("idle", 0, 3)], lambda rid: ([10, 11, 12, 13],))
+    step1 = sched.take_plan()
+    worker.start(step1)
+    worker.save(step1)  # returns although the compute mark is not reached
+    assert calls == [] and worker.save_stats.save_steps == 1
+
+    # Both finish before the next step: only the one with saves is held.
+    assert sched.request_finished("saver") is True
+    assert sched.request_finished("idle") is False
+    step2 = sched.take_plan()
+    assert step2.finished == ["saver"]
+    worker.start(step2)
+    worker.save(step2)
+    assert worker.poll()[0] == set()  # the copy has not run: blocks stay held
+
+    gate.set()
+    assert worker.flush(5)
+    assert len(calls) == 1
+    assert worker.poll()[0] == {"saver"}
+    assert worker.poll()[0] == set()
+    assert worker.save_stats.failed == (0 if rpc_ok else 1)
+    worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "specs,preempted,flush",
+    [
+        pytest.param((StubFullSpec(),), (), False, id="full-steady"),
+        # vLLM freed a preempted request's blocks; this step may reuse them.
+        pytest.param((StubFullSpec(),), ("r",), True, id="full-preempted"),
+        # Window blocks are freed as they slide out of the window mid-request.
+        pytest.param((StubWindowSpec(), StubFullSpec()), (), True, id="window-always"),
+    ],
+)
+def test_save_flush_before_block_reuse(specs, preempted, flush):
+    sched, _ = _sched(StubSemantics, {}, layout=_layout(StubSemantics, *specs))
+    sched.on_new_request(_req())
+    sched.plan_saves([("r", 0, 13)], lambda rid: tuple([10, 11, 12, 13] for _ in specs))
+    sched.take_plan()
+    sched.plan_saves([], lambda rid: None, preempted)
+    assert sched.take_plan().flush is flush
+    # A preempted request's saves are covered by the flush: no hold at finish.
+    assert sched.request_finished("r") is (not preempted)
 
 
 # --------------------------------------------------------------------- layout
