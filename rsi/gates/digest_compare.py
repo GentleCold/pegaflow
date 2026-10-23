@@ -26,11 +26,19 @@ in REF. A local or external block is
 Computed blocks are compared against the other computed copies: ``exact``
 when equal to one of them; under batch invariance every copy must be exact.
 ``max_rel_l1`` reports the closest per-layer float L1 for the inexact ones.
+Without split invariance (``split_invariant=False``: the computed KV depends
+on where the computation started, e.g. vLLM's MLA prefill attends to the
+cached context separately and merges), a computed block is judged only
+against copies computed with the same *split*: the start of the computing
+episode and the chunk ends before the block (``progress`` values below its
+end). Blocks with copies at other splits only are ``computed_unmatched_split``
+(reported, not judged).
 
 ``REF`` and ``CAND`` may be the same directory (self-consistency of a
 cold-then-warm run in one server); a computed block never references itself.
 
-Usage: python -m rsi.gates.digest_compare REF_DIR CAND_DIR [--invariant] [--json OUT]
+Usage: python -m rsi.gates.digest_compare REF_DIR CAND_DIR [--invariant]
+       [--split-variant] [--json OUT]
 """
 
 from __future__ import annotations
@@ -67,13 +75,21 @@ def computed_ranges(r: dict[str, Any]) -> list[tuple[int, int]]:
     return out
 
 
-def records(probe_dir: Path) -> Iterator[tuple[Key, str, tuple[str, ...], list[float], str]]:
-    """(key, tag, per-layer exact digests, per-layer l1, req_id) per digested block."""
-    last: dict[str, tuple[int, int]] = {}
+Split = tuple[int, tuple[int, ...]]  # episode start, chunk ends before the block
+
+
+def records(
+    probe_dir: Path,
+) -> Iterator[tuple[Key, str, tuple[str, ...], list[float], str, Split]]:
+    """(key, tag, per-layer exact digests, per-layer l1, req_id, split) per
+    digested block; ``split`` = (start of the last episode, its ``progress``
+    chunk ends below the block's end)."""
+    last: dict[str, tuple[int, int, list[int]]] = {}
     for r in _requests(probe_dir):
         if r["episodes"]:
-            _, local, start = r["episodes"][-1]
-            last[r["req_id"]] = (local or 0, start)
+            step, local, start = r["episodes"][-1]
+            ends = [p[1] for p in r["progress"] if p[0] >= step]
+            last[r["req_id"]] = (local or 0, start, ends)
     layers: dict[tuple[str, int], list[str]] = {}
     for f in sorted(probe_dir.glob("digest-*.jsonl")):
         for line in f.read_text().splitlines():
@@ -84,12 +100,13 @@ def records(probe_dir: Path) -> Iterator[tuple[Key, str, tuple[str, ...], list[f
                 raise ValueError(f"{f}: digested request {rec['req_id']} not in requests.jsonl")
             if layers.setdefault((rec["rank"], rec["group"]), rec["layers"]) != rec["layers"]:
                 raise ValueError(f"{f}: layer list of group {rec['group']} changed")
-            local, start = last[rec["req_id"]]
+            local, start, ends = last[rec["req_id"]]
             for blk in rec["blocks"]:
                 c = blk["covered"]
                 tag = "local" if c <= local else "external" if c <= start else "computed"
                 key = (rec["rank"], rec["group"], blk["key"])
-                yield key, tag, tuple(blk["exact"]), blk["l1"], rec["req_id"]
+                split = (start, tuple(e for e in ends if e < c))
+                yield key, tag, tuple(blk["exact"]), blk["l1"], rec["req_id"], split
 
 
 class Reference:
@@ -98,9 +115,14 @@ class Reference:
     def __init__(self, probe_dir: Path):
         # key -> per-layer digest tuple -> [occurrences, per-layer l1]
         self.copies: dict[Key, dict[tuple[str, ...], list[Any]]] = defaultdict(dict)
-        for key, tag, exact, l1, _ in records(probe_dir):
+        # (key, split) -> per-layer digest tuple -> [occurrences, per-layer l1]
+        self.split_copies: dict[tuple[Key, Split], dict[tuple[str, ...], list[Any]]] = defaultdict(
+            dict
+        )
+        for key, tag, exact, l1, _, split in records(probe_dir):
             if tag == "computed":
                 self.copies[key].setdefault(exact, [0, l1])[0] += 1
+                self.split_copies[(key, split)].setdefault(exact, [0, l1])[0] += 1
         # prefix key -> number of (request, episode) that computed its block end
         self.computers: Counter[str] = Counter()
         # Of those, computations whose bytes were never digested: a preempted
@@ -135,7 +157,13 @@ def _group() -> dict[str, Any]:
             "unreferenced",
         ):
             g[f"{t}_{k}"] = 0
-    g |= {"computed_compared": 0, "computed_exact": 0, "max_rel_l1": 0.0, "first_bad": None}
+    g |= {
+        "computed_compared": 0,
+        "computed_exact": 0,
+        "computed_unmatched_split": 0,
+        "max_rel_l1": 0.0,
+        "first_bad": None,
+    }
     return g
 
 
@@ -150,21 +178,30 @@ def _uncertain(g: dict[str, Any], tag: str, ref: Reference, key: Key) -> None:
         g[f"{tag}_uncertain_preempted"] += 1
 
 
-def compare(ref_dir: Path, cand_dir: Path, invariant: bool) -> dict[str, Any]:
+def compare(
+    ref_dir: Path, cand_dir: Path, invariant: bool, split_invariant: bool = True
+) -> dict[str, Any]:
     ref = Reference(ref_dir)
     own = 1 if ref_dir.resolve() == cand_dir.resolve() else 0
     groups: dict[int, dict[str, Any]] = defaultdict(_group)
-    for key, tag, exact, l1, rid in records(cand_dir):
+    for key, tag, exact, l1, rid, split in records(cand_dir):
         g = groups[key[1]]
         copies = ref.copies.get(key, {})
         if tag == "computed":
             if ref.occurrences(key) - own <= 0:
                 continue
+            pool = copies
+            if not split_invariant:
+                # Only a copy computed with the same split is a reference.
+                pool = ref.split_copies.get((key, split), {})
+                if sum(c[0] for c in pool.values()) - own <= 0:
+                    g["computed_unmatched_split"] += 1
+                    continue
             g["computed_compared"] += 1
-            if copies.get(exact, [0])[0] - own > 0:
+            if pool.get(exact, [0])[0] - own > 0:
                 g["computed_exact"] += 1
             else:
-                rel = min(_rel_l1(c[1], l1) for d, c in copies.items() if d != exact)
+                rel = min(_rel_l1(c[1], l1) for d, c in pool.items() if d != exact)
                 g["max_rel_l1"] = max(g["max_rel_l1"], rel)
             continue
         if not copies:
@@ -194,6 +231,7 @@ def compare(ref_dir: Path, cand_dir: Path, invariant: bool) -> dict[str, Any]:
     total: dict[str, Any] = {k: sum(g[k] for g in groups.values()) for k in counters}
     total["max_rel_l1"] = max((g["max_rel_l1"] for g in groups.values()), default=0.0)
     total["invariant"] = invariant
+    total["split_invariant"] = split_invariant
     total["groups"] = {str(k): v for k, v in sorted(groups.items())}
     return total
 
@@ -203,9 +241,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("ref", type=Path)
     ap.add_argument("cand", type=Path)
     ap.add_argument("--invariant", action="store_true", help="runs were batch-invariant")
+    ap.add_argument(
+        "--split-variant",
+        action="store_true",
+        help="computed KV depends on the split point: judge computed blocks per split",
+    )
     ap.add_argument("--json", type=Path, help="write the report here")
     args = ap.parse_args(argv)
-    report = compare(args.ref, args.cand, args.invariant)
+    report = compare(args.ref, args.cand, args.invariant, not args.split_variant)
     text = json.dumps(report, indent=1, sort_keys=True)
     if args.json:
         args.json.write_text(text)

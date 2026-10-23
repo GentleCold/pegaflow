@@ -502,3 +502,104 @@ def test_stop_waits_for_the_whole_process_group(tmp_path, monkeypatch):
     with pytest.raises(ProcessLookupError):
         os.killpg(proc.pid, 0)
     assert "gone after SIGTERM" in log.read_text()
+
+
+# ------------------------------------------------------------ split invariance
+
+
+def _split_probe(tmp_path):
+    """Key ``p:2`` (block 3) computed four times: twice from start 0 (bytes
+    A, A), once from start 2 blocks (bytes B: another split, e.g. MLA's
+    separately attended cached context), once from start 2 blocks with bytes
+    C (same split as B, different bytes: a real fault)."""
+    reqs, digests = [], []
+    for i, (start, byte) in enumerate([(0, "A"), (0, "A"), (2 * BT, "B"), (2 * BT, "C")]):
+        rid = f"r{i}"
+        r = _req("p", 3, 10 * i + 1, "cold") | {"req_id": rid, "digest": "full"}
+        r["episodes"] = [[10 * i + 1, start, start]]
+        r["progress"] = [[10 * i + 1, 3 * BT + 1]]
+        reqs.append(r)
+        blk = {"key": "p:2", "covered": 3 * BT, "exact": [byte], "l1": [1.0]}
+        digests.append({"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": [blk]})  # fmt: skip
+    return _probe(tmp_path, reqs, digests)
+
+
+@pytest.mark.parametrize(
+    "split_inv,compared,exact,unmatched",
+    [(True, 4, 2, 0), (False, 4, 2, 0)],
+    ids=["split-invariant", "split-variant"],
+)
+def test_computed_exact_judges_same_split_only(tmp_path, split_inv, compared, exact, unmatched):
+    """Split-invariant: every copy is a reference (B, C inexact). Split-variant:
+    A/A judged against each other (exact), B/C against each other (both
+    inexact: same split, different bytes still fails)."""
+    from rsi.gates import digest_compare
+
+    probe = _split_probe(tmp_path)
+    d = digest_compare.compare(probe, probe, invariant=True, split_invariant=split_inv)
+    assert (d["computed_compared"], d["computed_exact"], d["computed_unmatched_split"]) == (
+        compared,
+        exact,
+        unmatched,
+    )
+    assert not run_gate._digest_verdict(d, None)["pass"]
+
+
+def test_computed_other_split_only_is_reported_not_judged(tmp_path):
+    """Drop C: B has only copies at another split. Split-variant: B is
+    unmatched (reported, coverage < 1) and the verdict passes; split-invariant
+    keeps the strict rule and fails."""
+    import json
+
+    from rsi.gates import digest_compare
+
+    probe = _split_probe(tmp_path)
+    for name in ("requests.jsonl", "digest-pp0-tp0.jsonl"):
+        f = probe / name
+        f.write_text("".join(x + "\n" for x in f.read_text().splitlines() if json.loads(x)["req_id"] != "r3"))  # fmt: skip
+    d = digest_compare.compare(probe, probe, invariant=True, split_invariant=False)
+    assert (d["computed_compared"], d["computed_exact"], d["computed_unmatched_split"]) == (2, 2, 1)
+    v = run_gate._digest_verdict(d, None)
+    assert v["pass"] and v["computed_coverage"] == pytest.approx(2 / 3)
+    strict = digest_compare.compare(probe, probe, invariant=True, split_invariant=True)
+    assert not run_gate._digest_verdict(strict, None)["pass"]
+
+
+def _ctrl(differ: int, lp: int, n: int = 10, prewarmed: int = 10) -> dict:
+    return {
+        "n": n,
+        "differ": [i < differ for i in range(n)],
+        "logprob_differ": [i < lp for i in range(n)],
+        "prewarmed": prewarmed,
+        "ref_equals_cold": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "claim,ctrl,ok",
+    [
+        (True, _ctrl(0, 0), True),
+        (False, _ctrl(0, 0), False),  # declared variant, measured invariant
+        (True, _ctrl(0, 3), False),  # logprobs moved: not split-invariant
+        (False, _ctrl(2, 5), True),
+        (False, _ctrl(2, 5, prewarmed=5), False),  # pre-warm did not take
+        (True, None, False),
+    ],
+    ids=["inv-ok", "false-claim", "logprob-only", "variant-ok", "vacuous", "missing"],
+)
+def test_split_control_establishes_gate_claim(claim, ctrl, ok):
+    assert run_gate._split_control_verdict(ctrl, claim)["pass"] is ok
+
+
+@pytest.mark.parametrize(
+    "split_inv,warm,ok",
+    [(True, 0, True), (True, 1, False), (False, 12, True), (False, 13, False)],
+    ids=["inv-equal", "inv-differ", "variant-at-bound", "variant-over-bound"],
+)
+def test_outputs_bounded_by_split_control(split_inv, warm, ok):
+    """Split-variant: the control differs on 10 of the 100 prompts the arm
+    also ran, so the bound is 0.10 + SPLIT_MARGIN (0.02) = 12 completions."""
+    assert run_gate.SPLIT_MARGIN == 0.02
+    ctrl = _ctrl(10, 10, n=100)
+    v = run_gate._outputs_verdict({"cold": 0, "warm": warm}, True, split_inv, ctrl, 100)
+    assert v["pass"] is ok, v

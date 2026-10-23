@@ -74,12 +74,22 @@ async def run_gsm8k(
     concurrency: int,
     max_tokens: int = 384,
     xargs: dict[str, Any] | None = None,
+    logprobs: bool = False,
+    prewarm: bool = False,
 ) -> dict[str, Any]:
-    """``xargs`` go to ``vllm_xargs`` (``SamplingParams.extra_args``), e.g. probe tags."""
+    """``xargs`` go to ``vllm_xargs`` (``SamplingParams.extra_args``), e.g. probe tags.
+
+    ``logprobs``: also return ``tokens`` (per request: sampled-token logprobs,
+    cached prompt tokens, prompt tokens; the server needs
+    ``--enable-prompt-tokens-details`` for the cached count).
+    ``prewarm``: send each prompt once with ``max_tokens=1`` right before its
+    real request, so vLLM's prefix cache holds the whole prompt and the real
+    request starts computing at its last full prompt block (the split control)."""
     import aiohttp
 
     sem = asyncio.Semaphore(concurrency)
     outputs: list[str] = [""] * len(prompts)
+    tokens: list[dict[str, Any] | None] = [None] * len(prompts)
 
     async def one(session: aiohttp.ClientSession, i: int) -> None:
         body = {
@@ -91,9 +101,28 @@ async def run_gsm8k(
         }
         if xargs:
             body["vllm_xargs"] = xargs
-        async with sem, session.post(f"{url}/v1/completions", json=body) as r:
-            r.raise_for_status()
-            outputs[i] = (await r.json())["choices"][0]["text"]
+        if logprobs:
+            body["logprobs"] = 1
+        async with sem:
+            if prewarm:
+                warm = body | {"max_tokens": 1}
+                warm.pop("logprobs", None)
+                async with session.post(f"{url}/v1/completions", json=warm) as r:
+                    r.raise_for_status()
+                    await r.read()
+            async with session.post(f"{url}/v1/completions", json=body) as r:
+                r.raise_for_status()
+                res = await r.json()
+        choice = res["choices"][0]
+        outputs[i] = choice["text"]
+        if logprobs:
+            usage = res.get("usage") or {}
+            details = usage.get("prompt_tokens_details") or {}
+            tokens[i] = {
+                "logprobs": (choice.get("logprobs") or {}).get("token_logprobs"),
+                "cached": details.get("cached_tokens"),
+                "prompt_tokens": usage.get("prompt_tokens"),
+            }
 
     t0 = time.monotonic()
     timeout = aiohttp.ClientTimeout(total=None, sock_read=600)
@@ -106,6 +135,7 @@ async def run_gsm8k(
         "accuracy": correct / len(prompts) if prompts else 0.0,
         "seconds": time.monotonic() - t0,
         "outputs": outputs,
+        **({"tokens": tokens} if logprobs else {}),
     }
 
 

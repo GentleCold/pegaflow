@@ -105,6 +105,14 @@ WORKLOADS = ("gsm8k", "replay", "cap")
 TERM_GRACE = 120
 KILL_GRACE = 300
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
+# Split control (plain arm, gsm8k): ``split_ref`` repeats the cold pass with
+# logprobs, ``split`` pre-warms vLLM's prefix cache with each whole prompt so
+# the request starts at its last full prompt block (where a connector's warm
+# hit ends). Split-variant models (gate.json ``split_invariant: false``) bound
+# an arm's output divergence by the control's rate plus this margin.
+SPLIT_PASSES = ("split_ref", "split")
+SPLIT_MARGIN = 0.02
+MIN_PREWARMED = 0.9  # share of split requests whose hit must exceed split_ref's
 
 
 def free_port() -> int:
@@ -379,6 +387,9 @@ def vllm_server(
         *gate.get("vllm_args", []),
         *args.vllm_arg,
     ]
+    if arm_kind(arm) == "plain":
+        # Usage reports cached prompt tokens: shows the split pre-warm hit.
+        cmd.append("--enable-prompt-tokens-details")
     cfg = kv_transfer_config(arm, probe_dir, "tagged", cpu_bytes)
     if cfg is not None:
         cmd += ["--kv-transfer-config", json.dumps(cfg)]
@@ -492,6 +503,7 @@ def run_arm_workload(
         raise ValueError("cap workload needs a capacity")
     store_bytes = capacity if cap else parse_size(args.pool_size)
     invariant = gsm and bool(gate.get("batch_invariant"))
+    split_inv = bool(gate.get("split_invariant", True))
     result: dict[str, Any] = {
         "arm": arm,
         "workload": workload,
@@ -530,6 +542,8 @@ def run_arm_workload(
             limit = SELFTEST_LIMIT if kind == "selftest" else args.gsm8k_limit
             prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, limit)
             names = ["cold", "warm"]
+            if kind == "plain":
+                names += list(SPLIT_PASSES)  # the split control
         else:
             convs = workloads.build_turns(
                 Path(args.replay_file),
@@ -557,9 +571,19 @@ def run_arm_workload(
                 # reference, so nothing a connector loads goes unjudged.
                 xargs = {"rsi_pass": name, "rsi_digest": "full"}
                 res = asyncio.run(
-                    workloads.run_gsm8k(url, "m", prompts, args.concurrency, xargs=xargs)
+                    workloads.run_gsm8k(
+                        url,
+                        "m",
+                        prompts,
+                        args.concurrency,
+                        xargs=xargs,
+                        logprobs=name in SPLIT_PASSES,
+                        prewarm=name == "split",
+                    )
                 )
                 (out / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
+                if "tokens" in res:
+                    (out / f"{name}-tokens.json").write_text(json.dumps(res.pop("tokens")))
             else:
                 # Replay: digest a conversation sample in the untimed passes;
                 # all turns of a sampled conversation, so its references are
@@ -626,7 +650,7 @@ def run_arm_workload(
     result["load_errors"] = (
         [json.loads(x) for x in errs.read_text().splitlines()] if errs.exists() else []
     )
-    result["digest_self"] = digest_compare.compare(probe, probe, invariant)
+    result["digest_self"] = digest_compare.compare(probe, probe, invariant, split_inv)
     (out / "result.json").write_text(json.dumps(result, indent=1))
     return result
 
@@ -716,6 +740,109 @@ def _differ(ref: list[str] | None, got: list[str] | None) -> int | None:
     return sum(a != b for a, b in zip(ref[: len(got)], got, strict=True))
 
 
+def _tokens(run_dir: Path, label: str, name: str) -> list[dict[str, Any] | None] | None:
+    f = run_dir / label / "gsm8k" / f"{name}-tokens.json"
+    return json.loads(f.read_text()) if f.exists() else None
+
+
+def split_control(run_dir: Path) -> dict[str, Any] | None:
+    """The plain arm's split control: ``split`` (each prompt pre-warmed into
+    vLLM's prefix cache, so the request starts at its last full prompt block)
+    vs ``split_ref`` (same prompts, hits end at the shared few-shot prefix).
+    Per request: completion differs, sampled-token logprobs differ, and the
+    pre-warm took (``split`` cached more prompt tokens than ``split_ref``)."""
+    ref, got = _outputs(run_dir, "plain", "split_ref"), _outputs(run_dir, "plain", "split")
+    rt, gt = _tokens(run_dir, "plain", "split_ref"), _tokens(run_dir, "plain", "split")
+    if not ref or not got or rt is None or gt is None or len(ref) != len(got):
+        return None
+    differ = [a != b for a, b in zip(ref, got, strict=True)]
+    lp = [
+        a is None or b is None or a.get("logprobs") != b.get("logprobs")
+        for a, b in zip(rt, gt, strict=True)
+    ]
+    warmed = [
+        a is not None and b is not None and (b.get("cached") or 0) > (a.get("cached") or 0)
+        for a, b in zip(rt, gt, strict=True)
+    ]
+    cold = _outputs(run_dir, "plain", "cold")
+    return {
+        "n": len(ref),
+        "differ": differ,
+        "logprob_differ": lp,
+        "prewarmed": sum(warmed),
+        "ref_equals_cold": cold is not None and cold == ref,
+    }
+
+
+def control_rate(ctrl: dict[str, Any], m: int) -> float | None:
+    """Output divergence rate of the split control over the first ``m``
+    prompts (an arm runs the first ``m`` of the same list)."""
+    if not m or m > ctrl["n"]:
+        return None
+    return sum(ctrl["differ"][:m]) / m
+
+
+def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str, Any]:
+    """gate.json's ``split_invariant`` must be what the control measures:
+    true needs identical completions and logprobs at both splits, false needs
+    some divergence. The pre-warm must have taken for nearly every request,
+    else the control compared nothing."""
+    if ctrl is None:
+        return {"pass": False, "reason": "not evaluated (plain arm split passes missing)"}
+    n = ctrl["n"]
+    differ, lp = sum(ctrl["differ"]), sum(ctrl["logprob_differ"])
+    measured = differ == 0 and lp == 0
+    ok = measured == claim and ctrl["prewarmed"] >= MIN_PREWARMED * n
+    out = {
+        "pass": ok,
+        "split_invariant": claim,
+        "measured_invariant": measured,
+        "n": n,
+        "differ": differ,
+        "rate": differ / n if n else None,
+        "logprob_differ": lp,
+        "prewarmed": ctrl["prewarmed"],
+        "ref_equals_cold": ctrl["ref_equals_cold"],
+    }
+    if measured != claim:
+        out["reason"] = (
+            f"gate.json split_invariant={claim} but the control measured "
+            f"{'no' if measured else 'a'} divergence"
+        )
+    elif not ok:
+        out["reason"] = "pre-warm did not take: the control is vacuous"
+    return out
+
+
+def _outputs_verdict(
+    diffs: dict[str, int | None],
+    invariant: bool,
+    split_inv: bool,
+    ctrl: dict[str, Any] | None,
+    n: int | None,
+) -> dict[str, Any]:
+    """G2.gsm8k_outputs. Split-invariant: every completion equals baseline
+    cold. Split-variant: report-only, bounded per pass by the split control's
+    divergence rate on the same prompts plus ``SPLIT_MARGIN``."""
+    out: dict[str, Any] = {"invariant": invariant, "split_invariant": split_inv}
+    out |= {f"{p}_differ": d for p, d in diffs.items()}
+    if not invariant:
+        return {"pass": True} | out
+    if split_inv:
+        return {"pass": all(d == 0 for d in diffs.values())} | out
+    rate = control_rate(ctrl, n or 0) if ctrl else None
+    if rate is None or any(d is None for d in diffs.values()):
+        return {"pass": False, "reason": "split control not comparable"} | out
+    rates = {p: d / n for p, d in diffs.items()}
+    bound = rate + SPLIT_MARGIN
+    return {
+        "pass": all(r <= bound for r in rates.values()),
+        "control_rate": rate,
+        "bound": bound,
+        **{f"{p}_rate": r for p, r in rates.items()},
+    } | out
+
+
 def _digest_verdict(
     d: dict[str, Any] | None,
     min_judged: float | None,
@@ -753,10 +880,16 @@ def _digest_verdict(
             loaded += d[f"{t}_compared"] + unc + d[f"{t}_unreferenced"]
         ok = ok and preempted <= MAX_PREEMPTED_UNCERTAIN * loaded
     if d["invariant"]:
+        # Split-variant: only same-split copies were judged (digest_compare).
         ok = ok and d["computed_exact"] == d["computed_compared"]
     keys = [k for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    cov = {}
+    if d.get("split_invariant") is False:
+        seen_c = d["computed_compared"] + d.get("computed_unmatched_split", 0)
+        cov = {"computed_coverage": d["computed_compared"] / seen_c if seen_c else None}
     return {
         "pass": ok,
+        **cov,
         **({"vacuous": "no external block in the digested sample"} if vacuous else {}),
         **({"preempted_uncertain": preempted} if preempted else {}),
         **{k: d[k] for k in keys},
@@ -937,8 +1070,15 @@ def _perf_verdicts(
     return g
 
 
-def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path) -> dict[str, Any]:
+def verdicts(
+    results: dict[str, dict[str, Any]],
+    run_dir: Path,
+    committed: Path,
+    gate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     v: dict[str, Any] = {}
+    split_inv = bool((gate or {}).get("split_invariant", True))
+    ctrl = split_control(run_dir)
     base = results.get("baseline", {})
     ref_cold = _outputs(run_dir, "baseline", "cold")
     ref_acc = base.get("gsm8k", {}).get("passes", {}).get("cold", {}).get("accuracy")
@@ -961,6 +1101,8 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
             "invariant": invariant,
         },
         "G2.digest_self.gsm8k": _digest_verdict(base.get("gsm8k", {}).get("digest_self"), None),
+        # gate.json's split_invariant is established here, not declared.
+        "G2.split_control": _split_control_verdict(ctrl, split_inv),
         "G2.digest_self.cap": _digest_verdict(
             base.get("cap", {}).get("digest_self"), None, exhaustive=True
         )
@@ -982,17 +1124,18 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
         g["G0.spec"] = g0(run_dir, label, committed)
         g["G2.digest_self.gsm8k"] = _digest_verdict(gsm and gsm["digest_self"], MIN_JUDGED_GSM8K)
         g["G2.digest_vs_baseline.gsm8k"] = _digest_verdict(
-            digest_compare.compare(base_probe, run_dir / label / "gsm8k" / "probe", invariant)
+            digest_compare.compare(
+                base_probe, run_dir / label / "gsm8k" / "probe", invariant, split_inv
+            )
             if gsm and base_probe.exists()
             else None,
             MIN_JUDGED_GSM8K,
         )
         diffs = {p: _differ(ref_cold, _outputs(run_dir, label, p)) for p in ("cold", "warm")}
-        g["G2.gsm8k_outputs"] = {
-            "pass": not invariant or all(d == 0 for d in diffs.values()),
-            "invariant": invariant,
-            **{f"{p}_differ": d for p, d in diffs.items()},
-        }
+        warm_out = _outputs(run_dir, label, "warm")
+        g["G2.gsm8k_outputs"] = _outputs_verdict(
+            diffs, invariant, split_inv, ctrl, len(warm_out) if warm_out else None
+        )
         if kind == "selftest":
             # Negative arms must be caught by both digest checks (a single
             # flipped byte need not change a greedy output, so outputs are
@@ -1370,7 +1513,7 @@ def main(argv: list[str] | None = None) -> int:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
     problems = official_problems(args, arms, wls, gate_file, committed)
-    v = verdicts(results, run_dir, committed)
+    v = verdicts(results, run_dir, committed, gate)
     floor = None
     if "cap" in wls:
         # Not a verdict: a store smaller than this measures vLLM's GPU cache,
