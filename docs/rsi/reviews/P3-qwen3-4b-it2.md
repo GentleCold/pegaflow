@@ -50,13 +50,15 @@ releasing the GIL, runtime behaviour of failed/timed-out sync loads.
 
 ## Resolution
 
-Filled in by it2c (see `models/Qwen3-4B/ITERATIONS.md`).
+Filled in by it2c (see `models/Qwen3-4B/ITERATIONS.md` it2c). Slice
+`2026-10-23-qwen3-4b-p3-it2c-slice1` (rev 056eb4b): every verdict passes;
+gsm8k v2 cold 163.8 s (slice2 164.6), warm 162.3 s (+0.2%, slice2 +0.3%).
 
 | ID | Resolution |
 |---|---|
-| M1 | pending (it2c) |
-| S1 | pending (it2c) |
-| S2 | pending (it2c) |
-| S3 | pending (it2c) |
-| S4 | pending (it2c) |
-| nits | pending (it2c) |
+| M1 | Fixed (50e186b, 056eb4b). Saves of any request holding a sync-loaded block are held for `max_concurrent_batches` plans and re-offered from vLLM's rewound point; requests vLLM did not rewind although they computed on a failed block (shared-block case) never save again (`update_connector_output` -> `Scheduler.on_load_errors`). Async failures are safe: vLLM schedules the request only after processing `failed_recving` and resetting its computed tokens. Test: `test_sync_load_outcome_gates_saves[sync-ok\|sync-failed\|sync-failed-shared-later]`. |
+| S1 | Fixed (50e186b). `core.may_zero_or_copy_blocks`: zeroing, `block_size != hash_block_size` (CoW) or unknown -> worker `sync_saves` (wait inside `wait_for_save`, before the next step on both runners). Qwen3-4B stays async. README, ITERATIONS it2a and SKILL lesson corrected. Test: `test_layouts_that_zero_or_copy_save_synchronously`. |
+| S2 | Fixed (50e186b). No deadline; poll with 20-200 us backoff sleep, log every 10 s, invalid only on a final error state. Test: `test_sync_loads[sync-slow-ok]`. |
+| S3 | Done. Held-out replay 8 x 6 (`r2egym-heldout-from33.jsonl`, conversations 33..) `2026-10-23-qwen3-4b-p3-it2c-heldout`: every replay verdict passes (warm TTFT 0.090 vs 0.236 s, cold req/s -0.4%). Load-size artifact `2026-10-23-qwen3-4b-p3-it2c-load-stats.json`: replay p50 720 (slice) / 864 (held-out) / 3152 (official) tokens, 70-91% async; gsm8k 98% sync. |
+| S4 | Fixed in part (50e186b). Jobs complete in `finally`; a dead saver releases every hold, unblocks `flush` and drops later saves as failed. A hung RPC is not released: the PyO3 client has no per-call deadline and a client timeout would not stop the server's copy, so `flush` keeps waiting and logs every 10 s (a server-side deadline is a separate change). Test: `test_async_save_holds_blocks_until_copied[raises\|saver-dies]`. |
+| nits | Fixed. `.rsi-rev` = synced commit; `time.sleep(0)` spin replaced (S2); `policy.py` and README name no model class. |

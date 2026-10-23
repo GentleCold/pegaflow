@@ -271,7 +271,10 @@ Change:
   - Preemption frees blocks without `request_finished`. The scheduler sees
     `preempted_req_ids` in `build_connector_meta` and sets `plan.flush`; the
     worker waits for every pending job in `handle_preemptions`, which vLLM
-    calls before the step zeroes or writes any block (both model runners).
+    calls before the step's forward. (Corrected in it2c: the V1 model runner
+    calls it before zeroing and copy-on-write too, the V2 runner after them;
+    safe for Qwen3-4B, which has neither. Layouts that may zero or copy now
+    save synchronously.)
   - Window groups free blocks that slide out while the request runs, so any
     layout with a window group flushes before every step (not Qwen3-4B;
     keeps the core safe for P4-P6 until a cheaper rule is measured).
@@ -449,3 +452,162 @@ G5 gate is still under review fixes; at the pre-fix slice v2 scored E_C 0.40,
 limited by server reclaim/eviction (`feat/rsi-server-reclaim`).
 
 Status: accepted for G0-G4 once the it2 code review passes; G5 pending.
+
+## it2c (2026-10-23): it2 review fixes
+
+Review `docs/rsi/reviews/P3-qwen3-4b-it2.md` (APPROVE-WITH-FIXES). Commits
+50e186b, 056eb4b (connector_v2 + tests), this docs commit. Failure paths
+only: the measured path for Qwen3-4B is unchanged (async saves, sync short
+loads; the worker logs `saves=async`).
+
+### Changes
+
+- **M1, failed sync load feeds saves.** vLLM schedules step N+1 before it
+  processes step N's output (`max_concurrent_batches`, 2 with async
+  scheduling), so a failed sync load of step N is computed on in N and N+1
+  before vLLM rewinds the request. The scheduler records every sync-loaded
+  GPU block as unconfirmed for `confirm_steps = max_concurrent_batches`
+  plans; any request whose block table holds one (the loader, or a local
+  prefix hit on its blocks) saves nothing in those plans and keeps
+  `saved_upto` at `before`, so the range is offered again afterwards, from
+  vLLM's rewound `num_computed_tokens` if the load failed. vLLM rewinds only
+  the first request holding a shared invalid block
+  (`_update_requests_with_invalid_blocks`); the others keep KV computed on
+  the bad bytes. So `update_connector_output` forwards `invalid_block_ids`
+  to the scheduler, which checks every request alive at the error once at
+  its next schedule and stops saving for any whose computed tokens still
+  include a failed block (logged `computed on a failed load`). Async load
+  failures need neither: vLLM schedules a `WAITING_FOR_REMOTE_KVS` request
+  only after it processed `failed_recving` and reset its computed tokens
+  (`_handle_failed_recving`, `_update_waiting_for_remote_kv`), and async
+  loads never share blocks.
+- **S1, V2 runner order.** `core.may_zero_or_copy_blocks(kv_cache_config)`:
+  `needs_kv_cache_zeroing`, or any group with `block_size != hash_block_size`
+  (partial prefix hits copy-on-write), or an unknown field. Those layouts run
+  the worker with `sync_saves`: `wait_for_save` returns only after the
+  step's save job finished, before the next step's zeroing or CoW on either
+  model runner. Qwen3-4B: no zeroing, hash block == block, so async.
+- **S2, sync load deadline.** Removed `SYNC_LOAD_TIMEOUT_S`. The wait polls
+  with a sleep doubling from 20 us to 200 us (no busy spin), logs every 10 s,
+  and reports invalid only on a final error state.
+- **S4, saver death.** Each job completes in `finally` (`_completed`
+  advances even on `BaseException`); if the saver thread exits, `poll`
+  releases every held request, `flush` returns, and later saves are dropped
+  and counted as failed. A hung save RPC is not released: the PyO3 client has
+  no per-call deadline (`EngineRpcClient.call` blocks on the tonic future,
+  only `connect_timeout`), and a client-side timeout would not stop the
+  server's copy into the blocks, so `flush` keeps waiting and logs every
+  10 s. Adding a server-side save deadline is a server/client change, not
+  done here.
+- **Nits.** `policy.py` and the README name no model class; `.rsi-rev` is
+  written with the synced commit (056eb4b for the slice).
+
+### Tests
+
+`test_connector_v2_core.py` (131) + `test_semantics_bindings.py` on .44:
+166 passed; ruff check/format clean. New or extended contracts:
+- `test_sync_load_outcome_gates_saves[sync-ok|sync-failed|sync-failed-shared-later]`:
+  no save touching a sync-loaded block in the load step or the step vLLM
+  schedules before seeing it; after success the held range is saved; after
+  failure the loader re-saves from the rewound point and a request vLLM did
+  not rewind never saves; unrelated requests save at once.
+- `test_sync_loads[sync-slow-ok]`: a load that stays pending while the
+  clock passes any deadline is neither failed nor done before it finishes.
+- `test_async_save_holds_blocks_until_copied[raises|saver-dies]`: blocks are
+  released, flush returns, and a dead saver drops later saves.
+- `test_layouts_that_zero_or_copy_save_synchronously[plain|zeroing|cow|unknown]`.
+
+Full default Python gate: 518 passed, 1 failed
+(`test_e2e_version_preflight`: installed pegaflow version vs checkout on
+.44; not touched by this change).
+
+### Slice (all verdicts pass)
+
+`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2c-slice1`, rev 056eb4b, GPU1,
+full gsm8k + replay 8 x 6, same size as it2 slice2. `pass: true` for both
+arms.
+
+| Check | it2c | baseline | it2 slice2 (v2 / baseline) | verdict |
+|---|---|---|---|---|
+| G0.spec | 0 diffs | | 0 diffs | pass |
+| G2 digests gsm8k (self, vs baseline) | external 6578/6578, local 170243, 0 mismatched | | 7033/7033 | pass |
+| G2 digest replay | external 617/617, local 3195, 0 mismatched | | 617/617 | pass |
+| G2 gsm8k accuracy / outputs | 0.8582, 0 differ | 0.8582 | 0.8582 | pass |
+| G3 gsm8k / replay warm | E_ext 1.0 / 1.0, excess 0, 0 load errors | | 1.0 / 1.0 | pass |
+| G3 no_eviction | 0 | | 0 | pass |
+| G4 replay warm TTFT p50 (warm2/3) | 0.0939 / 0.0958 s | 0.2095 / 0.2103 s | 0.0910 / 0.0904 vs 0.2096 / 0.2102 | pass |
+| G4 replay warm req/s | 6.865 / 6.788 | 5.519 / 5.521 | 6.853 / 6.850 vs 5.513 / 5.506 | pass |
+| G4 replay cold TTFT p50 | 0.2085 s | 0.2108 s | 0.2080 vs 0.2095 | pass |
+| G4 replay cold req/s | 5.086 | 5.085 | 5.073 vs 5.084 | pass |
+| G4 gsm8k cold seconds | 163.8 | 175.6 | 164.6 vs 163.1 | pass |
+| G4 gsm8k warm seconds | 162.3 (+0.2%) | 162.0 | 163.5 vs 163.1 (+0.3%) | pass |
+
+The baseline's gsm8k cold pass (175.6 s) is an outlier: its plain arm ran
+138.7 s and its warm pass 162.0 s, and the first pass overlapped the
+held-out run's startup on GPU0. So the cold ratio (-6.7%) is not evidence
+of a speedup; v2's own cold time moved 164.6 -> 163.8 s (-0.5%) vs slice2,
+and v2 cold against slice2's baseline would be +0.4%.
+
+Hit rates (fractions of prompt tokens):
+
+| arm / pass | local | external | total | H* | E_ext | excess |
+|---|---|---|---|---|---|---|
+| baseline gsm8k warm | 0.933 | 0 | 0.933 | 0.992 | 0 | 0 |
+| v2 gsm8k warm | 0.921 | 0.072 | 0.992 | 0.992 | 1.0 | 0 |
+| baseline replay warm/2/3 | 0.791 | 0 | 0.791 | 0.998 | 0 | 0 |
+| v2 replay warm/2/3 | 0.730 | 0.268 | 0.998 | 0.998 | 1.0 | 0 |
+
+Save stats: gsm8k 18.1 s windows, 450 save steps, submit 15.8 ms, 0 flushes,
+saver wait 10.2 s, rpc 0.77 s, max_pending 3, 0 failed; replay 14.1 s,
+163 save steps, submit 5.4 ms, 0 failed. No `sync load failed`,
+`save failed`, `computed on a failed load` or `flush waiting` lines.
+
+### Held-out replay slice (S3)
+
+`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2c-heldout`, GPU0, replay only,
+8 x 6 from `~/kexi/datasets/r2egym-heldout-from33.jsonl` (lines 33.. of
+`r2egym-256.jsonl`, i.e. conversations the official run's 32 never use;
+`run_gate` has no skip flag). Rev 50e186b: the summary records the
+`.rsi-rev` of its start; 056eb4b only changed the failure-tracking path
+(`_check_failed_loads`), which never ran (0 load errors). G0 and the gsm8k
+checks are void (no gsm8k workload), so the run's overall `pass` is false;
+every replay verdict passes.
+
+| Check | v2 | baseline | verdict |
+|---|---|---|---|
+| G2 digest replay | external 729/729, local 4129, 0 mismatched | | pass |
+| G3 replay warm | E_ext 1.0, excess 0, 0 load errors | | pass |
+| G3 no_eviction | 0 | | pass |
+| G4 replay warm TTFT p50 (warm2/3) | 0.0896 / 0.0894 s | 0.2362 / 0.2372 s | pass (2.6x) |
+| G4 replay warm req/s | 7.867 / 7.926 | 6.117 / 6.103 | pass (+29%) |
+| G4 replay cold TTFT p50 | 0.2238 s | 0.2549 s | pass |
+| G4 replay cold req/s | 5.614 | 5.636 | pass (-0.4%) |
+
+Hits: baseline warm local 0.785 = total (H* 0.998); v2 warm local 0.729,
+external 0.269, total 0.998 = H*, E_ext 1.0.
+
+External load sizes per warm request (`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2c-load-stats.json`,
+from the probe's `first_computed - local_hit`, script
+`~/kexi/rsi-tools/load_stats.py`); sync = at most `sync_load_tokens` (256):
+
+| run / workload | warm reqs | sync | async | p50 | p90 | max |
+|---|---|---|---|---|---|---|
+| it2 slice2 replay | 117 | 27 | 90 | 720 | 2000 | 3504 |
+| it2 official replay (32 x 12) | 792 | 69 | 723 | 3152 | 5792 | 6688 |
+| it2c held-out replay | 138 | 42 | 96 | 864 | 1744 | 3936 |
+| it2 slice2 gsm8k | 1319 | 1294 | 25 | 64 | 96 | 1152 |
+
+The "replay hits p50 ~720 tokens, mostly async" claim holds on the slice
+and the held-out trace (70% async), and more so on the official trace
+(91% async); gsm8k is 98% sync.
+
+### Open risks
+
+- M1's hold delays the first save of a request that sync-loaded by one step
+  (two plans) on every short hit; no measurable G4 cost in the slice. The
+  failure path itself is unit-tested only (0 load errors in every run).
+- A hung save RPC still blocks `flush` and keeps held requests (logged);
+  fixing it needs a server-side save deadline.
+- `sync_saves` layouts (zeroing or CoW) pay the full save wait on the step
+  thread, i.e. it1's cost; when such a model is onboarded, measure it and
+  find a cheaper ordering point.

@@ -96,7 +96,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | it2 official run passes every G0-G4 verdict (`2026-10-23-qwen3-4b-p3-it2`); code review pending; G5 pending (gate fixes + server reclaim) |
+| P3 | onboard Qwen3-4B | it2 official run passes every G0-G4 verdict (`2026-10-23-qwen3-4b-p3-it2`); review APPROVE-WITH-FIXES, fixes done in it2c (slice + held-out pass); G5 pending (gate fixes + server reclaim) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | todo |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -497,6 +497,15 @@ names, magic constants that only exist in the old code).
   so it goes into an overlay dir on PYTHONPATH for that arm only.
 - Reporting rule: every comparison table carries baseline, old, native,
   lmcache (when available) and connector_v2.
+- P3 it2c (review fixes, 50e186b + 056eb4b): M1 saves held after sync loads
+  until vLLM saw the outcome, no saves from un-rewound requests on failed
+  blocks; S1 sync saves for zeroing/CoW layouts; S2 no sync-load deadline;
+  S4 saver death releases holds (hung RPC still waits, no client deadline).
+  Slice `2026-10-23-qwen3-4b-p3-it2c-slice1` (GPU1): every verdict passes;
+  gsm8k v2 163.8 s cold / 162.3 s warm (+0.2%), replay warm TTFT 0.094 vs
+  0.210 s; hits unchanged (replay warm 0.998 = H*). Held-out replay
+  `2026-10-23-qwen3-4b-p3-it2c-heldout` (convs 33..): all replay verdicts
+  pass. G4 numbers within 0.5 pp of slice2: no official rerun needed.
 
 ## Semantics changelog
 

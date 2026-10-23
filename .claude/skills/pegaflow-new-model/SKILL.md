@@ -190,15 +190,23 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 - Async saves in vLLM 0.32 need three hooks, not one: `wait_for_save` only
   queues (CUDA event + saver thread); `request_finished` returns True and
   `get_transfer_results.finished_sending` releases the blocks after the copy;
-  `handle_preemptions` (runs before block zeroing and the forward) flushes
-  when the plan saw `preempted_req_ids`. Report a request in
-  `finished_sending` even when its save failed, or vLLM leaks its blocks.
+  `handle_preemptions` (runs before the forward) flushes when the plan saw
+  `preempted_req_ids`. On vLLM's V2 model runner it runs after block zeroing
+  and copy-on-write, so layouts with `needs_kv_cache_zeroing` or
+  `hash_block_size < block_size` must finish saves inside `wait_for_save`.
+  Report a request in `finished_sending` even when its save failed, raised or
+  the saver thread died (complete jobs in `finally`), or vLLM leaks its blocks.
 - On short-prefix workloads the async load round trip, not the copy, is the
   cost: a warm gsm8k request waited ~7.6 steps from admission to its first
   computed step for a ~1 ms load. Read the probe's `episodes` vs first
   `progress` step and vLLM's TTFT sum before blaming saves. A sync load
   (`load_kv_async=False`, wait in `start_load_kv`) fixes it, but vLLM only
   recovers failed sync loads via `invalid_block_ids` with one KV cache group
-  and no block zeroing.
+  and no block zeroing. A failed sync load has already fed the forward, and
+  the server keeps the first copy of a key: hold every save of a request
+  touching sync-loaded blocks until vLLM processed that step's output
+  (`max_concurrent_batches` plans), and never save from a request vLLM did
+  not rewind (a shared invalid block is recomputed by its first holder only).
+  Never give a sync load a deadline: the server's copy may still land.
 - A 64-question gsm8k slice cannot resolve a 2% bound (~10 s of wall time);
   use the full 1319 questions in slices when a G4 gsm8k check is the target.
