@@ -413,9 +413,17 @@ def run_arm_workload(
             time.sleep(2)  # late finish records and metrics land in this pass
             res["vllm_metrics"] = workloads.diff(asyncio.run(workloads.scrape(url)), before)
             if pf_metrics:
-                res["pegaflow_metrics"] = workloads.diff(
-                    asyncio.run(workloads.scrape(pf_metrics, ("pegaflow",))), pf_before
-                )
+                pf_after = asyncio.run(workloads.scrape(pf_metrics, ("pegaflow",)))
+                res["pegaflow_metrics"] = workloads.diff(pf_after, pf_before)
+                if cap:
+                    # Absolute occupancy at pass end vs C: shows fragmentation.
+                    res["pegaflow_end"] = {
+                        k.split("{")[0]: v
+                        for k, v in pf_after.items()
+                        if k.startswith(
+                            ("pegaflow_cache_resident_bytes{", "pegaflow_pool_used_bytes")
+                        )
+                    }
             result["passes"][name] = res
             print(f"[{arm}/{workload}/{name}] {summary_line(res)}", flush=True)
 
@@ -574,10 +582,12 @@ def _hit_verdict(r: dict[str, Any] | None, workload: str) -> dict[str, Any]:
     }
 
 
+def _metric(metrics: dict[str, float], name: str) -> float:
+    return sum(n for k, n in metrics.items() if k.split("{")[0] == name)
+
+
 def _evictions(metrics: dict[str, float]) -> float:
-    return sum(
-        n for k, n in metrics.items() if k.startswith("pegaflow_cache_block_evictions_total")
-    )
+    return _metric(metrics, "pegaflow_cache_block_evictions_total")
 
 
 def _capacity_verdict(r: dict[str, Any] | None) -> dict[str, Any]:
@@ -590,6 +600,14 @@ def _capacity_verdict(r: dict[str, Any] | None) -> dict[str, Any]:
     e = w["efficiency_c"]
     passes = {n: p for n, p in r["passes"].items() if not n.startswith("_")}
     evicted = {n: _evictions(p.get("pegaflow_metrics", {})) for n, p in passes.items()}
+    resident_end = {n: p["pegaflow_end"] for n, p in passes.items() if "pegaflow_end" in p}
+    io = {
+        n: {
+            "saved_bytes": _metric(p.get("pegaflow_metrics", {}), "pegaflow_save_bytes_total"),
+            "loaded_bytes": _metric(p.get("pegaflow_metrics", {}), "pegaflow_load_bytes_total"),
+        }
+        for n, p in passes.items()
+    }
     pool = r.get("pool_capacity_bytes")
     # A server that grants itself more memory than C is not measured at C.
     pool_ok = pool is None or pool <= r["capacity_bytes"]
@@ -617,6 +635,8 @@ def _capacity_verdict(r: dict[str, Any] | None) -> dict[str, Any]:
         "excess_limit": w["excess_limit"],
         "load_errors": len(r["load_errors"]),
         "evicted": evicted,
+        "server_end_bytes": resident_end,
+        "server_io_bytes": io,
         "oracle_c_groups": diag["oracle_c"]["groups"],
         "lru_groups": diag["lru"]["groups"],
         "oracle_c_passes": diag["oracle_c"]["passes"],

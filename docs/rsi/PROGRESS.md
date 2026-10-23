@@ -400,6 +400,20 @@ names, magic constants that only exist in the old code).
   PR policy section added (per-model PRs, server PRs separate and
   human-reviewed).
 
+- G5 implemented on `feat/rsi-g5` (gate agent): `oracle.py` capacity
+  simulation (`U`, clairvoyant `H*_C`, group-oblivious `H_lru`, per-group
+  stored / evicted / stranded diagnostics), `run_gate` workload `cap` (fresh
+  PegaFlow `--pool-size C`, `C = 0.5 x U` from the baseline replay cold pass,
+  passes `cap_cold`, `cap_warm`, `cap_warm2..N`), verdicts `G2.digest_self.cap`
+  and `G5.replay_warm` (`E_C >= 0.9`) required for the connector under test,
+  `cap` now part of the official profile, `native` reference arm
+  (OffloadingConnector + RsiProbe, record only). G3 numbers re-derived
+  identically on all p0-final / p3-it1 probe dirs. Slice
+  `2026-10-23-qwen3-4b-g5-slice` (8 x 6, U 4.48 GiB, C 2.24 GiB): E_C
+  connector_v2 0.40, native 0.20, old 0.0 (0 server hits); oracle_C hit rate
+  0.903, LRU 0.827, local 0.79. Server limit found: reclaim drops 512 blocks
+  per round, so a small pool keeps only ~0.5 C resident (GATES.md G5).
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
