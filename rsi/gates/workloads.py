@@ -23,6 +23,23 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import aiohttp
 
+
+# vLLM's uvicorn closes an idle keep-alive connection after
+# VLLM_HTTP_TIMEOUT_KEEP_ALIVE (5 s); a pooled client that reuses a connection
+# the server is closing fails with "Server disconnected" / ECONNRESET before
+# any response byte, which aborts the pass (and the gate's stop() then
+# SIGTERMs vLLM: looks like an external kill). One connection per request
+# (localhost, negligible cost) removes the race; no retry, since a resent
+# request would be recorded twice by the probe.
+def session(timeout: Any = None) -> aiohttp.ClientSession:
+    import aiohttp
+
+    connector = aiohttp.TCPConnector(force_close=True)
+    if timeout is None:
+        return aiohttp.ClientSession(connector=connector)
+    return aiohttp.ClientSession(connector=connector, timeout=timeout)
+
+
 # --------------------------------------------------------------------- gsm8k
 
 _CALC = re.compile(r"<<[^>]*>>")
@@ -97,7 +114,7 @@ async def run_gsm8k(
 
     t0 = time.monotonic()
     timeout = aiohttp.ClientTimeout(total=None, sock_read=600)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
+    async with session(timeout) as s:
         await asyncio.gather(*(one(s, i) for i in range(len(prompts))))
     correct = sum(gsm8k_extract(o) == g for o, (_, g) in zip(outputs, prompts, strict=True))
     return {
@@ -207,7 +224,7 @@ async def run_replay(
 
     t0 = time.monotonic()
     timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
+    async with session(timeout) as s:
         await asyncio.gather(*(worker(s) for _ in range(concurrency)))
     wall = time.monotonic() - t0
     n = len(ttft)
@@ -232,9 +249,7 @@ _PROM = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^}]*\})?)\s+([-\d.eE+]+|NaN
 
 
 async def scrape(url: str, prefixes: tuple[str, ...] = ("vllm:",)) -> dict[str, float]:
-    import aiohttp
-
-    async with aiohttp.ClientSession() as s, s.get(f"{url}/metrics") as r:
+    async with session() as s, s.get(f"{url}/metrics") as r:
         text = await r.text()
     out: dict[str, float] = {}
     for line in text.splitlines():
