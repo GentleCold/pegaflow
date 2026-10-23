@@ -60,9 +60,22 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    The connector under test must read `PEGAFLOW_PORT` and tolerate an empty
    `kv_connector_extra_config`; vLLM is started with
    `kv_load_failure_policy=recompute`.
-5. **Optimize**: if hit efficiency E or perf is below target, form a hypothesis
-   from metrics (fallbacks per group, unused loads, write amplification), change
-   policy, rerun. One hypothesis per iteration, record result even if negative.
+5. **Optimize**: if hit efficiency E, capacity efficiency E_C (G5) or perf is
+   below target, form a hypothesis from metrics (fallbacks per group, unused
+   loads, write amplification, stranded bytes per group, save/load time), change
+   the lowest layer that fixes it, rerun. One hypothesis per iteration, record
+   result even if negative. Hypothesis checklist (extend it when you find more):
+   - window groups: save only the trailing window, not every block;
+   - checkpoint groups: save only at boundaries that requests resume from;
+   - state that cannot be resumed (`prefix_cacheable=False`, ring buffers): never save;
+   - eviction must be group-coherent: a resume point needs every group's data,
+     so evict a prefix's groups together and prefer evicting the tail;
+   - scan resistance: one-pass sweeps must not flush reused prefixes;
+   - save cost: no synchronous wait on the model step.
+   The server is in scope when the evidence points there (eviction, admission,
+   pools, query): keep it Kind-aware and model-agnostic (no model names, no
+   per-model branches), run `cargo test`, re-run the `old` arm to show no
+   regression, and get a separate server review.
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
    gate integrity (nothing relaxed), copying from the old connector, regressions

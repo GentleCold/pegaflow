@@ -71,6 +71,44 @@ cold replay and gsm8k may be at most 2% worse than baseline (see G4 under
 precise definitions); no >5% regression vs. last accepted iteration of the
 same model.
 
+## G5 Capacity hit rate (hard, RSI objective; added 2026-10-23, status: being implemented)
+
+User: actual hit rate has to approach the theoretical one at a fixed capacity.
+G3 runs with an unlimited pool, so it cannot see eviction policy, write
+amplification or cross-group coherence. Example: a checkpoint group's state at
+token P is useless once the full-attention blocks before P are evicted, and
+full blocks past the last resident checkpoint are useless too. The server's
+LRU (`pegaflow-core/src/cache.rs`) evicts each (hash, group) key on its own,
+so such stranded bytes are possible today.
+
+- Workload: replay (official constants), connector under test (and `old` as a
+  reference when present), each on a fresh PegaFlow server started with
+  `--pool-size C`. Separate `cap` passes: cold, warm, warm2..N like replay.
+- Capacity: `C = CAPACITY_FRACTION x U`, `CAPACITY_FRACTION = 0.5`. `U` = bytes
+  of the distinct (group, key) blocks the unlimited oracle stores over one full
+  replay pass, from the baseline arm's replay trace of the same run and the spec
+  dump's per-group page bytes x layers. Server fragmentation and headroom count
+  against the connector/server; they are part of what an iteration may improve.
+- Oracle at capacity `H*_C`: the G3 store events, with a store of `C` bytes and
+  clairvoyant eviction: an item (group, key, bytes) whose next use is furthest
+  in the future goes first; next use = the next request (by first schedule)
+  whose unlimited-oracle resolved prefix covers the item; an item never used
+  again is not stored. Hits are `semantics.resolve` over present blocks, as in
+  G3. This is a strong reference, not a proven optimum; `E_C > 1` is allowed.
+- Reference `H_lru`: the same simulation with group-oblivious LRU and no
+  bypass (reported only; shows what naive eviction gives).
+- Score over the timed `cap` warm passes: `ext_i = max(0, min(actual_i,
+  oracle_i) - local_i)` (capped by the unlimited oracle),
+  `ext*_C,i = max(0, oracle_C,i - local_i)`, `E_C = Σext / Σext*_C`.
+- Diagnostics, per group (not gated): resident bytes and stranded bytes at the
+  end of each pass (resident blocks that lie on no resolvable prefix of any
+  request in the trace; needs a server-side resident-key dump), evictions,
+  write amplification (saved bytes / loaded bytes).
+- Gate: `G5.replay_warm.E_C >= 0.9`; no load errors; the cap passes' digests
+  pass `G2.digest_self` (eviction must never produce a wrong load); `excess`
+  bounded as in G3 against the unlimited oracle; no `E_C` regression vs the last
+  accepted iteration.
+
 ## Run record
 
 Every gate run writes `~/kexi/rsi-runs/<date>-<model>-<iter>/` with

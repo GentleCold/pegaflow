@@ -27,7 +27,7 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
 | adapter (per KVCacheSpec type) | Python | onboarding agent |
 | policy (what to save/load/prefetch) | Python | onboarding agent (main RSI surface) |
 | semantics (`pegaflow-semantics`: needed/resolve/saveable/key/seal_plan) | Rust, PyO3 | agent proposes, review agent + human audit |
-| server (storage only) | Rust | not model-aware |
+| server (storage only) | Rust | onboarding agent may change it when a gate shows a server limit (e.g. group-incoherent eviction); must stay model-agnostic (Kind-aware, never model-name-aware), keep `cargo test` green and the `old` arm unregressed, and gets its own review |
 | gates (`docs/rsi/GATES.md`, `rsi/gates/`) | — | human only; agents may add checks, never relax |
 
 ## Isolation (no reference to existing implementation)
@@ -64,7 +64,7 @@ names, magic constants that only exist in the old code).
 
 | Phase | Content | Status |
 |---|---|---|
-| P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | in progress |
+| P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | it1b fails the new hard G4 (cold/gsm8k overhead); it2 (async save) in progress |
@@ -341,6 +341,31 @@ names, magic constants that only exist in the old code).
   req/s and replay cold 2.1x TTFT / 1.9x req/s vs baseline all pass; gsm8k
   cold +8.3% / warm +7.4% wall time FAIL. Not accepted; it2 (async save)
   targets exactly the gsm8k overhead. Details in Qwen3-4B/ITERATIONS.md.
+
+- p0-final (`2026-10-23-qwen3-4b-p0-final`, arms plain/baseline/old) done:
+  baseline controls pass; the `old` reference arm passes every G0-G3 check
+  (E_ext 1.0 gsm8k and replay). Reference numbers (black box): gsm8k cold
+  170.1 s vs baseline 169.5 s (+0.4%), replay warm2 req/s 10.2 vs 2.59,
+  TTFT p50 0.62 vs 3.57 s. So a <2% gsm8k overhead is reachable. Note
+  `plain` gsm8k is 148 s vs baseline 169.5 s: the probe (digesting every
+  gsm8k request) costs ~13%; G4 compares arms that both carry the probe.
+  P0 done.
+
+- User: actual hit rate must approach the theoretical hit rate at a FIXED
+  capacity; e.g. Kimi K3-style MLA + checkpoint groups whose boundaries differ:
+  if the MLA blocks are evicted, later checkpoints are useless, which is a
+  PegaFlow server limit (`cache.rs` LRU evicts each (hash, group) key on its
+  own). Decisions: (1) new hard gate G5 (GATES.md): pool = 0.5 x unique bytes
+  of the trace, bar = clairvoyant oracle at that capacity, `E_C >= 0.9`, plus
+  per-group stranded/evicted/write-amp diagnostics; (2) the server is now in
+  the RSI surface (Layering table): an onboarding agent may change eviction /
+  admission / pools when a gate points there, Kind-aware and model-agnostic,
+  with `cargo test`, an `old`-arm non-regression run and a separate review;
+  (3) skill step 5 gets a hypothesis checklist (window tail, checkpoint
+  boundaries, never-resumable state, group-coherent eviction, scan
+  resistance, async save). Qwen3.5-4B (P5, linear attention + full) is the
+  first model where cross-group coherence matters on the 4090s. G5 tooling is
+  being implemented by a gate agent on branch `feat/rsi-g5`.
 
 ## Semantics changelog
 
