@@ -105,14 +105,16 @@ WORKLOADS = ("gsm8k", "replay", "cap")
 TERM_GRACE = 120
 KILL_GRACE = 300
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
-# Split control (plain arm, gsm8k): ``split_ref`` repeats the cold pass with
-# logprobs, ``split`` pre-warms vLLM's prefix cache with each whole prompt so
-# the request starts at its last full prompt block (where a connector's warm
-# hit ends). Split-variant models (gate.json ``split_invariant: false``) bound
-# an arm's output divergence by the control's rate plus this margin.
+# Split control (gsm8k, plain and baseline arms): ``split_ref`` repeats the
+# cold pass with logprobs, ``split`` pre-warms vLLM's prefix cache with each
+# whole prompt so the request starts at its last full prompt block (where a
+# connector's warm hit ends). The plain arm's pair establishes gate.json
+# ``split_invariant``; on split-variant models an arm's warm completions must
+# equal the plain ``split`` ones and the baseline's ``split`` digests are the
+# same-split references for warm computed blocks.
 SPLIT_PASSES = ("split_ref", "split")
-SPLIT_MARGIN = 0.02
-MIN_PREWARMED = 0.9  # share of split requests whose hit must exceed split_ref's
+MIN_PREWARMED = 0.9  # share of split requests whose hit reaches the last full block
+MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
 
 
 def free_port() -> int:
@@ -548,6 +550,8 @@ def run_arm_workload(
             names = ["cold", "warm"]
             if kind == "plain":
                 names += list(SPLIT_PASSES)  # the split control
+            elif kind == "baseline" and not split_inv:
+                names.append("split")  # same-split references for warm computed KV
         else:
             convs = workloads.build_turns(
                 Path(args.replay_file),
@@ -581,7 +585,7 @@ def run_arm_workload(
                         prompts,
                         args.concurrency,
                         xargs=xargs,
-                        logprobs=name in SPLIT_PASSES,
+                        logprobs=kind == "plain" and name in SPLIT_PASSES,
                         prewarm=name == "split",
                     )
                 )
@@ -749,12 +753,24 @@ def _tokens(run_dir: Path, label: str, name: str) -> list[dict[str, Any] | None]
     return json.loads(f.read_text()) if f.exists() else None
 
 
+def _hit_alignment(run_dir: Path) -> int:
+    """vLLM's prefix-cache hit granularity (baseline spec dump; 16 if absent)."""
+    f = run_dir / "baseline" / "gsm8k" / "probe" / "spec.json"
+    if f.exists():
+        kc = json.loads(f.read_text()).get("kv_cache_config", {})
+        for k in ("cache_hit_alignment_tokens", "hash_block_size"):
+            if kc.get(k):
+                return int(kc[k])
+    return 16
+
+
 def split_control(run_dir: Path) -> dict[str, Any] | None:
     """The plain arm's split control: ``split`` (each prompt pre-warmed into
     vLLM's prefix cache, so the request starts at its last full prompt block)
     vs ``split_ref`` (same prompts, hits end at the shared few-shot prefix).
     Per request: completion differs, sampled-token logprobs differ, and the
-    pre-warm took (``split`` cached more prompt tokens than ``split_ref``)."""
+    pre-warm took (``split`` cached the whole prompt up to its last full
+    block: ``cached >= (prompt_tokens - 1) // align * align``)."""
     ref, got = _outputs(run_dir, "plain", "split_ref"), _outputs(run_dir, "plain", "split")
     rt, gt = _tokens(run_dir, "plain", "split_ref"), _tokens(run_dir, "plain", "split")
     if not ref or not got or rt is None or gt is None or len(ref) != len(got):
@@ -764,10 +780,17 @@ def split_control(run_dir: Path) -> dict[str, Any] | None:
         a is None or b is None or a.get("logprobs") != b.get("logprobs")
         for a, b in zip(rt, gt, strict=True)
     ]
+    al = _hit_alignment(run_dir)
     warmed = [
-        a is not None and b is not None and (b.get("cached") or 0) > (a.get("cached") or 0)
-        for a, b in zip(rt, gt, strict=True)
+        b is not None
+        and b.get("prompt_tokens") is not None
+        and (b.get("cached") or 0) >= (b["prompt_tokens"] - 1) // al * al
+        for b in gt
     ]
+    # prompt_len % align == 0: vLLM's own hit stops one block short of the
+    # prompt (it must compute the last token), a connector's need not, so the
+    # split differs from a connector's warm request on exactly these prompts.
+    aligned = [b is None or not b.get("prompt_tokens") or b["prompt_tokens"] % al == 0 for b in gt]
     cold = _outputs(run_dir, "plain", "cold")
     return {
         "n": len(ref),
@@ -775,15 +798,9 @@ def split_control(run_dir: Path) -> dict[str, Any] | None:
         "logprob_differ": lp,
         "prewarmed": sum(warmed),
         "ref_equals_cold": cold is not None and cold == ref,
+        "split_outputs": got,
+        "aligned": aligned,
     }
-
-
-def control_rate(ctrl: dict[str, Any], m: int) -> float | None:
-    """Output divergence rate of the split control over the first ``m``
-    prompts (an arm runs the first ``m`` of the same list)."""
-    if not m or m > ctrl["n"]:
-        return None
-    return sum(ctrl["differ"][:m]) / m
 
 
 def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str, Any]:
@@ -797,6 +814,9 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
     differ, lp = sum(ctrl["differ"]), sum(ctrl["logprob_differ"])
     measured = differ == 0 and lp == 0
     ok = measured == claim and ctrl["prewarmed"] >= MIN_PREWARMED * n
+    # split_ref is the cold pass repeated: if it differs from plain cold the
+    # control's basis is not the baseline the arms are compared to.
+    ok = ok and ctrl["ref_equals_cold"]
     out = {
         "pass": ok,
         "split_invariant": claim,
@@ -813,38 +833,70 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
             f"gate.json split_invariant={claim} but the control measured "
             f"{'no' if measured else 'a'} divergence"
         )
+    elif not ctrl["ref_equals_cold"]:
+        out["reason"] = "split_ref differs from plain cold: the control has no stable basis"
     elif not ok:
         out["reason"] = "pre-warm did not take: the control is vacuous"
     return out
+
+
+def split_differ(
+    ctrl: dict[str, Any] | None, got: list[str] | None
+) -> tuple[int | None, int | None]:
+    """Warm completions vs the plain ``split`` ones of the same prompts:
+    (differing among non-aligned prompts, differing among aligned prompts)."""
+    if ctrl is None or got is None or len(got) > ctrl["n"]:
+        return None, None
+    pairs = zip(ctrl["split_outputs"], got, ctrl["aligned"], strict=False)
+    diff = [(a != b, al) for a, b, al in pairs]
+    return sum(d for d, al in diff if not al), sum(d for d, al in diff if al)
 
 
 def _outputs_verdict(
     diffs: dict[str, int | None],
     invariant: bool,
     split_inv: bool,
-    ctrl: dict[str, Any] | None,
-    n: int | None,
+    split_diffs: tuple[int | None, int | None] = (None, None),
 ) -> dict[str, Any]:
-    """G2.gsm8k_outputs. Split-invariant: every completion equals baseline
-    cold. Split-variant: report-only, bounded per pass by the split control's
-    divergence rate on the same prompts plus ``SPLIT_MARGIN``."""
+    """G2.gsm8k_outputs. Split-invariant: every cold and warm completion
+    equals baseline cold. Split-variant: cold (same split as the baseline)
+    must equal baseline cold; warm (hit ends at the last full prompt block)
+    must equal the plain arm's ``split`` completions of the same prompts
+    exactly, except on ``prompt_len % align == 0`` prompts, where the plain
+    split stops one block earlier than a connector's hit (reported only); the
+    warm differ count vs baseline cold is reported only."""
     out: dict[str, Any] = {"invariant": invariant, "split_invariant": split_inv}
     out |= {f"{p}_differ": d for p, d in diffs.items()}
     if not invariant:
         return {"pass": True} | out
     if split_inv:
         return {"pass": all(d == 0 for d in diffs.values())} | out
-    rate = control_rate(ctrl, n or 0) if ctrl else None
-    if rate is None or any(d is None for d in diffs.values()):
-        return {"pass": False, "reason": "split control not comparable"} | out
-    rates = {p: d / n for p, d in diffs.items()}
-    bound = rate + SPLIT_MARGIN
-    return {
-        "pass": all(r <= bound for r in rates.values()),
-        "control_rate": rate,
-        "bound": bound,
-        **{f"{p}_rate": r for p, r in rates.items()},
-    } | out
+    out["warm_differ_vs_split"], out["warm_differ_vs_split_aligned"] = split_diffs
+    if split_diffs[0] is None or diffs.get("cold") is None:
+        return {"pass": False, "reason": "plain split outputs not comparable"} | out
+    return {"pass": diffs["cold"] == 0 and split_diffs[0] == 0} | out
+
+
+def _coverage_verdict(v: dict[str, Any], d: dict[str, Any] | None, passes: tuple[str, ...]) -> None:
+    """Split-variant: in each of ``passes`` the candidate's computed blocks
+    must be judged against same-split references: judged > 0 and at least
+    ``MIN_COMPUTED_COVERAGE`` of them (unjudged = only other-split copies in
+    REF, or REF never computed the key)."""
+    if d is None or d.get("split_invariant") is not False:
+        return
+    cov, ok = {}, True
+    by_pass = d.get("computed_by_pass", {})
+    for p in passes:
+        c = by_pass.get(p, {})
+        judged = c.get("compared", 0)
+        seen = judged + c.get("unmatched_split", 0) + c.get("unreferenced", 0)
+        frac = judged / seen if seen else None
+        cov[p] = {"judged": judged, "seen": seen, "coverage": frac}
+        ok = ok and judged > 0 and frac is not None and frac >= MIN_COMPUTED_COVERAGE
+    v["computed_coverage_by_pass"] = cov
+    if not ok:
+        v["pass"] = False
+        v.setdefault("reason", f"computed coverage below {MIN_COMPUTED_COVERAGE} or nothing judged")
 
 
 def _digest_verdict(
@@ -1127,19 +1179,20 @@ def verdicts(
         gsm = per_wl.get("gsm8k")
         g["G0.spec"] = g0(run_dir, label, committed)
         g["G2.digest_self.gsm8k"] = _digest_verdict(gsm and gsm["digest_self"], MIN_JUDGED_GSM8K)
-        g["G2.digest_vs_baseline.gsm8k"] = _digest_verdict(
+        vs_base = (
             digest_compare.compare(
                 base_probe, run_dir / label / "gsm8k" / "probe", invariant, split_inv
             )
             if gsm and base_probe.exists()
-            else None,
-            MIN_JUDGED_GSM8K,
+            else None
         )
+        g["G2.digest_vs_baseline.gsm8k"] = _digest_verdict(vs_base, MIN_JUDGED_GSM8K)
+        # Split-variant: cold computed KV is judged against baseline cold,
+        # warm against the baseline's split pass (same split).
+        _coverage_verdict(g["G2.digest_vs_baseline.gsm8k"], vs_base, ("cold", "warm"))
         diffs = {p: _differ(ref_cold, _outputs(run_dir, label, p)) for p in ("cold", "warm")}
-        warm_out = _outputs(run_dir, label, "warm")
-        g["G2.gsm8k_outputs"] = _outputs_verdict(
-            diffs, invariant, split_inv, ctrl, len(warm_out) if warm_out else None
-        )
+        split_diffs = split_differ(ctrl, _outputs(run_dir, label, "warm"))
+        g["G2.gsm8k_outputs"] = _outputs_verdict(diffs, invariant, split_inv, split_diffs)
         if kind == "selftest":
             # Negative arms must be caught by both digest checks (a single
             # flipped byte need not change a greedy output, so outputs are

@@ -584,25 +584,111 @@ def _ctrl(differ: int, lp: int, n: int = 10, prewarmed: int = 10) -> dict:
         (False, _ctrl(2, 5), True),
         (False, _ctrl(2, 5, prewarmed=5), False),  # pre-warm did not take
         (True, None, False),
+        (True, _ctrl(0, 0) | {"ref_equals_cold": False}, False),  # N1: no stable basis
     ],
-    ids=["inv-ok", "false-claim", "logprob-only", "variant-ok", "vacuous", "missing"],
+    ids=[
+        "inv-ok",
+        "false-claim",
+        "logprob-only",
+        "variant-ok",
+        "vacuous",
+        "missing",
+        "ref-not-cold",
+    ],  # fmt: skip
 )
 def test_split_control_establishes_gate_claim(claim, ctrl, ok):
     assert run_gate._split_control_verdict(ctrl, claim)["pass"] is ok
 
 
 @pytest.mark.parametrize(
-    "split_inv,warm,ok",
-    [(True, 0, True), (True, 1, False), (False, 12, True), (False, 13, False)],
-    ids=["inv-equal", "inv-differ", "variant-at-bound", "variant-over-bound"],
+    "split_inv,cold,warm,vs_split,ok",
+    [
+        (True, 0, 0, (None, None), True),
+        (True, 0, 1, (None, None), False),
+        (False, 0, 60, (0, 3), True),  # differs only where the plain split stops a block early
+        (False, 0, 60, (1, 0), False),  # one wrong completion fails
+        (False, 1, 60, (0, 0), False),  # cold has the baseline's split: no slack
+        (False, 0, 60, (None, None), False),  # no control: not judged, fails
+    ],
+    ids=[
+        "inv-equal",
+        "inv-differ",
+        "variant-equal-split",
+        "variant-one-wrong",
+        "variant-cold",
+        "variant-missing",
+    ],  # fmt: skip
 )
-def test_outputs_bounded_by_split_control(split_inv, warm, ok):
-    """Split-variant: the control differs on 10 of the 100 prompts the arm
-    also ran, so the bound is 0.10 + SPLIT_MARGIN (0.02) = 12 completions."""
-    assert run_gate.SPLIT_MARGIN == 0.02
-    ctrl = _ctrl(10, 10, n=100)
-    v = run_gate._outputs_verdict({"cold": 0, "warm": warm}, True, split_inv, ctrl, 100)
+def test_outputs_exact_against_same_split(split_inv, cold, warm, vs_split, ok):
+    v = run_gate._outputs_verdict({"cold": cold, "warm": warm}, True, split_inv, vs_split)
     assert v["pass"] is ok, v
+
+
+def test_split_differ_separates_aligned_prompts():
+    ctrl = {"n": 4, "split_outputs": ["a", "b", "c", "d"], "aligned": [False, True, False, True]}
+    assert run_gate.split_differ(ctrl, ["a", "x", "c", "d"]) == (0, 1)
+    assert run_gate.split_differ(ctrl, ["x", "b", "c"]) == (1, 0)
+    assert run_gate.split_differ(None, ["a"]) == (None, None)
+
+
+def test_split_control_prewarm_must_reach_last_full_block(tmp_path):
+    """S6: the pre-warm counts only if ``split`` cached the prompt up to its
+    last full block (one block more than split_ref is not enough)."""
+    import json
+
+    d = tmp_path / "plain" / "gsm8k"
+    d.mkdir(parents=True)
+    outs = ["o0", "o1", "o2"]
+    for name in ("cold", "split_ref", "split"):
+        (d / f"{name}-outputs.json").write_text(json.dumps(outs))
+    ref = [{"logprobs": [0.0], "cached": 32, "prompt_tokens": n} for n in (100, 64, 100)]
+    got = [{"logprobs": [0.0], "cached": c, "prompt_tokens": n} for c, n in ((96, 100), (48, 64), (48, 100))]  # fmt: skip
+    (d / "split_ref-tokens.json").write_text(json.dumps(ref))
+    (d / "split-tokens.json").write_text(json.dumps(got))
+    ctrl = run_gate.split_control(tmp_path)
+    assert ctrl["prewarmed"] == 2 and ctrl["aligned"] == [False, True, False]
+    assert ctrl["ref_equals_cold"]
+
+
+def _cov(by_pass: dict) -> dict:
+    v = {"pass": True}
+    run_gate._coverage_verdict(v, {"split_invariant": False, "computed_by_pass": by_pass}, ("cold", "warm"))  # fmt: skip
+    return v
+
+
+@pytest.mark.parametrize(
+    "warm,ok",
+    [
+        ({"compared": 95, "unmatched_split": 5}, True),
+        ({"compared": 0, "unmatched_split": 2136}, False),  # the reviewer's vacuous honest arm
+        ({"compared": 80, "unmatched_split": 10, "unreferenced": 10}, False),
+        ({}, False),  # no warm computed block judged at all
+    ],
+    ids=["covered", "vacuous", "low", "missing"],
+)
+def test_split_variant_needs_computed_coverage_per_pass(warm, ok):
+    v = _cov({"cold": {"compared": 10}, "warm": warm})
+    assert v["pass"] is ok, v
+    assert _cov({"cold": {"compared": 10}, "warm": warm} | {"cold": {}})["pass"] is False
+
+
+def test_split_variant_still_fails_wrong_loaded_bytes(tmp_path):
+    """S2: a loaded (external) block with wrong bytes fails on a
+    split-variant model too; only computed blocks are judged per split."""
+    from rsi.gates import digest_compare
+
+    reqs, digests = [], []
+    for i, (name, start, byte) in enumerate([("cold", 0, "A"), ("warm", 2 * BT, "flip")]):
+        r = _req("p", 2, 10 * i + 1, name) | {"req_id": f"r{i}", "digest": "full"}
+        r["episodes"] = [[10 * i + 1, 0, start]]
+        r["progress"] = [[10 * i + 1, 2 * BT + 1]]
+        reqs.append(r)
+        blk = {"key": "p:1", "covered": 2 * BT, "exact": [byte], "l1": [1.0]}
+        digests.append({"req_id": f"r{i}", "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": [blk]})  # fmt: skip
+    probe = _probe(tmp_path, reqs, digests)
+    d = digest_compare.compare(probe, probe, invariant=True, split_invariant=False)
+    assert d["external_mismatched"] == 1
+    assert not run_gate._digest_verdict(d, 0.0)["pass"]
 
 
 def test_workload_sessions_never_reuse_connections():

@@ -284,7 +284,9 @@ the last accepted run record by hand until `--accepted` exists.
   bf16/fp16 value), then the pass. Warm reuse can only come from the
   connector; stale cold-pass bytes cannot rescue a connector that loads nothing.
   gsm8k: `cold`, `warm` (plain arm also `split_ref`, `split`: the split
-  control, below). Replay: `cold`, `warm` (digested), `warm2..warmN`
+  control, below; with `split_invariant=false` the baseline arm also runs
+  `split`, the same-split references for warm computed KV; its pre-warm
+  requests are tagged `<pass>_prewarm` and never scored). Replay: `cold`, `warm` (digested), `warm2..warmN`
   (timed, N = `--replay-repeats`). Each request carries
   `vllm_xargs.rsi_pass = <pass>`; the oracle scores by that tag.
 - Probe trace per request: `episodes = [step, local_hit, start]` per schedule
@@ -312,9 +314,13 @@ the last accepted run record by hand until `--accepted` exists.
   *split* count as references: split = (start of the computing episode, the
   `progress` chunk ends of that episode below the block's end), i.e. where the
   cached context ended and how prefill was chunked up to the block. A computed
-  block with copies only at other splits is `computed_unmatched_split`
-  (reported, not judged); `computed_coverage = computed_compared /
-  (computed_compared + computed_unmatched_split)` is reported.
+  block with copies only at other splits is `computed_unmatched_split`, one
+  REF never computed is `computed_unreferenced` (REF != CAND); both are not
+  judged. `computed_by_pass` breaks these counts down by the candidate's
+  `rsi_pass`. The split key misses a prefill chunk that ends without
+  crossing a key-token boundary; that can only give two different MLA splits
+  the same key, i.e. make an honest block inexact (fail-closed), never a
+  wrong block exact.
 - G0.spec: the arm's scheduler spec dump and per-layer view layouts (shape
   without the block dim, stride, dtype) equal the baseline's, and the
   baseline's equals the committed `spec.json`. Volatile fields (`num_blocks`,
@@ -325,14 +331,21 @@ the last accepted run record by hand until `--accepted` exists.
 - G2.digest_self.gsm8k / digest_vs_baseline.gsm8k: local and external
   `mismatched == 0`, `unreferenced == 0`, `external_matched > 0`, judged
   (matched + mismatched) >= 0.9 of all external blocks, and under invariance
-  `computed_exact == computed_compared`. G2.digest_self.replay: same, with no
+  `computed_exact == computed_compared`. With `split_invariant=false`,
+  digest_vs_baseline.gsm8k also needs, in each of `cold` and `warm`, judged
+  computed blocks > 0 and `compared / (compared + unmatched_split +
+  unreferenced) >= 0.9` (`MIN_COMPUTED_COVERAGE`; warm is judged against the
+  baseline's `split` pass). G2.digest_self.replay: same, with no
   judged-fraction floor (untagged conversations share prefixes).
 - G2.gsm8k: `|acc(pass) - acc(baseline cold)| <= 0.01` for cold and warm.
   G2.gsm8k_outputs (when gate.json declares invariance): every completion equals
-  baseline cold, cold and warm; with `split_invariant=false`: per pass, the
-  share of completions differing from baseline cold must be `<=` the split
-  control's divergence rate over the same prompts + `SPLIT_MARGIN` (0.02);
-  the differ counts are otherwise report-only.
+  baseline cold, cold and warm; with `split_invariant=false`: every cold
+  completion equals baseline cold (same split), and every warm completion
+  equals the plain arm's `split` completion of the same prompt, except on
+  prompts with `prompt_len % cache_hit_alignment_tokens == 0`
+  (`warm_differ_vs_split_aligned`, reported only: vLLM's own hit stops one
+  block short there, a connector's need not). The warm differ count vs
+  baseline cold is reported only.
 - Split invariance (`split_invariant`, `G2.split_control`, baseline verdicts).
   Batch invariance makes a token's KV independent of batch composition, not
   of *where the request's computation starts*. vLLM 0.32's MLA prefill
@@ -358,20 +371,22 @@ the last accepted run record by hand until `--accepted` exists.
   only) reports cached prompt tokens per request. `G2.split_control` passes
   iff measured invariance (every completion and every sampled-token logprob
   equal between `split` and `split_ref`) equals gate.json's
-  `split_invariant`, and the pre-warm took (`split` cached more prompt tokens
-  than `split_ref`) for >= 0.9 of requests. So `false` with an invariant
-  control, or `true` with any divergence, fails the run. With
+  `split_invariant`, `split_ref` equals plain cold, and the pre-warm took
+  (`split` cached `>= (prompt_tokens - 1) // align * align` tokens, i.e. up to
+  the last full prompt block) for >= 0.9 of requests. So `false` with an
+  invariant control, or `true` with any divergence, fails the run. With
   `split_invariant=false` the loaded-block checks (`mismatched == 0`,
   `unreferenced == 0`, judged >= 0.9, `external_matched > 0`) and G2.gsm8k
-  stay as they are; only `computed_exact` (same-split references) and
-  `G2.gsm8k_outputs` (bounded by the control) change. The bound is the
-  control's divergence rate because a correct connector's warm pass is the
-  control's `split` pass with the prefix served from the store instead of
-  vLLM's prefix cache: same split, same bytes (byte-exact loads), so its
-  divergence from baseline cold is the control's up to scheduling noise,
-  which the batch-invariant run removes; the 0.02 margin covers the few
-  requests whose hit ends elsewhere (e.g. `prompt_len % 16 == 0`, where the
-  connector loads to `prompt_len - 1`).
+  stay as they are; only `computed_exact` (same-split references, with the
+  coverage floor above) and `G2.gsm8k_outputs` (warm vs the plain `split`
+  completions) change. A correct connector's warm pass is the control's
+  `split` pass with the prefix served from the store instead of vLLM's
+  prefix cache: same split, same bytes (byte-exact loads), so under batch
+  invariance its completions equal `split`'s exactly; only the aligned
+  prompts end their hit elsewhere (the connector loads to `prompt_len - 1`).
+  Measured on DeepSeek-V2-Lite TP2: honest self-test 0/128 differ from
+  `split`, liar/bitflip/offbyone 128/128; the old connector 38/1319, all 38
+  aligned (82 aligned prompts).
 - G3 (`oracle.py`): replays `requests.jsonl` with unlimited capacity. A block
   ending at token e is stored at the first step whose `progress` reaches e
   (checkpoint groups: only a step ending exactly on e) and is visible to

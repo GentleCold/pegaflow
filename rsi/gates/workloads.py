@@ -124,6 +124,9 @@ async def run_gsm8k(
             if prewarm:
                 warm = body | {"max_tokens": 1}
                 warm.pop("logprobs", None)
+                if xargs:
+                    # Its own pass label: the oracle and verdicts never score it.
+                    warm["vllm_xargs"] = xargs | {"rsi_pass": f"{xargs.get('rsi_pass')}_prewarm"}
                 async with session.post(f"{url}/v1/completions", json=warm) as r:
                     r.raise_for_status()
                     await r.read()

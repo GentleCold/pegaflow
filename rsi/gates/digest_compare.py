@@ -32,7 +32,13 @@ cached context separately and merges), a computed block is judged only
 against copies computed with the same *split*: the start of the computing
 episode and the chunk ends before the block (``progress`` values below its
 end). Blocks with copies at other splits only are ``computed_unmatched_split``
-(reported, not judged).
+(not judged); with REF != CAND a computed block REF never computed is
+``computed_unreferenced``. ``computed_by_pass`` breaks the computed counts
+down by the candidate's ``rsi_pass`` (the gate requires a minimum coverage per
+pass on split-variant models). The split key misses a prefill chunk that ends
+without crossing a ``key_tokens`` boundary; such a pair of computations gets
+the same key with different MLA splits, which can only make an honest block
+inexact (fail-closed), never a wrong one exact.
 
 ``REF`` and ``CAND`` may be the same directory (self-consistency of a
 cold-then-warm run in one server); a computed block never references itself.
@@ -161,6 +167,7 @@ def _group() -> dict[str, Any]:
         "computed_compared": 0,
         "computed_exact": 0,
         "computed_unmatched_split": 0,
+        "computed_unreferenced": 0,
         "max_rel_l1": 0.0,
         "first_bad": None,
     }
@@ -184,11 +191,17 @@ def compare(
     ref = Reference(ref_dir)
     own = 1 if ref_dir.resolve() == cand_dir.resolve() else 0
     groups: dict[int, dict[str, Any]] = defaultdict(_group)
+    pass_of = {r["req_id"]: r.get("pass") for r in _requests(cand_dir)}
+    by_pass: dict[str, Counter[str]] = defaultdict(Counter)
     for key, tag, exact, l1, rid, split in records(cand_dir):
         g = groups[key[1]]
         copies = ref.copies.get(key, {})
         if tag == "computed":
+            bp = by_pass[str(pass_of.get(rid))]
             if ref.occurrences(key) - own <= 0:
+                if not own:
+                    g["computed_unreferenced"] += 1
+                    bp["unreferenced"] += 1
                 continue
             pool = copies
             if not split_invariant:
@@ -196,10 +209,13 @@ def compare(
                 pool = ref.split_copies.get((key, split), {})
                 if sum(c[0] for c in pool.values()) - own <= 0:
                     g["computed_unmatched_split"] += 1
+                    bp["unmatched_split"] += 1
                     continue
             g["computed_compared"] += 1
+            bp["compared"] += 1
             if pool.get(exact, [0])[0] - own > 0:
                 g["computed_exact"] += 1
+                bp["exact"] += 1
             else:
                 rel = min(_rel_l1(c[1], l1) for d, c in pool.items() if d != exact)
                 g["max_rel_l1"] = max(g["max_rel_l1"], rel)
@@ -232,6 +248,7 @@ def compare(
     total["max_rel_l1"] = max((g["max_rel_l1"] for g in groups.values()), default=0.0)
     total["invariant"] = invariant
     total["split_invariant"] = split_invariant
+    total["computed_by_pass"] = {p: dict(c) for p, c in sorted(by_pass.items())}
     total["groups"] = {str(k): v for k, v in sorted(groups.items())}
     return total
 
