@@ -825,6 +825,29 @@ def test_stop_signal_aborts_the_run(tmp_path, sig, where):
     assert not (tmp_path / "finished").exists()
 
 
+def test_g0_spec_ignores_module_paths(tmp_path):
+    """M4: a fresh probe dump carries ``modules`` (host paths: the arm under
+    test imports pegaflow from its overlay, the baseline from the venv; the
+    committed dump has none). G0.spec must pass on the committed Qwen3-4B
+    layout with differing ``modules``; G0.provenance judges them."""
+    import json
+
+    committed = run_gate.REPO / "docs/rsi/models/Qwen3-4B/spec.json"
+    spec = json.loads(committed.read_text())
+    for label, pf in (("baseline", "/venv/pegaflow/__init__.py"), ("arm", "/run/overlay/pegaflow/__init__.py")):  # fmt: skip
+        probe = tmp_path / label / "gsm8k" / "probe"
+        probe.mkdir(parents=True)
+        dump = spec | {"modules": {"pegaflow": pf, "rsi.gates.rsi_probe": f"/{label}/rsi_probe.py"}}
+        (probe / "spec.json").write_text(json.dumps(dump))
+    v = run_gate.g0(tmp_path, "arm", committed)
+    assert v["pass"], v
+    # A real layout difference still fails.
+    bad = json.loads((tmp_path / "arm/gsm8k/probe/spec.json").read_text())
+    bad["kv_cache_config"]["kv_cache_layout"] = "LBHNC"
+    (tmp_path / "arm/gsm8k/probe/spec.json").write_text(json.dumps(bad))
+    assert not run_gate.g0(tmp_path, "arm", committed)["pass"]
+
+
 # ------------------------------------------------------------ split invariance
 
 

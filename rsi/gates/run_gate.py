@@ -707,7 +707,9 @@ def summary_line(res: dict[str, Any]) -> str:
 # ------------------------------------------------------------------- G0
 
 # Depend on GPU memory / CLI, not on the model layout.
-_VOLATILE = {"num_blocks", "size", "layer_stride", "model", "max_model_len", "probe"}
+# ``modules`` (host paths of the instrument and runtime) is judged by
+# G0.provenance, not compared across arms or with the committed dump.
+_VOLATILE = {"num_blocks", "size", "layer_stride", "model", "max_model_len", "probe", "modules"}
 
 
 def _strip(x: Any) -> Any:
