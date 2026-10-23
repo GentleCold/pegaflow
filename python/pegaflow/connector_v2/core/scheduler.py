@@ -140,15 +140,15 @@ class Scheduler:
         # (gid, block index, GPU block id) -> step from which saves may resume.
         # Prefix-cache sharing keeps a block at the same index in every table.
         self._unconfirmed: dict[tuple[int, int, int], int] = {}
-        # GPU blocks of failed sync loads that no request has recomputed yet
-        # (vLLM does not evict them under the recompute policy). vLLM rewinds
-        # only the first request holding a shared invalid block; any other
-        # one (e.g. a local prefix hit on it) keeps the KV it computed on the
-        # bad bytes, so it never saves again (``_tainted``). Each request is
-        # checked once per error (``_checked``), at its next schedule: its
-        # rewind, if any, is visible then.
+        # Failed sync-load blocks vLLM reported. vLLM rewinds only the first
+        # request holding a shared invalid block; any other one (e.g. a local
+        # prefix hit on it) keeps the KV it computed on the bad bytes, so it
+        # never saves again (``_tainted``). Every request alive at the error
+        # is checked once, at its next schedule, when its rewind is visible
+        # (``_to_check``). Requests admitted later are not checked: they can
+        # only hit the block once its first holder recomputed it.
         self._failed_blocks: set[int] = set()
-        self._checked: set[str] = set()
+        self._to_check: set[str] = set()
         self._tainted: set[str] = set()
         self._plan = StepPlan()
 
@@ -394,7 +394,7 @@ class Scheduler:
         block_ids = set(block_ids)
         if block_ids:
             self._failed_blocks |= block_ids
-            self._checked.clear()
+            self._to_check = set(self._requests) - self._tainted
 
     def plan_saves(
         self,
@@ -420,7 +420,7 @@ class Scheduler:
         self._steps += 1
         if self._unconfirmed:
             self._unconfirmed = {b: s for b, s in self._unconfirmed.items() if s > step}
-        if self._failed_blocks:
+        if self._to_check:
             self._check_failed_loads(scheduled, block_ids_of)
         for req_id in preempted:
             self._plan.flush = True
@@ -491,36 +491,27 @@ class Scheduler:
         block_ids_of: Callable[[str], tuple[list[int], ...] | None],
     ) -> None:
         """Taint requests whose computed tokens include a failed block (vLLM
-        did not rewind them to recompute it), then forget the failed blocks
-        this step recomputes."""
+        did not rewind them to recompute it)."""
         failed = self._failed_blocks
-        recomputed: set[int] = set()
-        for req_id, computed, n_sched in scheduled:
-            if req_id in self._tainted or req_id not in self._requests:
+        for req_id, computed, _ in scheduled:
+            if req_id not in self._to_check:
                 continue
             block_ids = block_ids_of(req_id)
             if block_ids is None:
-                continue
-            end = computed + max(n_sched, 0)
+                continue  # checked at a later schedule
+            self._to_check.discard(req_id)
             for g in self._layout.groups:
-                bt = g.sem.block_tokens
                 ids = block_ids[g.gid]
-                if req_id not in self._checked and any(
-                    ids[b] in failed for b in range(min(-(-computed // bt), len(ids)))
-                ):
+                n = min(-(-computed // g.sem.block_tokens), len(ids))
+                if any(ids[b] in failed for b in range(n)):
                     logger.warning(
                         "[PegaKVConnectorV2] req=%s computed on a failed load: no more saves",
                         req_id,
                     )
                     self._tainted.add(req_id)
                     break
-                # Fully rewritten by this step's forward.
-                lo, hi = computed // bt, min(end // bt, len(ids))
-                recomputed.update(ids[b] for b in range(lo, hi) if ids[b] in failed)
-            self._checked.add(req_id)
-        failed -= recomputed
-        if not failed:
-            self._checked.clear()
+        if not self._to_check:
+            failed.clear()
 
     def _touches_unconfirmed(self, block_ids: tuple[list[int], ...]) -> bool:
         return any(
@@ -551,7 +542,9 @@ class Scheduler:
         self._loading_since.pop(req_id, None)
         self._saved_upto.pop(req_id, None)
         self._tainted.discard(req_id)
-        self._checked.discard(req_id)
+        self._to_check.discard(req_id)
+        if not self._to_check:
+            self._failed_blocks.clear()
         self._requests.pop(req_id, None)
         if req_id not in self._saving:
             return False

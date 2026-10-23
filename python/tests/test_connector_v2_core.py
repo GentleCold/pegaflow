@@ -546,6 +546,8 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
         # the range; shared holds the invalid block too but is not rewound
         # (vLLM recomputes a shared block once), so it never saves again.
         pytest.param(-1, [("r", 4, 13), ("shared", 17, 1)], [11, 12, 13], id="sync-failed"),
+        # Same, with shared first scheduled after r recomputed the block.
+        pytest.param(-1, [("r", 4, 13)], [11, 12, 13], id="sync-failed-shared-later"),
     ],
 )
 def test_sync_load_outcome_gates_saves(load_state, step2, expected2):
@@ -591,7 +593,7 @@ def test_sync_load_outcome_gates_saves(load_state, step2, expected2):
     _, saved1 = step([("r", 17, 1), ("shared", 8, 9)])
     sched.on_load_errors(worker.take_invalid())  # vLLM processes step 0's output
     _, saved2 = step(step2)
-    _, saved3 = step([(rid, 17, 1) for rid, _, _ in step2])
+    _, saved3 = step([("r", 17, 1), ("shared", 17, 1)])
     assert (saved0, saved1, saved2, saved3) == ([30, 31, 32, 33], [], expected2, [])
     worker.shutdown()
 
