@@ -531,6 +531,15 @@ names, magic constants that only exist in the old code).
   only against same-split references; outputs bounded by the control's own
   divergence rate. P4 official run waits for that merge.
 
+- it2c re-review: APPROVE-WITH-FIXES. M1': a later turn of a tainted request
+  can prefix-hit blocks computed on the bad bytes (recompute policy evicts
+  nothing) and save on top of them; also a rewound loader leaving before it
+  recomputes. Fix direction: fail closed (stop saves for the process after a
+  taint). Should-fix: the "within 0.5 pp" no-rerun rule was misapplied
+  (replay warm TTFT +1.4/+2.6 pp vs baseline), so the it2 official run does
+  NOT stand for the final code: official rerun `qwen3-4b-p3-it2d` (GPU4, with
+  old + native arms) after the fix. Qwen3-4B acceptance waits for it.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
