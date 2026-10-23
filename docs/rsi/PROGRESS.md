@@ -427,6 +427,13 @@ names, magic constants that only exist in the old code).
   start rotated by j/4; a run whose under-test freeze/H*_C >= 0.9 is not
   official. G3 re-derived identically on all 45 recorded probe dirs.
 
+- G5 pre-fix reference `2026-10-23-qwen3-4b-g5-official` (rev 369b253,
+  32 x 12, U 25.81 GiB, C 12.91 GiB = 1.24x GPU KV): `warm_timed` E_C
+  connector_v2 0.216, old 0.124, native 0.558; H*_C 0.79-0.84, H_lru
+  0.52-0.56. Both PegaFlow arms are below H_lru, consistent with the server
+  reclaim-batch / prefix-oblivious LRU limit (GATES.md G5). Not comparable to
+  post-fix runs (different trace, per-arm local, no rotation).
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

@@ -138,6 +138,22 @@ so such stranded bytes are possible today.
   starts at block 0 (`old` slice: 0 server hits in every cap pass, pool =
   C, no alloc failure or admission reject). Fixing either is a server
   change (own PR).
+- Pre-fix reference (`2026-10-23-qwen3-4b-g5-official`, gate rev 369b253,
+  server from `feat/semantics-rsi`; before the review fixes: cap = replay
+  trace 32 x 12, `C = 0.5 x U` from the baseline replay, per-arm local, no
+  rotation, so not comparable to later runs). U 25.81 GiB, C 12.91 GiB
+  (1.24x GPU KV, below the current floor). `warm_timed`, prompt 2.55 M tokens:
+
+  | arm | E_C | hit | H*_C | H_lru | evictions / pass | load bytes / warm pass |
+  |---|---|---|---|---|---|---|
+  | connector_v2 | 0.216 | 0.440 | 0.785 | 0.517 | 42.5k-45.6k | 16.6-19.2 GB |
+  | old | 0.124 | 0.459 | 0.814 | 0.523 | 35.3k-40.4k | 8.8-9.6 GB |
+  | native | 0.558 | 0.649 | 0.843 | 0.561 | n/a | n/a |
+
+  `H*` (unlimited) 0.998 for all. All three are far below 0.9 and below
+  `H_lru`; native (vLLM's CPU offload, same C) beats both PegaFlow arms.
+  Warm TTFT p50: native 1.38-1.51 s, connector_v2 2.01-2.08 s, old
+  2.09-2.14 s, baseline (replay, no store) 2.54 s.
 
 ## Run record
 
