@@ -465,6 +465,39 @@ names, magic constants that only exist in the old code).
   total 0.998 = H*, E_ext 1.0 (local 0.35 + external 0.65); gsm8k warm 0.992 =
   H*. Digests 0 mismatched. Table in Qwen3-4B/ITERATIONS.md.
 
+- G5 official run, PRE-FIX gate code (`2026-10-23-qwen3-4b-g5-official`, gate
+  rev 369b253, GPU4, same run for all arms; v2 numbers match it2). Reference
+  only: the gate fixes change E_C (per-arm local subtraction) and capacity.
+
+  | arm | replay warm2 TTFT | warm2 req/s | cold TTFT | gsm8k cold/warm s | replay warm hit (E_ext) |
+  |---|---|---|---|---|---|
+  | baseline | 2.538 | 3.41 | 2.81 | 164.6 / 164.8 | 0.377 (0) |
+  | old | 0.630 | 10.24 | 1.356 | 166.7 / 169.5 | 0.998 (1.0) |
+  | native (vLLM OffloadingConnector) | 0.500 | 9.83 | 1.308 | 169.6 / 169.4 | 0.998 (1.0) |
+  | connector_v2 | 0.522 | 10.02 | 1.245 | 166.0 / 165.1 | 0.998 (1.0) |
+
+  At capacity C = 12.9 GiB (0.5 x U = 25.8 GiB, ~1.24x GPU KV):
+
+  | arm | cap hit | H*_C | H_lru | E_C | cap_warm2 TTFT | req/s |
+  |---|---|---|---|---|---|---|
+  | old | 0.459 | 0.814 | 0.523 | 0.12 | 2.087 | 3.73 |
+  | native | 0.649 | 0.843 | 0.561 | 0.56 | 1.378 | 4.70 |
+  | connector_v2 | 0.440 | 0.785 | 0.517 | 0.22 | 2.007 | 3.67 |
+
+  Findings: unlimited, v2 beats native on cold TTFT, throughput and gsm8k but
+  NOT on warm TTFT (0.522 vs 0.500 s, +4%) -> would fail the planned phase-2
+  "at least as good as native" G4 check. At capacity native is clearly ahead
+  (hit 0.65 vs 0.44, TTFT 1.38 vs 2.01 s): PegaFlow server reclaim/eviction is
+  the gap (`feat/rsi-server-reclaim`). H*_C differs per arm because of the
+  per-arm local subtraction (review S1, being fixed).
+- User: add LMCache with the same config as another reference arm. Assigned to
+  the gate agent after the G5 fixes: `LMCacheConnectorV1` + RsiProbe, local CPU
+  only, capacity = pool size / C, default chunk size recorded. lmcache is not
+  installed; installing into the shared venv would downgrade numpy/protobuf/otel,
+  so it goes into an overlay dir on PYTHONPATH for that arm only.
+- Reporting rule: every comparison table carries baseline, old, native,
+  lmcache (when available) and connector_v2.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
