@@ -504,6 +504,36 @@ def test_stop_waits_for_the_whole_process_group(tmp_path, monkeypatch):
     assert "gone after SIGTERM" in log.read_text()
 
 
+@pytest.mark.parametrize(
+    "arm,exc,fatal",
+    [
+        ("old", ValueError("crash"), False),
+        ("old", run_gate.TeardownError("group alive"), True),
+        ("native", "teardown-during-crash", True),
+        ("UnderTest", ValueError("crash"), True),
+    ],
+    ids=["ref-crash-recorded", "ref-teardown-aborts", "ref-teardown-chained", "under-test-crash"],
+)
+def test_stage_never_swallows_a_teardown_failure(monkeypatch, tmp_path, arm, exc, fatal):
+    """S3: a reference arm's crash is recorded, but a surviving process group
+    aborts the run (the next stage would start on a live GPU)."""
+
+    def boom(*_a, **_k):
+        if exc == "teardown-during-crash":
+            try:
+                raise ValueError("crash")
+            finally:
+                raise run_gate.TeardownError("group alive")
+        raise exc
+
+    monkeypatch.setattr(run_gate, "run_arm_workload", boom)
+    if fatal:
+        with pytest.raises((ValueError, run_gate.TeardownError)):
+            run_gate.run_stage(None, {}, arm, "gsm8k", tmp_path)
+    else:
+        assert "error" in run_gate.run_stage(None, {}, arm, "gsm8k", tmp_path)
+
+
 # ------------------------------------------------------------ split invariance
 
 

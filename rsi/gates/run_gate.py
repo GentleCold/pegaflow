@@ -151,6 +151,12 @@ def launched(cmd: list[str], env: dict[str, str], log: Path, health: str, timeou
             stop(proc, cmd[0], fh)
 
 
+class TeardownError(RuntimeError):
+    """A stage's process group survived SIGTERM + SIGKILL: the GPU / host
+    memory it holds would skew every later stage, so the run aborts (never
+    recorded as a reference arm's error)."""
+
+
 def stop(proc: subprocess.Popen, name: str, fh) -> None:
     """Stop ``proc``'s whole process group and return only once every member
     is gone, so the next stage cannot start while this one still holds its
@@ -167,7 +173,7 @@ def stop(proc: subprocess.Popen, name: str, fh) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         how = "SIGKILL"
         if not _group_gone(proc, KILL_GRACE):
-            raise RuntimeError(
+            raise TeardownError(
                 f"process group {proc.pid} ({name}) still alive {time.monotonic() - t0:.0f}s"
                 " after SIGTERM + SIGKILL"
             )
@@ -1430,6 +1436,31 @@ def official_problems(
     return out
 
 
+def _teardown_failed(e: BaseException) -> bool:
+    """``e`` or any exception it was raised from/during is a TeardownError
+    (``launched``'s finally raises it while another error is in flight)."""
+    seen: set[int] = set()
+    x: BaseException | None = e
+    while x is not None and id(x) not in seen:
+        if isinstance(x, TeardownError):
+            return True
+        seen.add(id(x))
+        x = x.__cause__ or x.__context__
+    return False
+
+
+def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
+    """Run one stage; a reference arm's crash is recorded, not fatal, unless
+    its teardown failed (the next stage would share a live GPU)."""
+    try:
+        return run_arm_workload(args, gate, arm, wl, out, **kw)
+    except Exception as e:
+        if arm_kind(arm) not in _RECORD_ONLY or _teardown_failed(e):
+            raise
+        print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)
+        return {"arm": arm, "workload": wl, "error": f"{type(e).__name__}: {e}"[:2000]}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--model", required=True)
@@ -1520,14 +1551,7 @@ def main(argv: list[str] | None = None) -> int:
     results: dict[str, dict[str, Any]] = {}
 
     def stage(arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
-        """Run one stage; a reference arm's crash is recorded, not fatal."""
-        try:
-            return run_arm_workload(args, gate, arm, wl, out, **kw)
-        except Exception as e:
-            if arm_kind(arm) not in _RECORD_ONLY:
-                raise
-            print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)
-            return {"arm": arm, "workload": wl, "error": f"{type(e).__name__}: {e}"[:2000]}
+        return run_stage(args, gate, arm, wl, out, **kw)
 
     for arm in arms:
         kind = arm_kind(arm)
