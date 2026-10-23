@@ -165,7 +165,13 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         else:
             from pegaflow import PyLoadState
 
-            sync_saves = may_zero_or_copy_blocks(kv_cache_config)
+            # An offered checkpoint block is only guaranteed to hold its state
+            # until the step after the offer may free or reuse it (vLLM does
+            # not keep it in the block table), so checkpoint saves finish in
+            # the offering step's wait_for_save.
+            sync_saves = may_zero_or_copy_blocks(kv_cache_config) or any(
+                g.sem.kind == "checkpoint" for g in self._layout.groups
+            )
             logger.info("[PegaKVConnectorV2] saves=%s", "sync" if sync_saves else "async")
             self._worker = Worker(
                 self._layout,
@@ -223,6 +229,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             scheduled,
             block_state.get_block_ids if block_state is not None else lambda _: None,
             scheduler_output.preempted_req_ids or (),
+            # Checkpoint (Mamba align) states, with their exact block ids.
+            getattr(block_state, "boundary_state_offloads", None),
         )
         return PegaConnectorMetadata(self._scheduler.take_plan())
 

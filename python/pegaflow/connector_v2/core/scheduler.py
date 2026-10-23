@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import operator
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -96,7 +96,21 @@ class _Lookup:
     loading: bool
 
 
+def _offered_ids(g: GroupInfo, blocks: range, offers: Sequence[tuple[int, int, int]]) -> list[int]:
+    """Positional GPU ids for a checkpoint group's ``blocks``, from vLLM's
+    offers (0 where vLLM offered no state for that boundary)."""
+    bt = g.sem.block_tokens
+    ids = [0] * blocks.stop
+    for gid, block_id, boundary in offers:
+        b = boundary // bt - 1
+        if gid == g.gid and boundary % bt == 0 and b in blocks:
+            ids[b] = block_id
+    return ids
+
+
 class Scheduler:
+    HIT_LOG_EVERY = 500  # lookups between "hit stats" log lines
+
     def __init__(
         self,
         layout: Layout,
@@ -147,6 +161,9 @@ class Scheduler:
         # and later loads are async so no further bad block enters that cache.
         self._saves_disabled = False
         self._plan = StepPlan()
+        # Lookups, and per missing-group set how often (and how many tokens)
+        # the full groups backed a longer hit than the one taken.
+        self.hit_stats: dict[str, int] = {}
 
     # ------------------------------------------------------------------ hits
     def on_new_request(self, request: Any) -> None:
@@ -238,6 +255,7 @@ class Scheduler:
         # never reported, and its answer can only lower p.
         accepted = operator.index(self._policy.accept(p, lookup.present))
         p = max(0, min(accepted, p))
+        self._count_miss(request, num_computed, lookup.present, p)
         if p <= num_computed or p % self._layout.step:
             return None
         kept = self._assign(p, num_computed, lookup.present, lookup.leases)
@@ -272,6 +290,9 @@ class Scheduler:
             # the group block sizes), so it is only a fail-safe.
             if any(b * bt < num_computed < (b + 1) * bt for b in need):
                 return None
+            # A checkpoint's needed block [p - bt, p) always lies past the local
+            # hit (p - num_computed >= step >= bt), so the state at p is always
+            # loaded: vLLM drops its own local state for an external hit.
             wanted = frozenset(b for b in need if b * bt >= num_computed)
             if not wanted:
                 continue
@@ -405,12 +426,21 @@ class Scheduler:
         scheduled: list[tuple[str, int, int]],
         block_ids_of: Callable[[str], tuple[list[int], ...] | None],
         preempted: Iterable[str] = (),
+        offers: Mapping[str, Sequence[tuple[int, int, int]]] | None = None,
     ) -> None:
         """``scheduled``: (req_id, num_computed_before_step, num_scheduled_tokens).
 
         ``preempted``: requests vLLM preempted (and whose blocks it freed) since
         the last plan. Their blocks may be reallocated in this very step, so
         the workers must finish pending saves before the step runs.
+
+        ``offers``: req_id -> [(gid, GPU block id, boundary tokens)], the
+        blocks vLLM hands out holding a checkpoint state (vLLM 0.32
+        ``boundary_state_offloads``). Checkpoint groups save only from these:
+        their block table does not say which block holds which state. An
+        offer is used only for the boundary this step's forward computes
+        (``semantics.saveable``); the worker saves it before the next step
+        can free or reuse the block (checkpoint layouts save synchronously).
 
         A request whose blocks include an unconfirmed sync-load block saves
         nothing yet (its range is offered again once the outcome is visible).
@@ -460,11 +490,16 @@ class Scheduler:
                     self._saved_upto[req_id] = before
                     continue
                 for g, blocks in ranges:
-                    items.extend(self._save_items(request, g, blocks, block_ids[g.gid]))
+                    if g.sem.kind == "checkpoint":
+                        ids = _offered_ids(g, blocks, (offers or {}).get(req_id, ()))
+                    else:
+                        ids = block_ids[g.gid]
+                    items.extend(self._save_items(request, g, blocks, ids))
             # Blocks _save_items skips (null id, no hash yet) are not offered
             # again. In vLLM 0.32 neither happens for full or window groups:
             # `after` is capped at num_tokens (every full block has a hash) and
-            # blocks written this step are allocated, not null.
+            # blocks written this step are allocated, not null. A checkpoint
+            # vLLM did not offer (it did not retain that boundary) is skipped.
             self._saved_upto[req_id] = after
         if not items:
             return
@@ -488,6 +523,38 @@ class Scheduler:
             save.block_ids.append(item.block_id)
             save.block_hashes.append(item.block_hash)
         self._plan.saves.extend(by_sid[sid] for sid in sorted(by_sid))
+
+    def _count_miss(
+        self, request: Any, num_computed: int, present: tuple[frozenset[int], ...], p: int
+    ) -> None:
+        """Group coherence: at the longest resume point the full groups back,
+        which other groups are missing (``hit stats`` log line)."""
+        groups = self._layout.groups
+        step = self._layout.step
+        # Storage group 0 is full: its contiguous prefix bounds every hit.
+        contiguous = 0
+        while contiguous in present[0]:
+            contiguous += 1
+        cap = max(request.num_tokens - 1, 0)
+        p_full = min(contiguous * groups[0].sem.block_tokens, cap) // step * step
+        stats = self.hit_stats
+        stats["lookups"] = stats.get("lookups", 0) + 1
+        if p_full > max(p, num_computed):
+            # Storage groups (sids) lacking their needed blocks at p_full.
+            missing = [
+                sid
+                for sid, g in enumerate(groups)
+                if not present[sid].issuperset(range(*self._sem.needed(g.sem, p_full)))
+            ]
+            key = "missing=" + ",".join(map(str, missing))  # "missing=" alone: policy cut
+            stats[key] = stats.get(key, 0) + 1
+            stats["lost_tokens"] = stats.get("lost_tokens", 0) + p_full - max(p, num_computed)
+        if stats["lookups"] % self.HIT_LOG_EVERY == 0:
+            self.report_hit_stats()
+
+    def report_hit_stats(self) -> None:
+        if len(self.hit_stats) > 1:  # anything beyond the lookup count
+            logger.info("[PegaKVConnectorV2] hit stats %s", dict(sorted(self.hit_stats.items())))
 
     def _touches_unconfirmed(self, block_ids: tuple[list[int], ...]) -> bool:
         return any(
@@ -525,6 +592,7 @@ class Scheduler:
         return True
 
     def shutdown(self) -> None:
+        self.report_hit_stats()
         for req_id in list(self._hits):
             self._drop_hit(req_id)
         # Load plans never handed to the workers still hold their leases.

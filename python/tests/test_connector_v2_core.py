@@ -742,6 +742,114 @@ def test_saves(sem, num_tokens, steps, block_ids, expected):
     assert _step_saves(sched, steps, block_ids) == expected
 
 
+# Checkpoint group (vLLM gid 0) + full group (gid 1, sid 0). Like vLLM's Mamba
+# align table, the checkpoint row is null except the running state block.
+CKPT_IDS = [0, 0, 0, 33]
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "steps,offers,expected",
+    [
+        # Prefill to 12 in chunks of 4: each chunk end's state is offered with
+        # its block; the checkpoint saves exactly the offered block, never the
+        # positional one (CKPT_IDS[b]).
+        pytest.param(
+            [("r", 0, 4), ("r", 4, 4), ("r", 8, 4)],
+            [{"r": [(0, 31, 4)]}, {"r": [(0, 32, 8)]}, {"r": [(0, 33, 12)]}],
+            [
+                [(0, [10], H[:1]), (1, [31], H[:1])],
+                [(0, [11], H[1:2]), (1, [32], H[1:2])],
+                [(0, [12], H[2:3]), (1, [33], H[2:3])],
+            ],
+            id="offer-per-boundary",
+        ),
+        # vLLM did not retain (offer) the boundary at 4: no checkpoint save.
+        pytest.param(
+            [("r", 0, 4), ("r", 4, 4)],
+            [{}, {"r": [(0, 32, 8)]}],
+            [[(0, [10], H[:1])], [(0, [11], H[1:2]), (1, [32], H[1:2])]],
+            id="unoffered-skipped",
+        ),
+        # Offers for another group, another request, an older boundary or an
+        # unaligned one never stand in for this step's state.
+        pytest.param(
+            [("r", 0, 4), ("r", 4, 4)],
+            [{"r": [(1, 31, 4)], "x": [(0, 39, 4)]}, {"r": [(0, 31, 4), (0, 35, 6)]}],
+            [[(0, [10], H[:1])], [(0, [11], H[1:2])]],
+            id="foreign-offers-ignored",
+        ),
+        # A step that ends off a boundary computes no checkpoint state.
+        pytest.param([("r", 0, 6)], [{"r": [(0, 31, 4)]}], [[(0, [10], H[:1])]], id="off-boundary"),
+    ],
+)
+def test_checkpoint_saves_from_offers(sem, steps, offers, expected):
+    layout = _layout(sem, StubCheckpointSpec(), StubFullSpec())
+    sched, _ = _sched(sem, {}, layout=layout)
+    sched.on_new_request(_req(num_tokens=13, n_hashes=3))
+    out = []
+    for step, offer in zip(steps, offers, strict=True):
+        sched.plan_saves([step], lambda _: (CKPT_IDS, FULL_IDS), (), offer)
+        out.append([(s.sid, s.block_ids, s.block_hashes) for s in sched.take_plan().saves])
+    assert out == expected
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "num_computed,ckpt_ans,expected,loads",
+    [
+        # Cold: full blocks 0-2 and the checkpoint state at 12 (block 2).
+        pytest.param(
+            0,
+            Ready(2, b"C", [0, 2]),
+            (12, True),
+            [(b"F", [[10, 11, 12], [None] * 3]), (b"C", [[None, None], [None, 33]])],
+            id="cold",
+        ),
+        # Local hit covers 8 tokens: full loads only block 2; the state at 12
+        # is loaded (vLLM drops its own local Mamba state for an external hit).
+        pytest.param(
+            8,
+            Ready(2, b"C", [0, 2]),
+            (4, True),
+            [(b"F", [[None, None, 12], [None] * 3]), (b"C", [[None, None], [None, 33]])],
+            id="after-local-hit",
+        ),
+        # Only the state at 4 is stored: resolve falls back to p=4.
+        pytest.param(
+            0,
+            Ready(1, b"C", [0]),
+            (4, True),
+            [(b"F", [[10, None, None], [None] * 3]), (b"C", [[None], [33]])],
+            id="older-checkpoint",
+        ),
+    ],
+)
+def test_checkpoint_loads_state_at_p(sem, num_computed, ckpt_ans, expected, loads):
+    layout = _layout(sem, StubCheckpointSpec(), StubFullSpec())
+    sched, _ = _sched(sem, {0: Ready(3, b"F"), 1: ckpt_ans}, layout=layout)
+    req = _req()
+    matched = sched.get_num_new_matched_tokens(req, num_computed)
+    assert matched == expected
+    p = num_computed + matched[0]
+    # vLLM allocates the external hit's state block at (p - 1) // bt.
+    ckpt_ids = [0] * (p // BT - 1) + [33]
+    sched.update_state_after_alloc(req, (ckpt_ids, FULL_IDS), matched[0])
+    (plan,) = sched.take_plan().loads
+    assert (plan.fail, plan.loads) == (False, loads)
+
+
+@BOTH
+def test_miss_attribution_names_the_missing_group(sem):
+    """Full blocks back p=12, the checkpoint only p=4: counted as missing sid 1."""
+    layout = _layout(sem, StubCheckpointSpec(), StubFullSpec())
+    sched, _ = _sched(sem, {0: Ready(3, b"F"), 1: Ready(1, b"C", [0])}, layout=layout)
+    assert sched.get_num_new_matched_tokens(_req(), 0) == (4, True)
+    sched._rpc.answers = {0: Ready(3, b"F"), 1: Ready(1, b"C", [2])}
+    assert sched.get_num_new_matched_tokens(_req(req_id="s"), 0) == (12, True)
+    assert sched.hit_stats == {"lookups": 2, "missing=1": 1, "lost_tokens": 8}
+
+
 def test_saves_reoffer_after_missing_block_ids():
     sched, _ = _sched(StubSemantics, {})
     sched.on_new_request(_req())
@@ -1062,13 +1170,6 @@ def test_save_flush_before_block_reuse(specs, preempted, flush):
             Parallel(),
             r"no adapter for MysterySpec \(group 1\)",
             id="unknown-spec",
-        ),
-        # M3: fail closed until the core handles boundary_state_offloads (P5).
-        pytest.param(
-            (StubFullSpec(), StubCheckpointSpec()),
-            Parallel(),
-            "boundary_state_offloads",
-            id="checkpoint",
         ),
         pytest.param((StubWindowSpec(),), Parallel(), "no full-attention group", id="window-only"),
         # S2 / V0: TP2 ranks declaring different segment sizes fail seal_plan.
@@ -1448,10 +1549,40 @@ def _qwen35_cfg():
 
 
 @BOTH
-def test_qwen35_layout_waits_for_core_checkpoint_support(sem, mamba, full_attention):
-    """Adapters exist for every group, so init fails on the core gap, not 'no adapter'."""
-    with pytest.raises(Unsupported, match="boundary_state_offloads"):
-        build_layout(_qwen35_cfg(), Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
+def test_qwen35_layout(sem, mamba, full_attention):
+    """Full group first (prefix query), then the 3 GDN checkpoint groups; step 528.
+
+    The Mamba state layout enters the namespace: a different state dtype is a
+    different namespace for the same page size.
+    """
+    layout = build_layout(_qwen35_cfg(), Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
+    assert [(g.gid, g.sem.kind) for g in layout.groups] == [
+        (3, "full"),
+        (0, "checkpoint"),
+        (1, "checkpoint"),
+        (2, "checkpoint"),
+    ]
+    assert layout.step == 528
+    cfg = _qwen35_cfg()
+    for g in cfg.kv_cache_groups[:3]:
+        g.kv_cache_spec = dataclasses.replace(g.kv_cache_spec, dtypes=("bfloat16", "bfloat16"))
+    other = build_layout(cfg, Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
+    assert other.namespace != layout.namespace
+
+
+# Qwen3-4B test layout namespaces computed by the 6545352 core (before
+# LayerDecl.layout); stub and native differ only in repr(Shard).
+QWEN3_NAMESPACE_V1 = {"stub": "cf6b5725", "native": "cd8acc0c"}
+
+
+@BOTH
+def test_namespace_vector_unchanged_for_full_attention(sem, full_attention):
+    """V1: LayerDecl.layout is hashed only when declared, so full-attention
+    layouts keep the namespace (and the stored blocks) they had before it."""
+    _, cfg = _attn_cfg(FullAttentionSpec(), 36)
+    layout = build_layout(cfg, Parallel(), {"model": "Qwen3-4B"}, semantics=sem)
+    which = "stub" if sem is StubSemantics else "native"
+    assert layout.namespace == QWEN3_NAMESPACE_V1[which]
 
 
 @BOTH

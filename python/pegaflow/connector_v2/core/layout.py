@@ -79,14 +79,6 @@ def build_layout(
         group_spec = next(iter(specs.values()), kv_group.kv_cache_spec)
         adapter = adapter_for(group_spec, gid)
         sem = adapter.group(group_spec)
-        if sem.kind == "checkpoint":
-            # vLLM 0.32 hands Mamba "align" boundary states off with exact block
-            # ids (KVConnectorBlockState.boundary_state_offloads); positional
-            # save/load would store wrong state under a correct key (P5 core task).
-            raise Unsupported(
-                f"group {gid} ({type(group_spec).__name__}): checkpoint groups need core "
-                f"support for vLLM boundary_state_offloads"
-            )
         bt = sem.block_tokens
         if bt != group_spec.block_size:
             raise Unsupported(
