@@ -466,6 +466,34 @@ names, magic constants that only exist in the old code).
   old-sampling records cannot pass the exhaustive rule; a rerun is needed.
   G3 `summarize` identical on all 153 recorded probe dirs.
 
+- Gate teardown (d646ac3, backport df01403 on fix/rsi-teardown-backport):
+  pegaflow-server with a 160 GB pinned pool took > 30 s to exit after
+  SIGKILL and `proc.wait(timeout=30)` aborted it2d's official run; the gate
+  now waits on the whole process group (120 s after SIGTERM, 300 s after
+  SIGKILL) and logs the exit time.
+- `split_invariant` (P4 finding): vLLM 0.32 MLA prefill attends to the cached
+  context separately (`_compute_prefill_context` + `merge_attn_states` at
+  `num_computed_tokens`), so on DeepSeek-V2-Lite the computed KV and greedy
+  outputs depend on where a hit ends; an honest connector failed
+  `G2.gsm8k_outputs` (warm 60/128) and `computed_exact` with every loaded
+  block byte-exact. New gate.json field (default true), established by a
+  plain-arm split control (`split_ref` vs `split`, each prompt pre-warmed);
+  with false, `computed_exact` judges only same-split copies and
+  `G2.gsm8k_outputs` is bounded by the control's rate + 0.02. Controls
+  measured (full gsm8k 1319, pre-warm took on 1319/1319):
+  Qwen3-4B FLASH_ATTN 0 differ / 0 logprob differ (split-invariant);
+  DeepSeek-V2-Lite TP2 TRITON_MLA 647 differ (0.4905; first 128: 0.4688),
+  1319/1319 logprobs differ (split-variant). Re-judged offline with
+  `split_invariant=false` + that control: P4 self-test honest passes every
+  G2 check (ext 1084/1084, warm 60/128 = 0.469 <= 0.489), liar / bitflip /
+  offbyone still fail both digest checks (2168 / 256 / 828 ext mismatched);
+  P4 old slice: old loaded blocks 10390/10390 matched, computed_exact
+  27526/27526 on same-split copies (coverage 0.70 vs baseline),
+  `G2.gsm8k_outputs` 642/1319 = 0.487 <= 0.511. Qwen3-4B: every verdict
+  unchanged on the 24 recorded runs (5580 verdict leaves) apart from the
+  new `G2.split_control`, which old records lack. DeepSeek-V2-Lite's
+  gate.json must set `"split_invariant": false` (P4's file).
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
