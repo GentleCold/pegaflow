@@ -336,6 +336,12 @@ names, magic constants that only exist in the old code).
   NEXT: it2 = remove the synchronous save wait (S5), slices on GPU2, by an
   isolated onboarding agent.
 
+- Official it1 (`2026-10-23-qwen3-4b-p3-it1`) finished, all verdicts passed
+  under the old G4. Re-judged with the hard G4: replay warm 4.9x TTFT / 2.8x
+  req/s and replay cold 2.1x TTFT / 1.9x req/s vs baseline all pass; gsm8k
+  cold +8.3% / warm +7.4% wall time FAIL. Not accepted; it2 (async save)
+  targets exactly the gsm8k overhead. Details in Qwen3-4B/ITERATIONS.md.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

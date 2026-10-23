@@ -199,6 +199,27 @@ passes both checks; `G4.replay_cold.ttft_p50` (+26%), `G4.replay_cold.req_per_s`
 (-8%), `G4.gsm8k_cold.seconds` (+4.1%) and `G4.gsm8k_warm.seconds` (+3.2%) fail
 the 2% overhead bound. it1b is not accepted.
 
+### it1 official run under the hard G4 (2026-10-23)
+
+`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it1` (official, GPU1, connector code
+of 41fb158). Judged at run time with the old G4: every verdict passed (G0, all
+G2 digests 0 mismatch, gsm8k accuracy 0.858 = baseline, G3 oracle hit 0.992 /
+0.998, no eviction). Re-judged offline with `_perf_verdicts`:
+
+| check | v2 | baseline | verdict |
+|---|---|---|---|
+| replay warm TTFT p50 (warm2/3) | 0.515 / 0.524 s | 2.534 / 2.543 s | pass (4.9x) |
+| replay warm req/s | 9.60 / 9.55 | 3.44 / 3.43 | pass (2.8x) |
+| replay cold TTFT p50 | 1.333 s | 2.797 s | pass |
+| replay cold req/s | 6.15 | 3.29 | pass |
+| gsm8k cold seconds | 175.4 | 162.0 | FAIL (+8.3%) |
+| gsm8k warm seconds | 174.0 | 162.0 | FAIL (+7.4%) |
+
+At 32x12 the replay working set exceeds vLLM's GPU cache, so even the cold
+pass reloads earlier turns from PegaFlow and beats baseline; the 8x6 slice was
+too small to show this. The remaining failure is per-step save overhead on the
+short-prefix gsm8k workload, which is it2's target. it1 is not accepted.
+
 ## it2 (plan): no synchronous save wait
 
 Hypothesis: the `wait_for_save` path blocks the step on a full device sync
