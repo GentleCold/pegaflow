@@ -723,6 +723,26 @@ def test_warmup_shares_no_prefix_with_workload():
     ]
 
 
+@pytest.mark.parametrize(
+    "digested,skipped,ok",
+    [((0, 1), {}, True), ((1,), {}, False), ((0, 1), {"0": "MambaSpec: not digested"}, False)],
+    ids=["all-groups", "group-without-records", "group-skipped-by-probe"],
+)
+def test_every_transferred_group_must_be_digested(tmp_path, digested, skipped, ok):
+    """A hybrid model whose state group (e.g. Mamba) the probe cannot digest
+    fails G2: the digest checks would judge only the attention bytes."""
+    import json
+
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    spec = _spec(CKPT, FULL) | {"probe": {"digest_skipped_groups": skipped}}
+    (probe / "spec.json").write_text(json.dumps(spec))
+    (probe / "digest-pp0-tp0.jsonl").write_text("".join(json.dumps({"group": g}) + "\n" for g in digested))  # fmt: skip
+    v = run_gate.digest_groups(probe)
+    assert v["pass"] is ok, v
+    assert v["groups"] == [0, 1]
+
+
 # ------------------------------------------------------------ split invariance
 
 

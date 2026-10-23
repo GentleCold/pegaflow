@@ -1005,6 +1005,30 @@ def _digest_verdict(
     }
 
 
+def digest_groups(probe: Path) -> dict[str, Any]:
+    """G2.digest_groups: every group whose blocks a connector transfers (not
+    skipped by the oracle, not scratch) has digest records in the probe dir,
+    and the probe did not skip it. Otherwise G2's digest checks judge only
+    some of the loaded bytes (e.g. Mamba state) and a connector loading wrong
+    bytes into the others passes them."""
+    f = probe / "spec.json"
+    if not f.exists():
+        return {"pass": False, "reason": "spec dump missing"}
+    spec = json.loads(f.read_text())
+    skipped = spec.get("probe", {}).get("digest_skipped_groups", {})
+    seen: set[int] = set()
+    for d in probe.glob("digest-*.jsonl"):
+        for line in d.read_text().splitlines():
+            if line.strip():
+                seen.add(int(json.loads(line)["group"]))
+    need = [
+        gid for gid, (label, g, _) in enumerate(oracle.group_kinds(spec))
+        if g is not None and label != "scratch"
+    ]  # fmt: skip
+    missing = {str(gid): skipped.get(str(gid), "no digest record") for gid in need if gid not in seen or str(gid) in skipped}  # fmt: skip
+    return {"pass": bool(need) and not missing, "groups": need, "undigested": missing}
+
+
 def _hit_verdict(r: dict[str, Any] | None, workload: str) -> dict[str, Any]:
     if r is None:
         return {"pass": False, "reason": "not evaluated"}
@@ -1210,6 +1234,7 @@ def verdicts(
             "invariant": invariant,
         },
         "G2.digest_self.gsm8k": _digest_verdict(base.get("gsm8k", {}).get("digest_self"), None),
+        "G2.digest_groups": digest_groups(base_probe),
         **(
             {"G0.provenance": g0_provenance(run_dir, "baseline", pegaflow_dirs.get("baseline"))}
             if pegaflow_dirs is not None
@@ -1239,6 +1264,7 @@ def verdicts(
         if pegaflow_dirs is not None:
             g["G0.provenance"] = g0_provenance(run_dir, label, pegaflow_dirs.get(label))
         g["G2.digest_self.gsm8k"] = _digest_verdict(gsm and gsm["digest_self"], MIN_JUDGED_GSM8K)
+        g["G2.digest_groups"] = digest_groups(run_dir / label / "gsm8k" / "probe")
         vs_base = (
             digest_compare.compare(
                 base_probe, run_dir / label / "gsm8k" / "probe", invariant, split_inv
@@ -1259,7 +1285,9 @@ def verdicts(
             # only reported); the honest arm must pass every G2 check.
             digests = ("G2.digest_self.gsm8k", "G2.digest_vs_baseline.gsm8k")
             if label == "selftest-honest":
-                g["pass"] = all(g[k]["pass"] for k in (*digests, "G2.gsm8k_outputs"))
+                g["pass"] = all(
+                    g[k]["pass"] for k in (*digests, "G2.gsm8k_outputs", "G2.digest_groups")
+                )
                 g["expect"] = "pass every G2 check"
             else:
                 g["pass"] = not any(g[k]["pass"] for k in digests)

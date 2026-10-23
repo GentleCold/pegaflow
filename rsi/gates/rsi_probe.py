@@ -259,10 +259,14 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         mode = getattr(vllm_config.cache_config, "mamba_cache_mode", None)
         out = {}
         for gid, g in enumerate(self._groups):
-            if isinstance(g.kv_cache_spec, MambaSpec) and str(_jsonable(mode)) != "align":
+            if isinstance(g.kv_cache_spec, MambaSpec):
                 # Outside align mode a state block is the running state of the
-                # request, not the state at the block end.
-                out[gid] = f"MambaSpec with mamba_cache_mode={_jsonable(mode)}"
+                # request, not the state at the block end. In align mode the
+                # block-end states are freed (nulled in the request's block
+                # table) as compute moves on, so none is left at finish, where
+                # the probe digests: not digested either way (the gate fails
+                # an arm whose transferable group is undigested).
+                out[gid] = f"MambaSpec with mamba_cache_mode={_jsonable(mode)}: not digested"
         return out
 
     # ------------------------------------------------------------------ G0

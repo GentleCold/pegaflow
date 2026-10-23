@@ -375,6 +375,13 @@ the last accepted run record by hand until `--accepted` exists.
   unreferenced) >= 0.9` (`MIN_COMPUTED_COVERAGE`; warm is judged against the
   baseline's `split` pass). G2.digest_self.replay: same, with no
   judged-fraction floor (untagged conversations share prefixes).
+- G2.digest_groups (baseline and every arm, gsm8k probe): every group the
+  oracle scores (not skipped, not scratch) has digest records and is not in
+  `probe.digest_skipped_groups`. The probe lists every `MambaSpec` group
+  there (outside `mamba_cache_mode=align` a state block is the running
+  state; in align mode the block-end states are freed before finish, where
+  the probe digests), so a hybrid model fails G2 until Mamba state is
+  digested (the honest self-test needs it too).
 - G2.gsm8k: `|acc(pass) - acc(baseline cold)| <= 0.01` for cold and warm.
   G2.gsm8k_outputs (when gate.json declares invariance): every completion equals
   baseline cold, cold and warm; with `split_invariant=false`: every cold
@@ -400,7 +407,8 @@ the last accepted run record by hand until `--accepted` exists.
   An honest connector's warm hit ends at the last full prompt block, the
   baseline's at the few-shot prefix, so on such models warm outputs differ from
   baseline cold and computed copies differ across runs although every loaded
-  block is byte-exact. The flag is not declared by onboarding: the plain arm
+  block is byte-exact. Onboarding writes the flag in its model's gate.json
+  (on its own branch), but the run never trusts it: the plain arm
   (no connector, no probe) runs `split_ref` (the gsm8k prompts, greedy, with
   logprobs, after a reset + poison; hits end at the shared few-shot prefix)
   and `split` (same, but each request is preceded by the same prompt with
