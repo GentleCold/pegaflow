@@ -66,7 +66,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | todo |
+| P3 | onboard Qwen3-4B | it1 code done, GPU validation pending (.3 unreachable) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | todo |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -257,6 +257,23 @@ names, magic constants that only exist in the old code).
   unreachable from the jump host ("No route to host", .2 too). NEXT on resume:
   check whether the run finished (`summary.json`), else rerun the same command;
   read the old-arm verdicts, record them here, mark P0 done, start P3.
+- P3 plan (isolated onboarding agent, Qwen3-4B, record `docs/rsi/models/Qwen3-4B/ITERATIONS.md`):
+  - Spec dump: one `FullAttentionSpec` group, layout LBNHC, `block_stride == page`
+    (65536 B). In LBNHC a block is `[N tokens][H heads][K|V]`, so K and V are
+    interleaved and cannot be stored as two segments: declare ONE segment = the
+    whole page.
+  - New `adapters/full_attention.py`: `Group.full(block_size)`, `Heads` shard
+    (replicas beyond `max_tp_shards`), view checked to be dense pages at the
+    server's default block stride (the gRPC register path has no block stride),
+    else `Unsupported`. No policy profile needed (defaults apply).
+  - The core already matches vLLM 0.32 (block_state, transfer results,
+    MultiConnector, empty extra, `PEGAFLOW_PORT`). No semantics change needed.
+- P3 it1 written (`ITERATIONS.md` it1): `adapters/full_attention.py` + registry
+  entry, adapter tests in `test_connector_v2_core.py` (local stub run 66 passed,
+  41 native skipped; ruff clean), README adapter table, SKILL lessons. No core,
+  semantics or policy change. .3 still "No route to host" at the end. NEXT on
+  resume: sync, native unit run, then the it1 slice gate (command in
+  ITERATIONS.md), then the official run only if the slice passes.
 
 ## Semantics changelog
 

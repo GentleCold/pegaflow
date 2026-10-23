@@ -10,6 +10,7 @@ extension or server is needed. Cases marked ``native`` re-run against the real
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import random
 import sys
@@ -21,6 +22,7 @@ import pytest
 from pegaflow.connector_v2 import adapters
 from pegaflow.connector_v2.adapters import LayerDecl, LayerView, Parallel, Unsupported
 from pegaflow.connector_v2.core import Scheduler, StepPlan, Worker, build_layout
+from pegaflow.connector_v2.core.layout import _tp_ranks
 from pegaflow.connector_v2.core.scheduler import GroupSave, LoadPlan
 from pegaflow.connector_v2.policy import Policy, SaveItem, load_policy
 
@@ -810,3 +812,153 @@ def test_stub_matches_native():
             after = before + rng.randrange(0, 20)
             assert _needed(s, after) == tuple(native.needed(n, after))
             assert _saveable(s, before, after) == tuple(native.saveable(n, before, after))
+
+
+# ------------------------------------------------- adapters/full_attention.py
+@dataclass(frozen=True)
+class FullAttentionSpec:  # duck-typed vLLM 0.32 spec; the registry keys on the class name
+    """Defaults = docs/rsi/models/Qwen3-4B/spec.json (bf16, 8 kv heads x 128)."""
+
+    block_size: int = 16
+    num_kv_heads: int = 8
+    head_size: int = 128
+    page_size_bytes: int = 65536
+    max_tp_shards: int | None = None
+    dcp_sharded: bool = True
+    has_layer_views: bool = True
+    sliding_window: int | None = None
+    attention_chunk_size: int | None = None
+    page_size_padded: int | None = None
+    num_head_slots: int | None = None
+    state_content_bytes: int | None = None
+    tokens_per_state: int = 1
+    kv_quant_mode: int = 0
+
+
+@dataclass
+class FakeKV:
+    """The bits of a torch.Tensor the adapter reads; strides in elements."""
+
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    elem: int = 2
+
+    def stride(self):
+        return self.strides
+
+    def element_size(self):
+        return self.elem
+
+
+QWEN3_BLOCKS = 4745
+# vLLM 0.32 LBNHC layer view [B, H, N, C/2] in bf16 (probe spec dump, 4090 run).
+QWEN3_KV = FakeKV((QWEN3_BLOCKS, 8, 16, 256), (32768, 256, 2048, 1))
+
+
+@pytest.fixture
+def full_attention(monkeypatch, sem):
+    from pegaflow.connector_v2.adapters import full_attention as mod
+
+    adapter = mod.FullAttentionAdapter(sem)
+    monkeypatch.setattr(mod, "ADAPTER", adapter)
+    return adapter
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "kv,num_blocks",
+    [
+        pytest.param(QWEN3_KV, QWEN3_BLOCKS, id="qwen3-4b-LBNHC"),
+        pytest.param(FakeKV((10, 8, 16, 256), (32768, 4096, 256, 1)), 10, id="LBHNC"),
+        # Kernel blocks of 8 tokens split each 16-token manager block in two.
+        pytest.param(FakeKV((20, 8, 8, 256), (16384, 256, 2048, 1)), 10, id="kernel-split"),
+        # Block-outer layouts put the other layers' pages between our blocks.
+        pytest.param(FakeKV((10, 8, 16, 256), (36 * 32768, 256, 2048, 1)), None, id="BLNHC"),
+        pytest.param(FakeKV((10, 8, 16, 256), (32768, 256, 4096, 1)), None, id="holes"),
+        pytest.param(FakeKV((10, 8, 16, 128), (16384, 128, 1024, 1)), None, id="wrong-page"),
+    ],
+)
+def test_full_attention_view(sem, full_attention, kv, num_blocks):
+    spec = FullAttentionSpec()
+    if num_blocks is None:
+        with pytest.raises(Unsupported):
+            full_attention.view(spec, "l0", kv)
+        return
+    view = full_attention.view(spec, "l0", kv)
+    # One segment = the whole page: LBNHC interleaves K and V per token/head.
+    assert (view.num_blocks, view.bytes_per_block, view.kv_stride_bytes) == (
+        num_blocks,
+        65536,
+        65536,
+    )
+    assert view.tensor is kv
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "spec,par,shards",
+    [
+        pytest.param(FullAttentionSpec(), Parallel(), [(0, 1)], id="tp1"),
+        pytest.param(FullAttentionSpec(), Parallel(tp_size=2), [(0, 2), (1, 2)], id="tp2"),
+        # 4 ranks over 2 head shards: consecutive ranks hold replicas.
+        pytest.param(
+            FullAttentionSpec(max_tp_shards=2),
+            Parallel(tp_size=4),
+            [(0, 2), (0, 2), (1, 2), (1, 2)],
+            id="tp4-replicas",
+        ),
+    ],
+)
+def test_full_attention_layout(sem, full_attention, spec, par, shards):
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(3)]
+    cfg = types.SimpleNamespace(
+        transfer_group_ids=(0,),
+        kv_cache_groups=[types.SimpleNamespace(kv_cache_spec=spec, layer_names=names)],
+        hash_block_size=16,
+    )
+    layout = build_layout(cfg, par, {"model": "Qwen3-4B"}, semantics=sem)  # runs seal_plan
+    assert [(g.sem.kind, g.sem.block_tokens, g.hash_scale) for g in layout.groups] == [
+        ("full", 16, 1)
+    ]
+    decls = [full_attention.layer(spec, names[0], r) for r in _tp_ranks(par)]
+    assert {d.segments for d in decls} == {(65536,)}
+    assert [d.shard for d in decls] == [sem.Shard.heads(i, n) for i, n in shards]
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("sliding_window", 4096),
+        ("page_size_padded", 69632),
+        ("kv_quant_mode", 1),
+        ("num_head_slots", 4),
+        ("has_layer_views", False),
+    ],
+)
+def test_full_attention_rejects_unvalidated_specs(sem, full_attention, field, value):
+    spec = dataclasses.replace(FullAttentionSpec(), **{field: value})
+    with pytest.raises(Unsupported):
+        full_attention.group(spec)
+
+
+@BOTH
+def test_full_attention_registers_one_page_segment(sem, full_attention):
+    """Qwen3-4B worker registration as the server sees it (TP1, 36 layers)."""
+    spec = FullAttentionSpec()
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(36)]
+    cfg = types.SimpleNamespace(
+        transfer_group_ids=(0,),
+        kv_cache_groups=[types.SimpleNamespace(kv_cache_spec=spec, layer_names=names)],
+        hash_block_size=16,
+    )
+    layout = build_layout(cfg, Parallel(), {"model": "Qwen3-4B"}, semantics=sem)
+    rpc = FakeRpc()
+    worker = _worker(sem, rpc, [], layout=layout)
+    worker.register(dict.fromkeys(names, QWEN3_KV), dict.fromkeys(names, spec))
+    reg = rpc.registered
+    assert reg["names"] == names
+    assert set(reg["segments"]) == {1}
+    assert set(reg["bytes_per_block"]) == set(reg["kv_strides"]) == {65536}
+    assert set(reg["num_blocks"]) == {QWEN3_BLOCKS}
+    assert (reg["backend"], reg["page_first"], set(reg["group_ids"])) == ("direct", False, {0})

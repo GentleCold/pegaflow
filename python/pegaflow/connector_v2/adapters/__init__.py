@@ -77,7 +77,9 @@ class Adapter(Protocol):
 
 
 # vLLM KVCacheSpec class name -> module in this package that exposes ``ADAPTER``.
-_REGISTRY: dict[str, str] = {}
+_REGISTRY: dict[str, str] = {
+    "FullAttentionSpec": "full_attention",
+}
 
 
 def adapter_for(spec: Any, group_index: int) -> Adapter:

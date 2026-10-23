@@ -112,3 +112,20 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   baseline, acc 0; bitflip = exactly one mismatched block per request, outputs
   only partly differ (accuracy alone would miss it); offbyone = most external
   blocks mismatched, acc ~0.2.
+- The local vLLM checkouts are not 0.32 (no `transfer_group_ids`,
+  `KVCacheTensor.layer_stride`, `KVConnectorBlockState`). Read the real source
+  with `curl https://raw.githubusercontent.com/vllm-project/vllm/v0.32.0/<path>`
+  into `/tmp`. Key files: `v1/kv_cache_interface.py` (specs,
+  `create_kv_cache_views`), `v1/worker/utils.py` (`allocate_kv_cache`),
+  `v1/core/sched/scheduler.py`, `distributed/kv_transfer/kv_connector/v1/{base,multi_connector}.py`.
+- Derive segments from the spec dump's `kv_cache_layout` and the layer view
+  stride, not from "K then V". In vLLM 0.32 the page is `[H|N, N|H, C]` with
+  `C = K | V`, so K and V are interleaved and a page is ONE segment. The
+  server's gRPC register path has no block stride: block `b` sits at
+  `data_ptr + b * (segments * bytes_per_block)`. Only layer-compact layouts
+  (block stride == page) can be registered as is.
+- The worker gets manager-block views (vLLM keeps `kv_caches` for connectors),
+  but with kernel-block splitting dim 0 counts kernel blocks. Divide by
+  `block_size / N`.
+- Local default gate without uv: `python3 -m venv /tmp/rsi-venv && /tmp/rsi-venv/bin/pip install pytest ruff`.
+  This runs the stub cases only; the native cases need the remote venv.

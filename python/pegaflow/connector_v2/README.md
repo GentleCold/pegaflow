@@ -61,6 +61,12 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
    (see the `Adapter` protocol in `adapters/__init__.py`).
 3. Add one line to `_REGISTRY`: `"<Class>": "<name>"`.
 
+Registered adapters:
+
+| Spec class | Module | Declares | Onboarded by |
+|---|---|---|---|
+| `FullAttentionSpec` | `full_attention` | `Group.full(block_size)`; one segment = the whole page (K/V interleaved per cell); `Heads` shard, replicas beyond `max_tp_shards`; dense layer-compact pages only | Qwen3-4B (`docs/rsi/models/Qwen3-4B/ITERATIONS.md`) |
+
 The shared rules live in the semantics crate, so an adapter only declares
 facts: the dependency kind, the tokens per block, the bytes per segment, and
 the shard. It never decides what to load or save.
