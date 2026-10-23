@@ -456,9 +456,12 @@ Status: accepted for G0-G4 once the it2 code review passes; G5 pending.
 ## it2c (2026-10-23): it2 review fixes
 
 Review `docs/rsi/reviews/P3-qwen3-4b-it2.md` (APPROVE-WITH-FIXES). Commits
-50e186b, 056eb4b (connector_v2 + tests), this docs commit. Failure paths
-only: the measured path for Qwen3-4B is unchanged (async saves, sync short
-loads; the worker logs `saves=async`).
+50e186b, 056eb4b (connector_v2 + tests), this docs commit. Mostly failure
+paths, but two changes run on the measured Qwen3-4B path (corrected in it2d):
+the M1 hold delays the saves of every request that sync-loaded by
+`max_concurrent_batches` plans, and the S2 sync-load wait now sleeps
+20-200 us per poll instead of `sleep(0)`. Still async saves (`saves=async`)
+and sync short loads.
 
 ### Changes
 
@@ -611,3 +614,77 @@ and the held-out trace (70% async), and more so on the official trace
 - `sync_saves` layouts (zeroing or CoW) pay the full save wait on the step
   thread, i.e. it1's cost; when such a model is onboarded, measure it and
   find a cheaper ordering point.
+
+## it2d (2026-10-23): fail closed after a failed sync load
+
+it2c re-review (APPROVE-WITH-FIXES), M1': under vLLM's recompute policy
+`_handle_invalid_blocks` evicts nothing, and `_update_requests_with_invalid_blocks`
+rewinds only the first holder of a shared invalid block. The bad blocks and
+every block computed on them therefore stay prefix-cached under their correct
+hashes. A later request can extend them and save on top: a sharer's next turn,
+or a hit on the freed blocks of a rewound loader that was preempted or aborted
+before it recomputed. Per-request taint tracking cannot see these hits.
+
+Fix (8a05b7c, `connector_v2` only): the first non-empty `invalid_block_ids` in
+`update_connector_output` calls `Scheduler.on_load_errors`, which sets
+`_saves_disabled` and logs an error once; `plan_saves` returns before planning
+any save from then on (preemption flushes still run). The it2c taint sets
+(`_failed_blocks`, `_to_check`, `_tainted`) are gone; the hold of unconfirmed
+sync-loaded blocks for `max_concurrent_batches` plans stays, since it covers the
+steps before vLLM reports the failure. `max_concurrent_batches` now falls back
+to `pipeline_parallel_size + 1` when the config lacks it. Cost: no saves for the
+rest of the process after one failed sync load; no load error was seen in any
+run. Async failures stay as in it2c (vLLM resets the request before it runs).
+
+Tests: `test_sync_load_outcome_gates_saves[sync-ok|sync-failed-sharer-next-turn|sync-failed-loader-preempted]`;
+166 passed (`test_connector_v2_core.py`, `test_semantics_bindings.py`) on .44,
+ruff clean. The teardown backport df01403 (gate owner, fast-forwarded) passes
+`rsi/gates/test_teardown.py`.
+
+### it2d official run
+
+`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2d` (rev 8a05b7c, GPU4, separate
+remote tree `~/kexi/pegaflow-rsi-qwen3-it2d`, import path checked in
+vllm.log; arms plain, baseline, old, v2; 32 x 12 replay, full gsm8k).
+`official: true`. Every v2 verdict passes. `old` fails G4.gsm8k_warm (+3.4%);
+this branch's gate still counts `old` as a required verdict set, so the exit
+code is 1 for that reason only. The first attempt (`...-it2d-aborted1`) died in
+gate teardown (pegaflow-server with a 160 GB pool outlived `proc.wait(30)`
+after SIGKILL); the unchanged relaunch is the official run, and df01403 fixes
+the teardown for later runs.
+
+| check | v2 | old | baseline | v2 verdict |
+|---|---|---|---|---|
+| replay warm TTFT p50 (warm2/3) | 0.563 / 0.538 s | 0.677 / 0.601 s | 2.544 / 2.547 s | pass |
+| replay warm req/s (warm2/3) | 10.12 / 9.94 | 9.99 / 10.03 | 3.42 / 3.42 | pass |
+| replay cold TTFT p50 | 1.287 s | 1.334 s | 2.804 s | pass |
+| replay cold req/s | 6.70 | 6.75 | 3.26 | pass |
+| gsm8k cold seconds | 165.96 (+0.9%) | 166.73 (+1.4%) | 164.45 | pass |
+| gsm8k warm seconds | 164.29 (+0.0%) | 169.93 (+3.4%) | 164.28 | pass (old fails) |
+
+plain gsm8k: 141.6 / 142.0 s. it2 official (rev 2ff447e) for comparison:
+replay warm TTFT 0.541 / 0.552 s, gsm8k +0.9% / +0.0%.
+
+| arm / pass | local | external | total | H* | E_ext | excess |
+|---|---|---|---|---|---|---|
+| baseline gsm8k warm | 0.933 | 0 | 0.933 | 0.992 | 0 | 0 |
+| old gsm8k warm | 0.928 | 0.065 | 0.993 | 0.992 | 1.0 | 1170 |
+| v2 gsm8k warm | 0.920 | 0.072 | 0.992 | 0.992 | 1.0 | 0 |
+| baseline replay warm/2/3 | 0.378 | 0 | 0.378 | 0.998 | 0 | 0 |
+| old replay cold | 0.386 | 0.478 | 0.864 | 0.864 | 1.0 | 0 |
+| old replay warm/2/3 | ~0.36 | ~0.64 | 0.998 | 0.998 | 1.0 | 195 |
+| v2 replay cold | 0.381 | 0.484 | 0.864 | 0.864 | 1.0 | 0 |
+| v2 replay warm/2/3 | 0.348 | 0.650 | 0.998 | 0.998 | 1.0 | 0 |
+
+Digests: gsm8k 6643/6643 external (170178 local), replay 18545/18545 (8635
+local), 0 mismatched; gsm8k accuracy 0.8582 = baseline; 0 load errors, G3
+no_eviction passes. Save stats (second 500-step window): gsm8k 439 save steps,
+submit 16.3 ms, rpc 776 ms, max job 60 ms; replay 310 save steps, 102240
+blocks, submit 13.2 ms, rpc 1147 ms, max job 190 ms; both max 3 pending,
+0 flushes, 0 failed. No `sync load failed` / `saves disabled` line. External
+loads: replay 792 warm requests, 69 sync / 723 async, p50 3184 tokens; gsm8k
+1300 sync / 19 async.
+
+Status: G0-G4 accepted pending the it2d review
+(`docs/rsi/reviews/P3-qwen3-4b-it2d.md`); G5 waits for the gate rerun. `old`
+is a reference arm: its G4.gsm8k_warm failure is recorded, not fixed.

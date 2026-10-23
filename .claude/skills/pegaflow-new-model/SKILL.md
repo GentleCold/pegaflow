@@ -205,8 +205,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   and no block zeroing. A failed sync load has already fed the forward, and
   the server keeps the first copy of a key: hold every save of a request
   touching sync-loaded blocks until vLLM processed that step's output
-  (`max_concurrent_batches` plans), and never save from a request vLLM did
-  not rewind (a shared invalid block is recomputed by its first holder only).
+  (`max_concurrent_batches` plans), and after any reported failure stop all
+  saves for the process: under the recompute policy vLLM evicts nothing, so
+  KV computed on the bad blocks stays prefix-cached under correct hashes and
+  any later request can extend it (tracking "tainted" requests misses a
+  sharer's next turn and a preempted loader's freed blocks).
   Never give a sync load a deadline: the server's copy may still land.
 - A 64-question gsm8k slice cannot resolve a 2% bound (~10 s of wall time);
   use the full 1319 questions in slices when a G4 gsm8k check is the target.

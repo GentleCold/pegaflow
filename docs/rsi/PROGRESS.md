@@ -96,7 +96,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | it2 official run passes every G0-G4 verdict (`2026-10-23-qwen3-4b-p3-it2`); review APPROVE-WITH-FIXES, fixes done in it2c (slice + held-out pass); G5 pending (gate fixes + server reclaim) |
+| P3 | onboard Qwen3-4B | G0-G4 accepted pending review: it2d official run (`2026-10-23-qwen3-4b-p3-it2d`, rev 8a05b7c) passes every v2 verdict; it2d review running; G5 waits for the gate rerun |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -505,12 +505,15 @@ names, magic constants that only exist in the old code).
   gsm8k v2 163.8 s cold / 162.3 s warm (+0.2%), replay warm TTFT 0.094 vs
   0.210 s; hits unchanged (replay warm 0.998 = H*). Held-out replay
   `2026-10-23-qwen3-4b-p3-it2c-heldout` (convs 33..): all replay verdicts
-  pass. G4 numbers within 0.5 pp of slice2: no official rerun needed.
+  pass. (Corrected by the re-review: replay warm TTFT moved +3.2% / +6.0% vs
+  slice2, +1.4 / +2.6 pp vs baseline, and warm3 req/s -1.5 pp, so G4 was NOT
+  within 0.5 pp of slice2; official rerun `qwen3-4b-p3-it2d` instead.)
 
 - it2c done (50e186b, 056eb4b, 8af8fe4): all it2 review findings resolved
   (S4 partly: a hung save RPC still blocks, needs a server-side deadline).
-  Slice and held-out replay slice pass; G4 within 0.5 pp of slice2, so the
-  official it2 run stands. Independent re-review of it2c running; Qwen3-4B is
+  Slice and held-out replay slice pass. (The "G4 within 0.5 pp of slice2, the
+  official it2 run stands" claim was wrong for replay warm, see the it2c
+  re-review entry below.) Independent re-review of it2c running; Qwen3-4B is
   accepted for G0-G4 when it passes (G5 pending).
 - P4 DeepSeek-V2-Lite-Chat started on branch `feat/rsi-deepseek-v2-lite`
   (model PR, stacked on #473), TP=2 (31 GB bf16 does not fit one 4090),
@@ -548,6 +551,39 @@ names, magic constants that only exist in the old code).
   `cap_convs` auto-scales until C(0.5) >= 2x GPU KV (fixed 64x12 gives
   DSV2-Lite only 1.87x); GPU KV bytes from distinct tensors, not per group.
   Verified: G3 identical on 125 probe dirs, M1/M2/S1/S2/S3 fixed in code.
+
+- P3 it2d (8a05b7c): M1' fixed by failing closed. The first sync-load failure
+  vLLM reports (`invalid_block_ids`) disables all saves for the process: under
+  the recompute policy vLLM evicts nothing, so blocks computed on bad bytes
+  stay prefix-cached and any later request can extend them. Tests
+  `sync-failed-sharer-next-turn`, `sync-failed-loader-preempted`; 166 passed.
+  Teardown backport df01403 fast-forwarded (first official attempt
+  `...-it2d-aborted1` died in gate teardown; unchanged relaunch is official).
+  Official `2026-10-23-qwen3-4b-p3-it2d` (GPU4, `official: true`): every v2
+  verdict passes; `old` (reference) fails G4.gsm8k_warm +3.4%, recorded only
+  (this branch's gate counts it, so exit 1).
+
+  | G4 check | v2 | old | baseline |
+  |---|---|---|---|
+  | replay warm TTFT p50 (warm2/3) | 0.563 / 0.538 s | 0.677 / 0.601 s | 2.544 / 2.547 s |
+  | replay warm req/s (warm2/3) | 10.12 / 9.94 | 9.99 / 10.03 | 3.42 / 3.42 |
+  | replay cold TTFT p50 | 1.287 s | 1.334 s | 2.804 s |
+  | replay cold req/s | 6.70 | 6.75 | 3.26 |
+  | gsm8k cold s | 165.96 (+0.9%) | 166.73 (+1.4%) | 164.45 |
+  | gsm8k warm s | 164.29 (+0.0%) | 169.93 (+3.4%) | 164.28 |
+
+  | hits | local | ext | total | H* | E_ext | excess |
+  |---|---|---|---|---|---|---|
+  | baseline gsm8k warm | 0.933 | 0 | 0.933 | 0.992 | 0 | 0 |
+  | old gsm8k warm | 0.928 | 0.065 | 0.993 | 0.992 | 1.0 | 1170 |
+  | v2 gsm8k warm | 0.920 | 0.072 | 0.992 | 0.992 | 1.0 | 0 |
+  | baseline replay warm | 0.378 | 0 | 0.378 | 0.998 | 0 | 0 |
+  | old replay cold / warm | 0.386 / ~0.36 | 0.478 / ~0.64 | 0.864 / 0.998 | 0.864 / 0.998 | 1.0 | 0 / 195 |
+  | v2 replay cold / warm | 0.381 / 0.348 | 0.484 / 0.650 | 0.864 / 0.998 | 0.864 / 0.998 | 1.0 | 0 |
+
+  Save stats: 0 failed, 0 flushes, max 3 pending, step-thread submit 13-16 ms.
+  Qwen3-4B: G0-G4 accepted pending the it2d review; G5 waits for the gate
+  rerun.
 
 ## Semantics changelog
 
