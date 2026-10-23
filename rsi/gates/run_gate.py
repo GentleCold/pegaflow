@@ -74,6 +74,10 @@ ACC_TOL = 0.01
 MIN_EFFICIENCY = 0.95
 ORACLE_FLOOR = {"gsm8k": 0.5, "replay": 0.5}  # warm oracle hit rate, else E is vacuous
 MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are judged
+# G4: passes with nothing to reuse from PegaFlow (replay cold: vLLM's own
+# prefix cache serves the earlier turns; gsm8k: the shared few-shot prefix) can
+# only tie baseline, so they bound the connector's overhead; warm replay must win.
+MAX_OVERHEAD = 0.02
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 
 
@@ -494,10 +498,60 @@ def _hit_verdict(r: dict[str, Any] | None, workload: str) -> dict[str, Any]:
     }
 
 
-def _ttft(r: dict[str, Any] | None) -> list[float]:
-    if r is None:
-        return []
-    return [p["ttft_p50"] for n, p in r["passes"].items() if n.startswith("warm") and n != "warm"]
+def _median(xs: list[float]) -> float | None:
+    return statistics.median(xs) if xs else None
+
+
+def _cmp(mine: list[float], theirs: list[float], lower: bool, slack: float) -> dict[str, Any]:
+    """Median of ``mine`` vs median of ``theirs``. ``slack`` 0: strictly better;
+    otherwise at most ``slack`` (fraction) worse."""
+    a, b = _median(mine), _median(theirs)
+    if a is None or b is None:
+        ok = False
+    elif slack == 0:
+        ok = a < b if lower else a > b
+    else:
+        ok = a <= b * (1 + slack) if lower else a >= b * (1 - slack)
+    return {"pass": ok, "value": mine, "baseline": theirs, "slack": slack}
+
+
+def _perf_verdicts(
+    rep: dict[str, Any] | None,
+    base_rep: dict[str, Any] | None,
+    gsm: dict[str, Any] | None,
+    base_gsm: dict[str, Any] | None,
+    replay_ok: bool,
+) -> dict[str, Any]:
+    """G4 vs baseline vLLM. Replay numbers only count when the replay KV was
+    correct (``replay_ok``)."""
+
+    def passes(r: dict[str, Any] | None, names: tuple[str, ...], key: str) -> list[float]:
+        ps = (r or {}).get("passes", {})
+        return [ps[n][key] for n in names if n in ps and key in ps[n]]
+
+    def timed(r: dict[str, Any] | None) -> tuple[str, ...]:
+        ps = (r or {}).get("passes", {})
+        return tuple(n for n in ps if n.startswith("warm") and n != "warm")
+
+    g: dict[str, Any] = {}
+    for key, lower in (("ttft_p50", True), ("req_per_s", False)):
+        for name, names, slack in (
+            ("replay_warm", timed(rep), 0.0),
+            ("replay_cold", ("cold",), MAX_OVERHEAD),
+        ):
+            mine = passes(rep, names, key)
+            theirs = passes(base_rep, timed(base_rep) if name == "replay_warm" else names, key)
+            v = _cmp(mine, theirs, lower, slack)
+            v["pass"] = v["pass"] and replay_ok
+            g[f"G4.{name}.{key}"] = v
+    for name in ("cold", "warm"):
+        g[f"G4.gsm8k_{name}.seconds"] = _cmp(
+            passes(gsm, (name,), "seconds"),
+            passes(base_gsm, (name,), "seconds"),
+            True,
+            MAX_OVERHEAD,
+        )
+    return g
 
 
 def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path) -> dict[str, Any]:
@@ -593,14 +647,9 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
             "pass": bool(evicted) and not any(evicted.values()),
             "evicted": evicted,
         }
-        mine, theirs = _ttft(rep), _ttft(base.get("replay"))
-        g["G4.replay_warm_ttft"] = {
-            "pass": bool(mine and theirs)
-            and statistics.median(mine) < statistics.median(theirs)
-            and g["G2.digest_self.replay"]["pass"],
-            "ttft_p50": mine,
-            "baseline_ttft_p50": theirs,
-        }
+        g |= _perf_verdicts(
+            rep, base.get("replay"), gsm, base.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
+        )
         g["pass"] = all(x["pass"] for x in g.values() if isinstance(x, dict))
         v[label] = g
     v["baseline"]["pass"] = all(x["pass"] for x in v["baseline"].values() if isinstance(x, dict))

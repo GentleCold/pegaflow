@@ -56,7 +56,7 @@ Gate: `E >= 0.95` on the replay workload at the configured capacity, and no
 model's `H` drops vs. its last accepted iteration. Old connector's `H` on the same
 trace is recorded as a black-box reference number only.
 
-## G4 Performance (soft gate, RSI objective)
+## G4 Performance (hard gate, RSI objective)
 
 Workload: multi-turn agent traces (user-provided "agentx" — TBD; fallback
 `/ppio/data_sets/R2EGym-SFT-Trajectories` replayed as multi-turn chat with
@@ -66,8 +66,10 @@ Metrics: TTFT p50/p99, end-to-end throughput (req/s, output tok/s), load and
 save bandwidth (GB/s), connector scheduler-side CPU time per step, GPU memory
 overhead. Compared against baseline vLLM (no PegaFlow) and the old connector.
 
-Gate: warm TTFT p50 must beat baseline vLLM; no >5% regression vs. last accepted
-iteration of the same model.
+Gate (hard): warm replay TTFT p50 and throughput must beat baseline vLLM;
+cold replay and gsm8k may be at most 2% worse than baseline (see G4 under
+precise definitions); no >5% regression vs. last accepted iteration of the
+same model.
 
 ## Run record
 
@@ -195,9 +197,19 @@ the last accepted run record by hand until `--accepted` exists.
   pass (the oracle has unlimited capacity). The server runs with
   `--pool-size 160gb --disable-numa-affinity` (per-NUMA pools give one GPU only
   `pool_size / numa_nodes`).
-- G4.replay_warm_ttft: median over the timed warm passes of `ttft_p50` < the
-  same for baseline; reported with every pass value; void if
-  G2.digest_self.replay fails.
+- G4 (hard since 2026-10-23, user: "性能需要达标才行，需要比基准快"; every
+  check is against the baseline arm on the same run, medians over the listed
+  passes, `MAX_OVERHEAD = 0.02`):
+  - `G4.replay_warm.ttft_p50` / `.req_per_s`: timed warm passes (warm2..N)
+    strictly better than baseline's.
+  - `G4.replay_cold.ttft_p50` / `.req_per_s`: cold pass at most 2% worse than
+    baseline's cold (nothing to load yet; vLLM's own prefix cache serves the
+    earlier turns, so cold can only tie; this bounds the save cost).
+  - `G4.gsm8k_cold.seconds` / `G4.gsm8k_warm.seconds`: wall time at most 2%
+    worse than baseline (the shared few-shot prefix stays in vLLM's local
+    cache, so gsm8k bounds per-step connector overhead).
+  - Replay G4 checks are void (fail) if G2.digest_self.replay fails. p99 values
+    are recorded in pass results but not gated.
 - Self-test arms (`rsi/gates/selftest/connector.py`, full-attention groups
   only): `honest` saves at finish and loads saved prefixes (must pass every G2
   check); `liar` claims every complete unit and loads nothing; `bitflip` flips
