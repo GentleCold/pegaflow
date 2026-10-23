@@ -422,6 +422,29 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
     Ok((copies, total_bytes))
 }
 
+/// Enqueue a batch of copies, then wait until the stream has drained, on
+/// success and on failure alike.
+///
+/// A backend can fail after it enqueued part of the batch. The caller drops
+/// the host buffers as soon as this returns, so returning before those copies
+/// finish would let the GPU read or write freed pinned memory that the pool may
+/// already have handed to another block.
+fn submit_and_wait(
+    stream: &Arc<CudaStream>,
+    submit: impl FnOnce() -> Result<(), String>,
+) -> Result<(), EngineError> {
+    let submitted = submit();
+    let drained = stream
+        .synchronize()
+        .map_err(|e| format!("Failed to synchronize: {e:?}"));
+    match (submitted, drained) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(EngineError::Storage(e)),
+        (Ok(()), Err(sync)) => Err(EngineError::Storage(sync)),
+        (Err(e), Err(sync)) => Err(EngineError::Storage(format!("{e}; {sync}"))),
+    }
+}
+
 /// Process a load task: copy blocks from CPU pinned memory to GPU for multiple
 /// layers. All layers and segments are collected into one descriptor batch,
 /// handed to a single backend (memcpy or kernel), then synchronized once.
@@ -438,15 +461,7 @@ fn process_load_task(
 
     let (copies, total_bytes) = build_copy_descs(layers)?;
 
-    backend.h2d(&copies, stream).map_err(EngineError::Storage)?;
-
-    // Wait for all transfers to complete
-    let event = stream
-        .record_event(None)
-        .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
-    event
-        .synchronize()
-        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e:?}")))?;
+    submit_and_wait(stream, || backend.h2d(&copies, stream))?;
 
     let elapsed = start.elapsed();
     let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
@@ -491,15 +506,8 @@ fn process_save_task(
 
     let (copies, total_bytes) = build_copy_descs(layers)?;
 
-    backend.d2h(&copies, stream).map_err(EngineError::Storage)?;
-
     // Single synchronization for all layers
-    let event = stream
-        .record_event(None)
-        .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
-    event
-        .synchronize()
-        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e:?}")))?;
+    submit_and_wait(stream, || backend.d2h(&copies, stream))?;
 
     let elapsed = start.elapsed();
     let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
@@ -520,4 +528,62 @@ fn process_save_task(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transfer::MemcpyBackend;
+    use cudarc::driver::sys;
+
+    /// A batch that fails part-way must still be drained before the caller
+    /// frees the host buffers: the copy enqueued before the failure has landed
+    /// when `submit_and_wait` returns its error.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn failed_submit_drains_copies_already_enqueued() {
+        const LEN: usize = 64 << 20;
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.new_stream().expect("stream");
+        let backend = MemcpyBackend::per_range();
+
+        let mut host: *mut std::ffi::c_void = std::ptr::null_mut();
+        let r = unsafe { sys::cuMemHostAlloc(&mut host, LEN, 0) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuMemHostAlloc");
+        let mut device: sys::CUdeviceptr = 0;
+        let r = unsafe { sys::cuMemAlloc_v2(&mut device, LEN) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuMemAlloc");
+        let r = unsafe { sys::cuMemsetD8_v2(device, 0xA5, LEN) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuMemsetD8");
+        let host = host as *mut u8;
+        unsafe { std::ptr::write_bytes(host, 0, LEN) };
+
+        let copy = |device: u64, host: *mut u8, size: usize, alloc: usize| CopyDesc {
+            device,
+            host,
+            host_device: 0,
+            size,
+            device_allocation: alloc,
+            host_allocation: alloc,
+        };
+        // A large valid D2H copy, then one the driver rejects (null host).
+        let copies = [
+            copy(device, host, LEN, 0),
+            copy(device, std::ptr::null_mut(), 4096, 1),
+        ];
+        let result = submit_and_wait(&stream, || backend.d2h(&copies, &stream));
+        assert!(result.is_err(), "the null host copy must fail");
+
+        // SAFETY: `host` holds LEN bytes and no copy targets it any more.
+        let landed = unsafe { std::slice::from_raw_parts(host, LEN) };
+        assert!(
+            landed.iter().all(|&b| b == 0xA5),
+            "the enqueued copy finished before the error was returned"
+        );
+
+        unsafe {
+            sys::cuMemFree_v2(device);
+            sys::cuMemFreeHost(host as *mut _);
+        }
+    }
 }
