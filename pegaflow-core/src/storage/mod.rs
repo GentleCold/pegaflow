@@ -399,7 +399,7 @@ impl StorageEngine {
         let mut out = self.allocator.allocate_many(size, count, node);
         while out.len() < count {
             out.push(self.allocate(size, numa_node)?);
-            // Reclaim usually frees far more than one region; take the rest in bulk.
+            // Reclaim may free more than one region; take the rest in bulk.
             let more = self.allocator.allocate_many(size, count - out.len(), node);
             out.extend(more);
         }

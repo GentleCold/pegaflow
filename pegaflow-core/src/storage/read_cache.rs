@@ -131,22 +131,24 @@ impl ReadCache {
     }
 
     /// Scan cache for a prefix of `keys`, stopping at the first miss.
+    ///
+    /// Hits are refreshed back to front: every later block of a prefix needs
+    /// the earlier ones, so the head must not be the first to age out.
     pub(super) fn get_prefix_blocks(&self, keys: &[BlockKey]) -> (usize, Vec<Arc<SealedBlock>>) {
-        let mut hit = 0usize;
         let mut blocks = Vec::with_capacity(keys.len());
         {
             let mut inner = self.inner.lock();
             for key in keys {
-                if let Some(block) = inner.cache.get(key) {
-                    refresh_recency(&mut inner, key);
-                    hit += 1;
-                    blocks.push(block);
-                } else {
+                let Some(block) = inner.cache.get(key) else {
                     break;
-                }
+                };
+                blocks.push(block);
+            }
+            for key in keys[..blocks.len()].iter().rev() {
+                refresh_recency(&mut inner, key);
             }
         }
-        (hit, blocks)
+        (blocks.len(), blocks)
     }
 
     pub(super) fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
@@ -958,6 +960,28 @@ mod tests {
         );
         assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
         assert_class(&cache, &hit, ResidentClass::Reclaimable);
+    }
+
+    #[test]
+    fn prefix_hit_ages_the_tail_before_the_head() {
+        // Every later block of a prefix depends on the earlier ones: after a
+        // prefix hit the tail goes first and the head is the most recent.
+        let cache = make_cache();
+        let keys: Vec<BlockKey> = (0..4u8)
+            .map(|i| BlockKey::new("ns".into(), vec![i]))
+            .collect();
+        cache.batch_insert(keys.iter().map(|k| (k.clone(), make_block())).collect());
+
+        // Blocks 0..3 hit, block 3 is the first miss.
+        let missing = BlockKey::new("ns".into(), vec![9]);
+        let query = [&keys[..3], std::slice::from_ref(&missing)].concat();
+        assert_eq!(cache.get_prefix_blocks(&query).0, 3);
+
+        let order: Vec<BlockKey> = (0..4).map(|_| cache.remove_lru_batch(1)[0].0.clone()).collect();
+        assert_eq!(
+            order,
+            [&keys[3], &keys[2], &keys[1], &keys[0]].map(Clone::clone)
+        );
     }
 
     #[test]
