@@ -698,6 +698,18 @@ def test_pool_check_fails_before_an_evicting_store(pool, fits):
             run_gate.check_pool(args, u)
 
 
+def test_contamination_marks_not_drops():
+    rep = lambda **p: {"replay": {"passes": {k: {"ttft_p99": v} for k, v in p.items()}}}  # noqa: E731
+    results = {
+        "baseline": rep(cold=1.0, warm2=0.5, warm3=0.5),
+        "old": rep(cold=9.0, warm2=6.0, warm3=0.4),
+        "X": rep(cold=1.0, warm=50.0, warm2=0.5, warm3=5.0, _warmup=99.0),
+    }
+    got = {(c["arm"], c["pass"]) for c in run_gate.contamination(results)}
+    # 9x and exactly 10x pass; 12x is flagged; untimed warm / _warmup ignored.
+    assert got == {("old", "warm2")}
+
+
 def test_warmup_shares_no_prefix_with_workload():
     from rsi.gates import workloads
 

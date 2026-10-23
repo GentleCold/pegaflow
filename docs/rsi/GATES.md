@@ -223,8 +223,11 @@ shots, 32 x 12 replay, 3 replay passes, pinned scheduler flags), the arms
 (`gsm8k`, `replay`, `cap`; cap `auto` x 12 at fractions 0.25,0.5,0.75), the G5
 capacity floor (`C(0.5) >= 2 x` GPU KV bytes), no
 `--num-gpu-blocks`/`--vllm-arg` override, and committed
-`docs/rsi/models/<model>/{gate.json,spec.json}`. `summary.json` lists
-`not_official_because`. A required verdict that cannot be evaluated is a fail.
+`docs/rsi/models/<model>/{gate.json,spec.json}`. A run is also not official
+when it is contaminated: any arm's G4-timed replay pass (`cold`, `warm2..`)
+has p99 TTFT `> 10x` the in-run baseline's p99 for the same pass
+(`summary.contamination`; the pass is kept and still judged, never
+dropped). `summary.json` lists `not_official_because`. A required verdict that cannot be evaluated is a fail.
 Required verdicts: `baseline` and the connector under test, including
 `G2.digest_self.cap` and `G5.replay_warm`. Not required (`required: false`,
 every verdict recorded): `old` (black-box reference), `native` and `lmcache`. A crash of

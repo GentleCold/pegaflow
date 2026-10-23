@@ -1510,6 +1510,30 @@ def g5_problems(v: dict[str, Any], floor: dict[str, Any], plan: dict[str, Any] |
     return out
 
 
+CONTAMINATION_P99 = 10.0  # x the baseline's p99 TTFT of the same pass
+
+
+def contamination(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """G4-timed replay passes whose p99 TTFT exceeds ``CONTAMINATION_P99`` x the
+    in-run baseline's p99 for the same pass: a stall from outside the arm
+    (another process's pinned-pool allocation, JIT, a shared GPU) is not a
+    G4 measurement. Nothing is dropped: the run becomes non-official."""
+    base = results.get("baseline", {}).get("replay", {}).get("passes", {})
+    out = []
+    for label, per in results.items():
+        if label == "baseline":
+            continue
+        for name, p in per.get("replay", {}).get("passes", {}).items():
+            b = base.get(name, {}).get("ttft_p99")
+            mine = p.get("ttft_p99") if isinstance(p, dict) else None
+            # G4-timed passes only: cold, warm2.. (``warm`` is the digested one).
+            if name.startswith("_") or name == "warm" or not b or mine is None:
+                continue
+            if mine > CONTAMINATION_P99 * b:
+                out.append({"arm": label, "pass": name, "ttft_p99": mine, "baseline_p99": b})
+    return out
+
+
 def official_problems(
     args, arms: list[str], wls: list[str], gate_file: Path, committed: Path
 ) -> list[str]:
@@ -1792,6 +1816,12 @@ def main(argv: list[str] | None = None) -> int:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
     problems = official_problems(args, arms, wls, gate_file, committed)
+    contaminated = contamination(results)
+    problems += [
+        f"contaminated: {c['arm']} replay/{c['pass']} p99 TTFT {c['ttft_p99']:.3g}s > "
+        f"{CONTAMINATION_P99:g}x baseline {c['baseline_p99']:.3g}s"
+        for c in contaminated
+    ]
     if "under_test" in prov and not prov["under_test"]["verified"]:
         problems.append(
             f"connector under test {prov['under_test']['root']} at an unverified rev"
@@ -1811,6 +1841,7 @@ def main(argv: list[str] | None = None) -> int:
         "under_test_rev": prov.get("under_test", {}).get("rev"),
         "provenance": prov,
         "pool_checks": pool_checks,
+        "contamination": contaminated,
         "args": vars(args),
         "gate": gate,
         "official": not problems,
