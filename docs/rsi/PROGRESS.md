@@ -341,6 +341,9 @@ names, magic constants that only exist in the old code).
   req/s and replay cold 2.1x TTFT / 1.9x req/s vs baseline all pass; gsm8k
   cold +8.3% / warm +7.4% wall time FAIL. Not accepted; it2 (async save)
   targets exactly the gsm8k overhead. Details in Qwen3-4B/ITERATIONS.md.
+  Save stats: device sync ~50% of each 500-step window (e.g. 10.5 s of 19.0 s
+  on gsm8k), save RPC ~1.5%, 0 failed saves. Decision (timer check): stay on
+  P3, it2 (async save) continues; P4 starts only after it2 is accepted.
 
 - p0-final (`2026-10-23-qwen3-4b-p0-final`, arms plain/baseline/old) done:
   baseline controls pass; the `old` reference arm passes every G0-G3 check

@@ -220,6 +220,25 @@ pass reloads earlier turns from PegaFlow and beats baseline; the 8x6 slice was
 too small to show this. The remaining failure is per-step save overhead on the
 short-prefix gsm8k workload, which is it2's target. it1 is not accepted.
 
+Hit numbers (official): gsm8k warm oracle hit 0.992, replay warm oracle hit
+0.998, `E_ext` 1.0 on both, excess within one block per request, no eviction,
+digests 0 mismatched (gsm8k 6773 external blocks, replay 18286).
+
+Save stats from the official vLLM logs (`save stats` lines, 500-step windows):
+
+| workload | window | save steps | sync ms | rpc ms | avg ms / save step |
+|---|---|---|---|---|---|
+| gsm8k | 19.0 s | 429/500 | 10474 | 293 | 25.1 |
+| gsm8k | 19.3 s | 419/500 | 9929 | 287 | 24.4 |
+| gsm8k | 17.7 s | 314/500 | 8719 | 212 | 28.4 |
+| replay | 13.2 s | 281/500 | 8534 | 199 | 31.1 |
+| replay | 19.6 s | 325/500 | 8818 | 217 | 27.8 |
+
+The device sync is ~50% of wall time in each window and the RPC ~1.5%, so the
+synchronous wait in `Worker.save` explains the gsm8k overhead; it2 removes it.
+Reference: the black-box `old` arm (p0-final) is within +0.4% of baseline on
+gsm8k cold, so the 2% bound is reachable.
+
 ## it2 (plan): no synchronous save wait
 
 Hypothesis: the `wait_for_save` path blocks the step on a full device sync
