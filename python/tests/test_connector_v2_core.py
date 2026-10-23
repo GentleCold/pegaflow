@@ -1331,3 +1331,145 @@ def test_namespace_covers_page_byte_order(sem, full_attention):
     hnc = _layout_of(sem, FullAttentionSpec(), kv_cache_layout="LBHNC")
     assert nhc.namespace != hnc.namespace
     assert nhc.namespace == _layout_of(sem, FullAttentionSpec()).namespace
+
+
+# ---------------------------------------------------------------- adapters/mamba.py
+@dataclass(frozen=True)
+class MambaSpec:  # duck-typed vLLM 0.32 spec; the registry keys on the class name
+    """Defaults = docs/rsi/models/Qwen3.5-4B/spec.json (GDN, align, page padded)."""
+
+    block_size: int = 528
+    shapes: tuple[tuple[int, ...], ...] = ((3, 8192), (32, 128, 128))
+    dtypes: tuple[str, ...] = ("bfloat16", "float32")
+    page_size_bytes: int = 2162688
+    mamba_cache_mode: str = "align"
+    num_speculative_blocks: int = 0
+    num_prefill_checkpoint_blocks: int = 0
+    prefill_checkpoint_alignment: int | None = None
+    num_heads: int = 1
+    tokens_per_state: int = -1
+    tp_replicated: bool = False
+    has_layer_views: bool = True
+
+
+QWEN35_BLOCKS = 481
+QWEN35_REAL = 2146304
+# vLLM 0.32 raw Mamba layer view [B, 1, 1, real] int8, pages padded to 2162688.
+QWEN35_KV = FakeKV((QWEN35_BLOCKS, 1, 1, QWEN35_REAL), (2162688, QWEN35_REAL, QWEN35_REAL, 1), 1)
+
+
+@pytest.fixture
+def mamba(monkeypatch, sem):
+    from pegaflow.connector_v2.adapters import mamba as mod
+
+    adapter = mod.MambaAdapter(sem)
+    monkeypatch.setattr(mod, "ADAPTER", adapter)
+    return adapter
+
+
+@BOTH
+def test_mamba_declares_one_padded_page_checkpoint(sem, mamba):
+    spec = MambaSpec()
+    g = mamba.group(spec)
+    assert (g.kind, g.block_tokens) == ("checkpoint", 528)
+    decl = mamba.layer(spec, "layers.0.linear_attn", Parallel())
+    # The copy unit is the block stride: the server addresses data_ptr + b * bytes_per_block.
+    assert decl.segments == (2162688,)
+    assert decl.layout == (((3, 8192), "bfloat16"), ((32, 128, 128), "float32"))
+    view = mamba.view(spec, "layers.0.linear_attn", QWEN35_KV)
+    assert (view.num_blocks, view.bytes_per_block, view.kv_stride_bytes) == (
+        QWEN35_BLOCKS,
+        2162688,
+        2162688,
+    )
+    tp2 = [mamba.layer(spec, "l", Parallel(tp_rank=r, tp_size=2)).shard for r in (0, 1)]
+    assert tp2 == [sem.Shard.heads(0, 2), sem.Shard.heads(1, 2)]
+    replicated = dataclasses.replace(spec, tp_replicated=True)
+    assert mamba.layer(replicated, "l", Parallel(tp_size=2)).shard == sem.Shard.replicated()
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("mamba_cache_mode", "none"),
+        ("num_speculative_blocks", 1),
+        ("num_prefill_checkpoint_blocks", 2),
+        ("tokens_per_state", 16),
+        ("has_layer_views", False),
+        ("page_size_bytes", 2146303),  # states do not fit the page
+    ],
+)
+def test_mamba_rejects_unvalidated_specs(sem, mamba, field, value):
+    spec = dataclasses.replace(MambaSpec(), **{field: value})
+    with pytest.raises(Unsupported):
+        mamba.group(spec)
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "kv",
+    [
+        # Block-outer layouts put other layers' pages between our blocks.
+        pytest.param(
+            FakeKV((10, 1, 1, QWEN35_REAL), (8 * 2162688, QWEN35_REAL, QWEN35_REAL, 1), 1),
+            id="block-outer",
+        ),
+        pytest.param(FakeKV((10, 1, 1, 2097152), (2162688, 2097152, 2097152, 1), 1), id="ssm-only"),
+        pytest.param(FakeKV((10, 3, 8192), (2162688, 8192, 1), 1), id="not-4d"),
+    ],
+)
+def test_mamba_view_rejects_foreign_geometry(sem, mamba, kv):
+    with pytest.raises(Unsupported):
+        mamba.view(MambaSpec(), "l0", kv)
+
+
+def _qwen35_cfg():
+    """docs/rsi/models/Qwen3.5-4B/spec.json: 3 GDN groups + 1 attention group, block 528."""
+    attn = FullAttentionSpec(block_size=528, num_kv_heads=4, head_size=256, page_size_bytes=2162688)
+    groups = [
+        types.SimpleNamespace(
+            kv_cache_spec=MambaSpec(),
+            layer_names=[f"layers.{i}.linear_attn" for i in range(g, 32, 4)],
+        )
+        for g in range(3)
+    ]
+    groups.append(
+        types.SimpleNamespace(
+            kv_cache_spec=attn, layer_names=[f"layers.{i}.self_attn.attn" for i in range(3, 32, 4)]
+        )
+    )
+    return types.SimpleNamespace(
+        transfer_group_ids=(0, 1, 2, 3),
+        kv_cache_groups=groups,
+        hash_block_size=528,
+        kv_cache_layout="LBNHC",
+    )
+
+
+@BOTH
+def test_qwen35_layout_waits_for_core_checkpoint_support(sem, mamba, full_attention):
+    """Adapters exist for every group, so init fails on the core gap, not 'no adapter'."""
+    with pytest.raises(Unsupported, match="boundary_state_offloads"):
+        build_layout(_qwen35_cfg(), Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
+
+
+@BOTH
+@pytest.mark.parametrize("tp", [1, 2])
+def test_qwen35_declarations_seal(sem, mamba, full_attention, tp):
+    """V0 for the hybrid layout: every rank's GDN + attention regions seal."""
+    cfg = _qwen35_cfg()
+    ranks = []
+    for r in range(tp):
+        par = Parallel(tp_rank=r, tp_size=tp)
+        regions = []
+        for sid, g in enumerate(cfg.kv_cache_groups):
+            spec = g.kv_cache_spec
+            if tp > 1 and isinstance(spec, FullAttentionSpec):
+                spec = dataclasses.replace(spec, num_kv_heads=2, page_size_bytes=1081344)
+            adapter = mamba if isinstance(spec, MambaSpec) else full_attention
+            for name in g.layer_names:
+                d = adapter.layer(spec, name, par)
+                regions.append(sem.Region(name, sid, [int(s) for s in d.segments], d.shard))
+        ranks.append((r, regions))
+    sem.seal_plan(ranks)

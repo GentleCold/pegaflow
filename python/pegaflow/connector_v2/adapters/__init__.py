@@ -51,6 +51,9 @@ class LayerDecl:
     shard: Any  # semantics.Shard
     transfer_backend: str = "direct"  # "direct" | "kernel"
     page_first: bool = False  # all layers of a block in one page per rank
+    # Byte-order facts the segment sizes do not carry (e.g. the packed state
+    # shapes/dtypes of a Mamba page); hashed into the namespace, never read.
+    layout: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,7 @@ class Adapter(Protocol):
 # vLLM KVCacheSpec class name -> module in this package that exposes ``ADAPTER``.
 _REGISTRY: dict[str, str] = {
     "FullAttentionSpec": "full_attention",
+    "MambaSpec": "mamba",
 }
 
 

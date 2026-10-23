@@ -130,6 +130,7 @@ Registered adapters:
 | Spec class | Module | Declares | Onboarded by |
 |---|---|---|---|
 | `FullAttentionSpec` | `full_attention` | `Group.full(block_size)`; one segment = the whole page (K/V interleaved per cell); `Heads` shard, replicas beyond `max_tp_shards` (checked against `kv_tp_replicas`); dense layer-compact pages only, no kernel-split HNC pages; rejects window, chunked, padded, packed, quantized and `non_causal` specs | Qwen3-4B (`docs/rsi/models/Qwen3-4B/ITERATIONS.md`) |
+| `MambaSpec` | `mamba` | `Group.checkpoint(block_size)`; one segment = the whole (padded) state page; state shapes/dtypes in `LayerDecl.layout`; `Heads` shard (or `Replicated` for `tp_replicated`); `align` mode only, rejects speculative/prefill-checkpoint blocks, per-token states, DCP. Draft: the core still rejects checkpoint groups | Qwen3.5-4B (draft, `docs/rsi/models/Qwen3.5-4B/ITERATIONS.md`) |
 
 The shared rules live in the semantics crate, so an adapter only declares
 facts: the dependency kind, the tokens per block, the bytes per segment, and

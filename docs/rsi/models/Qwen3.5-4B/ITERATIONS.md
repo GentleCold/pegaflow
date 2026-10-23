@@ -176,3 +176,61 @@ The adapter and core need these changes (it1, after the gate fix):
   so the stored checkpoint density is what bounds H* for this model. G5
   (capacity) then decides whether saving every chunk-end state is worth its
   2 MB per GDN layer per boundary.
+
+### Save offers: what vLLM actually hands the connector
+
+Read after the mapping above (`v1/core/single_type_kv_cache_manager.py:430-443, 1860-2000`):
+- `boundary_state_offloads` entries come from `MambaManager.cache_blocks`
+  for blocks that got a hash, plus a CoW-preserved partial tail. With the
+  default `prefix_cache_retention_interval=0` only the replay boundary and
+  shared-prefix junctions are hashed, so only those are offered. Denser
+  external checkpoints need `--prefix-cache-retention-interval 528` (or
+  `None`, dense), which also changes vLLM's own retention. That is a run
+  setting for gate.json and the model profile, not a semantics change.
+- vLLM's docstring: offered blocks "are not kept alive by the request
+  block table for the whole request, so a caller that reads them
+  asynchronously must pin them first". `pop_blocks_for_free` drops
+  not-yet-taken offers of a freed request.
+- vLLM's OffloadingConnector fences the offered block id and flushes the
+  job if the scheduler re-allocates that block.
+- For this model `needs_kv_cache_zeroing` is True, so
+  `may_zero_or_copy_blocks` already makes the v2 core save synchronously
+  in `wait_for_save`, after the forward that wrote the state. If the offer
+  for a boundary arrives in the same step whose forward writes it, a sync
+  save needs no extra fence. This ordering is not verified yet; it1 checks
+  it on GPU4 with a slice.
+
+### Adapter draft (it0, no core change)
+
+`python/pegaflow/connector_v2/adapters/mamba.py`, registered for `MambaSpec`:
+- `group`: `Group.checkpoint(block_size)`.
+- `layer`: one segment = `page_size_bytes` (2162688, padded). The server
+  addresses block b at `data_ptr + b * bytes_per_block` (the gRPC register
+  path passes no block stride), so the copy unit must equal the page
+  stride. Storing the 16384 B padding costs 0.76% and needs no server
+  change. Shard `Heads(tp_rank, tp_size)`, or `Replicated` when
+  `tp_replicated`.
+- `layout`: state shapes/dtypes, through a new namespace-only
+  `LayerDecl.layout` field. It is appended to the namespace fingerprint only
+  when non-empty, so existing namespaces do not move.
+- `view`: checks vLLM's raw `[B, 1, 1, real]` int8 view with pages `page`
+  bytes apart. Verified on .44 (CPU, `create_kv_cache_views`) for LBNHC,
+  LBHNC, BLNHC and BLHNC: all give stride `(2162688, ...)` for a group
+  tensor.
+- Rejects `mamba_cache_mode != "align"`, speculative or prefill-checkpoint
+  blocks, `tokens_per_state > 0`, `num_heads != 1`, DCP, no layer views,
+  and states larger than the page.
+
+`build_layout` still raises `Unsupported(... boundary_state_offloads)` for
+checkpoint groups. The test pins that Qwen3.5-4B now fails there and not at
+"no adapter".
+
+Tests (`test_connector_v2_core.py`, stub specs from spec.json, stub +
+native semantics): declaration and view, rejected fields, foreign
+geometry, layout failure at the core gap, and V0 `seal_plan` of the full
+hybrid layout at TP1/TP2. 158 passed on .44 (CPU only). The full default
+gate gives 545 passed and 1 failed: `test_e2e_version_preflight`
+compares the remote tree's installed version, unrelated.
+
+Kind: none new. Checkpoint covers align mode. The open items are core
+work: save from offers, always load the state at p, and fences.

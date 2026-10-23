@@ -98,7 +98,7 @@ names, magic constants that only exist in the old code).
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 pending (G5 r3 official) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
-| P5 | onboard Qwen3.5-4B | todo |
+| P5 | onboard Qwen3.5-4B | it0 (`feat/rsi-qwen3.5-4b`): spec dump, mapping, adapter draft; blocked on core checkpoint saves and `feat/rsi-gate-hybrid` |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ## Log
@@ -622,6 +622,17 @@ names, magic constants that only exist in the old code).
     0.518 s. Kernel rejected.
   - The batched-submit lever (native: 21.9 GB/s) is server-owned, so the
     numbers went to the server agent. P3 it3 stops.
+- P5 it0 (Qwen3.5-4B, `feat/rsi-qwen3.5-4b`):
+  - Spec dump: 3 `MambaSpec` (GDN, align) groups + 1 `FullAttentionSpec`,
+    block 528, aliased 2162688 B pages. Self-test stopped at the honest
+    arm's `NotImplementedError` for MambaSpec; the probe digested group 3
+    only. Gate items 1-4 accepted, built on `feat/rsi-gate-hybrid` after
+    feat/rsi-g5 (940def4 already fails G2 on undigested groups).
+  - Mapping: GDN = `Kind::Checkpoint(528)`, attention = `Full(528)`. No new
+    Kind; no Semantics changelog entry.
+  - Adapter draft `adapters/mamba.py` + stub-spec tests. `LayerDecl.layout`
+    (namespace-only) added for the packed state shapes/dtypes; empty for
+    existing adapters, so Qwen3-4B's namespace is unchanged.
 
 ## Semantics changelog
 

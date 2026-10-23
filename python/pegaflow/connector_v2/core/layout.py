@@ -161,7 +161,10 @@ def _layer_fingerprint(gid: int, specs: dict[str, Any], par: Parallel) -> list[A
         decls = []
         for rank in _tp_ranks(par):
             decl = adapter.layer(spec, name, rank)
-            decls.append([list(decl.segments), repr(decl.shard)])
+            entry: list[Any] = [list(decl.segments), repr(decl.shard)]
+            if decl.layout:  # only when declared, so existing namespaces do not move
+                entry.append(list(decl.layout))
+            decls.append(entry)
         seen.add(json.dumps([type(spec).__name__, decls]))
     return sorted(seen)
 
