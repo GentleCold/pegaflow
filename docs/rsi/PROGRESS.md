@@ -440,6 +440,25 @@ names, magic constants that only exist in the old code).
     replay warm 0.730 / 0.268 / 0.998 = H* 0.998, E_ext 1.0. G2 digests 0
     mismatched. NEXT (orchestrator): review agent + official run.
 
+- G5 branch review (independent agent): APPROVE-WITH-FIXES. Must-fix: pool
+  check fails open when the metric is missing; nothing proves external hits
+  came from the C-byte store (add load-bytes >= ext blocks x block bytes).
+  Should-fix: E_C rewards lowering vLLM's own local hit (score against the
+  baseline arm's per-request local instead); crashing reference arms abort the
+  run; `old` still counted as required. Also: a "fill once, never evict" policy
+  scores E_C ~0.95 because warm passes replay the same trace. User flagged the
+  slice capacity as too small (C = 2.24 GiB = 0.22x GPU KV; official 12.9 GiB =
+  1.24x). Decision: G5 gets its own larger workload (64 convs), C/U in
+  {0.25, 0.5, 0.75} (gate at 0.5), hard floor C >= 2x vLLM GPU KV for an
+  official run; slice G5 = smoke test only. Fixes + capacity change assigned to
+  the gate agent on `feat/rsi-g5`; merge after a re-review.
+- Server iteration started on `feat/rsi-server-reclaim` (separate PR):
+  reclaim frees a fixed 512 blocks per round (~0.5 C on the slice) and the LRU
+  is prefix-oblivious (chain heads served from vLLM's GPU cache age out first,
+  breaking every lookup that starts at block 0). GPU6/7.
+- P3 it2 official run `qwen3-4b-p3-it2` started on GPU1; independent review of
+  it2 running.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
