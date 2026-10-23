@@ -266,7 +266,7 @@ fn build_backend(
     ctx: &std::sync::Arc<CudaContext>,
 ) -> Result<Box<dyn TransferBackend>, EngineError> {
     match mode {
-        TransferMode::Direct => Ok(Box::new(MemcpyBackend)),
+        TransferMode::Direct => Ok(Box::new(MemcpyBackend::new())),
         TransferMode::Kernel => {
             let kernel = KernelBackend::new(ctx)
                 .map_err(|e| EngineError::CudaInit(format!("kernel backend init failed: {e}")))?;

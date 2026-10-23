@@ -4,9 +4,9 @@
 //! [`CopyDesc`] (`device` address, `host` address, `size`). The same batch can
 //! be moved by two backends with different tradeoffs:
 //!
-//! - [`MemcpyBackend`]: coalesces contiguous copies and issues one
-//!   `cuMemcpy{Hto,Dto}DAsync_v2` per merged range. Drives the copy engines
-//!   (DMA); best for few/large transfers and overlaps with compute.
+//! - [`MemcpyBackend`]: coalesces contiguous copies, then submits the merged
+//!   ranges with one `cuMemcpyBatchAsync` (per-range `cuMemcpy{Hto,Dto}DAsync_v2`
+//!   as the fallback). Drives the copy engines (DMA) and overlaps with compute.
 //! - [`KernelBackend`]: a single grid-strided kernel reads/writes mapped pinned
 //!   host memory directly (zero-copy over PCIe). One launch regardless of the
 //!   number of fragments; best when the batch is highly fragmented and the
@@ -65,8 +65,8 @@ pub trait TransferBackend: Send {
 /// instance can run a different backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TransferMode {
-    /// One directional `cuMemcpyAsync` per coalesced range, on the DMA copy
-    /// engines. The default: best bandwidth for few/large transfers.
+    /// Coalesced ranges on the DMA copy engines, submitted with one
+    /// `cuMemcpyBatchAsync` (per range as the fallback). The default.
     #[default]
     Direct,
     /// A single grid-strided copy kernel that reads/writes mapped pinned host

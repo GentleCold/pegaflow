@@ -210,9 +210,10 @@ mod tests {
         let total = N * SEG;
 
         let ctx = CudaContext::new(0).expect("ctx");
-        let stream = ctx.default_stream();
+        let stream = ctx.new_stream().expect("stream");
         let kernel = KernelBackend::new(&ctx).expect("kernel backend");
-        let memcpy = MemcpyBackend;
+        let per_range = MemcpyBackend::per_range();
+        let batch = MemcpyBackend::new();
 
         let host = alloc_mapped_host(total);
         let device = alloc_device(total);
@@ -234,7 +235,7 @@ mod tests {
         let d = descs(device, host, N, SEG);
 
         // H2D via each backend, then verify device holds the pattern.
-        for backend in [&kernel as &dyn TransferBackend, &memcpy] {
+        for backend in [&kernel as &dyn TransferBackend, &per_range, &batch] {
             host_slice.copy_from_slice(&pattern);
             clear_device();
             backend.h2d(&d, &stream).expect("h2d");
@@ -246,7 +247,7 @@ mod tests {
         }
 
         // D2H via each backend: device holds the pattern, host is cleared first.
-        for backend in [&kernel as &dyn TransferBackend, &memcpy] {
+        for backend in [&kernel as &dyn TransferBackend, &per_range, &batch] {
             let r = unsafe { sys::cuMemcpyHtoD_v2(device, pattern.as_ptr() as *const _, total) };
             assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "HtoD seed");
             host_slice.fill(0);

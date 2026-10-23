@@ -1,8 +1,8 @@
 //! Native GPU<->CPU transfer benchmark for the transfer_h2d bench target.
 //!
 //! This exercises the same `CopyDesc` batches used by PegaFlow GPU workers:
-//! direct DMA copies (`MemcpyBackend`) and the mapped-host single-kernel path
-//! (`KernelBackend`). It is intentionally scoped to local transfer mechanics;
+//! direct DMA copies (`MemcpyBackend`, per-range and batch submission) and the
+//! mapped-host single-kernel path (`KernelBackend`). It is intentionally scoped to local transfer mechanics;
 //! it does not model P/D RDMA handshakes, request scheduling, or decode-side
 //! completion behavior.
 //!
@@ -10,9 +10,10 @@
 //!   cargo bench -p pegaflow-core --no-default-features \
 //!       --features cuda-13,rdma --bench transfer_h2d
 //!
-//! Optional host allocation flags:
+//! Optional flags:
 //!   cargo bench -p pegaflow-core --bench transfer_h2d -- --hugepages
 //!   cargo bench -p pegaflow-core --bench transfer_h2d -- --alloc-gib 8
+//!   cargo bench -p pegaflow-core --bench transfer_h2d -- --seg-kib 64
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,7 +21,8 @@ use std::time::Instant;
 use cudarc::driver::{CudaContext, CudaStream, sys};
 use pegaflow_core::transfer::{CopyDesc, KernelBackend, MemcpyBackend, TransferBackend};
 
-const SEG: usize = 4096;
+/// Default fragment size; `--seg-kib N` overrides it.
+const DEFAULT_SEG: usize = 4096;
 const STRIDE_FACTOR: usize = 2;
 const WARMUP: usize = 3;
 const ITERS: usize = 20;
@@ -81,28 +83,30 @@ impl FragmentLayout {
         }
     }
 
-    fn device_bytes(self, blocks: usize) -> usize {
+    fn device_bytes(self, blocks: usize, seg: usize) -> usize {
         match self {
-            Self::Contiguous | Self::Shuffled => blocks * SEG,
-            Self::StridedDevice => ((blocks - 1) * STRIDE_FACTOR + 1) * SEG,
+            Self::Contiguous | Self::Shuffled => blocks * seg,
+            Self::StridedDevice => ((blocks - 1) * STRIDE_FACTOR + 1) * seg,
         }
     }
 
-    fn host_bytes(self, blocks: usize) -> usize {
-        blocks * SEG
+    fn host_bytes(self, blocks: usize, seg: usize) -> usize {
+        blocks * seg
     }
 
-    fn copies(self, device: u64, host: &MappedHost, blocks: usize) -> Vec<CopyDesc> {
+    fn copies(self, device: u64, host: &MappedHost, blocks: usize, seg: usize) -> Vec<CopyDesc> {
+        let desc =
+            |dev_off: usize, host_off: usize| copy_desc(device, host, dev_off, host_off, seg);
         match self {
             Self::Contiguous => (0..blocks)
-                .map(|slot| copy_desc(device, host, slot * SEG, slot * SEG))
+                .map(|slot| desc(slot * seg, slot * seg))
                 .collect(),
             Self::StridedDevice => (0..blocks)
-                .map(|slot| copy_desc(device, host, slot * STRIDE_FACTOR * SEG, slot * SEG))
+                .map(|slot| desc(slot * STRIDE_FACTOR * seg, slot * seg))
                 .collect(),
             Self::Shuffled => shuffled_slots(blocks)
                 .into_iter()
-                .map(|slot| copy_desc(device, host, slot * SEG, slot * SEG))
+                .map(|slot| desc(slot * seg, slot * seg))
                 .collect(),
         }
     }
@@ -117,6 +121,7 @@ enum HostMemory {
 struct BenchConfig {
     host_memory: HostMemory,
     alloc_bytes: usize,
+    seg: usize,
 }
 
 struct MappedHost {
@@ -147,7 +152,8 @@ impl Drop for MappedHost {
 
 fn parse_config() -> BenchConfig {
     let mut host_memory = HostMemory::CudaHostAlloc;
-    let mut alloc_bytes = max_host_bytes();
+    let mut alloc_bytes = 0;
+    let mut seg = DEFAULT_SEG;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -163,10 +169,18 @@ fn parse_config() -> BenchConfig {
                     .checked_mul(1024 * 1024 * 1024)
                     .expect("alloc-gib overflow");
             }
+            "--seg-kib" => {
+                let value = args.next().expect("--seg-kib requires an integer value");
+                let kib: usize = value.parse().expect("--seg-kib must be an integer");
+                seg = kib
+                    .checked_mul(1024)
+                    .filter(|&b| b > 0)
+                    .expect("--seg-kib must be > 0");
+            }
             "--bench" => {}
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo bench -p pegaflow-core --bench transfer_h2d -- [--hugepages] [--alloc-gib N]"
+                    "usage: cargo bench -p pegaflow-core --bench transfer_h2d -- [--hugepages] [--alloc-gib N] [--seg-kib N]"
                 );
                 std::process::exit(0);
             }
@@ -176,17 +190,18 @@ fn parse_config() -> BenchConfig {
 
     BenchConfig {
         host_memory,
-        alloc_bytes: alloc_bytes.max(max_host_bytes()),
+        alloc_bytes: alloc_bytes.max(max_host_bytes(seg)),
+        seg,
     }
 }
 
-fn max_host_bytes() -> usize {
+fn max_host_bytes(seg: usize) -> usize {
     BLOCK_COUNTS
         .iter()
         .copied()
         .max()
         .expect("BLOCK_COUNTS must not be empty")
-        * SEG
+        * seg
 }
 
 fn alloc_mapped_host(len: usize, host_memory: HostMemory) -> MappedHost {
@@ -285,12 +300,18 @@ fn fill_device(device: u64, len: usize) {
     );
 }
 
-fn copy_desc(device: u64, host: &MappedHost, device_offset: usize, host_offset: usize) -> CopyDesc {
+fn copy_desc(
+    device: u64,
+    host: &MappedHost,
+    device_offset: usize,
+    host_offset: usize,
+    seg: usize,
+) -> CopyDesc {
     CopyDesc {
         device: device + device_offset as u64,
         host: unsafe { host.host.add(host_offset) },
         host_device: host.device + host_offset as u64,
-        size: SEG,
+        size: seg,
         device_allocation: 0,
         host_allocation: 0,
     }
@@ -338,22 +359,24 @@ fn measure(
     (avg_ms, gibps)
 }
 
+#[allow(clippy::too_many_arguments, reason = "one bench result row")]
 fn print_result(
     layout: FragmentLayout,
     blocks: usize,
+    seg: usize,
     direction: Direction,
-    backend: &dyn TransferBackend,
+    backend: &str,
     avg_ms: f64,
     gibps: f64,
 ) {
-    let total_mib = blocks * SEG / (1024 * 1024);
+    let total_mib = blocks * seg / (1024 * 1024);
     println!(
-        "{:>15}  {:>8}  {:>8}M  {:>9}  {:>7}  {:>11.3}  {:>11.2}",
+        "{:>15}  {:>8}  {:>8}M  {:>9}  {:>9}  {:>11.3}  {:>11.2}",
         layout.name(),
         blocks,
         total_mib,
         direction.name(),
-        backend.name(),
+        backend,
         avg_ms,
         gibps,
     );
@@ -362,13 +385,14 @@ fn print_result(
 fn main() {
     let config = parse_config();
     let ctx = CudaContext::new(0).expect("cuda ctx");
-    let stream = ctx.default_stream();
+    let stream = ctx.new_stream().expect("stream");
     let kernel = KernelBackend::new(&ctx).expect("kernel backend");
-    let memcpy = MemcpyBackend;
+    let per_range = MemcpyBackend::per_range();
+    let batch = MemcpyBackend::new();
 
     println!(
         "fragment={} B, stride_factor={}, warmup={}, iters={}, host_memory={:?}, host_alloc={} MiB\n",
-        SEG,
+        config.seg,
         STRIDE_FACTOR,
         WARMUP,
         ITERS,
@@ -376,34 +400,44 @@ fn main() {
         config.alloc_bytes / (1024 * 1024)
     );
     println!(
-        "{:>15}  {:>8}  {:>9}  {:>9}  {:>7}  {:>11}  {:>11}",
+        "{:>15}  {:>8}  {:>9}  {:>9}  {:>9}  {:>11}  {:>11}",
         "layout", "blocks", "total", "direction", "backend", "avg_ms", "GiB/s"
     );
 
-    let backends: [&dyn TransferBackend; 2] = [&memcpy, &kernel];
+    let backends: [(&str, &dyn TransferBackend); 3] = [
+        ("per-range", &per_range),
+        ("batch", &batch),
+        ("kernel", &kernel),
+    ];
 
     for &layout in LAYOUTS {
         for &blocks in BLOCK_COUNTS {
-            let host_bytes = layout.host_bytes(blocks);
-            let device_bytes = layout.device_bytes(blocks);
-            let total_bytes = blocks * SEG;
+            let seg = config.seg;
+            let host_bytes = layout.host_bytes(blocks, seg);
+            let device_bytes = layout.device_bytes(blocks, seg);
+            let total_bytes = blocks * seg;
             let host = alloc_mapped_host(config.alloc_bytes.max(host_bytes), config.host_memory);
             let device = alloc_device(device_bytes);
             fill_host(&host, host_bytes);
             fill_device(device, device_bytes);
 
-            let copies = layout.copies(device, &host, blocks);
+            let copies = layout.copies(device, &host, blocks, seg);
             for &direction in DIRECTIONS {
-                for backend in backends {
+                for (label, backend) in backends {
                     let (avg_ms, gibps) =
                         measure(backend, direction, &copies, &stream, total_bytes);
-                    print_result(layout, blocks, direction, backend, avg_ms, gibps);
+                    print_result(layout, blocks, seg, direction, label, avg_ms, gibps);
                 }
             }
 
             check_cuda(unsafe { sys::cuMemFree_v2(device) }, "cuMemFree_v2");
         }
     }
+    // A failed batch call falls back to per-range for the process; say so.
+    println!(
+        "\nbatch backend submission after run: {}",
+        batch.submission()
+    );
 }
 
 fn check_cuda(result: sys::CUresult, op: &str) {
