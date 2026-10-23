@@ -169,14 +169,26 @@ fn filter_new_hashes_per_group(
     survivors
 }
 
+/// Keep the blocks of one layer whose `(group, hash)` still needs saving, each
+/// hash once.
+///
+/// Two requests in one step can compute the same new block in different GPU
+/// blocks. Only one copy can become resident, so saving both would copy twice
+/// and grow that block's region by the dead duplicate.
+fn retain_new_unique(ctx: &mut LayerContext, needed: &HashSet<(u32, Vec<u8>)>) {
+    let group = ctx.group;
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    ctx.blocks_to_save
+        .retain(|(_, hash)| needed.contains(&(group, hash.clone())) && seen.insert(hash.clone()));
+}
+
 /// Layer-first save targets: one pinned region per saved block, shared by
 /// every layer (and K/V segment) this call saves for that block.
 ///
 /// A sealed block is evicted as a unit, so its region frees exactly when the
 /// block goes. A region per save batch instead frees only after the batch's
-/// last block is evicted: on the G5 capacity trace that left up to 19% of the
-/// pool held by already-evicted blocks, and reclaim evicted live blocks to
-/// make up for it.
+/// last block is evicted, and while it is held, reclaim has to evict live
+/// blocks to find room.
 fn alloc_block_targets(
     storage: &crate::storage::StorageEngine,
     layer_contexts: &[LayerContext],
@@ -193,7 +205,9 @@ fn alloc_block_targets(
                     region_bytes.push(0);
                     region_bytes.len() - 1
                 });
-            region_bytes[i] += ctx.layout.padded_block_bytes();
+            region_bytes[i] = region_bytes[i]
+                .checked_add(ctx.layout.padded_block_bytes())
+                .ok_or_else(|| EngineError::Storage("block buffer size overflow".into()))?;
         }
     }
 
@@ -475,9 +489,7 @@ impl PegaEngine {
         // Per-layer filter: keep only blocks whose (group, hash) needs saving
         let mut total_blocks_to_save = 0usize;
         for ctx in &mut layer_contexts {
-            let group = ctx.group;
-            ctx.blocks_to_save
-                .retain(|(_, hash)| hashes_to_save.contains(&(group, hash.clone())));
+            retain_new_unique(ctx, &hashes_to_save);
             total_blocks_to_save += ctx.blocks_to_save.len();
         }
         // Remove layers with no blocks to save
@@ -715,5 +727,33 @@ mod tests {
         let mut l1 = l1.blocks;
         drop((l0.remove(1), l1.remove(1)));
         assert_eq!(storage.pool_used_bytes_for_test(), 3 * 2 * SEG as u64);
+    }
+
+    #[test]
+    fn duplicate_and_resident_hashes_are_not_saved() {
+        let layout = KVCacheLayout::new(0x1000, 4 * 1024, 4, 1024, 0, 1).unwrap();
+        let mut c = ctx("l0", 0, layout, &[b"a", b"b", b"a", b"c"]);
+        // `c` is already resident; `a` appears twice in this call.
+        let needed: HashSet<(u32, Vec<u8>)> = [(0, b"a".to_vec()), (0, b"b".to_vec())].into();
+        retain_new_unique(&mut c, &needed);
+        assert_eq!(
+            c.blocks_to_save,
+            vec![(0, b"a".to_vec()), (1, b"b".to_vec())],
+            "the first GPU block of each needed hash is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_allocation_returns_every_region() {
+        const BLOCK: usize = 64 * 1024;
+        // Room for one block region, not two (page-aligned, so no rounding up).
+        let storage =
+            StorageEngine::new_with_config(BLOCK + BLOCK / 2, false, StorageConfig::default(), &[])
+                .unwrap();
+        let layout = KVCacheLayout::new(0x1000, 2 * BLOCK, 2, BLOCK, 0, 1).unwrap();
+        let contexts = vec![ctx("l0", 0, layout, &[b"a", b"b"])];
+
+        assert!(alloc_block_targets(&storage, &contexts, None).is_err());
+        assert_eq!(storage.pool_used_bytes_for_test(), 0);
     }
 }
