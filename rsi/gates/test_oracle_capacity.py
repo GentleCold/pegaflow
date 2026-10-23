@@ -603,3 +603,18 @@ def test_outputs_bounded_by_split_control(split_inv, warm, ok):
     ctrl = _ctrl(10, 10, n=100)
     v = run_gate._outputs_verdict({"cold": 0, "warm": warm}, True, split_inv, ctrl, 100)
     assert v["pass"] is ok, v
+
+
+def test_workload_sessions_never_reuse_connections():
+    """vLLM's uvicorn closes idle keep-alive connections after 5 s; a pooled
+    client reuses a closing socket and the pass dies with "Server
+    disconnected" (the gate then stops vLLM: looks like an external SIGTERM)."""
+    import asyncio
+
+    from rsi.gates import workloads
+
+    async def force_close() -> bool:
+        async with workloads.session() as s:
+            return s.connector.force_close
+
+    assert asyncio.run(force_close())
