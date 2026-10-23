@@ -11,6 +11,7 @@ eviction. Group coherence across Kinds is not exercised here.
 | H1: reclaim rounds sized to the resident cache | b0e6d93 | yes |
 | H2: refresh a prefix hit tail-first | 59083cf, reverted in df1d544/e718c7e | no (negative) |
 | H3: one pinned region per saved block | 1521d64 | yes |
+| H4: one `cuMemcpyBatchAsync` per transfer (recovers H3's warm TTFT) | a8bf231 | yes |
 
 Official capacity (32x12 replay, C = 12.9 GiB = 5873 blocks), timed warm
 passes:
@@ -123,6 +124,20 @@ larger loss and its fix could be measured directly.
   - A block whose layers arrive in several save calls gets one region per
     call.
   - Page-first saves already allocated one page per block and are unchanged.
+  - Region size rounds up to an allocator size class (at most 1/8 extra).
+    Qwen3-4B's 2.25 MiB block is an exact class. A block of, say, 8784
+    units would round to 9216 (+4.9% on every resident block). Check this
+    on the next model.
+- H4 (a8bf231): the memcpy backend submits all merged ranges of one
+  transfer with one `cuMemcpyBatchAsync` (stream-ordered source access),
+  instead of one `cuMemcpyAsync` per range. See "H4: H3's warm TTFT cost".
+- Review fixes:
+  - c04b6c7: a load or save task synchronizes its stream before it returns
+    an error. It used to return first and drop host buffers that queued
+    copies could still touch.
+  - ef53344: one save call saves each hash once per layer. Before, a block
+    computed twice in one step had its region sized and copied twice, and
+    the dead duplicate stayed pinned while the block was resident.
 
 ## Evidence (Qwen3-4B, gate rev 369b253, GPU6/7)
 
@@ -170,7 +185,8 @@ reclaim never runs there):
   - req/s stays at 9.8-10.3 for every run.
   - Save duration (old's connector metric) is unchanged at 0.66-0.73 s per
     pass. Old's load-duration sum does not separate the servers: 17-22 s
-    on H1 and 17-28 s on H3. The cause is not identified; see Open risks.
+    on H1 and 17-28 s on H3. The cause is lost copy coalescing. H4 fixes
+    it; see "H4: H3's warm TTFT cost".
   - G4 still passes, because baseline replay warm TTFT is 2.5 s.
 - full-h3 cap warm passes ran faster: old 61 / 55 / 55 s (H1c: 72 / 70 /
   70 s), v2 68 / 62 / 64 s (H1c: 73 / 70 / 70 s). The likely reason is more
@@ -195,6 +211,194 @@ Rejected follow-ups (not committed):
   workload, though, the next turn re-reads blocks the previous turn just
   saved, and LIP evicts exactly those first. Not tried on a non-looping
   trace. Rejected as fitting the gate rather than the workload.
+
+## H4: H3's warm TTFT cost
+
+Cause: lost copy coalescing.
+- The memcpy backend merges copies only when they are in the same device
+  allocation (layer) and the same host allocation, and contiguous on both
+  sides.
+- Before H3, one layer's blocks from a save call sat in one region, so a
+  prefix loaded into consecutive GPU blocks merged into about one copy per
+  layer.
+- Under H3, layer L of block i and of block i+1 are in different regions,
+  a full block apart. No host-adjacency rule can merge them, so the
+  "merge across allocations" idea is dropped.
+- Both arms register one contiguous 65536 B segment per layer (copies =
+  blocks x 36, 64 KiB each), so the same cause applies to old.
+
+Copy counts per warm replay run (32x12, `RUST_LOG` debug, 64 GB pool), from
+`cnt2-h1log`, `cnt2-h3log`, and `swA-h4`:
+
+| server | arm | load submits / task p50 | copies / submit | load p50 | load GB/s | save GB/s |
+|---|---|---|---|---|---|---|
+| H1 | v2 | 5256 | 1.4 (87 KiB) | 30.6 ms | 15.9 | 15.4 |
+| H3 | v2 | 7722 | 1.0 (64 KiB) | 38.7 ms | 12.85 | 11.7 |
+| H4 | v2 | 1 | 7282 | 25.7 ms | 19.7 | 15.4 |
+| H1 | old | 12348 | 1.3 (86 KiB) | 73.4 ms | 15.5 | 15.6 |
+| H3 | old | 18612 | 1.0 (64 KiB) | 96.2 ms | 12.4 | 11.3 |
+| H4 | old | 1 | 22806 | 66.6 ms | 20.0 | 14.2 |
+
+Load bytes are the same on every server (444-458 GB per run).
+
+Options, by measurement:
+- Batched submit (`cuMemcpyBatchAsync`), chosen. It keeps H3's
+  one-region-per-block ownership.
+- Kernel backend: rejected. In the transfer bench it is fastest for H2D
+  (below), but P3 measured it 26% slower per load end to end on Qwen3
+  (TTFT +37%). P4 found that server submissions on the GPU slow NCCL
+  all-reduce.
+- Layer-major region per batch with refcounted sub-ranges: not needed.
+
+`pegaflow-core/benches/transfer_h2d.rs --seg-kib 64` on the RTX 4090 (driver
+595.91.07, CUDA 13.2), 1 GiB of 64 KiB pages in shuffled order:
+
+| direction | per-range | batch | kernel |
+|---|---|---|---|
+| H2D | 79.6 ms (12.6 GiB/s) | 52.8 ms (19.0 GiB/s) | 41.0 ms (24.4 GiB/s) |
+| D2H | 78.4 ms | 57.4 ms | 60.1 ms |
+
+With 4 KiB pages, batch is 2.9-3.5x faster than per-range. Contiguous
+copies run the same on both paths.
+
+The b96e80c guard:
+- PR #278 removed `cuMemcpyBatchAsync` for "driver instability on some
+  CUDA stacks". It recorded no stack and no failure.
+- Issue #195 measured a 2.4-5.7x speedup for small scattered H2D pages.
+- vLLM 0.32 uses the same call in `swap_blocks_batch` with stream-ordered
+  source access.
+- One failure mode was found here: the batch call returns
+  `CUDA_ERROR_INVALID_VALUE` on the legacy default stream. It works on a
+  created stream, which is what GPU workers use. The bench and the kernel
+  test now use a created stream too.
+
+Fallback design (`transfer/memcpy.rs`):
+- The batch path needs driver 13.0+ (cuda-13 build, `_v2` entry point) or
+  12.8+ (cuda-12 build).
+- `PEGAFLOW_DISABLE_BATCH_MEMCPY=1` forces per-range submission.
+- A batch call that returns an error is retried per range, and the rest of
+  the process stays on per range. A repeated copy just rewrites the same
+  bytes. The fallback warns once.
+- At startup the server logs which path it uses ("memcpy transfer
+  submission: batch ..."). Every H4 run logged batch, and none fell back.
+
+Swap-pair protocol: H4 and H1 run at the same time on GPU6/7 and then swap
+GPUs, 32x12 replay, 64 GB pool. Cells are warm2 / warm3 TTFT p50 in
+seconds:
+
+| pair | v2 H1 | v2 H4 | old H1 | old H4 |
+|---|---|---|---|---|
+| `swA` (H4 GPU6, H1 GPU7) | 0.512 / 0.543 | 0.469 / 0.475 | 0.607 / 0.638 | 0.474 / 0.469 |
+| `swB` (H4 GPU7, H1 GPU6) | 0.521 / 0.554 | 0.487 / 0.495 | 0.607 / 0.606 | 0.470 / 0.487 |
+
+- H4 is 7-14% below H1 for v2 and 20-26% below H1 for old, in both GPU
+  assignments. The old arm, which H3 regressed, is now faster than on H1.
+- req/s is 10.3-10.6 on H4 vs 10.0-10.5 on H1.
+
+Other H4 checks:
+- Capacity: `full-h4` used the same cap plan as `full-h3` (32 convs, C =
+  12.9 GiB). E_C is old 0.539 / v2 0.448 (H3: 0.544 / 0.438), so it did not
+  drop. Cap warm passes take 55-56 s for old (H3: 55 s).
+- Correctness: `gsm8k-h4` (64 questions) scores 0.8594 on every arm. Every
+  gsm8k G2, G3, and G4 verdict passes for both arms, and digests match the
+  baseline.
+- `full-h4` replay (160 GB pool): warm2/3 TTFT p50 is old 0.482 / 0.513 s
+  and v2 0.481 / 0.512 s. G4 replay passes on both arms.
+
+The official r3 cap plan (64 convs, C(0.5) = 27.2 GB) reruns for base vs H4
+are in "G5 at the official cap plan".
+
+## G5 at the official cap plan (gate bf9ef3c, r3 plan)
+
+The r3 plan: 64 convs, U 54.43 GB, and C(0.5) = 27.2 GB = 11536 blocks
+(2.44x GPU KV). The numbers above used the older 32-conv plan, so they are
+not comparable with these.
+
+Cap-only reruns on GPU6/7. The arms are baseline, old, and v2 (8a05b7c via
+`--under-test-path`), all with the same cap plan:
+
+Pending: `cap3-base` (GPU7) and `cap3-h4` (GPU6) are running.
+
+Miss attribution at C/U 0.5 uses the r3 traces (base server). A
+server-faithful sim replays each arm's real query window. It reproduces
+the logged per-query hit count for 90% (v2) and 84% (old) of timed
+requests. Sim E_C is 0.698 / 0.685 (v2 / old), against 0.684 / 0.681
+measured.
+
+| class (share of ext\*_C) | v2 | old |
+|---|---|---|
+| served | 0.698 | 0.685 |
+| evicted: the stopping block and the rest of the needed range are gone | 0.278 | 0.270 |
+| stranded: head evicted, a later needed block resident | 0.017 | 0.025 |
+| query starts past the local hit | 0 | 0.011 |
+| scan reached the prompt end | 0.008 | 0.008 |
+
+- At this C, fragmentation is no longer the main loss. Almost every miss
+  is a range LRU evicted whole, and stranding costs at most 2.5%. A
+  prefix-aware policy that only avoids stranding can win at most that
+  much.
+- The gate's H_lru bar is 0.859 for both arms. The steps below go from the
+  gate's model to the server-faithful sim, scored the gate's way (v2 /
+  old):
+
+  | model | v2 | old |
+  |---|---|---|
+  | gate H_lru model | 0.859 | 0.859 |
+  | + H1 reclaim rounds | 0.859 | 0.858 |
+  | + save only blocks the connector computed | 0.828 | 0.831 |
+  | + the arm's own local hit (lower than baseline's) | 0.584 | 0.682 |
+  | + the arm's real query window | 0.698 | 0.685 |
+
+  Most of the gap to H_lru comes from the arm's own local hit. The arm's
+  vLLM keeps fewer blocks locally than baseline does, so the store has to
+  serve more, and what it serves first is the blocks LRU evicts first. The
+  server cannot change that. With the baseline's local hit, the same
+  server sim gives v2 0.853.
+- Policies in the sim (v2 / old, sim LRU = 0.698 / 0.685):
+
+  | policy | v2 | old |
+  |---|---|---|
+  | reverse refresh (H2) | 0.704 | 0.688 |
+  | segmented LRU, protected 0.5 | 0.717 | 0.691 |
+  | segmented LRU, protected 0.8 / 0.9 | 0.615 / 0.550 | 0.616 / 0.548 |
+  | tail-first among the 1024 oldest | 0.734 | 0.720 |
+  | tail-first among the 2048 oldest | 0.742 | 0.728 |
+  | tail-first among the 4096 oldest | 0.742-0.747 | 0.728 |
+  | tail-first among the 8192 oldest | 0.596 | 0.589 |
+
+  "Tail-first" evicts the deepest chain position in an LRU window. It is
+  the only candidate that beats LRU on both arms, by +0.04-0.05. Even
+  that is far from 0.9, and its window is a tuning knob with a cliff.
+  Scan resistance (SLRU) helps only at a small protected share and hurts
+  beyond it.
+
+## Tests and checks (10.1.0.44, RTX 4090, CUDA 13.2, branch head ef53344)
+
+- `cargo test --no-default-features --features cuda-13,rdma --no-fail-fast`
+  (workspace):
+  - Everything passes except `pegaflow-core --test ssd_cache`, where 0 of 11
+    pass with "pinned pool exhausted while allocating ... buffer".
+  - Master 75dfa4c fails the same 11 on this host, so this is environmental
+    (same as on .117).
+  - pegaflow-core lib: 170 passed, 1 ignored.
+  - pegaflow-core integration: engine_basic 10, eviction 3, hybrid_groups 3,
+    prefetch_lease 2, prefix_semantics 5, save_validation 2.
+  - pegaflow-server: lib 24, mock_vllm_rpc_e2e 8, http_cleanup_hang_repro 1.
+    Its binaries need the uv CPython 3.12 lib dir on `LD_LIBRARY_PATH`.
+  - pegaflow-common 48, pegaflow-metaserver 52, pegaflow-transfer 17,
+    pegaflow-pd-wire 7.
+- `cargo test -p pegaflow-core --lib -- --ignored` (GPU):
+  `kernel_matches_direct_both_directions` (kernel, per-range, and batch
+  backends) and `failed_submit_drains_copies_already_enqueued` pass.
+- `./scripts/check.sh` with ruff 0.14.14 (the prek pin):
+  - cargo fmt passes.
+  - typos is not installed on the host, and the script skips it.
+  - `ruff format --check python/` fails on 11 files this branch does not
+    touch. Master 75dfa4c fails on the same 11 files with the same ruff.
+  - The script stops at the first failure, so its remaining steps were run
+    by hand: `ruff check python/`, clippy `-D warnings` (default features
+    and `cuda-13,rdma`), and `cargo check -p pegaflow-core` /
+    `-p pegaflow-server`. All pass.
 
 ## Server bug candidates (low priority, not on this branch)
 
@@ -223,24 +427,15 @@ Rejected follow-ups (not committed):
   call (one per layer for Qwen3-4B) and is now one per saved block, so a
   call saving more than 36 blocks makes more allocations. Save duration did
   not move.
-- H3 costs warm replay TTFT when the pool is not under pressure (+10-17%
-  p50 for v2, see Evidence); throughput is unchanged. The leading candidate
-  is lost copy coalescing.
-  - The memcpy backend merges copies only when they are adjacent on both
-    sides and in the same host allocation.
-  - Before H3, one layer's blocks from a save call shared an allocation and
-    were host-adjacent. A copy over those blocks into consecutive GPU blocks
-    could merge into one copy per layer and segment.
-  - Now each block-layer segment is a separate copy of
-    block bytes / (layers x segments), which is 32 KiB for Qwen3-4B.
-
-  Not verified: copy counts were not instrumented. Possible follow-ups:
-  - Pick the kernel backend for fragmented batches. It issues one launch
-    regardless of the fragment count. Today the connector chooses the
-    backend per model at registration.
-  - Allow merging across allocations that are adjacent in one pinned
-    backing.
-
-  Either one needs its own measurement.
+- Batch memcpy runs on driver 595.91.07 / CUDA 13.2 (RTX 4090) only. The
+  stack b96e80c hit is unknown. A failing batch call falls back to per
+  range, but a call that returns success and then misbehaves would not.
+  `PEGAFLOW_DISABLE_BATCH_MEMCPY=1` is the kill switch.
+- Each region is one allocator node. `PinnedMemoryPool::MAX_ALLOCS` is
+  4,000,000 per shard, so regions under about 40 KiB on a 160 GB pool
+  would run out of nodes before bytes. Today's regions are far larger.
+- SSD prefetch still restores blocks into shared chunks of up to 256 MiB
+  (`ssd_cache.rs`), so a restored block can keep a chunk pinned after
+  eviction, the pattern H3 removed from saves.
 - Not measured: models with several KV groups, TP > 1, and SSD-enabled
   pools.

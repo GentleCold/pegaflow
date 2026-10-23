@@ -453,6 +453,18 @@ names, magic constants that only exist in the old code).
     not yet verified.
   - Server candidates logged: SIGTERM is not handled, and pinned pool
     teardown takes ~0.36 s/GiB.
+- Server reclaim H4 and review fixes (same branch).
+  - H4 (a8bf231): one `cuMemcpyBatchAsync` per transfer, with per-range
+    fallback. The H3 cost was lost coalescing: 7.7k separate 64 KiB copies
+    per v2 load, 12.85 GB/s. H4 makes it one submit at 19.7-20.0 GB/s.
+  - Swap-pair warm2/3 TTFT p50, H4 vs H1: v2 0.47-0.50 vs 0.51-0.55 s, old
+    0.47-0.49 vs 0.61-0.64 s. The old-arm regression is gone.
+  - E_C on the old cap plan is unchanged vs H3: 0.539 / 0.448.
+  - Fixes from the review:
+    - c04b6c7: drain the stream on a failed transfer.
+    - ef53344: save each block once per call.
+  - `cargo test` and `check.sh` results are recorded in the doc. The
+    failures there (`ssd_cache`, ruff format) also occur on master.
 
 ## Semantics changelog
 
