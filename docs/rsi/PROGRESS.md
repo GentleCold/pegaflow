@@ -67,7 +67,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | it1b review fixes done, GPU validation pending (.3 unreachable) |
+| P3 | onboard Qwen3-4B | it1b slice gate all pass on .44; official run in flight (`p3-it1.log`) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | todo |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -312,6 +312,18 @@ names, magic constants that only exist in the old code).
   - The .3 p0-final record is lost with the host, so p0-final is rerun from
     scratch on .44 GPU0 (`p0-final.log`). P3 it1 slice on GPU1
     (`p3-it1-slice.log`), rev 41fb158.
+
+- P3 it1b slice gate (.44 GPU1, rev 41fb158, 64 gsm8k / 8x6 replay, not
+  official): every verdict passes. G0.spec 0 diffs. G2 digest: external
+  1492/1492 (gsm8k) and 617/617 (replay) matched, 0 mismatched; gsm8k 0.8594
+  cold = warm = baseline, outputs identical. G3: gsm8k warm H=0.978 vs oracle
+  0.992, E_ext=1.0; replay warm H=0.991 vs oracle 0.998, E_ext=1.0; excess 0,
+  no evictions, no load errors. G4: warm TTFT p50 0.101/0.104 s vs baseline
+  0.209 s (2.0x); cold 0.266 s vs 0.211 s (save cost). Save stats (gsm8k):
+  ~21 ms per save step, 30% of steps save, sync 3.2 s of a 13.8 s window, rpc
+  77 ms, 0 failed. Sync dominates, so S5 async saves are the it2 candidate
+  (cold TTFT). Official run (full gsm8k, 32x12 replay) launched on GPU1:
+  `~/kexi/rsi-runs/p3-it1.log`. p0-final on GPU0 still running (old arm).
 
 ## Semantics changelog
 

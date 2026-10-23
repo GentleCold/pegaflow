@@ -167,3 +167,28 @@ Resolution table has the per-finding detail.
   the scheduler copy). If a future vLLM leaves it None on one role, the
   scheduler and worker namespaces diverge and registration or queries mismatch
   loudly (no hits), not silently.
+
+### it1b slice gate result (.44, 2026-10-23)
+
+Run `~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it1-slice` (64 gsm8k, 8 convs x 6
+turns; not official). All verdicts pass.
+
+| Check | Value |
+|---|---|
+| G0.spec | 0 diffs |
+| G2 digest external (gsm8k / replay) | 1492/1492, 617/617 matched; 0 mismatched |
+| G2 gsm8k | 0.8594 baseline = cold = warm; outputs identical |
+| G3 gsm8k warm | H 0.978, oracle 0.992, E_ext 1.0, excess 0 |
+| G3 replay warm | H 0.991, oracle 0.998, E_ext 1.0, excess 0 |
+| G3 no_eviction / load errors | pass / 0 |
+| G4 replay warm TTFT p50 | 0.101-0.117 s vs baseline 0.209 s |
+| replay cold TTFT p50 | 0.266 s vs baseline 0.211 s |
+
+Save stats (gsm8k cold window): 151 of 500 steps save, ~21.5 ms avg (max 34 ms)
+per save step, sync 3175 ms vs rpc 77 ms, 0 failed. The synchronous D2H wait
+is the whole cost; it explains the +26% cold TTFT. Candidate for it2: S5
+async saves, judged by the official run's cold numbers.
+
+Next: official run `qwen3-4b-p3-it1` on GPU1 (in flight). If it passes, mark
+it1 accepted and start it2 (async save) or move on to P4.
+
