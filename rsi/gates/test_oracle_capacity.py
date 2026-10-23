@@ -743,6 +743,88 @@ def test_every_transferred_group_must_be_digested(tmp_path, digested, skipped, o
     assert v["groups"] == [0, 1]
 
 
+_RUN_LIKE = """
+import asyncio, sys, time
+from pathlib import Path
+from rsi.gates import run_gate
+port, out, where = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+
+
+async def swallowing_pass():
+    # A pass that converts its cancellation into an ordinary error, which a
+    # reference arm's stage would record and move past.
+    try:
+        await asyncio.sleep(600)
+    except asyncio.CancelledError:
+        raise RuntimeError("pass failed")
+
+
+def fake_stage(args, gate, arm, wl, out_dir, **kw):
+    (out / f"started-{arm}").write_text("")
+    cmd = [sys.executable, "-m", "http.server", port, "--bind", "127.0.0.1"]
+    with run_gate.launched(cmd, {}, out / f"{arm}.log", f"http://127.0.0.1:{port}/", 60) as p:
+        (out / "pid").write_text(str(p.pid))
+        try:
+            if where == "asyncio":
+                asyncio.run(swallowing_pass())
+            else:
+                time.sleep(600)
+        except Exception as e:  # what a pass loop could do with it
+            raise RuntimeError("stage failed") from e
+    return {}
+
+
+run_gate.run_arm_workload = fake_stage
+run_gate.install_stop_handlers()
+for arm in ("old", "native"):  # reference arms: an ordinary crash is recorded
+    run_gate.run_stage(None, {}, arm, "replay", out)
+(out / "finished").write_text("")
+"""
+
+
+@pytest.mark.parametrize("where", ["asyncio", "sleep"])
+@pytest.mark.parametrize("sig", ["SIGINT", "SIGTERM", "SIGHUP"])
+def test_stop_signal_aborts_the_run(tmp_path, sig, where):
+    """``kill -<SIG> -<run_gate pgid>`` while a stage is inside asyncio.run or
+    a sleep: the stage's process group is stopped, no later stage starts, and
+    the gate exits 128 + signal. The gate is started with SIGINT ignored, as
+    a background job of a non-interactive shell (``setsid nohup ... &``) is."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    root = Path(run_gate.__file__).resolve().parents[2]
+    env = os.environ | {"PYTHONPATH": str(root)}
+    port = str(run_gate.free_port())
+
+    def ignore_sigint():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    gate = subprocess.Popen(
+        [sys.executable, "-c", _RUN_LIKE, port, str(tmp_path), where],
+        env=env,
+        start_new_session=True,
+        preexec_fn=ignore_sigint,
+    )
+    pid_file = tmp_path / "pid"
+    t0 = time.monotonic()
+    while not pid_file.exists():
+        assert gate.poll() is None and time.monotonic() - t0 < 60
+        time.sleep(0.2)
+    time.sleep(1)  # inside asyncio.run / sleep
+    sleeper = int(pid_file.read_text())
+    signum = getattr(signal, sig)
+    os.killpg(gate.pid, signum)
+    assert gate.wait(timeout=120) == 128 + signum
+    with pytest.raises(ProcessLookupError):
+        os.killpg(sleeper, 0)
+    assert not (tmp_path / "started-native").exists()
+    assert not (tmp_path / "finished").exists()
+
+
 # ------------------------------------------------------------ split invariance
 
 

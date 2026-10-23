@@ -151,6 +151,15 @@ def launched(cmd: list[str], env: dict[str, str], log: Path, health: str, timeou
             stop(proc, cmd[0], fh)
 
 
+_STOP: dict[str, Any] = {"signal": None, "teardown": 0}
+
+
+def check_stop() -> None:
+    """Raise SystemExit if a stop signal was received (``install_stop_handlers``)."""
+    if _STOP["signal"] is not None:
+        raise SystemExit(128 + _STOP["signal"])
+
+
 class TeardownError(RuntimeError):
     """A stage's process group survived SIGTERM + SIGKILL: the GPU / host
     memory it holds would skew every later stage, so the run aborts (never
@@ -165,23 +174,28 @@ def stop(proc: subprocess.Popen, name: str, fh) -> None:
     pegaflow-server can take minutes after SIGKILL to unpin a large pool, so
     the wait is on the group, with a generous bound; the exit time is logged."""
     t0 = time.monotonic()
-    with suppress(ProcessLookupError):
-        os.killpg(proc.pid, signal.SIGTERM)
-    how = "SIGTERM"
-    if not _group_gone(proc, TERM_GRACE):
+    _STOP["teardown"] += 1  # a stop signal now waits for this group
+    try:
         with suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        how = "SIGKILL"
-        if not _group_gone(proc, KILL_GRACE):
-            raise TeardownError(
-                f"process group {proc.pid} ({name}) still alive {time.monotonic() - t0:.0f}s"
-                " after SIGTERM + SIGKILL"
-            )
+            os.killpg(proc.pid, signal.SIGTERM)
+        how = "SIGTERM"
+        if not _group_gone(proc, TERM_GRACE):
+            with suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            how = "SIGKILL"
+            if not _group_gone(proc, KILL_GRACE):
+                raise TeardownError(
+                    f"process group {proc.pid} ({name}) still alive"
+                    f" {time.monotonic() - t0:.0f}s after SIGTERM + SIGKILL"
+                )
+    finally:
+        _STOP["teardown"] -= 1
     msg = f"[gate] {name} group {proc.pid} gone after {how} in {time.monotonic() - t0:.1f}s"
     with suppress(ValueError, OSError):
         fh.write(f"\n{msg}\n")
         fh.flush()
     print(msg, flush=True)
+    check_stop()
 
 
 def _group_gone(proc: subprocess.Popen, timeout: float) -> bool:
@@ -582,6 +596,7 @@ def run_arm_workload(
             result["passes"][workloads.WARMUP_PASS] = asyncio.run(workloads.run_warmup(url, "m"))
             reset_prefix_cache(url)
         for name in names:
+            check_stop()
             stage = name.removeprefix("cap_")
             if stage != "cold":
                 time.sleep(args.settle)  # let async saves land before the warm pass
@@ -646,6 +661,7 @@ def run_arm_workload(
                             ("pegaflow_cache_resident_bytes{", "pegaflow_pool_used_bytes")
                         )
                     }
+            check_stop()  # a pass cut short by a stop signal is not recorded
             result["passes"][name] = res
             print(f"[{arm}/{workload}/{name}] {summary_line(res)}", flush=True)
 
@@ -1589,21 +1605,28 @@ def official_problems(
     return out
 
 
-STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
 def install_stop_handlers() -> None:
-    """SIGTERM / SIGHUP raise SystemExit, so every ``launched`` context (and
-    ExitStack) unwinds and stops its process group: by default they kill the
-    gate outright and leave vLLM / pegaflow-server (own sessions) running on
-    the GPU. Later stop signals are ignored so they cannot cut the teardown
-    short (``stop`` still bounds it)."""
+    """SIGINT / SIGTERM / SIGHUP abort the whole run: the handler raises
+    SystemExit, so every ``launched`` context unwinds and stops its process
+    group (vLLM / pegaflow-server run in their own sessions and never get
+    the signal), and the gate exits 128 + signal. Installing it for SIGINT
+    also keeps ``asyncio.run`` from installing its own SIGINT handler, which
+    only cancels the running task: a pass that swallows or converts the
+    CancelledError would let the run go on. The request is also recorded
+    (``check_stop``), so no later pass or stage starts even if an exception
+    is converted or caught on the way. A signal during ``stop`` is deferred
+    until that group is gone; later signals are ignored."""
 
     def handler(signum: int, _frame: Any) -> None:
         for s in STOP_SIGNALS:
             signal.signal(s, signal.SIG_IGN)
-        print(f"[gate] {signal.Signals(signum).name}: stopping", flush=True)
-        raise SystemExit(128 + signum)
+        _STOP["signal"] = signum
+        print(f"[gate] {signal.Signals(signum).name}: stopping the run", flush=True)
+        if not _STOP["teardown"]:
+            raise SystemExit(128 + signum)
 
     for s in STOP_SIGNALS:
         signal.signal(s, handler)
@@ -1658,10 +1681,13 @@ def _teardown_failed(e: BaseException) -> bool:
 
 def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
     """Run one stage; a reference arm's crash is recorded, not fatal, unless
-    its teardown failed (the next stage would share a live GPU)."""
+    its teardown failed (the next stage would share a live GPU) or a stop
+    signal was received (whatever the exception became on the way)."""
+    check_stop()
     try:
         return run_arm_workload(args, gate, arm, wl, out, **kw)
     except Exception as e:
+        check_stop()
         if arm_kind(arm) not in _RECORD_ONLY or _teardown_failed(e):
             raise
         print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)

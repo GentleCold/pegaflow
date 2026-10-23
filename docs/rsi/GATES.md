@@ -238,10 +238,13 @@ SIGTERMs the group, waits up to 120 s, SIGKILLs it, waits up to 300 s, and a
 group that survives that aborts the run (`TeardownError`, also for reference
 arms: the next stage would start on a live GPU).
 
-Stopping a run: `kill -TERM -<run_gate pgid>` (or `-HUP`; launched with
-`setsid`, the gate's pgid is its pid). The gate turns the signal into
-`SystemExit`, so the current stage's process groups are stopped as above
-before it exits (code 128 + signal; no `summary.json`). Never SIGKILL the
+Stopping a run: `kill -TERM -<run_gate pgid>` (or `-INT`, `-HUP`; launched
+with `setsid`, the gate's pgid is its pid). Each aborts the whole run: the
+gate turns the signal into `SystemExit` (its own SIGINT handler replaces an
+inherited SIG_IGN and asyncio's cancel-only handler), records it so no later
+pass or stage starts even if a pass converts the exception, stops the
+current stage's process groups as above (a signal during teardown waits for
+the group) and exits 128 + signal, with no `summary.json`. Never SIGKILL the
 gate: its children, in their own sessions, would keep the GPU.
 
 Exit 0 does **not** cover G1 (run `cargo test -p pegaflow-semantics`) or the
