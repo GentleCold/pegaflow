@@ -100,6 +100,10 @@ CAP_FLOOR_MARGIN = 1.1  # the auto size aims 10% above the floor (estimate vs me
 # key's undigested computations are preempted episodes, at most this share.
 MAX_PREEMPTED_UNCERTAIN = 0.01
 WORKLOADS = ("gsm8k", "replay", "cap")
+# Server teardown: SIGTERM grace for the whole process group, then SIGKILL and
+# a bound for the kernel to tear down (unpinning a 160 GB pool takes > 30 s).
+TERM_GRACE = 120
+KILL_GRACE = 300
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 
 
@@ -134,34 +138,49 @@ def launched(cmd: list[str], env: dict[str, str], log: Path, health: str, timeou
             wait_http(health, proc, timeout, log)
             yield proc
         finally:
-            with suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                with suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=30)
-            # Children (vLLM's EngineCore) outlive the API server while they
-            # free GPU / CPU-offload memory; the next stage needs that memory.
-            if not _group_gone(proc.pid, 120):
-                with suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                if not _group_gone(proc.pid, 60):
-                    raise RuntimeError(
-                        f"process group {proc.pid} ({cmd[0]}) still alive after SIGKILL"
-                    )
+            stop(proc, cmd[0], fh)
 
 
-def _group_gone(pgid: int, timeout: float) -> bool:
+def stop(proc: subprocess.Popen, name: str, fh) -> None:
+    """Stop ``proc``'s whole process group and return only once every member
+    is gone, so the next stage cannot start while this one still holds its
+    port, GPU memory or pinned host memory. Children (vLLM's EngineCore)
+    outlive the API server while they free GPU / CPU-offload memory, and
+    pegaflow-server can take minutes after SIGKILL to unpin a large pool, so
+    the wait is on the group, with a generous bound; the exit time is logged."""
     t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
+    with suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    how = "SIGTERM"
+    if not _group_gone(proc, TERM_GRACE):
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        how = "SIGKILL"
+        if not _group_gone(proc, KILL_GRACE):
+            raise RuntimeError(
+                f"process group {proc.pid} ({name}) still alive {time.monotonic() - t0:.0f}s"
+                " after SIGTERM + SIGKILL"
+            )
+    msg = f"[gate] {name} group {proc.pid} gone after {how} in {time.monotonic() - t0:.1f}s"
+    with suppress(ValueError, OSError):
+        fh.write(f"\n{msg}\n")
+        fh.flush()
+    print(msg, flush=True)
+
+
+def _group_gone(proc: subprocess.Popen, timeout: float) -> bool:
+    """Reap the leader (an unreaped zombie still counts as a group member)
+    and wait until no process of its group is left."""
+    t0 = time.monotonic()
+    while True:
+        proc.poll()
         try:
-            os.killpg(pgid, 0)
+            os.killpg(proc.pid, 0)
         except ProcessLookupError:
             return True
+        if time.monotonic() - t0 >= timeout:
+            return False
         time.sleep(1)
-    return False
 
 
 def pegaflow_server(args, log: Path, pool_size: str):
