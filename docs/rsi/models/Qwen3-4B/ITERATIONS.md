@@ -415,3 +415,37 @@ Remote (.44, shared venv): 156 passed (`test_connector_v2_core.py` +
 - **Held-out replay slice** (policy rule): not run; `sync_load_tokens` was
   chosen from gsm8k load sizes (p90 96 tokens), not tuned to the replay trace.
 
+
+### it2 official run (2026-10-23)
+
+`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2` (official, GPU1, rev 2ff447e,
+32 x 12 replay, full gsm8k). Every required verdict passes (G0, G2 x6, G3 x3,
+G4 x6). Exit 0.
+
+| check | v2 | baseline | verdict |
+|---|---|---|---|
+| replay warm TTFT p50 (warm2/3) | 0.541 / 0.552 s | 2.560 / 2.538 s | pass (4.7x) |
+| replay warm req/s | 10.02 / 10.05 | 3.43 / 3.44 | pass (2.9x) |
+| replay cold TTFT p50 | 1.242 s | 2.785 s | pass |
+| replay cold req/s | 6.80 | 3.30 | pass |
+| gsm8k cold seconds | 163.5 | 162.0 | pass (+0.9%) |
+| gsm8k warm seconds | 162.4 | 162.4 | pass (+0.0%) |
+
+Hit rates (fractions of prompt tokens):
+
+| arm / pass | local | external | total | H* | E_ext | excess |
+|---|---|---|---|---|---|---|
+| baseline gsm8k warm | 0.933 | 0 | 0.933 | 0.992 | 0 | 0 |
+| v2 gsm8k warm | 0.922 | 0.070 | 0.992 | 0.992 | 1.0 | 0 |
+| baseline replay warm2 | 0.377 | 0 | 0.377 | 0.998 | 0 | 0 |
+| v2 replay warm / warm2 / warm3 | 0.35 | 0.65 | 0.998 | 0.998 | 1.0 | 0 |
+
+Digests: gsm8k 6448 external blocks, replay 18531, 0 mismatched. gsm8k
+accuracy 0.8582 = baseline. Save stats (replay, 500-step window): step-thread
+submit 12 ms, saver wait 9.5 s off the step thread, rpc 277 ms, max 2 pending,
+0 failed. Preemption flushes: 0 (no preemption in this run either; the
+preemption wait stays unit-test-only evidence). Capacity (G5) not judged: the
+G5 gate is still under review fixes; at the pre-fix slice v2 scored E_C 0.40,
+limited by server reclaim/eviction (`feat/rsi-server-reclaim`).
+
+Status: accepted for G0-G4 once the it2 code review passes; G5 pending.

@@ -96,7 +96,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | it2 slice passes every verdict incl. hard G4 (async saves + sync short loads); official run + review pending |
+| P3 | onboard Qwen3-4B | it2 official run passes every G0-G4 verdict (`2026-10-23-qwen3-4b-p3-it2`); code review pending; G5 pending (gate fixes + server reclaim) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | todo |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -458,6 +458,12 @@ names, magic constants that only exist in the old code).
   breaking every lookup that starts at block 0). GPU6/7.
 - P3 it2 official run `qwen3-4b-p3-it2` started on GPU1; independent review of
   it2 running.
+
+- Official it2 (`2026-10-23-qwen3-4b-p3-it2`, rev 2ff447e): official, exit 0,
+  all G0-G4 pass. replay warm TTFT 0.54 vs 2.55 s (4.7x), req/s 10.0 vs 3.4;
+  cold TTFT 1.24 vs 2.79 s; gsm8k +0.9% cold / +0.0% warm. Hits: replay warm
+  total 0.998 = H*, E_ext 1.0 (local 0.35 + external 0.65); gsm8k warm 0.992 =
+  H*. Digests 0 mismatched. Table in Qwen3-4B/ITERATIONS.md.
 
 ## Semantics changelog
 
