@@ -534,6 +534,46 @@ def test_stage_never_swallows_a_teardown_failure(monkeypatch, tmp_path, arm, exc
         assert "error" in run_gate.run_stage(None, {}, arm, "gsm8k", tmp_path)
 
 
+_GATE_LIKE = """
+import sys, time
+from pathlib import Path
+from rsi.gates import run_gate
+run_gate.install_stop_handlers()
+port, out = sys.argv[1], Path(sys.argv[2])
+cmd = [sys.executable, "-m", "http.server", port, "--bind", "127.0.0.1"]
+with run_gate.launched(cmd, {}, out / "sleeper.log", f"http://127.0.0.1:{port}/", 60) as p:
+    (out / "pid").write_text(str(p.pid))
+    time.sleep(600)
+"""
+
+
+def test_sigterm_tears_down_launched_groups(tmp_path):
+    """``kill -TERM <gate>`` must stop the stages' process groups (own
+    sessions, so the signal never reaches them) before the gate exits."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    root = Path(run_gate.__file__).resolve().parents[2]
+    env = os.environ | {"PYTHONPATH": str(root)}
+    port = str(run_gate.free_port())
+    gate = subprocess.Popen([sys.executable, "-c", _GATE_LIKE, port, str(tmp_path)], env=env)
+    pid_file = tmp_path / "pid"
+    t0 = time.monotonic()
+    while not pid_file.exists():
+        assert gate.poll() is None and time.monotonic() - t0 < 60
+        time.sleep(0.2)
+    sleeper = int(pid_file.read_text())
+    os.killpg(sleeper, 0)  # alive, own group
+    gate.send_signal(signal.SIGTERM)
+    assert gate.wait(timeout=60) == 128 + signal.SIGTERM
+    with pytest.raises(ProcessLookupError):
+        os.killpg(sleeper, 0)
+
+
 # ------------------------------------------------------------ split invariance
 
 

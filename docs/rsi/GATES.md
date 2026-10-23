@@ -230,6 +230,16 @@ Required verdicts: `baseline` and the connector under test, including
 every verdict recorded): `old` (black-box reference), `native` and `lmcache`. A crash of
 a reference arm's stage is recorded under `errors` in its verdicts and the
 run continues; a crash of baseline or the connector under test aborts it.
+Every stage's vLLM / pegaflow-server runs in its own process group; teardown
+SIGTERMs the group, waits up to 120 s, SIGKILLs it, waits up to 300 s, and a
+group that survives that aborts the run (`TeardownError`, also for reference
+arms: the next stage would start on a live GPU).
+
+Stopping a run: `kill -TERM -<run_gate pgid>` (or `-HUP`; launched with
+`setsid`, the gate's pgid is its pid). The gate turns the signal into
+`SystemExit`, so the current stage's process groups are stopped as above
+before it exits (code 128 + signal; no `summary.json`). Never SIGKILL the
+gate: its children, in their own sessions, would keep the GPU.
 
 Exit 0 does **not** cover G1 (run `cargo test -p pegaflow-semantics`) or the
 "no regression vs last accepted iteration" clauses of G3/G4: compare against

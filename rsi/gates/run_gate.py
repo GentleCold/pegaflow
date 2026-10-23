@@ -1436,6 +1436,26 @@ def official_problems(
     return out
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
+def install_stop_handlers() -> None:
+    """SIGTERM / SIGHUP raise SystemExit, so every ``launched`` context (and
+    ExitStack) unwinds and stops its process group: by default they kill the
+    gate outright and leave vLLM / pegaflow-server (own sessions) running on
+    the GPU. Later stop signals are ignored so they cannot cut the teardown
+    short (``stop`` still bounds it)."""
+
+    def handler(signum: int, _frame: Any) -> None:
+        for s in STOP_SIGNALS:
+            signal.signal(s, signal.SIG_IGN)
+        print(f"[gate] {signal.Signals(signum).name}: stopping", flush=True)
+        raise SystemExit(128 + signum)
+
+    for s in STOP_SIGNALS:
+        signal.signal(s, handler)
+
+
 def _teardown_failed(e: BaseException) -> bool:
     """``e`` or any exception it was raised from/during is a TeardownError
     (``launched``'s finally raises it while another error is in flight)."""
@@ -1527,6 +1547,7 @@ def main(argv: list[str] | None = None) -> int:
         help=f"C/U list; {CAPACITY_FRACTION} is gated, the rest are reported",
     )
     args = ap.parse_args(argv)
+    install_stop_handlers()
     try:
         fractions = parse_fractions(args.cap_fractions)
     except ValueError as e:
