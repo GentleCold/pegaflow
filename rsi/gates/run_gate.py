@@ -79,6 +79,10 @@ MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are 
 # only tie baseline, so they bound the connector's overhead; warm replay must win.
 MAX_OVERHEAD = 0.02
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
+# Server teardown: SIGTERM grace for the whole process group, then SIGKILL and
+# a bound for the kernel to tear down (unpinning a 160 GB pool takes > 30 s).
+TERM_GRACE = 120
+KILL_GRACE = 300
 
 
 def free_port() -> int:
@@ -112,14 +116,49 @@ def launched(cmd: list[str], env: dict[str, str], log: Path, health: str, timeou
             wait_http(health, proc, timeout, log)
             yield proc
         finally:
-            with suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                with suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=30)
+            stop(proc, cmd[0], fh)
+
+
+def stop(proc: subprocess.Popen, name: str, fh) -> None:
+    """Stop ``proc``'s whole process group and return only once every member
+    is gone, so the next stage cannot start while this one still holds its
+    port, GPU memory or pinned host memory. Children (vLLM's EngineCore)
+    outlive the API server while they free GPU / CPU-offload memory, and
+    pegaflow-server can take minutes after SIGKILL to unpin a large pool, so
+    the wait is on the group, with a generous bound; the exit time is logged."""
+    t0 = time.monotonic()
+    with suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    how = "SIGTERM"
+    if not _group_gone(proc, TERM_GRACE):
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        how = "SIGKILL"
+        if not _group_gone(proc, KILL_GRACE):
+            raise RuntimeError(
+                f"process group {proc.pid} ({name}) still alive {time.monotonic() - t0:.0f}s"
+                " after SIGTERM + SIGKILL"
+            )
+    msg = f"[gate] {name} group {proc.pid} gone after {how} in {time.monotonic() - t0:.1f}s"
+    with suppress(ValueError, OSError):
+        fh.write(f"\n{msg}\n")
+        fh.flush()
+    print(msg, flush=True)
+
+
+def _group_gone(proc: subprocess.Popen, timeout: float) -> bool:
+    """Reap the leader (an unreaped zombie still counts as a group member)
+    and wait until no process of its group is left."""
+    t0 = time.monotonic()
+    while True:
+        proc.poll()
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() - t0 >= timeout:
+            return False
+        time.sleep(1)
 
 
 def pegaflow_server(args, log: Path):
