@@ -750,3 +750,41 @@ Next hypothesis (one change): a larger batch with a looser time bound,
 which sends fewer RPCs than KB32 while still capping the hold. Sweep: 64
 steps alone, 64 steps or 1000 ms, 32 steps or 1000 ms. The best one then
 gets the 3x repeat.
+
+### Sweep (`2026-10-23-dsv2-lite-p4-it4-sweep-01`, GPU 0,1 only, 64gb, run_gate pgid 2017502)
+
+Pressure columns come from `~/kexi/rsi-tools/pressure.py`. It reads vLLM's
+10 s "Engine 000" lines (max waiting, max GPU KV usage) and the worker
+`save stats`. Holds and RPCs are summed over all four passes. vLLM's
+preemption histogram has no le=0 bucket, and the gate does not scrape
+`num_preemptions_total`, so the record only shows "requests preempted
+more than once": 0 for every arm. "Free GPU blocks" is the inverse of max
+KV usage. This workload never goes above 28%, so it applies no block
+pressure. The cap workload (G5) does, and it has not been run yet.
+
+| arm | cold p50 | vs baseline | cold req/s | warm2 / warm3 p50 | RPCs (4 passes) | hold mean / max ms | max waiting | max KV usage |
+|---|---|---|---|---|---|---|---|---|
+| baseline | 0.1897 | | 5.675 | 0.164 / 0.163 | | | 0 | 25.6% |
+| KOff | 0.1989 | +4.9% | 5.562 | 0.100 / 0.104 | 498 | 11 / 99 | 6 | 25.6% |
+| KB32 | 0.1810 | -4.6% | 5.667 | 0.099 / 0.103 | 50 | 209 / 1030 | 2 | 25.5% |
+| KB64 | 0.1882 | -0.8% | 5.673 | 0.103 / 0.110 | 28 | 572 / 1554 | 0 | 28.2% |
+| KB64T1000 | 0.1904 | +0.4% | 5.668 | 0.097 / 0.103 | 27 | 359 / 1078 | 0 | 26.4% |
+| KB32T1000 | 0.1916 | +1.0% | 5.667 | 0.097 / 0.100 | 51 | 247 / 1068 | 0 | 25.6% |
+
+Every arm: E_ext 1.0, excess 0, no eviction, the same warm hits,
+`flushes=0`.
+
+Findings:
+- Every batched arm is within 2% of baseline on cold p50 and req/s.
+  KOff is +4.9% in this run. Between 27 and 51 RPCs the differences
+  (-4.6% to +1.0%) are run noise: the KB32 3x repeat spread was 1.7 pp.
+- 64 steps adds hold (mean 0.57 s, max 1.55 s) for no measurable gain
+  over 32. The 1000 ms bound trims the 64-step hold to about KB32's level.
+  At 32 steps it rarely fires (51 vs 50 RPCs), so it costs nothing, and it
+  caps the hold when steps are slow (long prefills, a busy GPU).
+- Chosen default: `save_batch_steps = 32`, `save_batch_ms = 1000.0`, on
+  by default. The time bound is a safety cap, not the trigger. It has
+  no measured cold cost here (KB32T1000 +1.0%, within the KB32 repeat
+  spread). The pressure-based flush the coordinator suggested is not
+  needed at this load (no waiting, KV under 30%). It is the fallback if
+  G5's cap run shows added preemptions or lower E_C.
