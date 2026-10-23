@@ -400,6 +400,14 @@ names, magic constants that only exist in the old code).
   PR policy section added (per-model PRs, server PRs separate and
   human-reviewed).
 
+- User worried policy would grow too complex. Agreed rules (SKILL.md step 5,
+  checked by the review agent in step 6): no model / spec class names in
+  `policy.py`; every knob needs gate evidence, toml only overrides defaults,
+  unused knobs are deleted; budget ~150 lines per Kind and <= 12 knobs, refactor
+  first when exceeded; simplification is a valid iteration; held-out replay
+  slice against tuning to the trace; growing policy logic means it belongs in
+  semantics (new Kind) or the server (separate PR).
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

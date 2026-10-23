@@ -80,10 +80,26 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    acceptance is "pending server review" until it is approved. Connector code
    stays model-agnostic too: per-model differences live only in
    `connector_v2/models/<model>.toml` (see PROGRESS.md "PR policy").
+   Policy complexity rules (keep policy growing with Kinds, not with models):
+   - no model names and no vLLM spec class names in `policy.py`; decide only
+     on Kind and numbers (block tokens, window, sizes);
+   - every knob needs gate evidence that it helps; a toml sets only values
+     that differ from `default.toml`; a knob no accepted model uses is deleted;
+   - budget: about 150 lines of policy per Kind and at most 12 knobs in
+     total; past that, refactor first (a refactor-only iteration) before
+     adding behaviour;
+   - a simplification is a valid iteration: accept it when every accepted
+     model's gate numbers do not regress;
+   - no tuning to the trace: report the accepted numbers on a held-out replay
+     slice too (`skip` past the conversations you tuned on);
+   - if policy logic keeps growing, it is in the wrong layer: propose a Kind
+     (semantics, human-reviewed) or a server change (separate PR) instead.
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
    gate integrity (nothing relaxed), copying from the old connector, regressions
-   on earlier models. Fix or justify every finding in ITERATIONS.md.
+   on earlier models, and the policy complexity rules above (grep `policy.py`
+   for model / spec class names, count knobs and lines, unused knobs). Fix or
+   justify every finding in ITERATIONS.md.
 7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers.
 
 ## 3. Lessons (append)
