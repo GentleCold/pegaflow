@@ -518,6 +518,19 @@ names, magic constants that only exist in the old code).
   own remote tree via PYTHONPATH (the shared venv's .pth points at
   `~/kexi/pegaflow-semantics-rsi/python`).
 
+- P4 gate finding (DeepSeek-V2-Lite-Chat, TP2, TRITON_MLA, batch invariant):
+  vLLM 0.32 MLA prefill attends to the cached context separately
+  (`_compute_prefill_context` + `merge_attn_states` at the computed-token
+  boundary), so outputs after a hit depend on where the hit ends; plain vLLM,
+  no connector: prefix warmed to 256 changes logprobs, 512 diverges at output
+  token 3. The honest selftest therefore fails `G2.gsm8k_outputs` (60/128) and
+  `computed_exact`, while every loaded block is byte-exact and the negative
+  selftests still fail. Gate fix assigned to the gate owner on `feat/rsi-g5`:
+  `split_invariant` established by a gate-run split control (not declared by
+  the agent); loaded-block byte checks and accuracy stay hard; computed_exact
+  only against same-split references; outputs bounded by the control's own
+  divergence rate. P4 official run waits for that merge.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
