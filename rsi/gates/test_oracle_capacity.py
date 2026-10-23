@@ -923,3 +923,16 @@ def test_workload_sessions_never_reuse_connections():
             return s.connector.force_close
 
     assert asyncio.run(force_close())
+    # Every workload HTTP client goes through session(): no other
+    # ClientSession / TCPConnector anywhere in the gate code.
+    import re
+    from pathlib import Path
+
+    src = Path(workloads.__file__).parent
+    for f in sorted(src.rglob("*.py")):
+        if f.name.startswith("test_"):
+            continue
+        text = f.read_text()
+        if f.name == "workloads.py":
+            text = text.replace(text[text.index("def session(") : text.index("# ---", text.index("def session("))], "")  # fmt: skip
+        assert not re.search(r"ClientSession\(|TCPConnector\(", text), f
