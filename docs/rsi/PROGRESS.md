@@ -608,6 +608,21 @@ names, magic constants that only exist in the old code).
   14.2 vs 21.9 GB/s effective H2D on replay warm2. Both copy 64 KiB
   per-layer pages.
 
+- P3 it2e non-regression (fc06c9b):
+  - Slice `2026-10-23-qwen3-4b-p3-it2e-slice`: all correctness and replay
+    verdicts pass. gsm8k cold failed at +9.9%. A 10 s zero-throughput stall
+    matches a P4 160 GiB pool teardown plus an allocation on the host.
+  - gsm8k-only rerun `...-it2e-gsm8k-rerun`: cold +0.5%, warm -0.2%, pass.
+  - Second native record-only sample (`...-it2d-native-e9f`, gate e9f3f33):
+    the same hits, noisy timings.
+- P3 it3 (measurement only, `2026-10-23-qwen3-4b-p3-it3-backend`):
+  - v2 loads are blocks x 36 layers x 64 KiB copies (p50 7704 per load).
+  - Direct backend: 38.2 ms per load at 15.0 GB/s.
+  - Kernel backend: 48.3 ms at 12.3 GB/s (+26%); warm2 TTFT 0.709 vs
+    0.518 s. Kernel rejected.
+  - The batched-submit lever (native: 21.9 GB/s) is server-owned, so the
+    numbers went to the server agent. P3 it3 stops.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

@@ -781,6 +781,51 @@ Next measurements, before any code:
 Any change must keep v2's G4 win on gsm8k: native loses there (+7.5% / +4.0%)
 because its store path costs step time.
 
+### it3 measurement (2026-10-24): copies per load, direct vs kernel backend
+
+Measurement only. Copy submission is pegaflow-core's and the server agent
+owns it (`feat/rsi-server-reclaim`), so no code changed here. Run
+`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it3-backend`:
+- replay 32 x 12, GPU4, host busy, judged on in-run deltas only;
+- arms baseline, v2 (direct) and v2 with `transfer_backend="kernel"`. The
+  kernel arm is a test-only subclass in `~/kexi/rsi-tools/it3_kernel_arm.py`,
+  not committed;
+- server rev 056eb4b with `RUST_LOG=pegaflow_core::gpu_worker=debug`.
+
+The run is non-official (replay only), so its gsm8k verdicts are "missing".
+
+Per-load numbers come from the server's `Load task completed` lines, 955-957
+loads per arm. Descriptors before `merge()` are blocks x 36 layers at
+65536 B each (p50 7704 per load); merged runs are not logged.
+
+| per load, >= 100 blocks (n = 767) | direct | kernel |
+|---|---|---|
+| elapsed p50 | 38.2 ms | 48.3 ms (+26%) |
+| bandwidth p50 | 15.0 GB/s | 12.3 GB/s |
+| all loads, elapsed p50 / mean | 32.3 / 31.7 ms | 40.6 / 39.0 ms |
+
+| replay pass | direct TTFT p50, req/s | kernel | baseline |
+|---|---|---|---|
+| cold | 1.249 s, 6.77 | 1.527 s, 5.79 | 2.797 s, 3.28 |
+| warm2 | 0.518 s, 10.06 | 0.709 s, 8.56 | 2.552 s, 3.42 |
+| warm3 | 0.536 s, 9.99 | 0.705 s, 8.57 | 2.553 s, 3.42 |
+
+Hit rates are the same in both arms: warm2 ext 0.65, total 0.998, E_ext 1.0,
+excess 0.
+
+Result:
+- The kernel backend is 26% slower per load for Qwen3's 64 KiB pages and
+  costs +37% warm2 TTFT, so it is not a candidate.
+- The remaining lever is the direct path's submission. Native's one
+  `cuMemcpyBatchAsync` per load reaches 21.9 GB/s (different, noisy run)
+  against direct's 15.0. That is about 30% of load time, which clears the
+  20% bar. But it is a server change, guarded by b96e80c ("cuMemcpyBatchAsync*
+  has shown driver instability on some CUDA stacks"; no issue or stack named).
+- Numbers sent to the server agent, which is reworking that path for H3 (one
+  pinned region per block broke coalescing). If a backend choice ends up as
+  a server default, the connector stays unchanged.
+- Qwen3 it3 stops here on the P3 side.
+
 ## it2e (2026-10-24): it2d review fixes
 
 Review `docs/rsi/reviews/P3-qwen3-4b-it2d.md` (ACCEPT-WITH-FIXES, no
@@ -814,4 +859,38 @@ the final code.
   arm. Every v2 and baseline verdict passes.
 
 Tests: 167 passed on .44 (`test_connector_v2_core.py`,
-`test_semantics_bindings.py`); ruff clean. Non-regression slice: see below.
+`test_semantics_bindings.py`); ruff clean.
+
+### Non-regression slice
+
+`~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2e-slice` (rev fc06c9b, GPU4, the
+it2c-slice1 profile: 8 x 6 replay, full gsm8k). vLLM logged
+`from=/root/kexi/pegaflow-rsi-qwen3-it2d/python/pegaflow/connector_v2`.
+
+- Correctness passes: G0, G2 (digests, accuracy 0.8582, outputs) and G3
+  (E_ext 1.0, excess 0, 0 load errors) all pass, with no `sync load failed`
+  line.
+- Replay G4 passes: warm TTFT 0.096 / 0.091 s vs baseline 0.213 / 0.212 s;
+  warm req/s 6.84 vs 5.48; cold matches baseline.
+- gsm8k warm passes: 165.3 s vs 165.4 s.
+- gsm8k cold failed: 181.9 s vs 165.5 s (+9.9%).
+  - The first save-stats window is 44.5 s (it2d and it2c: 29.3 / 29.1 s);
+    later windows are the same as before (18.5 / 18.4 s).
+  - vLLM logged a whole 10 s interval, 19:49:16-26, with 0 prompt and 0
+    generation throughput while 31 requests were running.
+  - That interval matches other runs' pegaflow-server events on the host,
+    from the timestamps in every pegaflow.log:
+    - P4 `dsv2-lite-p4-it3-rpc-01` EmptyRpcV2 replay: closed 19:47:45, last
+      write (teardown end) 19:49:29;
+    - P4 `dsv2-lite-p4-it3-rpc-23` Batch8V2 replay: pool alloc from 19:48:24,
+      ready 19:50:29;
+    - `qwen3-4b-g5-official-e9f3f33-r3` cap025: allocated at 19:46:36.
+
+    A 160 GiB pool teardown and a pool allocation on the same host overlap
+    the stall. This is consistent with P4's finding that pool teardown
+    stalls other processes. Load average was 86 at the time.
+  - The change itself does not touch this path: no sync failure, and
+    `min_hit_tokens` was 0.
+- gsm8k-only rerun `2026-10-23-qwen3-4b-p3-it2e-gsm8k-rerun` (baseline + v2,
+  GPU4): cold 166.1 vs 165.2 s (+0.5%), warm 164.7 vs 165.0 s (-0.2%). Both
+  pass, so the slice's cold failure does not reproduce.
