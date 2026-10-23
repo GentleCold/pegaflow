@@ -28,6 +28,7 @@ from pegaflow.connector_v2.core import (
     build_layout,
     may_zero_or_copy_blocks,
 )
+from pegaflow.connector_v2.core.layout import StorageRanks
 from pegaflow.connector_v2.core.scheduler import GroupSave, LoadPlan
 from pegaflow.connector_v2.policy import Policy, SaveItem, load_policy
 
@@ -118,19 +119,54 @@ def _saveable(g: _Group, before: int, after: int) -> tuple[int, int]:
     return (0, 0)
 
 
+@dataclass(frozen=True)
+class _Fragment:
+    layer: str
+    part: int
+    holders: list[int]
+
+    @property
+    def writer(self) -> int:
+        return self.holders[0]
+
+
+@dataclass(frozen=True)
+class _SealPlan:
+    plan: dict[int, list[_Fragment]]
+
+    @property
+    def groups(self) -> list[int]:
+        return sorted(self.plan)
+
+    def fragments(self, group: int) -> list[_Fragment]:
+        return self.plan[group]
+
+    def slot_of(self, rank: int, layer: str) -> tuple[int, int] | None:
+        for g, frags in self.plan.items():
+            for slot, f in enumerate(frags):
+                if f.layer == layer and rank in f.holders:
+                    return g, slot
+        return None
+
+
 def _seal_plan(ranks):
-    """Only the checks the core relies on: equal segments, every part held."""
-    layers: dict[str, tuple[list[int], int, set[int]]] = {}
-    for _, regions in ranks:
+    """The checks the core relies on (equal segments, every part held) and
+    the fragment order: layer name, then part; holders ascending."""
+    layers: dict[str, tuple[int, list[int], int, dict[int, set[int]]]] = {}
+    for rank, regions in ranks:
         for r in regions:
-            segs, count, parts = layers.setdefault(r.layer, (r.segments, r.shard.count, set()))
+            g, segs, count, parts = layers.setdefault(
+                r.layer, (r.group, r.segments, r.shard.count, {})
+            )
             if segs != r.segments or count != r.shard.count:
                 raise ValueError(f"layer {r.layer}: segment sizes differ")
-            parts.add(r.shard.index)
-    for layer, (_, count, parts) in layers.items():
-        if parts != set(range(count)):
+            parts.setdefault(r.shard.index, set()).add(rank)
+    plan: dict[int, list[_Fragment]] = {}
+    for layer, (g, _, count, parts) in sorted(layers.items()):
+        if set(parts) != set(range(count)):
             raise ValueError(f"layer {layer}: missing part")
-    return object()
+        plan.setdefault(g, []).extend(_Fragment(layer, p, sorted(parts[p])) for p in range(count))
+    return _SealPlan(plan)
 
 
 StubSemantics = types.SimpleNamespace(
@@ -781,14 +817,14 @@ class JumpClock:
         return self.now
 
 
-def _worker(sem, rpc, states, layout=None, mark=FakeMark, clock=None, sync_saves=False):
+def _worker(sem, rpc, states, layout=None, mark=FakeMark, clock=None, sync_saves=False, par=None):
     it = iter(states)
     kwargs = {"clock": clock} if clock is not None else {}
     return Worker(
         layout or _layout(sem),
         rpc,
         "inst",
-        Parallel(),
+        par or Parallel(),
         0,
         lambda t: b"ipc",
         lambda: next(it),
@@ -1237,6 +1273,13 @@ def test_full_attention_layout(sem, full_attention, spec, par, kv, shards):
     ranks = [dataclasses.replace(par, tp_rank=r) for r in range(par.tp_size)]
     decls = [full_attention.layer(spec, names[0], r) for r in ranks]
     assert [d.shard for d in decls] == [sem.Shard.heads(i, n) for i, n in shards]
+    # One storage rank per head shard; its first holder writes it.
+    first = {i: r for r, (i, _) in reversed(list(enumerate(shards)))}
+    assert layout.storage == StorageRanks(
+        shards[0][1],
+        tuple(i for i, _ in shards),
+        tuple(first[i] == r for r, (i, _) in enumerate(shards)),
+    )
     # Rank 0 registration as the server sees it: one page-sized segment per layer.
     rpc = FakeRpc()
     _worker(sem, rpc, [], layout=layout).register(
@@ -1335,15 +1378,29 @@ def test_mla_attention_layout(sem, mla_attention, par):
     ranks = [dataclasses.replace(par, tp_rank=r) for r in range(par.tp_size)]
     # Every rank holds the same latent page: one fragment per layer after seal_plan.
     assert {mla_attention.layer(spec, names[0], r).shard for r in ranks} == {sem.Shard.replicated()}
-    rpc = FakeRpc()
-    _worker(sem, rpc, [], layout=layout).register(
-        dict.fromkeys(names, DSV2_KV), dict.fromkeys(names, spec)
-    )
-    reg = rpc.registered
-    assert set(reg["segments"]) == {1}
-    assert set(reg["bytes_per_block"]) == set(reg["kv_strides"]) == {18432}
-    assert set(reg["num_blocks"]) == {DSV2_BLOCKS}
-    assert (reg["backend"], reg["page_first"]) == ("direct", False)
+    # Replicas share one storage rank: one slot per layer, only rank 0 saves.
+    n = par.tp_size
+    assert layout.storage == StorageRanks(1, (0,) * n, (True,) + (False,) * (n - 1))
+    for r in ranks:
+        rpc = FakeRpc()
+        saved = []
+        rpc.save = lambda *args, saved=saved: saved.append(args) or (True, "")
+        loaded = []
+        rpc.load = lambda *args, loaded=loaded: loaded.append(args[1]) or (True, "")
+        worker = _worker(sem, rpc, [FakeLoadState()], layout=layout, par=r)
+        worker.register(dict.fromkeys(names, DSV2_KV), dict.fromkeys(names, spec))
+        reg = rpc.registered
+        assert (reg["tp_rank"], reg["tp_size"]) == (0, 1)
+        assert set(reg["segments"]) == {1}
+        assert set(reg["bytes_per_block"]) == set(reg["kv_strides"]) == {18432}
+        assert set(reg["num_blocks"]) == {DSV2_BLOCKS}
+        assert (reg["backend"], reg["page_first"]) == ("direct", False)
+        worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
+        assert worker.flush(5)
+        assert [(a[1], len(a[-1])) for a in saved] == ([(0, 27)] if r.tp_rank == 0 else [])
+        worker.start(StepPlan(loads=[LoadPlan("q", [(b"L0", [[3]])], sync=False)]))
+        assert loaded == [0]  # every holder loads its own GPU from storage rank 0
+        worker.shutdown()
 
 
 def test_mla_seal_plan_one_writer():

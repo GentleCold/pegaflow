@@ -158,7 +158,10 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             )
             try:
                 self._rpc.start_session_watcher(
-                    self._instance_id, self._layout.namespace, par.tp_size, par.world_size
+                    self._instance_id,
+                    self._layout.namespace,
+                    self._layout.storage.tp_size,  # the tp_size workers register with
+                    par.world_size,
                 )
             except Exception:
                 logger.warning("[PegaKVConnectorV2] session watcher failed", exc_info=True)

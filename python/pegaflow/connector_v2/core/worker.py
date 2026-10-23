@@ -99,6 +99,10 @@ class Worker:
         self._rpc = rpc
         self._instance_id = instance_id
         self._par = par
+        # Server-side rank: TP replicas share one (layout.StorageRanks).
+        storage = layout.storage
+        self._storage_rank = storage.rank[par.tp_rank]
+        self._writer = storage.writer[par.tp_rank]
         self._device_id = device_id
         self._wrap = wrap
         self._new_load_state = new_load_state
@@ -172,9 +176,9 @@ class Worker:
         ok, msg = self._rpc.register_context_batch(
             self._instance_id,
             self._layout.namespace,
-            par.tp_rank,
+            self._storage_rank,
             par.pp_rank,
-            par.tp_size,
+            self._layout.storage.tp_size,
             par.world_size,
             self._device_id,
             names,
@@ -190,11 +194,14 @@ class Worker:
         if not ok:
             raise RuntimeError(f"PegaFlow register_context_batch failed: {msg}")
         logger.info(
-            "[PegaKVConnectorV2] registered %d layers instance=%s namespace=%s device=%d",
+            "[PegaKVConnectorV2] registered %d layers instance=%s namespace=%s device=%d "
+            "storage_rank=%d writer=%s",
             len(names),
             self._instance_id,
             self._layout.namespace,
             self._device_id,
+            self._storage_rank,
+            self._writer,
         )
 
     def start(self, plan: StepPlan) -> None:
@@ -249,7 +256,7 @@ class Worker:
             state = self._new_load_state()
             ok, msg = self._rpc.load(
                 self._instance_id,
-                self._par.tp_rank,
+                self._storage_rank,
                 self._device_id,
                 state.shm_name(),
                 self._layers,
@@ -304,7 +311,9 @@ class Worker:
         """
         t0 = self._clock()
         saves: list[tuple[str, list[int], list[bytes]]] = []
-        for gs in plan.saves:
+        # A replica that is not its part's writer stores nothing: the writer's
+        # copy seals the block and every holder loads from it.
+        for gs in plan.saves if self._writer else ():
             for name in self._layers[gs.sid]:
                 saves.append((name, gs.block_ids, gs.block_hashes))
         if saves and self._saver_dead:
@@ -387,7 +396,7 @@ class Worker:
                 try:
                     ok, msg = self._rpc.save(
                         self._instance_id,
-                        self._par.tp_rank,
+                        self._storage_rank,
                         self._par.pp_rank,
                         self._device_id,
                         job.saves,
