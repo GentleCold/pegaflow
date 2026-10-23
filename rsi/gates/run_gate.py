@@ -413,15 +413,18 @@ def vllm_server(
     return url, launched(cmd, env, log, f"{url}/health", 900)
 
 
-def reset_and_poison(url: str) -> dict[str, Any]:
-    """Drop the local prefix cache, then overwrite all GPU KV bytes."""
+def reset_prefix_cache(url: str) -> None:
     for _ in range(30):
         r = requests.post(f"{url}/reset_prefix_cache", timeout=30)
         if r.ok and r.json().get("success", True) is not False:
-            break
+            return
         time.sleep(1)
-    else:
-        raise RuntimeError(f"reset_prefix_cache kept failing: {r.status_code} {r.text}")
+    raise RuntimeError(f"reset_prefix_cache kept failing: {r.status_code} {r.text}")
+
+
+def reset_and_poison(url: str) -> dict[str, Any]:
+    """Drop the local prefix cache, then overwrite all GPU KV bytes."""
+    reset_prefix_cache(url)
     r = requests.post(f"{url}/collective_rpc", json={"method": "rsi_poison"}, timeout=120)
     r.raise_for_status()
     results = r.json()["results"]
@@ -572,6 +575,12 @@ def run_arm_workload(
             if cap:
                 # Baseline: U (cold) and reference local hits (cold, warm).
                 names = cap_names(args.replay_repeats)[: 2 if kind == "baseline" else None]
+        if not cap:
+            # Untimed first request (first-use costs), then drop it from
+            # vLLM's prefix cache; cap timing is not gated and its blocks
+            # would take capped store space.
+            result["passes"][workloads.WARMUP_PASS] = asyncio.run(workloads.run_warmup(url, "m"))
+            reset_prefix_cache(url)
         for name in names:
             stage = name.removeprefix("cap_")
             if stage != "cold":
@@ -645,6 +654,9 @@ def run_arm_workload(
         return result
     spec = json.loads((probe / "spec.json").read_text())
     reqs = oracle.load_requests(probe / "requests.jsonl")
+    bad = oracle.warmup_problems(reqs, workloads.WARMUP_PASS)
+    if bad:
+        raise RuntimeError(f"{arm}/{workload}: warmup not isolated: {bad}")
     result["hit"] = oracle.summarize(spec, reqs, {n: {n} for n in names})
     if cap and kind == "baseline":
         result["unique_bytes"] = oracle.unique_bytes(spec, reqs, {"cap_cold"})

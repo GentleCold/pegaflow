@@ -90,6 +90,18 @@ def group_kinds(spec: dict[str, Any]) -> list[tuple[str, Any, int]]:
     return out
 
 
+def warmup_problems(reqs: list[dict[str, Any]], warmup: str = "_warmup") -> list[str]:
+    """The warmup request must share no prefix block with the workload:
+    keys chain the whole prefix, so disjoint keys = no common prefix block."""
+    warm = [r for r in reqs if r.get("pass") == warmup]
+    keys = {k for r in warm for k in r["keys"]}
+    shared = sum(1 for r in reqs if r.get("pass") != warmup and any(k in keys for k in r["keys"]))
+    out = [f"{len(warm)} warmup requests (expected at most 1)"] if len(warm) > 1 else []
+    if shared:
+        out.append(f"{shared} workload requests share a prefix block with the warmup")
+    return out
+
+
 def load_requests(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 

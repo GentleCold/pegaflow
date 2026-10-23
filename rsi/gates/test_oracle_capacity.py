@@ -698,6 +698,19 @@ def test_pool_check_fails_before_an_evicting_store(pool, fits):
             run_gate.check_pool(args, u)
 
 
+def test_warmup_shares_no_prefix_with_workload():
+    from rsi.gates import workloads
+
+    w = workloads.warmup_prompt()
+    assert w == workloads.warmup_prompt() and len(w) == workloads.WARMUP_TOKENS
+    reqs = [{"pass": "_warmup", "keys": ["w0", "w1"]}, {"pass": "cold", "keys": ["a0", "a1"]}]
+    assert oracle.warmup_problems(reqs) == []
+    reqs.append({"pass": "warm", "keys": ["w0", "b1"]})
+    assert oracle.warmup_problems(reqs) == [
+        "1 workload requests share a prefix block with the warmup"
+    ]
+
+
 # ------------------------------------------------------------ split invariance
 
 

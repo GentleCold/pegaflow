@@ -159,6 +159,42 @@ async def run_gsm8k(
     }
 
 
+# ------------------------------------------------------------------ warmup
+
+WARMUP_PASS = "_warmup"
+WARMUP_TOKENS = 512
+WARMUP_SEED = 20261024
+
+
+def warmup_prompt() -> list[int]:
+    """Fixed pseudo-random token ids (the same for every run and model):
+    shares no prefix block with any workload prompt (asserted on the probe
+    trace, ``oracle.warmup_problems``)."""
+    import random
+
+    rng = random.Random(WARMUP_SEED)
+    return [rng.randrange(1000, 30000) for _ in range(WARMUP_TOKENS)]
+
+
+async def run_warmup(url: str, model: str) -> dict[str, Any]:
+    """One untimed request before a stage's first pass: CUDA graph / JIT /
+    allocator first-use costs land here, not in the cold pass. Tagged
+    ``rsi_pass=_warmup``, which no verdict or oracle segment scores."""
+    body = {
+        "model": model,
+        "prompt": warmup_prompt(),
+        "max_tokens": 16,
+        "temperature": 0,
+        "ignore_eos": True,
+        "vllm_xargs": {"rsi_pass": WARMUP_PASS},
+    }
+    t0 = time.monotonic()
+    async with session() as s, s.post(f"{url}/v1/completions", json=body) as r:
+        r.raise_for_status()
+        await r.read()
+    return {"seconds": time.monotonic() - t0}
+
+
 # -------------------------------------------------------- multi-turn replay
 
 

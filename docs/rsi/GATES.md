@@ -308,7 +308,12 @@ the last accepted run record by hand until `--accepted` exists.
   `--max-num-batched-tokens 2048 --max-num-seqs 256 --enable-prefix-caching
   --seed 42 --generation-config vllm`, `PYTHONHASHSEED=0`.
 - Passes: each arm x workload gets fresh vLLM (+ fresh PegaFlow for `old` and
-  under-test arms). `cold`, then per warm pass: sleep `--settle` s,
+  under-test arms). gsm8k and replay first send one untimed warmup request
+  (`workloads.warmup_prompt()`: 512 fixed pseudo-random token ids, 16 output
+  tokens, `rsi_pass=_warmup`, never scored) and `POST /reset_prefix_cache`;
+  the stage fails unless no workload request shares a prefix block with it
+  (`oracle.warmup_problems` on the probe trace). Cap stages have no warmup
+  (untimed; its blocks would take capped store space). `cold`, then per warm pass: sleep `--settle` s,
   `POST /reset_prefix_cache`, then `POST /collective_rpc {"method": "rsi_poison"}`
   (`RsiWorkerExt`, fills every byte of every KV allocation with 0x3F, a finite
   bf16/fp16 value), then the pass. Warm reuse can only come from the
