@@ -46,6 +46,9 @@ class Policy:
     # Defaults equal models/default.toml (a test pins this).
     min_hit_tokens: int = 0  # drop hits shorter than this
     loading_wait_ms: int = 1000  # how long to wait while the server prefetches
+    # Hits of at most this many tokens load before the step's forward (where the
+    # layout allows it), longer ones asynchronously between steps.
+    sync_load_tokens: int = 256
 
     def accept(self, p: int, present: Sequence[frozenset[int]]) -> int:
         """Hit length to use, <= ``p``; ``present[sid]`` = blocks the server has."""

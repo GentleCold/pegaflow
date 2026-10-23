@@ -127,8 +127,18 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                     "load (e.g. an expired lease) errors the request: use recompute"
                 )
             profile = extra.get("model_profile") or getattr(mc, "architecture", None)
+            # vLLM maps a failed synchronous load (invalid_block_ids) back to
+            # requests only with one KV cache group, and zeroes new blocks on
+            # the compute stream, unordered against the server's copy.
+            sync_loads = len(kv_cache_config.kv_cache_groups) == 1 and not getattr(
+                kv_cache_config, "needs_kv_cache_zeroing", True
+            )
             self._scheduler = Scheduler(
-                self._layout, load_policy(profile), self._rpc, self._instance_id
+                self._layout,
+                load_policy(profile),
+                self._rpc,
+                self._instance_id,
+                sync_loads=sync_loads,
             )
             try:
                 self._rpc.start_session_watcher(
@@ -234,7 +244,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         self._worker.start(meta.plan)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        return  # loads are async (between steps), never layer-pipelined
+        return  # sync loads complete in start_load_kv, never layer-pipelined
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: Any, **kwargs: Any
@@ -253,6 +263,10 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         return KVConnectorTransferResults(
             finished_sending=sending, finished_recving=finished, failed_recving=failed
         )
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self._worker is not None
+        return self._worker.take_invalid()
 
     def shutdown(self) -> None:
         if self._scheduler is not None:

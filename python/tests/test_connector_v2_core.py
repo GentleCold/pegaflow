@@ -488,6 +488,42 @@ def test_alloc(ext, ids, fail, loads, released):
     assert sched.take_plan().loads == []
 
 
+@pytest.mark.parametrize(
+    "sync_loads,threshold,num_computed,load_state,expected",
+    [
+        # Short hit: loaded before the forward, nothing reported on success.
+        pytest.param(True, 256, 0, 1, ((12, False), set(), set()), id="sync-ok"),
+        # A failed sync load cannot be a failed receive (vLLM already counts
+        # the tokens): every GPU block holding hit tokens is reported invalid.
+        pytest.param(True, 256, 4, -1, ((8, False), set(), {11, 12}), id="sync-failed"),
+        pytest.param(True, 8, 0, 1, ((12, True), {"r"}, set()), id="long-hit-async"),
+        # Layouts vLLM cannot recover a failed sync load for stay async.
+        pytest.param(False, 256, 0, 1, ((12, True), {"r"}, set()), id="layout-async"),
+    ],
+)
+def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
+    layout = _layout(StubSemantics, StubFullSpec())
+    rpc = FakeRpc({0: Ready(3, b"L0")})
+    sched = Scheduler(
+        layout,
+        Policy(sync_load_tokens=threshold),
+        rpc,
+        "inst",
+        clock=Clock(),
+        semantics=StubSemantics,
+        sync_loads=sync_loads,
+    )
+    req = _req()
+    matched = sched.get_num_new_matched_tokens(req, num_computed)
+    sched.update_state_after_alloc(req, ([10, 11, 12, 13],), matched[0])
+    worker = _worker(StubSemantics, rpc, [FakeLoadState(state=load_state)], layout=layout)
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.start(sched.take_plan())
+    _, recving, _ = worker.poll()
+    assert (matched, recving, worker.take_invalid()) == expected
+    worker.shutdown()
+
+
 def test_shutdown_releases_unsent_plans():
     sched, rpc = _sched(StubSemantics, HIT)
     req = _req()

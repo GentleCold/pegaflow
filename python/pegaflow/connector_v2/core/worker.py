@@ -70,6 +70,8 @@ class Worker:
     # wait_for_save calls between save-cost log lines.
     SAVE_LOG_EVERY = 500
     SHUTDOWN_FLUSH_S = 30.0
+    # A synchronous load that has not landed by then is reported invalid.
+    SYNC_LOAD_TIMEOUT_S = 30.0
 
     def __init__(
         self,
@@ -99,6 +101,7 @@ class Worker:
         self._batches: list[_Batch] = []
         self._failed: set[str] = set()  # failed, not yet reported
         self._done: set[str] = set()  # finished without a load batch, not yet reported
+        self._invalid: set[int] = set()  # GPU blocks of failed sync loads, not yet reported
         # Async saves. Jobs complete in submit order (one saver thread), so a
         # sequence number is enough to know what has landed.
         self._cv = threading.Condition()
@@ -197,16 +200,37 @@ class Worker:
         The server consumes leases one by one and fails the whole call on the
         first bad one (e.g. an expired lease), so batching requests would fail
         every request of the step for one bad lease.
+
+        Sync loads are waited for before returning (vLLM calls this before
+        the forward when the step has any); a failed one reports its blocks
+        as invalid. Async loads report through ``poll``.
         """
+        sync: list[tuple[Any, list[int]]] = []
         for lp in plan.loads:
             if lp.fail:
-                self._failed.add(lp.req_id)
+                if lp.sync:
+                    self._invalid.update(lp.covered)
+                else:
+                    self._failed.add(lp.req_id)
             elif not lp.loads:
-                self._done.add(lp.req_id)  # nothing to copy, still owes a completion
+                if not lp.sync:
+                    self._done.add(lp.req_id)  # nothing to copy, still owes a completion
             else:
-                self._start_load(lp.req_id, lp.loads)
+                state = self._start_load(lp.req_id, lp.loads)
+                if state is None:
+                    if lp.sync:
+                        self._invalid.update(lp.covered)
+                    else:
+                        self._failed.add(lp.req_id)
+                elif lp.sync:
+                    sync.append((state, lp.covered))
+                else:
+                    self._batches.append(_Batch(state, [lp.req_id]))
+        if sync:
+            self._wait_sync(sync)
 
-    def _start_load(self, req_id: str, loads: list[tuple[bytes, list[list[int | None]]]]) -> None:
+    def _start_load(self, req_id: str, loads: list[tuple[bytes, list[list[int | None]]]]) -> Any:
+        """Issue the load RPC; the load state, or None if the RPC failed."""
         try:
             state = self._new_load_state()
             ok, msg = self._rpc.load(
@@ -221,9 +245,32 @@ class Worker:
             ok, msg = False, repr(e)
         if not ok:
             logger.warning("[PegaKVConnectorV2] load failed req=%s: %s", req_id, msg)
-            self._failed.add(req_id)
-            return
-        self._batches.append(_Batch(state, [req_id]))
+            return None
+        return state
+
+    def _wait_sync(self, loads: list[tuple[Any, list[int]]]) -> None:
+        """Spin until every sync load landed (the server signals after its copy).
+
+        Short by construction (policy ``sync_load_tokens``): ~1 ms per load.
+        """
+        deadline = self._clock() + self.SYNC_LOAD_TIMEOUT_S
+        for state, covered in loads:
+            while not state.is_ready():
+                if self._clock() > deadline:
+                    break
+                time.sleep(0)  # let the saver thread run
+            if not state.is_ready() or state.get_state() != 1:
+                logger.warning(
+                    "[PegaKVConnectorV2] sync load failed state=%s blocks=%d",
+                    state.get_state(),
+                    len(covered),
+                )
+                self._invalid.update(covered)
+
+    def take_invalid(self) -> set[int]:
+        """GPU blocks whose sync load failed since the last call."""
+        out, self._invalid = self._invalid, set()
+        return out
 
     # ----------------------------------------------------------------- saves
     def save(self, plan: StepPlan) -> None:

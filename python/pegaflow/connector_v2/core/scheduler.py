@@ -33,11 +33,18 @@ class LoadPlan:
     GPU block id for the lease's j-th block in storage group g, or None to skip.
     ``fail`` asks workers to report the request as a failed receive without
     loading (the scheduler found the plan unusable after allocation).
+
+    ``sync`` loads finish before this step's forward. vLLM already counts
+    their tokens as computed, so a failure is reported as invalid blocks
+    (``covered``: the GPU blocks holding the hit's tokens) instead of a
+    failed receive, and a success is not reported at all.
     """
 
     req_id: str
     loads: list[tuple[bytes, list[list[int | None]]]] = field(default_factory=list)
     fail: bool = False
+    sync: bool = False
+    covered: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -79,6 +86,7 @@ class _Hit:
     num_computed: int
     present: tuple[frozenset[int], ...]  # server answers per sid (for re-planning)
     leases: list[_Lease]  # held leases, each with a non-empty ``wanted``
+    sync: bool = False  # loaded before the forward of the step that schedules it
 
 
 @dataclass
@@ -97,13 +105,19 @@ class Scheduler:
         instance_id: str,
         clock: Callable[[], float] = time.monotonic,
         semantics: Any | None = None,
+        sync_loads: bool = False,
     ):
+        """``sync_loads``: vLLM can recover from a failed synchronous load of this
+        layout (it maps ``invalid_block_ids`` back to requests only with one
+        KV cache group, and the worker's block zeroing is not ordered against
+        the server's copy)."""
         self._layout = layout
         self._policy = policy
         self._rpc = rpc
         self._instance_id = instance_id
         self._clock = clock
         self._sem = semantics if semantics is not None else native_semantics()
+        self._sync_loads = sync_loads
         self._requests: dict[str, Any] = {}  # live vLLM Request objects
         self._hits: dict[str, _Hit] = {}  # leased, waiting for allocation
         self._loading_since: dict[str, float] = {}
@@ -153,8 +167,12 @@ class Scheduler:
             self._release(lookup.leases)
             return 0, False
         self._release_unkept(lookup.leases, hit.leases)
+        n = hit.p - num_computed
+        # A short load costs about a millisecond; waiting for it before the
+        # forward beats the two scheduler round trips of an async load.
+        hit.sync = self._sync_loads and n <= self._policy.sync_load_tokens
         self._hits[req_id] = hit
-        return hit.p - num_computed, True
+        return n, not hit.sync
 
     def _lookup(self, request: Any) -> _Lookup:
         layout = self._layout
@@ -256,7 +274,9 @@ class Scheduler:
         if num_external_tokens == 0:
             self._release(hit.leases)
             return
-        plan = LoadPlan(req_id)
+        plan = LoadPlan(req_id, sync=hit.sync)
+        if plan.sync:
+            plan.covered = self._covered_blocks(hit.num_computed, num_external_tokens, block_ids)
         try:
             leases = self._recut(hit, num_external_tokens)
             if leases is None:
@@ -296,6 +316,18 @@ class Scheduler:
                 planned,
             )
         return leases
+
+    def _covered_blocks(
+        self, num_computed: int, num_external_tokens: int, block_ids: tuple[list[int], ...]
+    ) -> list[int]:
+        """GPU blocks holding the external tokens (what a failed sync load leaves invalid)."""
+        out: list[int] = []
+        end = num_computed + num_external_tokens
+        for g in self._layout.groups:
+            bt = g.sem.block_tokens
+            ids = block_ids[g.gid]
+            out.extend(i for i in ids[num_computed // bt : -(-end // bt)] if i != 0)
+        return out
 
     def _fill_targets(
         self, plan: LoadPlan, leases: list[_Lease], block_ids: tuple[list[int], ...]
