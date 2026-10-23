@@ -140,16 +140,11 @@ class Scheduler:
         # (gid, block index, GPU block id) -> step from which saves may resume.
         # Prefix-cache sharing keeps a block at the same index in every table.
         self._unconfirmed: dict[tuple[int, int, int], int] = {}
-        # Failed sync-load blocks vLLM reported. vLLM rewinds only the first
-        # request holding a shared invalid block; any other one (e.g. a local
-        # prefix hit on it) keeps the KV it computed on the bad bytes, so it
-        # never saves again (``_tainted``). Every request alive at the error
-        # is checked once, at its next schedule, when its rewind is visible
-        # (``_to_check``). Requests admitted later are not checked: they can
-        # only hit the block once its first holder recomputed it.
-        self._failed_blocks: set[int] = set()
-        self._to_check: set[str] = set()
-        self._tainted: set[str] = set()
+        # Fail closed after a failed sync load: vLLM (recompute policy) keeps
+        # the invalid blocks and every block computed on them in its prefix
+        # cache under their correct hashes, so any later request may extend
+        # bad KV. No save is planned once vLLM reported one (``on_load_errors``).
+        self._saves_disabled = False
         self._plan = StepPlan()
 
     # ------------------------------------------------------------------ hits
@@ -390,11 +385,15 @@ class Scheduler:
     # ----------------------------------------------------------------- saves
     def on_load_errors(self, block_ids: Iterable[int]) -> None:
         """vLLM processed failed sync loads of these GPU blocks (before it
-        schedules the next step)."""
+        schedules the next step): stop saving for the rest of the process."""
         block_ids = set(block_ids)
-        if block_ids:
-            self._failed_blocks |= block_ids
-            self._to_check = set(self._requests) - self._tainted
+        if block_ids and not self._saves_disabled:
+            self._saves_disabled = True
+            logger.error(
+                "[PegaKVConnectorV2] sync load failed (%d GPU blocks): vLLM may reuse KV "
+                "computed on them, saves disabled for this process",
+                len(block_ids),
+            )
 
     def plan_saves(
         self,
@@ -409,8 +408,8 @@ class Scheduler:
         the workers must finish pending saves before the step runs.
 
         A request whose blocks include an unconfirmed sync-load block saves
-        nothing yet (its range is offered again once the outcome is visible:
-        from the rewound point if the load failed).
+        nothing yet (its range is offered again once the outcome is visible).
+        After a failed sync load nothing is saved at all.
 
         Raises ValueError if the policy returns an item it was not offered: a
         forged (block, hash) pair would poison the store for every reader.
@@ -420,16 +419,16 @@ class Scheduler:
         self._steps += 1
         if self._unconfirmed:
             self._unconfirmed = {b: s for b, s in self._unconfirmed.items() if s > step}
-        if self._to_check:
-            self._check_failed_loads(scheduled, block_ids_of)
         for req_id in preempted:
             self._plan.flush = True
             self._saving.discard(req_id)  # the flush covers its old blocks
         self._plan.flush |= self._flush_always
+        if self._saves_disabled:
+            return
         items: list[SaveItem] = []
         for req_id, computed, n_sched in scheduled:
             request = self._requests.get(req_id)
-            if request is None or n_sched <= 0 or req_id in self._tainted:
+            if request is None or n_sched <= 0:
                 continue
             # Only tokens vLLM already knows have hashes; draft (spec-decode) or
             # not-yet-sampled (async scheduling) positions are offered by a
@@ -485,34 +484,6 @@ class Scheduler:
             save.block_hashes.append(item.block_hash)
         self._plan.saves.extend(by_sid[sid] for sid in sorted(by_sid))
 
-    def _check_failed_loads(
-        self,
-        scheduled: list[tuple[str, int, int]],
-        block_ids_of: Callable[[str], tuple[list[int], ...] | None],
-    ) -> None:
-        """Taint requests whose computed tokens include a failed block (vLLM
-        did not rewind them to recompute it)."""
-        failed = self._failed_blocks
-        for req_id, computed, _ in scheduled:
-            if req_id not in self._to_check:
-                continue
-            block_ids = block_ids_of(req_id)
-            if block_ids is None:
-                continue  # checked at a later schedule
-            self._to_check.discard(req_id)
-            for g in self._layout.groups:
-                ids = block_ids[g.gid]
-                n = min(-(-computed // g.sem.block_tokens), len(ids))
-                if any(ids[b] in failed for b in range(n)):
-                    logger.warning(
-                        "[PegaKVConnectorV2] req=%s computed on a failed load: no more saves",
-                        req_id,
-                    )
-                    self._tainted.add(req_id)
-                    break
-        if not self._to_check:
-            failed.clear()
-
     def _touches_unconfirmed(self, block_ids: tuple[list[int], ...]) -> bool:
         return any(
             b < len(block_ids[gid]) and block_ids[gid][b] == block_id
@@ -541,10 +512,6 @@ class Scheduler:
         self._drop_hit(req_id)
         self._loading_since.pop(req_id, None)
         self._saved_upto.pop(req_id, None)
-        self._tainted.discard(req_id)
-        self._to_check.discard(req_id)
-        if not self._to_check:
-            self._failed_blocks.clear()
         self._requests.pop(req_id, None)
         if req_id not in self._saving:
             return False

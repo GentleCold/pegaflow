@@ -148,8 +148,11 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 self._rpc,
                 self._instance_id,
                 sync_loads=sync_loads,
-                # Steps vLLM schedules before it processes a step's output.
-                confirm_steps=vllm_config.max_concurrent_batches,
+                # Steps vLLM schedules before it processes a step's output
+                # (fallback: the largest value vLLM 0.32 uses, pp + 1).
+                confirm_steps=getattr(
+                    vllm_config, "max_concurrent_batches", pc.pipeline_parallel_size + 1
+                ),
             )
             try:
                 self._rpc.start_session_watcher(
@@ -222,7 +225,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         return PegaConnectorMetadata(self._scheduler.take_plan())
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
-        # Failed sync loads: requests that computed on them must not save.
+        # A failed sync load: KV computed on it may be reused, stop saving.
         if self._scheduler is not None and connector_output.invalid_block_ids:
             self._scheduler.on_load_errors(connector_output.invalid_block_ids)
 

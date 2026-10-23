@@ -538,28 +538,35 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
     worker.shutdown()
 
 
+# Step 2 onwards, after vLLM processed step 0's outcome. "X" is shared's next
+# turn: a new request whose prefix hit covers shared's blocks 10, 11, 20, 21.
+OK_NEXT = [[("r", 17, 1), ("shared", 17, 1)], [("X", 16, 5)]]
+FAIL_NEXT = [[("r", 4, 13), ("shared", 17, 1)], [("X", 16, 5)]]
+
+
 @pytest.mark.parametrize(
-    "load_state,step2,expected2",
+    "load_state,steps,preempted,expected",
     [
-        pytest.param(1, [("r", 17, 1), ("shared", 17, 1)], [13, 20, 21], id="sync-ok"),
-        # vLLM rewinds r to its first invalid block (token 4) and re-offers
-        # the range; shared holds the invalid block too but is not rewound
-        # (vLLM recomputes a shared block once), so it never saves again.
-        pytest.param(-1, [("r", 4, 13), ("shared", 17, 1)], [11, 12, 13], id="sync-failed"),
-        # Same, with shared first scheduled after r recomputed the block.
-        pytest.param(-1, [("r", 4, 13)], [11, 12, 13], id="sync-failed-shared-later"),
+        pytest.param(1, OK_NEXT, (), [[13, 20, 21], [22]], id="sync-ok"),
+        # vLLM (recompute policy) evicts nothing: r is rewound, but shared
+        # (not rewound) built 20-21 on the bad block 11 and they stay cached
+        # under correct hashes, so its next turn X would extend bad KV.
+        pytest.param(-1, FAIL_NEXT, (), [[], []], id="sync-failed-sharer-next-turn"),
+        # The rewound loader is preempted before recomputing past its failed
+        # blocks: they stay hashed and freed; a later hit would reuse them.
+        pytest.param(-1, [[], [("X", 16, 5)]], ("r",), [[], []], id="sync-failed-loader-preempted"),
     ],
 )
-def test_sync_load_outcome_gates_saves(load_state, step2, expected2):
+def test_sync_load_outcome_gates_saves(load_state, steps, preempted, expected):
     """M1: the server keeps the first copy of a key, so KV computed on a sync
-    load must not be saved before vLLM has processed the load's outcome
-    (``confirm_steps``: vLLM's max_concurrent_batches), nor ever if vLLM kept
-    a request's KV computed on a failed block.
+    load is not saved before vLLM processed the load's outcome
+    (``confirm_steps``: vLLM's max_concurrent_batches), and after a failed one
+    nothing is saved at all (vLLM may serve KV built on it from its prefix
+    cache to any later request).
 
     Step 0: r sync-loads blocks 1-2 and prefills to 17; other is unrelated.
     Step 1 (scheduled before step 0's output is processed): r decodes, shared
     prefills on a local prefix hit on r's blocks 0-1.
-    Step 2: vLLM has processed step 0's outcome.
     """
     layout = _layout(StubSemantics, StubFullSpec())
     rpc = FakeRpc({0: Ready(3, b"L0")})
@@ -573,28 +580,38 @@ def test_sync_load_outcome_gates_saves(load_state, step2, expected2):
         sync_loads=True,
         confirm_steps=2,
     )
-    tables = {"r": [10, 11, 12, 13], "shared": [10, 11, 20, 21], "other": [30, 31, 32, 33]}
-    for rid in tables:
+    tables = {
+        "r": [10, 11, 12, 13],
+        "shared": [10, 11, 20, 21],
+        "other": [30, 31, 32, 33],
+        "X": [10, 11, 20, 21, 22, 23],
+    }
+    for rid in ("r", "shared", "other"):
         sched.on_new_request(_req(17, 4, rid))
     req = sched._requests["r"]
     n, load_async = sched.get_num_new_matched_tokens(req, 4)
     assert (n, load_async) == (8, False)
     sched.update_state_after_alloc(req, (tables["r"],), n)
 
-    def step(scheduled):
-        sched.plan_saves(scheduled, lambda rid: (tables[rid],))
-        plan = sched.take_plan()
-        return plan, [b for s in plan.saves for b in s.block_ids]
+    def step(scheduled, preempted=()):
+        sched.plan_saves(scheduled, lambda rid: (tables[rid],), preempted)
+        return [b for s in sched.take_plan().saves for b in s.block_ids]
 
-    load_step, saved0 = step([("r", 12, 5), ("other", 0, 17)])
+    # The load plan and step 0's saves ship in one StepPlan.
+    sched.plan_saves([("r", 12, 5), ("other", 0, 17)], lambda rid: (tables[rid],))
+    load_step = sched.take_plan()
+    saved0 = [b for s in load_step.saves for b in s.block_ids]
     worker = _worker(StubSemantics, rpc, [FakeLoadState(state=load_state)], layout=layout)
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     worker.start(load_step)
-    _, saved1 = step([("r", 17, 1), ("shared", 8, 9)])
+    saved1 = step([("r", 17, 1), ("shared", 8, 9)])
     sched.on_load_errors(worker.take_invalid())  # vLLM processes step 0's output
-    _, saved2 = step(step2)
-    _, saved3 = step([("r", 17, 1), ("shared", 17, 1)])
-    assert (saved0, saved1, saved2, saved3) == ([30, 31, 32, 33], [], expected2, [])
+    later = []
+    for i, scheduled in enumerate(steps):
+        if i == 1:
+            sched.on_new_request(_req(21, 6, "X"))
+        later.append(step(scheduled, preempted if i == 0 else ()))
+    assert (saved0, saved1, later) == ([30, 31, 32, 33], [], expected)
     worker.shutdown()
 
 

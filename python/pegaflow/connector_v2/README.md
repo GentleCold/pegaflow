@@ -50,11 +50,13 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     that may have failed is saved:
     - a request whose blocks include a sync-loaded block saves nothing until
       vLLM has processed that step's output (`max_concurrent_batches` plans
-      later); the held range is offered again, from vLLM's rewound point if
-      the load failed;
-    - a request vLLM did not rewind although its computed tokens include a
-      failed block (vLLM recomputes a shared invalid block once, in the
-      first request holding it) never saves again.
+      later); the held range is then offered again;
+    - once vLLM reports a failed sync load, the scheduler plans no save for
+      the rest of the process (logged as an error). Under the recompute
+      policy vLLM evicts nothing: the failed blocks and every block computed
+      on them stay in its prefix cache under their correct hashes, so any
+      later request (a sharer's next turn, a hit on a preempted loader's
+      freed blocks) may extend bad KV.
 
     An async load needs neither: vLLM schedules the request only after it
     processed the failure and reset its computed tokens.
