@@ -363,6 +363,21 @@ Each entry: what was added, why, which vectors cover it.
 
 - "agentx" perf workload: not found in repo; asked the user. Fallback: multi-turn
   agent traces from `/ppio/data_sets/R2EGym-SFT-Trajectories`.
+- Capacity-blind gates (raised 2026-10-23, user asked how the loop would
+  find "manage SWA and full blocks separately" for DeepSeek-V4.1-Flash):
+  every gate runs with an unlimited pool (`G3.no_eviction`), and write
+  amplification / saved-but-never-loaded bytes are listed in GATES.md but not
+  computed. So a policy that saves only the trailing window of SWA groups, or
+  evicts them first, scores the same as saving everything. Proposal: G5
+  capacity gate (fixed pool sized to a fraction of the trace's unique KV bytes,
+  oracle-at-capacity as the bar), per-group write-amp / unused-bytes metrics in
+  `oracle.py`, and an "optimization hypotheses" checklist in the skill.
+  DSV4.1 under vLLM 0.32: kv-source layers `MLAAttentionSpec`
+  (`tokens_per_state = compress_ratio`), SWA part `SlidingWindowMLASpec`
+  (`DeepseekV4SWACache`, block 64), compressor `CircularBufferSpec`
+  (one ring block per request, `prefix_cacheable=False`); the oracle has no
+  Kind for `CircularBufferSpec` yet (fails as unknown). Not in the four-model
+  scope and no weights downloaded.
 - Server-side seal_plan (replace slot counting) and layout-fingerprint
   namespace in the server: not needed for TP1 onboarding; schedule after P6
   or when a TP>1 gate is added.
