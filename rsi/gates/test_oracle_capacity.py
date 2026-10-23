@@ -574,6 +574,117 @@ def test_sigterm_tears_down_launched_groups(tmp_path):
         os.killpg(sleeper, 0)
 
 
+# ------------------------------------------------------------ provenance
+
+
+def _git_tree(tmp_path):
+    """A repo with python/pegaflow/{__init__,a}.py committed; returns (repo, rev)."""
+    import subprocess
+
+    repo = tmp_path / "src"
+    pkg = repo / "python" / "pegaflow"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "a.py").write_text("x = 1\n")
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run([*git, "config", "uploadpack.allowFilter", "true"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "c"], check=True)
+    rev = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+    return repo, rev
+
+
+def _copy(repo, tmp_path, rev, edit=None, extra=None):
+    import shutil
+
+    dst = tmp_path / "copy"
+    shutil.copytree(repo / "python", dst / "python")
+    (dst / ".rsi-rev").write_text(rev + "\n")
+    if edit:
+        (dst / "python" / "pegaflow" / "a.py").write_text(edit)
+    for name, body in (extra or {}).items():
+        (dst / "python" / "pegaflow" / name).write_bytes(body)
+    return dst
+
+
+@pytest.mark.parametrize(
+    "case,verified",
+    [("git-clean", True), ("git-dirty", False), ("rsi-rev", True), ("rsi-rev-edited", False),
+     ("rsi-rev-extra-py", False), ("rsi-rev-native", True), ("unknown-rev", False), ("no-rev", False)],
+)  # fmt: skip
+def test_tree_rev_is_verified_blob_for_blob(tmp_path, case, verified):
+    """M3: a run is official with a tree under test only if its rev is
+    verified: a clean git toplevel, or ``.rsi-rev`` whose tracked files match
+    on disk (a native extension is allowed and hashed)."""
+    from rsi.gates import provenance
+
+    repo, rev = _git_tree(tmp_path)
+    trees = provenance.Trees(tmp_path / "work", remote=f"file://{repo}")
+    if case.startswith("git"):
+        root = repo
+        if case == "git-dirty":
+            (repo / "python" / "pegaflow" / "a.py").write_text("x = 2\n")
+    elif case == "no-rev":
+        root = _copy(repo, tmp_path, rev)
+        (root / ".rsi-rev").unlink()
+    else:
+        root = _copy(
+            repo,
+            tmp_path,
+            "0" * 40 if case == "unknown-rev" else rev,
+            edit="x = 2\n" if case == "rsi-rev-edited" else None,
+            extra={"b.py": b""} if case == "rsi-rev-extra-py" else {"m.so": b"elf"} if case == "rsi-rev-native" else None,
+        )  # fmt: skip
+    rec = trees.tree(root, ("python/pegaflow",))
+    assert rec["verified"] is verified, rec
+    if case == "rsi-rev-native":
+        assert list(rec["native_sha256"]) == ["python/pegaflow/m.so"]
+    if verified:
+        assert rec["rev"] == rev
+
+
+def test_under_test_overlay_exposes_only_pegaflow(tmp_path):
+    """M2: the overlay holds a single ``pegaflow`` symlink, so a tree under
+    test cannot shadow ``rsi``, ``vllm`` or ``sitecustomize``."""
+    from rsi.gates import provenance
+
+    tree = tmp_path / "ut"
+    for d in ("pegaflow", "rsi/gates", "vllm"):
+        (tree / d).mkdir(parents=True)
+    (tree / "pegaflow" / "__init__.py").write_text("")
+    (tree / "sitecustomize.py").write_text("")
+    ov = provenance.overlay(tree, tmp_path / "ov")
+    assert [p.name for p in ov.iterdir()] == ["pegaflow"]
+    assert (ov / "pegaflow").resolve() == (tree / "pegaflow").resolve()
+
+
+def test_module_files_must_resolve_under_gate_and_venv(tmp_path):
+    import sys
+
+    from rsi.gates import provenance
+
+    repo = run_gate.REPO
+    purelib = provenance.venv_purelib()
+    pf = tmp_path / "pf"
+    good = {
+        "rsi.gates.rsi_probe": str(repo / "rsi/gates/rsi_probe.py"),
+        "worker_extension": str(repo / "rsi/gates/rsi_probe.py"),
+        "vllm": str(purelib / "vllm/__init__.py"),
+        "torch": str(purelib / "torch/__init__.py"),
+        "pegaflow": str(pf / "__init__.py"),
+        "prefix": sys.prefix,
+    }
+    assert provenance.module_problems(good, repo, pf, "x") == []
+    for k, bad in (
+        ("rsi.gates.rsi_probe", str(tmp_path / "rsi/gates/rsi_probe.py")),
+        ("vllm", str(tmp_path / "vllm/__init__.py")),
+        ("pegaflow", str(tmp_path / "other/__init__.py")),
+        ("sitecustomize", str(tmp_path / "sitecustomize.py")),
+    ):
+        assert provenance.module_problems(good | {k: bad}, repo, pf, "x"), k
+
+
 # ------------------------------------------------------------ split invariance
 
 

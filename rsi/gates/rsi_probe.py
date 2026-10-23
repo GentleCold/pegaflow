@@ -60,6 +60,35 @@ _CHUNK_BYTES = 64 << 20  # bound on the uint8 chunk; int64 temporaries are 8x th
 _MASK = 2**64 - 1
 
 
+def module_files() -> dict[str, Any]:
+    """Files this process resolved its instrument and runtime from (G0
+    provenance): the probe, the worker extension, vLLM, torch, ``pegaflow``
+    (imported, or where it would resolve) and its native extension if
+    loaded, ``site/usercustomize`` if loaded, and the interpreter prefix."""
+    import importlib.util
+    import sys
+
+    def file_of(name: str) -> str | None:
+        m = sys.modules.get(name)
+        return getattr(m, "__file__", None) if m is not None else None
+
+    out: dict[str, Any] = {
+        "rsi.gates.rsi_probe": __file__,
+        "worker_extension": file_of(RsiWorkerExt.__module__),
+        "prefix": sys.prefix,
+    }
+    for name in ("vllm", "torch", "pegaflow"):
+        f = file_of(name)
+        if f is None:
+            spec = importlib.util.find_spec(name)
+            f = spec.origin if spec else None
+        out[name] = f
+    for name in ("pegaflow.pegaflow", "sitecustomize", "usercustomize"):
+        if file_of(name):
+            out[name] = file_of(name)
+    return out
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, torch.dtype):
         return str(value).removeprefix("torch.")
@@ -295,6 +324,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 "tensors": tensors,
             },
             "probe": {"digest_skipped_groups": {str(k): v for k, v in self._skip_groups.items()}},
+            "modules": module_files(),
         }
         (self._dir / "spec.json").write_text(json.dumps(dump, indent=1, sort_keys=True))
 
@@ -338,6 +368,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             "device": str(first.device) if first is not None else None,
             "raw_bytes": self._raw.numel() if self._raw is not None else 0,
             "layers": layers,
+            "modules": module_files(),
         }
         (self._dir / f"spec-{self._rank}.json").write_text(
             json.dumps(out, indent=1, sort_keys=True)

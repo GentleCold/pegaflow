@@ -56,7 +56,7 @@ from typing import Any
 
 import requests
 
-from rsi.gates import digest_compare, oracle, workloads
+from rsi.gates import digest_compare, oracle, provenance, workloads
 
 REPO = Path(__file__).resolve().parents[2]
 OLD = "pegaflow.connector:PegaKVConnector"
@@ -362,8 +362,10 @@ def vllm_server(
         del env[k]
     if arm_kind(arm) == "under_test" and args.under_test_path:
         # The connector under test (and its native extension) from another
-        # tree; reference arms keep the venv's pegaflow.
-        env["PYTHONPATH"] = f"{args.under_test_path}:{env['PYTHONPATH']}"
+        # tree, through an overlay holding only its ``pegaflow``: the tree
+        # cannot shadow the probe, vLLM or sitecustomize. Reference arms keep
+        # the venv's pegaflow.
+        env["PYTHONPATH"] = f"{args.under_test_overlay}:{env['PYTHONPATH']}"
     if arm_kind(arm) == "lmcache":
         # LMCache lives in an overlay (its pins would downgrade the shared
         # venv); only this arm's vLLM sees it.
@@ -738,6 +740,38 @@ def g0(run_dir: Path, label: str, committed: Path) -> dict[str, Any]:
     else:
         diffs.append(f"committed spec dump {committed} missing")
     return {"pass": not diffs, "diffs": diffs[:20], "num_diffs": len(diffs)}
+
+
+def expected_pegaflow(args, kind: str) -> Path | None:
+    """The ``pegaflow`` dir an arm's processes must import."""
+    if kind == "under_test" and getattr(args, "under_test_path", ""):
+        return (Path(args.under_test_path) / "pegaflow").resolve()
+    return provenance.gate_pegaflow_dir()
+
+
+def g0_provenance(run_dir: Path, label: str, pegaflow_dir: Path | None) -> dict[str, Any]:
+    """Every spec dump of the arm (scheduler and workers, every workload)
+    recorded its module files; they resolve under the gate tree, the shared
+    venv and the arm's expected ``pegaflow``."""
+    dumps = sorted((run_dir / label).glob("*/probe/spec*.json"))
+    if not dumps:
+        return {"pass": False, "reason": "no spec dump"}
+    problems, pegaflow_files = [], set()
+    for f in dumps:
+        files = json.loads(f.read_text()).get("modules")
+        where = str(f.relative_to(run_dir))
+        if not files:
+            problems.append(f"{where}: module files not recorded")
+            continue
+        problems += provenance.module_problems(files, REPO, pegaflow_dir, where)
+        pegaflow_files |= {files[k] for k in ("pegaflow", "pegaflow.pegaflow") if files.get(k)}
+    return {
+        "pass": not problems,
+        "problems": problems[:20],
+        "dumps": len(dumps),
+        "pegaflow_dir": str(pegaflow_dir),
+        "pegaflow_files": sorted(pegaflow_files),
+    }
 
 
 # ------------------------------------------------------------- verdicts
@@ -1137,6 +1171,7 @@ def verdicts(
     run_dir: Path,
     committed: Path,
     gate: dict[str, Any] | None = None,
+    pegaflow_dirs: dict[str, Path | None] | None = None,
 ) -> dict[str, Any]:
     v: dict[str, Any] = {}
     split_inv = bool((gate or {}).get("split_invariant", True))
@@ -1163,6 +1198,11 @@ def verdicts(
             "invariant": invariant,
         },
         "G2.digest_self.gsm8k": _digest_verdict(base.get("gsm8k", {}).get("digest_self"), None),
+        **(
+            {"G0.provenance": g0_provenance(run_dir, "baseline", pegaflow_dirs.get("baseline"))}
+            if pegaflow_dirs is not None
+            else {}
+        ),
         # gate.json's split_invariant is established here, not declared.
         "G2.split_control": _split_control_verdict(ctrl, split_inv),
         "G2.digest_self.cap": _digest_verdict(
@@ -1184,6 +1224,8 @@ def verdicts(
         g: dict[str, Any] = {}
         gsm = per_wl.get("gsm8k")
         g["G0.spec"] = g0(run_dir, label, committed)
+        if pegaflow_dirs is not None:
+            g["G0.provenance"] = g0_provenance(run_dir, label, pegaflow_dirs.get(label))
         g["G2.digest_self.gsm8k"] = _digest_verdict(gsm and gsm["digest_self"], MIN_JUDGED_GSM8K)
         vs_base = (
             digest_compare.compare(
@@ -1456,6 +1498,40 @@ def install_stop_handlers() -> None:
         signal.signal(s, handler)
 
 
+def record_provenance(args, run_dir: Path) -> dict[str, Any]:
+    """Revs (verified against ``provenance.REMOTE``) and hashes of what the
+    run measured: the gate tree, the venv's ``pegaflow`` (reference arms, the
+    oracle's ``pegaflow.semantics``), the ``--under-test-path`` tree and the
+    pegaflow-server binary (sha256; its tree's ``.rsi-rev`` is a claim)."""
+    trees = provenance.Trees(run_dir / ".provenance")
+    try:
+        out: dict[str, Any] = {"gate": trees.tree(REPO, ("rsi", "python/pegaflow"))}
+        venv = provenance.gate_pegaflow_dir()
+        out["venv_pegaflow"] = (
+            trees.tree(provenance.tree_root(venv), ("python/pegaflow",))
+            | {"pegaflow_dir": str(venv)}
+            if venv
+            else {"verified": False, "reason": "pegaflow not importable"}
+        )
+        if args.under_test_path:
+            ut = expected_pegaflow(args, "under_test")
+            out["under_test"] = trees.tree(provenance.tree_root(ut), ("python/pegaflow",)) | {
+                "pegaflow_dir": str(ut)
+            }
+        server = Path(args.pegaflow_server).resolve()
+        rev_file = server.parents[2] / ".rsi-rev"
+        out["pegaflow_server"] = {
+            "path": str(server),
+            "sha256": provenance.sha256(server) if server.is_file() else None,
+            # A binary cannot be tied to a rev: the tree's claim, unverified.
+            "tree_rev_claimed": rev_file.read_text().strip() if rev_file.is_file() else None,
+            "python_path_head": str(REPO / "python"),
+        }
+        return out
+    finally:
+        trees.cleanup()
+
+
 def _teardown_failed(e: BaseException) -> bool:
     """``e`` or any exception it was raised from/during is a TeardownError
     (``launched``'s finally raises it while another error is in flight)."""
@@ -1570,6 +1646,13 @@ def main(argv: list[str] | None = None) -> int:
     if "cap" in wls:  # G5 sizes every store from the baseline cap trace
         wls = [w for w in wls if w != "cap"] + ["cap"]
     results: dict[str, dict[str, Any]] = {}
+    if args.under_test_path:
+        args.under_test_overlay = str(
+            provenance.overlay(Path(args.under_test_path), run_dir / "under-test-overlay")
+        )
+    # Before any stage: what the run is about to measure.
+    prov = record_provenance(args, run_dir)
+    print(f"[gate] provenance {json.dumps(prov, default=str)}", flush=True)
 
     def stage(arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
         return run_stage(args, gate, arm, wl, out, **kw)
@@ -1621,7 +1704,13 @@ def main(argv: list[str] | None = None) -> int:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
     problems = official_problems(args, arms, wls, gate_file, committed)
-    v = verdicts(results, run_dir, committed, gate)
+    if "under_test" in prov and not prov["under_test"]["verified"]:
+        problems.append(
+            f"connector under test {prov['under_test']['root']} at an unverified rev"
+            f" ({prov['under_test'].get('reason')})"
+        )
+    dirs = {arm_label(a): expected_pegaflow(args, arm_kind(a)) for a in arms}
+    v = verdicts(results, run_dir, committed, gate, dirs)
     floor = None
     if "cap" in wls:
         # Not a verdict: a store smaller than this measures vLLM's GPU cache,
@@ -1631,9 +1720,8 @@ def main(argv: list[str] | None = None) -> int:
     summary = {
         "tag": args.tag,
         "rev": git_rev(),
-        "under_test_rev": git_rev(Path(args.under_test_path).resolve().parent)
-        if args.under_test_path
-        else None,
+        "under_test_rev": prov.get("under_test", {}).get("rev"),
+        "provenance": prov,
         "args": vars(args),
         "gate": gate,
         "official": not problems,

@@ -272,10 +272,30 @@ the last accepted run record by hand until `--accepted` exists.
   granularity loss and are not a pure eviction-policy comparison),
   `selftest:<mode>` (gsm8k only), `<module>:<Class>`. `old`, `native`,
   `lmcache` and the connector under test run as `MultiConnector[arm, RsiProbe]`.
-  `--under-test-path DIR` puts `DIR` (another tree's `python/`) first on the
-  `PYTHONPATH` of the connector-under-test arm only, so the gate code and the
-  reference arms stay at the gate tree's rev; `summary.under_test_rev` records
-  that tree's rev (`git` or `.rsi-rev`).
+  `--under-test-path DIR` (another tree's `python/`) puts an overlay dir
+  holding only a `pegaflow -> DIR/pegaflow` symlink first on the `PYTHONPATH`
+  of the connector-under-test arm only, so that tree cannot replace the
+  probe, its worker extension, vLLM or `sitecustomize`. Gate code (`rsi/`)
+  always comes from the gate tree. `pegaflow` does not: for the gate process
+  (the oracle's `pegaflow.semantics`), the reference arms (`old`) and
+  pegaflow-server's embedded Python it resolves through the shared venv's
+  `pegaflow_llm.pth` (on the 4090 host:
+  `/root/kexi/pegaflow-semantics-rsi/python`), not the gate tree's
+  `python/`. `summary.provenance` records, before any stage: the gate
+  tree's, the venv `pegaflow` tree's and the under-test tree's rev with
+  `verified` (a clean git toplevel, or `.rsi-rev` whose `git ls-tree -r
+  <rev> python/pegaflow` blob ids equal the files, fetched blob-less from
+  `provenance.REMOTE`), each tree's native-extension sha256, and the
+  pegaflow-server binary's sha256 with its tree's `.rsi-rev` (a claim: a
+  binary is not tied to a rev). A run with `--under-test-path` is official
+  only if the under-test tree is verified. G0.provenance (every arm, and
+  baseline): every spec dump (scheduler and each worker) records the module
+  files of `rsi.gates.rsi_probe`, the worker extension, vLLM, torch,
+  `pegaflow` (+ its loaded native module, `site/usercustomize` if loaded)
+  and the interpreter prefix; probe and extension must resolve under the gate
+  tree, vLLM / torch / prefix to the shared venv, and `pegaflow` to the arm's
+  expected dir (the overlay target for the arm under test, the venv's
+  otherwise).
   The connector under test runs as `MultiConnector[under_test, RsiProbe]` with
   `kv_load_failure_policy=recompute`, reads its server port from
   `PEGAFLOW_PORT`, and gets an empty `kv_connector_extra_config`. The probe
