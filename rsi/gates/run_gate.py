@@ -10,6 +10,7 @@ Arms:
   plain                    vLLM without any KV connector (gsm8k only; control)
   baseline                 vLLM + RsiProbe only (no PegaFlow)
   old                      reference connector (pegaflow.connector:PegaKVConnector), black box
+  native                   reference: vLLM's OffloadingConnector (CPU offload), record only
   selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k only
   <module>:<Class>         connector under test
 
@@ -17,7 +18,9 @@ Every arm/workload pair gets fresh servers. Passes: ``cold``, then before each
 warm pass ``/reset_prefix_cache`` (local only) and ``rsi_poison`` (every GPU KV
 byte overwritten), so warm reuse can only come from the connector. Replay runs
 ``--replay-repeats`` warm passes; the first carries digest tags (G2/G3), the
-others are timed for G4.
+others are timed for G4. The ``cap`` workload (G5) repeats the replay passes
+(tagged ``cap_<pass>``) on a fresh store of ``C = CAPACITY_FRACTION x U``
+bytes, ``U`` = unique KV bytes of the baseline arm's replay cold pass.
 
 Per-model gate settings (attention backend, batch invariance, extra vLLM args)
 come from ``docs/rsi/models/<model>/gate.json``; the committed spec dump is
@@ -78,6 +81,11 @@ MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are 
 # prefix cache serves the earlier turns; gsm8k: the shared few-shot prefix) can
 # only tie baseline, so they bound the connector's overhead; warm replay must win.
 MAX_OVERHEAD = 0.02
+# G5: store capacity as a fraction of the trace's unique KV bytes, and the bar
+# against the clairvoyant oracle at that capacity.
+CAPACITY_FRACTION = 0.5
+MIN_EFFICIENCY_C = 0.9
+WORKLOADS = ("gsm8k", "replay", "cap")
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 
 
@@ -122,7 +130,7 @@ def launched(cmd: list[str], env: dict[str, str], log: Path, health: str, timeou
                 proc.wait(timeout=30)
 
 
-def pegaflow_server(args, log: Path):
+def pegaflow_server(args, log: Path, pool_size: str):
     grpc, http = free_port(), free_port()
     env = os.environ.copy()
     env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -138,7 +146,7 @@ def pegaflow_server(args, log: Path):
         "--http-addr",
         f"127.0.0.1:{http}",
         "--pool-size",
-        args.pool_size,
+        pool_size,
         "--devices",
         args.gpu,
         "--enable-prometheus",
@@ -149,8 +157,11 @@ def pegaflow_server(args, log: Path):
     return grpc, http, launched(cmd, env, log, f"http://127.0.0.1:{http}/health", 300)
 
 
+_REFERENCE = ("plain", "baseline", "old", "native")
+
+
 def arm_kind(arm: str) -> str:
-    if arm in ("plain", "baseline", "old"):
+    if arm in _REFERENCE:
         return arm
     return "selftest" if arm.startswith("selftest:") else "under_test"
 
@@ -158,10 +169,21 @@ def arm_kind(arm: str) -> str:
 def arm_label(arm: str) -> str:
     if arm.startswith("selftest:"):
         return "selftest-" + arm.split(":", 1)[1]
-    return arm if arm in ("plain", "baseline", "old") else arm.split(":")[-1]
+    return arm if arm in _REFERENCE else arm.split(":")[-1]
 
 
-def kv_transfer_config(arm: str, probe_dir: Path, digest: str) -> dict[str, Any] | None:
+def parse_size(s: str) -> int:
+    """Bytes of a ``--pool-size`` string (same units as pegaflow-server)."""
+    s = s.strip().lower()
+    for unit, mult in (("tb", 1 << 40), ("gb", 1 << 30), ("mb", 1 << 20), ("kb", 1 << 10)):
+        if s.endswith(unit):
+            return int(float(s[: -len(unit)]) * mult)
+    return int(float(s.removesuffix("b")))
+
+
+def kv_transfer_config(
+    arm: str, probe_dir: Path, digest: str, cpu_bytes: int = 0
+) -> dict[str, Any] | None:
     kind = arm_kind(arm)
     if kind == "plain":
         return None
@@ -173,18 +195,26 @@ def kv_transfer_config(arm: str, probe_dir: Path, digest: str) -> dict[str, Any]
     }
     if kind == "baseline":
         return probe
-    if kind == "selftest":
-        module, cls = SELFTEST.split(":")
-        extra = {"mode": arm.split(":", 1)[1]}
+    if kind == "native":
+        # vLLM's own CPU offload, as ``--kv-offloading-size`` would set it up.
+        under_test = {
+            "kv_connector": "OffloadingConnector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {"cpu_bytes_to_use": cpu_bytes},
+        }
     else:
-        module, cls = (OLD if kind == "old" else arm).split(":")
-        extra = {}
-    under_test = {
-        "kv_connector": cls,
-        "kv_connector_module_path": module,
-        "kv_role": "kv_both",
-        "kv_connector_extra_config": extra,
-    }
+        if kind == "selftest":
+            module, cls = SELFTEST.split(":")
+            extra = {"mode": arm.split(":", 1)[1]}
+        else:
+            module, cls = (OLD if kind == "old" else arm).split(":")
+            extra = {}
+        under_test = {
+            "kv_connector": cls,
+            "kv_connector_module_path": module,
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": extra,
+        }
     return {
         "kv_connector": "MultiConnector",
         "kv_role": "kv_both",
@@ -195,7 +225,14 @@ def kv_transfer_config(arm: str, probe_dir: Path, digest: str) -> dict[str, Any]
 
 
 def vllm_server(
-    args, gate: dict[str, Any], arm: str, probe_dir: Path, invariant: bool, pf_port, log
+    args,
+    gate: dict[str, Any],
+    arm: str,
+    probe_dir: Path,
+    invariant: bool,
+    pf_port,
+    log,
+    cpu_bytes: int = 0,
 ):
     port = free_port()
     env = os.environ.copy()
@@ -247,7 +284,7 @@ def vllm_server(
         *gate.get("vllm_args", []),
         *args.vllm_arg,
     ]
-    cfg = kv_transfer_config(arm, probe_dir, "tagged")
+    cfg = kv_transfer_config(arm, probe_dir, "tagged", cpu_bytes)
     if cfg is not None:
         cmd += ["--kv-transfer-config", json.dumps(cfg)]
     if args.num_gpu_blocks:
@@ -273,13 +310,26 @@ def reset_and_poison(url: str) -> dict[str, Any]:
     return {"poisoned": results}
 
 
-def run_arm_workload(args, gate, arm: str, workload: str, out: Path) -> dict[str, Any]:
+def cap_names(repeats: int) -> list[str]:
+    """G5 pass labels: the replay passes, prefixed ``cap_``."""
+    return [f"cap_{n}" for n in ["cold", "warm"] + [f"warm{k}" for k in range(2, repeats + 1)]]
+
+
+def run_arm_workload(
+    args, gate, arm: str, workload: str, out: Path, capacity: int = 0
+) -> dict[str, Any]:
+    """``capacity`` (``cap`` workload): store bytes, for PegaFlow's pool or
+    the native arm's CPU cache. Other workloads use ``--pool-size``."""
     out.mkdir(parents=True, exist_ok=True)
     probe = out / "probe"
     if probe.exists():
         shutil.rmtree(probe)
     kind = arm_kind(arm)
     gsm = workload == "gsm8k"
+    cap = workload == "cap"
+    if cap and capacity <= 0:
+        raise ValueError("cap workload needs a capacity")
+    store_bytes = capacity if cap else parse_size(args.pool_size)
     invariant = gsm and bool(gate.get("batch_invariant"))
     result: dict[str, Any] = {
         "arm": arm,
@@ -287,13 +337,31 @@ def run_arm_workload(args, gate, arm: str, workload: str, out: Path) -> dict[str
         "invariant": invariant,
         "passes": {},
     }
+    if cap:
+        result["capacity_bytes"] = capacity
     with ExitStack() as stack:
         pf_port = pf_http = None
         if kind in ("old", "under_test"):
-            pf_port, pf_http, cm = pegaflow_server(args, out / "pegaflow.log")
+            pf_port, pf_http, cm = pegaflow_server(
+                args, out / "pegaflow.log", str(capacity) if cap else args.pool_size
+            )
             stack.enter_context(cm)
-        url, cm = vllm_server(args, gate, arm, probe, invariant, pf_port, out / "vllm.log")
+        url, cm = vllm_server(
+            args,
+            gate,
+            arm,
+            probe,
+            invariant,
+            pf_port,
+            out / "vllm.log",
+            store_bytes if kind == "native" else 0,
+        )
         stack.enter_context(cm)
+        if cap and pf_http:
+            # What the server actually allocated: must not exceed C.
+            m = asyncio.run(workloads.scrape(f"http://127.0.0.1:{pf_http}", ("pegaflow",)))
+            pool = [n for k, n in m.items() if k.startswith("pegaflow_pool_capacity_bytes")]
+            result["pool_capacity_bytes"] = int(sum(pool)) if pool else None
 
         if gsm:
             limit = SELFTEST_LIMIT if kind == "selftest" else args.gsm8k_limit
@@ -308,8 +376,11 @@ def run_arm_workload(args, gate, arm: str, workload: str, out: Path) -> dict[str
                 args.replay_turns,
             )
             names = ["cold", "warm"] + [f"warm{k}" for k in range(2, args.replay_repeats + 1)]
+            if cap:
+                names = cap_names(args.replay_repeats)
         for name in names:
-            if name != "cold":
+            stage = name.removeprefix("cap_")
+            if stage != "cold":
                 time.sleep(args.settle)  # let async saves land before the warm pass
                 result["passes"].setdefault("_poison", {})[name] = reset_and_poison(url)
             before = asyncio.run(workloads.scrape(url))
@@ -328,7 +399,7 @@ def run_arm_workload(args, gate, arm: str, workload: str, out: Path) -> dict[str
             else:
                 # Digest a conversation sample in the untimed passes; all turns
                 # of a sampled conversation, so its references are digested too.
-                timed = name not in ("cold", "warm")
+                timed = stage not in ("cold", "warm")
                 xs = [
                     {"rsi_pass": name}
                     | ({} if timed or c % args.replay_digest_every else {"rsi_digest": "full"})
@@ -354,6 +425,11 @@ def run_arm_workload(args, gate, arm: str, workload: str, out: Path) -> dict[str
     spec = json.loads((probe / "spec.json").read_text())
     reqs = oracle.load_requests(probe / "requests.jsonl")
     result["hit"] = oracle.summarize(spec, reqs, {n: {n} for n in names})
+    if cap:
+        timed = {n for n in names if n.removeprefix("cap_") not in ("cold", "warm")}
+        result["capacity"] = oracle.summarize_capacity(
+            spec, reqs, capacity, {"warm_timed": timed} | {n: {n} for n in names}
+        )
     errs = probe / "load_errors.jsonl"
     result["load_errors"] = (
         [json.loads(x) for x in errs.read_text().splitlines()] if errs.exists() else []
@@ -498,6 +574,56 @@ def _hit_verdict(r: dict[str, Any] | None, workload: str) -> dict[str, Any]:
     }
 
 
+def _evictions(metrics: dict[str, float]) -> float:
+    return sum(
+        n for k, n in metrics.items() if k.startswith("pegaflow_cache_block_evictions_total")
+    )
+
+
+def _capacity_verdict(r: dict[str, Any] | None) -> dict[str, Any]:
+    """G5 over the timed cap warm passes."""
+    if r is None or "capacity" not in r:
+        reason = (r or {}).get("error", "not evaluated")
+        return {"pass": False, "reason": reason}
+    c = r["capacity"]
+    w = c["warm_timed"]
+    e = w["efficiency_c"]
+    passes = {n: p for n, p in r["passes"].items() if not n.startswith("_")}
+    evicted = {n: _evictions(p.get("pegaflow_metrics", {})) for n, p in passes.items()}
+    pool = r.get("pool_capacity_bytes")
+    # A server that grants itself more memory than C is not measured at C.
+    pool_ok = pool is None or pool <= r["capacity_bytes"]
+    ok = (
+        e is not None
+        and e >= MIN_EFFICIENCY_C
+        and w["excess_tokens"] <= w["excess_limit"]
+        and not r["load_errors"]
+        and pool_ok
+    )
+    diag = c["diagnostics"]
+    return {
+        "pass": ok,
+        "efficiency_c": e,
+        "min_efficiency_c": MIN_EFFICIENCY_C,
+        "unique_bytes": r.get("unique_bytes"),
+        "capacity_bytes": r["capacity_bytes"],
+        "pool_capacity_bytes": pool,
+        "hit_rate": w["hit_rate"],
+        "oracle_hit_rate": w["oracle_hit_rate"],
+        "oracle_c_hit_rate": w["oracle_c_hit_rate"],
+        "lru_hit_rate": w["lru_hit_rate"],
+        "lru_vs_oracle_c": w["lru_vs_oracle_c"],
+        "excess_tokens": w["excess_tokens"],
+        "excess_limit": w["excess_limit"],
+        "load_errors": len(r["load_errors"]),
+        "evicted": evicted,
+        "oracle_c_groups": diag["oracle_c"]["groups"],
+        "lru_groups": diag["lru"]["groups"],
+        "oracle_c_passes": diag["oracle_c"]["passes"],
+        "lru_passes": diag["lru"]["passes"],
+    }
+
+
 def _median(xs: list[float]) -> float | None:
     return statistics.median(xs) if xs else None
 
@@ -639,6 +765,7 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
                 if k.startswith("pegaflow_cache_block_evictions_total")
             )
             for wl, r in per_wl.items()
+            if wl != "cap"
             for p in r["passes"]
             if not p.startswith("_")
         }
@@ -650,7 +777,21 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
         g |= _perf_verdicts(
             rep, base.get("replay"), gsm, base.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
         )
-        g["pass"] = all(x["pass"] for x in g.values() if isinstance(x, dict))
+        cap = per_wl.get("cap")
+        g["G2.digest_self.cap"] = _digest_verdict(cap and cap.get("digest_self"), 0.0)
+        g["G5.replay_warm"] = _capacity_verdict(cap)
+        if not g["G2.digest_self.cap"]["pass"]:
+            g["G5.replay_warm"]["pass"] = False
+        if kind == "old":
+            # G5 on the old connector is a black-box reference number only.
+            for k in ("G2.digest_self.cap", "G5.replay_warm"):
+                g[k]["reference_only"] = True
+        g["pass"] = all(
+            x["pass"] for x in g.values() if isinstance(x, dict) and not x.get("reference_only")
+        )
+        if kind == "native":
+            # Reference arm (phase 1): numbers are recorded, never gated.
+            g["required"] = False
         v[label] = g
     v["baseline"]["pass"] = all(x["pass"] for x in v["baseline"].values() if isinstance(x, dict))
     return v
@@ -662,6 +803,17 @@ def git_rev() -> str:
             ["git", "rev-parse", "HEAD"], cwd=REPO, text=True, stderr=subprocess.DEVNULL
         ).strip()
     return (REPO / ".rsi-rev").read_text().strip() if (REPO / ".rsi-rev").exists() else "unknown"
+
+
+def capacity_basis(run_dir: Path) -> int | None:
+    """``U``: unique KV bytes the unlimited oracle stores over the baseline
+    arm's replay cold pass (one full pass over the trace) of this run."""
+    probe = run_dir / "baseline" / "replay" / "probe"
+    if not (probe / "spec.json").exists() or not (probe / "requests.jsonl").exists():
+        return None
+    spec = json.loads((probe / "spec.json").read_text())
+    u = oracle.unique_bytes(spec, oracle.load_requests(probe / "requests.jsonl"), {"cold"})
+    return u or None
 
 
 def official_problems(
@@ -676,8 +828,8 @@ def official_problems(
     for need in ("plain", "baseline", "under_test"):
         if need not in kinds:
             out.append(f"arm {need} missing")
-    if set(wls) != {"gsm8k", "replay"}:
-        out.append(f"workloads {wls} != gsm8k,replay")
+    if set(wls) != set(WORKLOADS):
+        out.append(f"workloads {wls} != {','.join(WORKLOADS)}")
     if args.num_gpu_blocks or args.vllm_arg:
         out.append("--num-gpu-blocks / --vllm-arg override")
     for f in (gate_file, committed):
@@ -695,7 +847,11 @@ def main(argv: list[str] | None = None) -> int:
         default="plain,baseline,old",
         help="comma list; selftest arms: selftest:honest,selftest:liar,...",
     )
-    ap.add_argument("--workloads", default="gsm8k,replay")
+    ap.add_argument(
+        "--workloads",
+        default=",".join(WORKLOADS),
+        help="cap (G5) needs the baseline arm's replay in the same run",
+    )
     ap.add_argument("--runs-root", default=str(Path.home() / "kexi" / "rsi-runs"))
     ap.add_argument("--gpu", default="0", help="CUDA device ids (comma list, len = tp)")
     ap.add_argument("--tp", type=int, default=1)
@@ -740,16 +896,34 @@ def main(argv: list[str] | None = None) -> int:
     wls = [w for w in args.workloads.split(",") if w]
     if "baseline" in arms:  # every comparison references the baseline
         arms = ["baseline"] + [a for a in arms if a != "baseline"]
+    if "cap" in wls:  # G5 sizes the store from the baseline replay trace
+        wls = [w for w in wls if w != "cap"] + ["cap"]
     results: dict[str, dict[str, Any]] = {}
     for arm in arms:
         kind = arm_kind(arm)
         for wl in wls:
             if wl != "gsm8k" and kind in ("plain", "selftest"):
                 continue
+            if wl == "cap" and kind == "baseline":
+                continue  # nothing to store
             label = arm_label(arm)
-            results.setdefault(label, {})[wl] = run_arm_workload(
-                args, gate, arm, wl, run_dir / label / wl
-            )
+            out = run_dir / label / wl
+            if wl != "cap":
+                results.setdefault(label, {})[wl] = run_arm_workload(args, gate, arm, wl, out)
+                continue
+            u = capacity_basis(run_dir)
+            if u is None:
+                results.setdefault(label, {})[wl] = {
+                    "arm": arm,
+                    "workload": wl,
+                    "error": "no baseline replay trace in this run to size the store",
+                }
+                continue
+            c = int(CAPACITY_FRACTION * u)
+            r = run_arm_workload(args, gate, arm, wl, out, capacity=c)
+            r["unique_bytes"] = u
+            (out / "result.json").write_text(json.dumps(r, indent=1))
+            results.setdefault(label, {})[wl] = r
 
     def strip(r: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in r.items() if k != "digest_self"}
@@ -773,7 +947,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     print(f"run record: {run_dir}")
-    return 0 if not problems and all(x["pass"] for x in v.values()) else 1
+    required = [x for x in v.values() if x.get("required", True)]
+    return 0 if not problems and all(x["pass"] for x in required) else 1
 
 
 if __name__ == "__main__":
