@@ -85,7 +85,7 @@ so such stranded bytes are possible today.
   store matters: `--cap-convs 64 x --cap-turns 12` conversations from the same
   r2egym file (official). The baseline arm runs it first (`cap_cold`,
   `cap_warm`, no store) to fix `U` and the per-request reference local hits.
-  Each store arm (under test, `old`, `native`) then runs `cap_cold`,
+  Each store arm (under test, `old`, `native`, `lmcache`) then runs `cap_cold`,
   `cap_warm`, `cap_warm2..N` once per capacity fraction, each on a fresh vLLM
   and a fresh store of `C` bytes. Warm pass `j` starts the conversations
   rotated by `j/4` of their count, so the passes differ in arrival order.
@@ -124,9 +124,10 @@ so such stranded bytes are possible today.
   against the unlimited oracle; no `E_C` regression vs the last accepted
   iteration. A slice-size G5 (below the capacity floor) is a smoke test of
   flow and digests only; its `E_C` supports no conclusion.
-- Reference arms: `old` and `native` (vLLM `OffloadingConnector` with exactly
-  `C` CPU bytes) record their G5 numbers and are never required; phase 2 will
-  gate warm replay and `E_C` against `native`.
+- Reference arms: `old`, `native` (vLLM `OffloadingConnector` with exactly
+  `C` CPU bytes) and `lmcache` (LMCache local CPU backend of exactly `C`
+  bytes, 256-token chunks) record their G5 numbers and are never required;
+  phase 2 will gate warm replay and `E_C` against `native`.
 - Known server limit (slice 2026-10-23, `old` and connector_v2 on the same
   build): reclaim evicts `RECLAIM_BATCH_SIZE = 512` blocks per round
   (`pegaflow-core/src/storage/mod.rs`), so on a small pool each eviction
@@ -184,7 +185,7 @@ CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python/.venv/bin:~/kexi/cuda13/bin:
 LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 ~/kexi/pegaflow/python/.venv/bin/python -m rsi.gates.run_gate \
   --model ~/kexi/models/<model> --tag <model>-it<N> \
-  --arms plain,baseline,old,native,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0
+  --arms plain,baseline,old,native,lmcache,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0
 # G5 smoke on a slice (below the capacity floor: not official, no E_C conclusion):
 #   ... --gsm8k-limit 64 --replay-convs 8 --replay-turns 6 --cap-convs 8 --cap-turns 6
 ```
@@ -208,7 +209,7 @@ capacity floor (`C(0.5) >= 2 x` GPU KV bytes), no
 `not_official_because`. A required verdict that cannot be evaluated is a fail.
 Required verdicts: `baseline` and the connector under test, including
 `G2.digest_self.cap` and `G5.replay_warm`. Not required (`required: false`,
-every verdict recorded): `old` (black-box reference) and `native`. A crash of
+every verdict recorded): `old` (black-box reference), `native` and `lmcache`. A crash of
 a reference arm's stage is recorded under `errors` in its verdicts and the
 run continues; a crash of baseline or the connector under test aborts it.
 
@@ -226,9 +227,23 @@ the last accepted run record by hand until `--accepted` exists.
   phase 2 will gate warm replay and `E_C` against it; OffloadingConnector
   switches `kv_cache_layout` to `LBHNC`, so its `G0.spec` and
   `G2.digest_vs_baseline.gsm8k` fail by construction: layout, not data;
-  `G2.digest_self.*` and `G2.gsm8k_outputs` are its correctness evidence), `selftest:<mode>`
-  (gsm8k only), `<module>:<Class>`. `old`, `native` and the connector under
-  test run as `MultiConnector[arm, RsiProbe]`.
+  `G2.digest_self.*` and `G2.gsm8k_outputs` are its correctness evidence),
+  `lmcache` (reference arm, record only: LMCache's vLLM connector
+  `LMCacheConnectorV1`, lmcache 0.5.6 from the overlay `--lmcache-overlay`
+  (default `~/kexi/overlays/lmcache`, on `PYTHONPATH` of that arm's vLLM
+  only: its pins would downgrade numpy / protobuf / otel in the shared venv),
+  no PegaFlow server, configured by env only (inherited `LMCACHE_*` dropped):
+  `LMCACHE_LOCAL_CPU=True`, `LMCACHE_MAX_LOCAL_CPU_SIZE` = `B / 2^30` GiB
+  (exact: LMCache allocates `int(GiB x 2^30)` bytes = `B`, same `B` as
+  `native`), `LMCACHE_MAX_LOCAL_DISK_SIZE=0`, no disk / remote URL, chunk
+  size LMCache's default 256 tokens, telemetry off (`LMCACHE_TRACK_USAGE=false`,
+  `DO_NOT_TRACK=1`); `result.lmcache` records the env and LMCache's logged
+  configuration. LMCache stores and looks up 256-token chunks (a trailing
+  partial chunk is not saved by default), so its hit lengths are multiples of
+  256 where the oracle counts 16-token blocks: its `E` / `E_C` include that
+  granularity loss and are not a pure eviction-policy comparison),
+  `selftest:<mode>` (gsm8k only), `<module>:<Class>`. `old`, `native`,
+  `lmcache` and the connector under test run as `MultiConnector[arm, RsiProbe]`.
   The connector under test runs as `MultiConnector[under_test, RsiProbe]` with
   `kv_load_failure_policy=recompute`, reads its server port from
   `PEGAFLOW_PORT`, and gets an empty `kv_connector_extra_config`. The probe
@@ -298,7 +313,7 @@ the last accepted run record by hand until `--accepted` exists.
   G2.digest_self.replay.
 - G3.no_eviction: `pegaflow_cache_block_evictions_total` delta = 0 in every
   gsm8k and replay pass (the oracle has unlimited capacity; `cap*` passes are
-  meant to evict and are excluded; `native` has no PegaFlow server: n/a, pass).
+  meant to evict and are excluded; `native` / `lmcache` have no PegaFlow server: n/a, pass).
   The server runs with
   `--pool-size 160gb --disable-numa-affinity` (per-NUMA pools give one GPU only
   `pool_size / numa_nodes`).
@@ -341,7 +356,7 @@ the last accepted run record by hand until `--accepted` exists.
     2x GPU KV`.
   - Store-arm cap stages, per fraction `f` in `--cap-fractions` (must include
     0.5; official `0.25,0.5,0.75`), dir `cap` for 0.5 and `capNNN` (percent)
-    otherwise: fresh vLLM and (except `native`) a fresh PegaFlow server with
+    otherwise: fresh vLLM and (except `native` / `lmcache`, CPU bytes = `C`) a fresh PegaFlow server with
     `--pool-size C` `--disable-numa-affinity`, `C = int(f x U)`; passes
     `cap_cold`, `cap_warm` (digested), `cap_warm2..N` (timed), the replay
     settle / reset / poison protocol. `pool_capacity_bytes` = the server's
@@ -386,7 +401,7 @@ the last accepted run record by hand until `--accepted` exists.
     no load errors, `unmatched_requests == 0`, `G2.digest_self.cap` passes
     (same as `G2.digest_self.replay`, over the cap probe dir), and for a
     PegaFlow arm `pool_capacity_bytes` present and `<= C` and Σ
-    `loaded_bytes >= Σ external_hit_bytes` over `warm_timed` (`native`: no
+    `loaded_bytes >= Σ external_hit_bytes` over `warm_timed` (`native` / `lmcache`: no
     server, pool and load proof not applicable). Reported with it: `U`, `C`,
     hit / oracle / oracle_C / LRU / freeze hit rates, per-pass eviction
     counter deltas, per-pass server I/O (`saved_bytes`, `loaded_bytes`,

@@ -262,12 +262,25 @@ def test_verdicts_reference_arms_not_required_and_errors_isolated(tmp_path):
         "baseline": {},
         "old": {"gsm8k": {"arm": "old", "workload": "gsm8k", "error": "RuntimeError: boom"}},
         "native": {"cap": good},
+        "lmcache": {"cap": good},
         "UnderTest": {"cap": good, "cap025": good},
     }
     v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
     assert v["old"]["required"] is False and v["old"]["errors"]
-    assert v["native"]["required"] is False
-    assert v["native"]["G3.no_eviction"]["na"]
+    for ref in ("native", "lmcache"):  # in-vLLM CPU stores: no server to prove
+        assert v[ref]["required"] is False
+        assert v[ref]["G3.no_eviction"]["na"]
+        assert v[ref]["G5.replay_warm"]["pool_ok"]
     assert v["UnderTest"].get("required", True)
     assert v["UnderTest"]["G5.replay_warm"]["pass"]
     assert "cap025" in v["UnderTest"]["G5.curve"]
+
+
+@pytest.mark.parametrize("cpu_bytes", [12_919_701_504, 2_404_122_624, 171_798_691_840, 1])
+def test_lmcache_cpu_size_is_exact_bytes(cpu_bytes):
+    """LMCache takes GiB and allocates ``int(GiB * 1024**3)``: the arm must get
+    exactly the PegaFlow pool / C bytes, local CPU only."""
+    env = run_gate.lmcache_env(cpu_bytes)
+    assert int(float(env["LMCACHE_MAX_LOCAL_CPU_SIZE"]) * 1024**3) == cpu_bytes
+    assert env["LMCACHE_LOCAL_CPU"] == "True" and env["LMCACHE_MAX_LOCAL_DISK_SIZE"] == "0"
+    assert not any(k in env for k in ("LMCACHE_LOCAL_DISK", "LMCACHE_REMOTE_URL"))

@@ -11,6 +11,7 @@ Arms:
   baseline                 vLLM + RsiProbe only (no PegaFlow)
   old                      reference connector (pegaflow.connector:PegaKVConnector), black box
   native                   reference: vLLM's OffloadingConnector (CPU offload), record only
+  lmcache                  reference: LMCacheConnectorV1, local CPU backend only, record only
   selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k only
   <module>:<Class>         connector under test
 
@@ -136,6 +137,23 @@ def launched(cmd: list[str], env: dict[str, str], log: Path, health: str, timeou
                 with suppress(ProcessLookupError):
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait(timeout=30)
+            # Children (vLLM's EngineCore) outlive the API server while they
+            # free GPU / CPU-offload memory; the next stage needs that memory.
+            if not _group_gone(proc.pid, 120):
+                with suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                _group_gone(proc.pid, 60)
+
+
+def _group_gone(pgid: int, timeout: float) -> bool:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(1)
+    return False
 
 
 def pegaflow_server(args, log: Path, pool_size: str):
@@ -165,7 +183,39 @@ def pegaflow_server(args, log: Path, pool_size: str):
     return grpc, http, launched(cmd, env, log, f"http://127.0.0.1:{http}/health", 300)
 
 
-_REFERENCE = ("plain", "baseline", "old", "native")
+_REFERENCE = ("plain", "baseline", "old", "native", "lmcache")
+# Reference arms: numbers recorded, never required, a crash is recorded.
+_RECORD_ONLY = ("old", "native", "lmcache")
+# Reference stores without a PegaFlow server (a CPU cache inside vLLM).
+_OFFLOAD = ("native", "lmcache")
+LMCACHE_OVERLAY = Path.home() / "kexi" / "overlays" / "lmcache"
+
+
+def lmcache_env(cpu_bytes: int) -> dict[str, str]:
+    """LMCache config (env, read by ``LMCacheEngineConfig.from_env``): local
+    CPU backend only, sized to exactly ``cpu_bytes``. ``max_local_cpu_size``
+    is GiB and LMCache allocates ``int(GiB * 1024**3)`` bytes; ``bytes / 2**30``
+    is exact in a float and ``repr`` round-trips it. Chunk size stays at
+    LMCache's default (256 tokens); telemetry is off. Disk and remote stay at
+    their defaults (None); the caller drops any inherited ``LMCACHE_*``."""
+    return {
+        "LMCACHE_LOCAL_CPU": "True",
+        "LMCACHE_MAX_LOCAL_CPU_SIZE": repr(cpu_bytes / (1 << 30)),
+        "LMCACHE_MAX_LOCAL_DISK_SIZE": "0",
+        "LMCACHE_TRACK_USAGE": "false",
+        "DO_NOT_TRACK": "1",
+    }
+
+
+def lmcache_config(log: Path, cpu_bytes: int) -> dict[str, Any]:
+    """What the lmcache arm ran with: the env we set and LMCache's own
+    ``LMCache Configuration:`` log line (chunk size, backends, CPU GiB)."""
+    line = next((x for x in log.read_text().splitlines() if "LMCache Configuration:" in x), None)
+    return {
+        "cpu_bytes": cpu_bytes,
+        "env": lmcache_env(cpu_bytes),
+        "logged": line.split("LMCache Configuration:", 1)[1].strip()[:4000] if line else None,
+    }
 
 
 def arm_kind(arm: str) -> str:
@@ -210,6 +260,9 @@ def kv_transfer_config(
             "kv_role": "kv_both",
             "kv_connector_extra_config": {"cpu_bytes_to_use": cpu_bytes},
         }
+    elif kind == "lmcache":
+        # LMCache's vLLM connector; sized by env (``lmcache_env``).
+        under_test = {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both"}
     else:
         if kind == "selftest":
             module, cls = SELFTEST.split(":")
@@ -262,6 +315,13 @@ def vllm_server(
         env.pop("VLLM_BATCH_INVARIANT", None)
     if pf_port is not None:
         env["PEGAFLOW_PORT"] = str(pf_port)  # contract: the connector under test reads it
+    for k in [k for k in env if k.startswith("LMCACHE_")]:
+        del env[k]
+    if arm_kind(arm) == "lmcache":
+        # LMCache lives in an overlay (its pins would downgrade the shared
+        # venv); only this arm's vLLM sees it.
+        env["PYTHONPATH"] = f"{env['PYTHONPATH']}:{args.lmcache_overlay}"
+        env |= lmcache_env(cpu_bytes)
     cmd = [
         "vllm",
         "serve",
@@ -424,9 +484,11 @@ def run_arm_workload(
             invariant,
             pf_port,
             out / "vllm.log",
-            store_bytes if kind == "native" else 0,
+            store_bytes if kind in _OFFLOAD else 0,
         )
         stack.enter_context(cm)
+        if kind == "lmcache":
+            result["lmcache"] = lmcache_config(out / "vllm.log", store_bytes)
         if cap and pf_http:
             # What the server actually allocated: must not exceed C.
             m = asyncio.run(workloads.scrape(f"http://127.0.0.1:{pf_http}", ("pegaflow",)))
@@ -912,9 +974,9 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
             if not p.startswith("_")
         }
         # The oracle has unlimited capacity: an evicting pool measures its size.
-        if kind == "native":
-            # No PegaFlow server: vLLM's CPU cache exports no eviction counter.
-            g["G3.no_eviction"] = {"pass": True, "na": "native arm has no PegaFlow server"}
+        if kind in _OFFLOAD:
+            # No PegaFlow server: the CPU cache exports no eviction counter.
+            g["G3.no_eviction"] = {"pass": True, "na": f"{kind} arm has no PegaFlow server"}
         else:
             g["G3.no_eviction"] = {
                 "pass": bool(evicted) and not any(evicted.values()),
@@ -924,7 +986,7 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
             rep, base.get("replay"), gsm, base.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
         )
         cap = per_wl.get("cap")
-        pegaflow = kind != "native"
+        pegaflow = kind not in _OFFLOAD
         g["G2.digest_self.cap"] = _digest_verdict(cap and cap.get("digest_self"), 0.0)
         g["G5.replay_warm"] = _capacity_verdict(cap, pegaflow, gated=True)
         if not g["G2.digest_self.cap"]["pass"]:
@@ -960,7 +1022,7 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
         g["pass"] = not errors and all(
             x["pass"] for x in g.values() if isinstance(x, dict) and "pass" in x
         )
-        if kind in ("old", "native"):
+        if kind in _RECORD_ONLY:
             # Reference arms: every number is recorded, nothing is gated.
             g["required"] = False
         v[label] = g
@@ -1045,6 +1107,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--pegaflow-server", default=str(REPO / "target" / "release" / "pegaflow-server")
     )
+    ap.add_argument(
+        "--lmcache-overlay",
+        default=str(LMCACHE_OVERLAY),
+        help="dir with lmcache + its missing pure deps, on PYTHONPATH of the lmcache arm only",
+    )
     ap.add_argument("--concurrency", type=int, default=OFFICIAL["concurrency"])
     ap.add_argument("--settle", type=float, default=5.0)
     ap.add_argument("--gsm8k-dir", default=str(Path.home() / "kexi" / "datasets" / "gsm8k-main"))
@@ -1094,7 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return run_arm_workload(args, gate, arm, wl, out, **kw)
         except Exception as e:
-            if arm_kind(arm) not in ("old", "native"):
+            if arm_kind(arm) not in _RECORD_ONLY:
                 raise
             print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)
             return {"arm": arm, "workload": wl, "error": f"{type(e).__name__}: {e}"[:2000]}
@@ -1144,7 +1211,7 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"capacity below {MIN_CAPACITY_GPU_KV:g}x GPU KV")
         # The bar must separate a store frozen after its first fill.
         for label, g in v.items():
-            if label in ("baseline", "old", "native") or label.startswith("selftest-"):
+            if label in _REFERENCE or label.startswith("selftest-"):
                 continue
             fz = g.get("G5.replay_warm", {}).get("freeze_vs_oracle_c")
             if fz is None or fz >= MIN_EFFICIENCY_C:
