@@ -437,3 +437,316 @@ Findings:
 Process note: these runs are stopped only by their own gate. Their
 run_gate pgids were recorded at launch (probe-23 1647263, defer-01
 1689145, defer-23 1689150).
+
+## it3b (2026-10-23): the save RPC vs the server copy (probe arms, no code change)
+
+The question is which part of the save job costs the time. More arms in
+`p4probe.py` (remote only), all at rev 1bfb590, which includes the gate
+keep-alive fix:
+
+- `NoRpcV2`: the full worker save path (event wait, building the arguments),
+  but the save RPC returns True without calling the server.
+- `EmptyRpcV2`: the real save RPC with an empty `saves` list. The gRPC round
+  trip happens, the server copies nothing.
+- `Batch8V2`: the same saves as v2, but the held jobs are merged into one RPC
+  every 8 steps (or on flush). The merged job carries the last job's seq and
+  compute mark. The stream is in order, so the last mark covers every earlier
+  step.
+
+Cold replay, replay-only, 8x6. Prefill, queue and decode are vLLM's
+per-request sums in seconds.
+
+| run (GPU) | arm | TTFT p50 | vs baseline | req/s | prefill | queue | decode |
+|---|---|---|---|---|---|---|---|
+| norpc-01 (0,1) | baseline | 0.1844 | | 5.739 | 5.50 | 2.13 | 32.36 |
+| | v2 | 0.1890 | +2.5% | 5.630 | 5.82 | 2.27 | 32.87 |
+| | NoRpcV2 | 0.1869 | +1.4% | 5.684 | 5.65 | 2.17 | 32.60 |
+| norpc-23 (2,3) | baseline | 0.1720 | | 5.676 | 5.47 | 1.90 | 32.90 |
+| | v2 | 0.2032 | +18.1% | 5.467 | 6.53 | 2.87 | 33.29 |
+| | NoRpcV2 | 0.1780 | +3.5% | 5.701 | 5.54 | 2.12 | 32.65 |
+| rpc-01 (0,1) | baseline | 0.1864 | | 5.728 | 5.73 | 2.35 | 32.36 |
+| | v2 | excluded (contaminated, see below) | | | | | |
+| | EmptyRpcV2 | 0.1921 | +3.1% | 5.687 | 5.85 | 2.40 | 32.50 |
+| | Batch8V2 | 0.1988 | +6.6% | (1.192, contaminated mid-decode) | 6.13 | 2.42 | |
+| | NoSaveV2 | 0.1920 | +3.0% | 5.685 | 5.86 | 2.43 | 32.50 |
+| rpc-23 (2,3) | baseline | 0.1869 | | 5.709 | 5.80 | 2.36 | 32.44 |
+| | v2 | 0.2010 | +7.6% | 5.569 | 6.18 | 2.45 | 32.98 |
+| | EmptyRpcV2 | excluded (contaminated) | | | | | |
+| | Batch8V2 | 0.1909 | +2.1% | 5.585 | 6.06 | 2.36 | 33.08 |
+| | NoSaveV2 | 0.1913 | +2.4% | 5.661 | 5.83 | 2.22 | 32.67 |
+
+Warm (warm2 / warm3 TTFT p50, rpc runs): v2 0.097 to 0.117 s, Batch8V2 0.105
+to 0.115 s, baseline 0.159 to 0.167 s. EmptyRpcV2 and NoSaveV2 stay at
+baseline (no saves, so no external hits). Batch8V2's loaded-block checks
+pass (E_ext 1.0, excess 0, load_errors 0, no eviction). The hit table
+matches v2's: warm local 0.705 / ext 0.293 / total 0.998 / H* 0.998.
+Batch8V2's rpc-23 warm pass has p99 1.36 s with queue 11.5 s, against 1.8 s
+on its other warm passes and on v2. That is one queued burst on the
+first warm pass and it does not repeat.
+
+Contaminated passes, excluded. Three passes stalled for 22 to 32 s, each
+in its first forward step after vLLM's Triton JIT compile (rpc-01 v2,
+rpc-23 EmptyRpcV2), or in one mid-pass step (rpc-01 Batch8V2). They line
+up to the second with another agent's 160 GiB `pegaflow-server` finishing
+teardown on .44:
+
+- the qwen3-4b-g5 old arm on GPU 5: "gone after SIGTERM in 66.0s" ends
+  19:39:47, and rpc-01 v2's first step runs 19:39:22 to 19:39:46;
+- the same run's next server: 61.0 s, ends 19:46:31; rpc-23 EmptyRpcV2 runs
+  19:46:10 to 19:46:32.
+
+The stalled requests had no load (hit=0), no save backlog (tp0
+max_pending 2, max_job_ms 108.6, the same as the clean v2 pass) and no
+pending registration (the session opened 19:39:18). Nothing else ran on
+our pair. The reading that this is a CUDA driver stall while a 160 GiB
+pinned pool is freed is unverified. It sits next to the server's teardown
+candidates (SIGTERM not handled, about 0.36 s/GiB release, hugepages),
+which are for the server owner. Our own servers take 59 to 95 s to tear
+down, so our runs can stall other agents the same way. The gate owner has
+two proposals: an untimed warmup request per arm before the cold pass,
+and flagging a cold pass whose p99 is more than 10x the in-run baseline.
+
+What the server does per save (v2 rpc-23 cold, tp0, from the server's
+metrics): 138 save RPCs, 1.167 GB, `save_duration` sum 0.297 s (129 under
+10 ms, max under 25 ms). On the client side, rpc_ms is 481 over 169 jobs,
+wait_ms 3360 (compute event), max_pending 2. The copy itself is cheap for
+the server. The cost shows up on the GPU's other work.
+
+Findings:
+- NoSaveV2, NoRpcV2 and EmptyRpcV2 are all within 1.4 to 3.5% of baseline.
+  Their ranges overlap across the pairs. So the Python save path and an
+  empty gRPC round trip are not the cost. The server copy is.
+- Batch8V2 is +2.1% on 2,3 against v2's +7.6% in the same run. The 0,1 run
+  (+6.6%) lost its v2 control to the stall. Batching is the one probe that
+  moves cold toward the noise band while keeping warm hits. It is followed
+  up in the next section.
+
+### TP2 all-reduce vs a concurrent D2H (microbenchmark, GPU 0,1)
+
+The coordinator's hypothesis: with TP2 and no P2P, NCCL all-reduce goes
+through host memory, and the save D2H competes with it. To test it,
+`~/kexi/tmp/dsv2-p4/ar_d2h_bench.py` (remote only) runs a separate saver
+process (like pegaflow-server) that copies D2H from GPU memory into pinned
+host memory on a non-blocking stream. It times one "step": 54 all-reduces
+of [T, 2048] bf16 (27 layers x 2), p50 over 30 steps. NCCL 2.29.7 picks
+SHM (`Channel 00 : 0[0] -> 1[1] via SHM/direct/direct`).
+
+| saver | T=512 ms | T=2048 | T=4096 |
+|---|---|---|---|
+| none | 9.0 | 30.6 | 61.5 |
+| GPU2 (outside the pair), back-to-back 64 MB, 24.9 GB/s | 9.0 | 30.6 | 61.8 |
+| GPU0 back-to-back 64 MB | 54.4 | 215.9 | 430.8 |
+| GPU1 back-to-back 64 MB | 43.5 | 171.4 | 341.7 |
+| GPU0 back-to-back, saver pinned to NUMA3 (GPU0-local) | 51.0 | 198.9 | 398.3 |
+| GPU0 back-to-back, saver pinned to NUMA0 | 54.3 | 215.6 | 430.5 |
+| GPU0 + GPU1 back-to-back | 96.0 | 363.9 | 734.7 |
+| GPU0 2 MB / 10 ms (0.18 GB/s) | 10.2 | 36.5 | 73.6 |
+| GPU0 1 MB / 10 ms (0.09 GB/s) | 9.7 | 34.6 | 69.3 |
+| GPU0 + GPU1, 1 MB / 10 ms each | 10.2 | 36.6 | 73.4 |
+| GPU0 7 MB / 40 ms, one copy | 9.1 | 35.2 | 69.5 |
+| same, as 256 KiB strided pieces | 9.1 | 36.4 | 73.3 |
+| same, as 18 KiB pieces (one MLA page) | 9.1 | 36.1 | 72.8 |
+| GPU0 2 MB / 10 ms, side stream in a rank-0 thread (same context) | 10.2 | 37.2 | 72.0 |
+| GPU0 tiny kernel every 10 ms, other process, no copy | 9.1 | 31.9 | 64.1 |
+| GPU0 tiny kernel every 2 ms, other process, no copy | 9.6 | 34.4 | 68.7 |
+
+Findings:
+- The interference is per GPU, not per PCIe link. A 25 GB/s D2H on a GPU
+  outside the pair costs the all-reduce nothing. Any D2H on a pair GPU slows
+  it. Pinning the saver to the GPU-local NUMA node recovers only 8%.
+  Candidate (a), checking that rank 0's D2H does not share a root complex
+  with the NCCL path, is not the lever. Every 4090 here is on its own root
+  port (`pci0000:00/20/40/60`), SYS to every other GPU.
+- Chunking does not help. At the same bytes and pacing, one copy, 256 KiB
+  pieces and 18 KiB pieces cost the same. Back-to-back small copies are
+  worse than large ones. Candidate (b) as "chunk the D2H" does not hold.
+  Rate-limiting lowers the cost roughly in proportion, but even 0.09 GB/s
+  costs +13% at T=4096. Cold replay saves about 1.2 GB in 6.6 s (about
+  0.18 GB/s, the +19% row), so pacing alone cannot reach 2%.
+- Splitting the same bytes across both writers is no better.
+- About half the cost is there without any copy: a tiny kernel submitted
+  from another process every 2 ms costs +12%. An active second context
+  takes time from NCCL's SHM proxy kernels. That points at how often the
+  server submits work on the GPU more than at bytes.
+
+These measurements went to the server agent, who owns the server copy and
+submit path (feat/rsi-server-reclaim). The connector side can change how
+often a save reaches the server: batching across steps (candidate (c)),
+next.
+
+### Batching across steps (probe arms, `batch-01` / `batch-23`, rev 1bfb590)
+
+`Batch32V2` is Batch8V2 with 32 steps. `CountV2` is v2 plus a counter of
+device-contiguous block runs per layer save. That count is a lower bound on
+the server's `cuMemcpyDtoHAsync` calls, since the server merges contiguous
+ranges.
+
+| run (GPU) | arm | cold TTFT p50 | vs baseline | req/s | prefill | queue | warm2 / warm3 p50 |
+|---|---|---|---|---|---|---|---|
+| batch-01 (0,1) | baseline | 0.1894 | | 5.691 | 5.83 | 2.38 | 0.172 / 0.161 |
+| | v2 | 0.2071 | +9.3% | 5.589 | 6.36 | 2.48 | 0.101 / 0.116 |
+| | Batch8V2 | 0.1944 | +2.6% | 5.594 | 6.08 | 2.22 | 0.104 / 0.109 |
+| | Batch32V2 | 0.1897 | +0.2% | 5.662 | 5.88 | 2.43 | 0.108 / 0.100 |
+| batch-23 (2,3) | baseline | 0.2010 | | 5.657 | 5.39 | 2.06 | 0.162 / 0.151 |
+| | v2 | 0.1996 | -0.7% | 5.556 | 6.06 | 2.33 | 0.118 / 0.111 |
+| | Batch32V2 | excluded (stalled in decode, see below) | | | | | 0.099 / 0.108 |
+| | CountV2 | 0.1966 | -2.2% | 5.590 | 6.16 | 2.54 | 0.100 / 0.107 |
+
+The batch-23 baseline cold p50 (0.2010) is high for this pair: it was
+0.1869 to 0.1892 in four earlier runs. So the p50 deltas on 2,3 in this run
+are not comparable. Prefill sums still order the same way as on 0,1
+(baseline 5.39, v2 6.06, CountV2 6.16). Warm E_ext is 1.0 with excess 0 and
+no eviction for every saving arm. Warm hits for Batch8V2 and Batch32V2 equal
+v2's (local 0.705 / ext 0.293 / total 0.998 / H* 0.998).
+
+The Batch32V2 cold pass on 2,3 lost 24 s in one decode step. That step
+lines up with this run's own other pair: the batch-01 Batch8V2 server tore
+down from 20:52:15 to 20:53:18. It is excluded and is rerun one pair at a
+time in it4.
+
+Copies per save (CountV2, cold to warm3, tp0): over 500 jobs, 13,500 layer
+saves, 74,952 blocks and 16,308 contiguous runs. That is 1.21 runs per
+layer save and about 33 per job (27 layers). So the server issues about 33
+`cuMemcpyDtoHAsync` calls per save RPC. Batch32 cuts the RPC count about
+16x (one RPC per 32 steps, instead of one every ~2 steps that save), and so
+the copy submissions per second too.
+
+Findings:
+- Fewer save submissions bring cold back toward baseline: Batch8 +2.6%,
+  Batch32 +0.2%, against v2 +9.3% in the same run on 0,1. Warm hits and the
+  warm speedup are unchanged.
+- Each of these is one sample. The claim needs the coordinator's 3x
+  in-run repeat on one pair, with no other pegaflow server starting or
+  stopping on the host during a timed pass.
+
+## it4 (2026-10-23): save batching as a policy knob (commit 72bffa6)
+
+Hypothesis: the cold cost scales with how often the server submits copies
+on vLLM's GPU. Merging consecutive steps' saves into one save RPC brings
+cold replay within 2% of baseline, with warm hits unchanged.
+
+### Design
+
+- Two new knobs in `models/default.toml` / `Policy`, model-agnostic.
+  `save_batch_steps` and `save_batch_ms`: a step's save job is held, and
+  is sent merged with the following steps' jobs once the oldest held job
+  has seen `save_batch_steps` engine steps or waited `save_batch_ms`,
+  whichever comes first. A value <= 0 disables that bound;
+  `save_batch_steps = 1` sends every step. The commit ships both off, so
+  the defaults stay at today's behaviour until the gates pick a value.
+- Merging: one entry per layer, with the block ids and hashes of every
+  held step in order. The merged job takes the last held job's sequence
+  number and compute mark. vLLM's compute stream is in order, so the last
+  mark covers every earlier held step's forward. A held job already owns
+  its sequence number, so the finish fence (`finished_sending`) of a
+  request that finishes while its saves are held still waits for them.
+- `flush` (preemption, shutdown) sends held jobs first, so a preemption
+  never waits on the batch bound. vLLM calls `wait_for_save` on steps
+  without a forward too, so held jobs keep aging while the engine only
+  polls.
+- New `save stats` fields: `rpcs` (save RPCs sent), `sent` /
+  `sent_wait_ms` / `max_sent_wait_ms` (how long finished requests were
+  held between vLLM's finish and our `finished_sending`).
+- Unit tests: `test_save_batching` covers the off, step, idle-step, time
+  and either-bound cases. `test_save_batching_flush_and_finish_fence`
+  covers the fence plus flush. 207 passed.
+
+### Knob sweep (`2026-10-23-dsv2-lite-p4-it4-knob-01`, GPU 0,1 only, `--pool-size 64gb`)
+
+The arms are v2 subclasses that set the worker's batch fields (KB32:
+steps 32; KT100 / KT250: time 100 / 250 ms, no step bound).
+
+| arm | cold TTFT p50 | vs baseline | req/s | prefill | queue | save RPCs (cold window) | finished_sending hold mean / max ms (cold) |
+|---|---|---|---|---|---|---|---|
+| baseline | 0.1877 | | 5.714 | 5.56 | 2.13 | | |
+| v2 | 0.2254 | +20.1% | 5.474 | 6.42 | 2.60 | 169 | 23 / 161 |
+| KB32 | 0.1799 | -4.2% | 5.670 | 5.61 | 2.16 | 13 | 480 / 1030 |
+| KT100 | 0.1899 | +1.2% | 5.596 | 6.16 | 2.49 | 46 | 78 / 225 |
+| KT250 | 0.1902 | +1.3% | 5.621 | 6.05 | 2.50 | 22 | 154 / 282 |
+
+Warm (warm2 / warm3 TTFT p50): baseline 0.162 / 0.161, v2 0.096 / 0.109,
+KB32 0.102 / 0.101, KT100 0.111 / 0.104, KT250 0.099 / 0.110. Every saving
+arm: E_ext 1.0, excess 0, load_errors 0, no eviction, replay digests 1382
+external / 7094 local matched, 0 mismatched. Hits (warm): local 0.705 /
+ext 0.293 / total 0.998 / H* 0.998, the same for every arm. Every arm
+logs `flushes=0`, so no preemption flush had to wait. Each of the 37
+requests per pass has at most 1 preemption: the gate scrapes only the
+per-request histogram, whose le=1 bucket holds all 37.
+
+Contamination check:
+- v2's +20% has p99 0.83 (not 10x baseline), but it is far above its
+  earlier +5 to +9%. Its cold pass (21:14) ran while another agent's 160
+  GiB server (qwen3-4b-g5 gsm8k) was up and serving on GPU 5. It is one
+  noisy sample. The repeat run carries its own v2 arm.
+- KB32's first warm pass lost 18 s (p99 17.8 s, queue 143 s). The 8
+  requests waited on async loads (vLLM: "KV fetch: 8 in progress") from
+  21:20:38 to 21:20:56, and the engine only polled. The other agent's
+  160 GiB server tore down from 21:19:50 to 21:20:56 and ended in the same
+  second. This is the teardown stall again (unverified mechanism, see
+  it3b), now hitting a load. Pass excluded.
+
+Readings:
+- The RPC count is what moves cold: 169 -> 46 -> 22 -> 13 RPCs gives
+  +20 -> +1.2 -> +1.3 -> -4.2%.
+- The cost of batching is the finished_sending hold. With a step bound
+  only (KB32), it grows with step time: a mean of 480 ms and a max of
+  1 s in cold, against 23 / 161 ms unbatched. The time bound caps it
+  (KT250: max 282 ms) but sends about 2x the RPCs of KB32. Both bounds
+  together (steps 32, time 250 ms) are the candidate default, since the
+  time bound limits the hold when steps are slow.
+- Not yet measured: G5 E_C (the cap workload, where later saves may turn
+  a quick next turn into a miss) and Qwen3-4B TP1.
+
+### KB32 3x in-run repeat (`2026-10-23-dsv2-lite-p4-it4-rep-01`, GPU 0,1 only, 64gb)
+
+Arms: baseline, v2 (batching off), and KB32 three times (KB32b / KB32c are
+aliases). Host check: no other pegaflow server started or stopped during
+the cold passes.
+
+| arm | cold TTFT p50 | vs baseline | cold req/s | vs baseline | prefill | G4 cold p50 / req/s | warm2 / warm3 p50 | save RPCs (cold) | hold mean / max ms (cold) |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline | 0.1861 | | 5.706 | | 5.60 | | 0.175 / 0.164 | | |
+| v2 | 0.2011 | +8.1% | 5.562 | -2.5% | 6.24 | fail / fail | 0.117 / 0.106 | 168 | 20 / 104 |
+| KB32 | 0.1890 | +1.5% | 5.676 | -0.5% | 5.86 | pass / pass | 0.096 / 0.123 | 15 | 451 / 1117 |
+| KB32b | 0.1874 | +0.7% | 5.673 | -0.6% | 5.86 | pass / pass | 0.096 / 0.104 | 15 | 510 / 1121 |
+| KB32c | 0.1905 | +2.4% | 5.640 | -1.2% | 5.95 | fail / pass | 0.096 / 0.105 | 15 | 454 / 1119 |
+
+Every saving arm: E_ext 1.0, excess 0, load_errors 0, no eviction, warm
+hits local 0.705 / ext 0.293 / total 0.998 / H* 0.998, `flushes=0`.
+
+Findings:
+- KB32 brings cold from +8.1% to +0.7 to +2.4% (mean +1.5%). Two of three
+  pass the hard G4 bound, and the third misses it by 0.4 pp. Warm is not
+  hurt (it is at or below v2).
+- The finished_sending hold is the price: a mean of about 0.5 s and a max
+  of 1.1 s with a step bound alone. The 250 ms time bound targets that.
+### Candidate default 32 steps or 250 ms, 3x (`2026-10-23-dsv2-lite-p4-it4-def-01`, GPU 0,1 only, 64gb)
+
+KD / KDb / KDc use the working-tree `default.toml` (`save_batch_steps =
+32`, `save_batch_ms = 250.0`, confirmed in the log). KOff sets batching
+off as the in-run control. Host check: no other pegaflow server started
+or stopped during the cold passes.
+
+| arm | cold TTFT p50 | vs baseline | cold req/s | vs baseline | prefill | G4 cold p50 / req/s | warm2 / warm3 p50 | save RPCs (cold) | hold mean / max ms (cold) |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline | 0.1811 | | 5.693 | | 5.58 | | 0.161 / 0.158 | | |
+| KOff | 0.2024 | +11.8% | 5.550 | -2.5% | 6.07 | fail / fail | 0.097 / 0.105 | 169 | 20 / 101 |
+| KD | 0.1907 | +5.3% | 5.610 | -1.5% | 6.12 | fail / pass | 0.094 / 0.107 | 24 | 144 / 282 |
+| KDb | 0.1906 | +5.3% | 5.609 | -1.5% | 6.14 | fail / pass | 0.097 / 0.100 | 25 | 124 / 279 |
+| KDc | 0.1891 | +4.4% | 5.609 | -1.5% | 6.12 | fail / pass | 0.096 / 0.108 | 24 | 143 / 281 |
+
+All saving arms: E_ext 1.0, excess 0, no eviction, the same warm hits,
+`flushes=0`.
+
+Negative result: the 250 ms bound halves the gain. It caps the hold (max
+282 ms vs 1.1 s), but it sends 24 RPCs per cold pass against KB32's 15,
+and cold is +4.4 to +5.3% against KB32's +0.7 to +2.4%. Under this load a
+cold step takes about 40 to 60 ms, so 250 ms is only 4 to 6 steps.
+Batching off is +11.8% in this run (v2 ranged +5 to +20% across runs).
+The cold cost tracks save RPCs per pass: 169 -> 24 -> 15 gives about
++8 to +12% -> +5% -> +1.5%. The working-tree default stays uncommitted.
+
+Next hypothesis (one change): a larger batch with a looser time bound,
+which sends fewer RPCs than KB32 while still capping the hold. Sweep: 64
+steps alone, 64 steps or 1000 ms, 32 steps or 1000 ms. The best one then
+gets the 3x repeat.
