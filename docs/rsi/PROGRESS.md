@@ -97,7 +97,7 @@ names, magic constants that only exist in the old code).
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | it2 official run passes every G0-G4 verdict (`2026-10-23-qwen3-4b-p3-it2`); review APPROVE-WITH-FIXES, fixes done in it2c (slice + held-out pass); G5 pending (gate fixes + server reclaim) |
-| P4 | onboard DeepSeek-V2-Lite-Chat | todo |
+| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
 
@@ -506,6 +506,17 @@ names, magic constants that only exist in the old code).
   0.210 s; hits unchanged (replay warm 0.998 = H*). Held-out replay
   `2026-10-23-qwen3-4b-p3-it2c-heldout` (convs 33..): all replay verdicts
   pass. G4 numbers within 0.5 pp of slice2: no official rerun needed.
+
+- it2c done (50e186b, 056eb4b, 8af8fe4): all it2 review findings resolved
+  (S4 partly: a hung save RPC still blocks, needs a server-side deadline).
+  Slice and held-out replay slice pass; G4 within 0.5 pp of slice2, so the
+  official it2 run stands. Independent re-review of it2c running; Qwen3-4B is
+  accepted for G0-G4 when it passes (G5 pending).
+- P4 DeepSeek-V2-Lite-Chat started on branch `feat/rsi-deepseek-v2-lite`
+  (model PR, stacked on #473), TP=2 (31 GB bf16 does not fit one 4090),
+  GPUs 0-3, isolated onboarding agent. Its runs import connector_v2 from its
+  own remote tree via PYTHONPATH (the shared venv's .pth points at
+  `~/kexi/pegaflow-semantics-rsi/python`).
 
 ## Semantics changelog
 
