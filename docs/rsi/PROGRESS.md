@@ -440,6 +440,20 @@ names, magic constants that only exist in the old code).
     replay warm 0.730 / 0.268 / 0.998 = H* 0.998, E_ext 1.0. G2 digests 0
     mismatched. NEXT (orchestrator): review agent + official run.
 
+- Server reclaim/eviction (branch `feat/rsi-server-reclaim`, own PR, see
+  `docs/rsi/server/reclaim-eviction.md`).
+  - H1 (b0e6d93): reclaim rounds sized to the resident cache.
+  - H2: tail-first refresh, reverted as a negative result.
+  - H3 (1521d64): one pinned region per saved block. Layer-first saves held
+    up to 885 blocks (15%) of evicted memory.
+  - Official G5 E_C, old / v2: base 0.122 / 0.205 -> H1+H3 0.544 / 0.438.
+    Residency after cap_cold 5823 / 5848 of 5873. G5 still fails at 0.9.
+  - Cost: H3 adds 10-17% to warm replay TTFT p50 without reclaim (v2
+    0.54 -> 0.61 s), with req/s unchanged. Likely lost copy coalescing;
+    not yet verified.
+  - Server candidates logged: SIGTERM is not handled, and pinned pool
+    teardown takes ~0.36 s/GiB.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
