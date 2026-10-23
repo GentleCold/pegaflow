@@ -977,11 +977,11 @@ mod tests {
         let query = [&keys[..3], std::slice::from_ref(&missing)].concat();
         assert_eq!(cache.get_prefix_blocks(&query).0, 3);
 
-        let order: Vec<BlockKey> = (0..4)
-            .map(|_| cache.remove_lru_batch(1)[0].0.clone())
-            .collect();
-        let tail_first: Vec<BlockKey> = keys.iter().rev().cloned().collect();
-        assert_eq!(order, tail_first);
+        let order: Vec<BlockKey> = (0..4).map(|_| cache.remove_lru_batch(1)[0].0.clone()).collect();
+        assert_eq!(
+            order,
+            [&keys[3], &keys[2], &keys[1], &keys[0]].map(Clone::clone)
+        );
     }
 
     #[test]
