@@ -27,8 +27,27 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
 | adapter (per KVCacheSpec type) | Python | onboarding agent |
 | policy (what to save/load/prefetch) | Python | onboarding agent (main RSI surface) |
 | semantics (`pegaflow-semantics`: needed/resolve/saveable/key/seal_plan) | Rust, PyO3 | agent proposes, review agent + human audit |
-| server (storage only) | Rust | onboarding agent may change it when a gate shows a server limit (e.g. group-incoherent eviction); must stay model-agnostic (Kind-aware, never model-name-aware), keep `cargo test` green and the `old` arm unregressed, and gets its own review |
+| server (storage only) | Rust | onboarding agent may propose a change when a gate shows a server limit (e.g. group-incoherent eviction); must stay model-agnostic (Kind-aware, never model-name-aware), keep `cargo test` green and the `old` arm unregressed; always its own PR, human review required (see "PR policy") |
 | gates (`docs/rsi/GATES.md`, `rsi/gates/`) | — | human only; agents may add checks, never relax |
+
+## PR policy (user, 2026-10-23)
+
+- Connector code is NOT per model: one `connector_v2`, adapters per vLLM
+  KVCacheSpec class, policy shared, per-model knobs only in
+  `connector_v2/models/<model>.toml`. A model iteration may touch adapters /
+  policy as long as every earlier accepted model still passes its gates.
+- Review unit = one model: each model's onboarding (all its iterations, docs,
+  accepted run) is one branch `feat/rsi-<model>` and one PR, stacked on the
+  previous one. #473 is the observation PR for the foundation (semantics,
+  gates, connector core) + Qwen3-4B.
+- Server changes (`pegaflow-core`, `pegaflow-server`, proto) are always a
+  separate branch `feat/rsi-server-<topic>` and a separate PR, human-reviewed;
+  agents never merge them. The model PR that needs one states the dependency
+  and runs its gates against that server build; the model is "accepted
+  pending server review" until a human approves the server PR.
+- Gate changes (`rsi/gates/**`, GATES.md) stay human-owned: agent-written gate
+  code lands on its own branch (e.g. `feat/rsi-g5`) and is reviewed before it
+  is used to accept anything.
 
 ## Isolation (no reference to existing implementation)
 
@@ -369,6 +388,17 @@ names, magic constants that only exist in the old code).
   resistance, async save). Qwen3.5-4B (P5, linear attention + full) is the
   first model where cross-group coherence matters on the 4090s. G5 tooling is
   being implemented by a gate agent on branch `feat/rsi-g5`.
+
+- User asked whether baseline should include vLLM's official offload. Yes:
+  vLLM 0.32 ships `OffloadingConnector` (`--kv-offloading-size <GiB>`,
+  backend `native`; `SimpleCPUOffloadConnector` with
+  `VLLM_USE_SIMPLE_KV_OFFLOAD`), both `SupportsHMA`. New arm `native`
+  (OffloadingConnector + RsiProbe, CPU bytes = PegaFlow pool size; at G5 the
+  same capacity C). Phase 1: recorded next to `baseline` in G3/G4/G5 tables.
+  Phase 2, after the first numbers: G4 warm replay and G5 `E_C` must also be
+  at least as good as `native` (hard). Added to the G5 agent's scope.
+  PR policy section added (per-model PRs, server PRs separate and
+  human-reviewed).
 
 ## Semantics changelog
 

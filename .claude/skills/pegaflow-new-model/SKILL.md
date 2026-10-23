@@ -75,7 +75,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    The server is in scope when the evidence points there (eviction, admission,
    pools, query): keep it Kind-aware and model-agnostic (no model names, no
    per-model branches), run `cargo test`, re-run the `old` arm to show no
-   regression, and get a separate server review.
+   regression. Server code goes on its own branch `feat/rsi-server-<topic>` as
+   a separate PR for HUMAN review (never merge it yourself); the model's
+   acceptance is "pending server review" until it is approved. Connector code
+   stays model-agnostic too: per-model differences live only in
+   `connector_v2/models/<model>.toml` (see PROGRESS.md "PR policy").
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
    gate integrity (nothing relaxed), copying from the old connector, regressions
