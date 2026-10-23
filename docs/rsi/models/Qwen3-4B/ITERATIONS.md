@@ -247,3 +247,126 @@ inline. Making the save asynchronous with respect to the model step should
 bring cold replay and gsm8k within 2% of baseline without touching warm hits.
 Accept only if every G2/G3 check still passes and the full G4 set passes.
 
+
+## G5 official (r3, 2026-10-23)
+
+Record `~/kexi/rsi-runs/2026-10-23-qwen3-4b-g5-official-e9f3f33-r3` (.44 GPU5,
+18:53:55 to 22:00 UTC). `official: true`, `not_official_because: []`.
+
+- Gate rev e9f3f33 (tree `~/kexi/pegaflow-rsi-g5-e9f3f33`, `.rsi-rev`).
+- Connector under test: `pegaflow.connector_v2:PegaKVConnectorV2` at
+  8a05b7c (`--under-test-path ~/kexi/pegaflow-rsi-g5-7bf8076-ut/python`, a
+  `PYTHONPATH` prepend; the run predates the overlay). The tree was checked
+  afterwards with `provenance.Trees` (144bfd8): it matches 8a05b7c
+  blob-for-blob (63 files).
+- Venv `pegaflow` (`old` arm, oracle): 056eb4b at
+  `~/kexi/pegaflow-semantics-rsi/python`, also verified.
+- pegaflow-server sha256 `d1970ead…c579d7`; its tree claims 056eb4b.
+- Run settings: `--pool-size 160gb` (pre-64gb default), cap `auto` (64
+  conversations), fractions 0.25/0.5/0.75.
+- The run predates 91b6a8e..bf9ef3c, so `summary.provenance`, the warmup
+  request and `G2.digest_groups` are absent. None of them changes a Qwen3-4B
+  verdict: Qwen3-4B is split-invariant (FLASH_ATTN, `G2.split_control`
+  passes), and it has one full-attention group, which is digested.
+- Contamination, checked offline with the 325fbd0 rule (timed replay p99 TTFT
+  `> 10x` the baseline's p99 in the same pass): none. The largest ratio is
+  native `cold` (20.68 s vs 6.38 s, 3.2x); every other arm is below 1x.
+
+Verdict: Qwen3-4B accepted on G0-G4. G5 fails: E_C(0.5) is 0.684 vs 0.9,
+which is at LRU level (H_lru/H*_C 0.859).
+
+### Uncapped hit table (tokens)
+
+gsm8k: prompt 1,469,407 tokens per pass; H* is 0.9329 cold, 0.9925 warm.
+Accuracy is 0.8582 in every pass of every arm.
+
+| arm | pass | local | ext | total | hit | E_ext |
+|---|---|---|---|---|---|---|
+| baseline | warm | 1,370,784 | 0 | 1,370,784 | 0.9329 | 0.0 |
+| old | warm | 1,361,424 | 98,098 | 1,459,522 | 0.9933 | 1.0 |
+| native | warm | 1,370,784 | 88,738 | 1,459,522 | 0.9933 | 1.0 |
+| v2 | warm | 1,338,544 | 119,808 | 1,458,352 | 0.9925 | 1.0 |
+
+Cold equals baseline cold (1,370,784 local) for every arm.
+
+Replay: prompt 1,275,208 tokens per pass; H* is 0.8641 cold (native 0.8631),
+0.9983 warm.
+
+| arm | pass | local | ext | total | hit | E_ext |
+|---|---|---|---|---|---|---|
+| baseline | cold / warm / warm2 / warm3 | 482,624 / 482,624 / 481,216 / 481,216 | 0 | same | 0.3785 / 0.3785 / 0.3774 / 0.3774 | 0.0 |
+| old | cold | 488,272 | 613,664 | 1,101,936 | 0.8641 | 1.0 |
+| old | warm / warm2 / warm3 | 456,672 / 475,248 / 454,224 | 816,515 / 797,939 / 818,963 | 1,273,187 | 0.9984 | 1.0 |
+| native | cold | 489,904 | 612,032 | 1,101,936 | 0.8641 | 1.0 |
+| native | warm / warm2 / warm3 | 482,512 / 481,856 / 481,856 | 790,675 / 791,331 / 791,331 | 1,273,187 | 0.9984 | 1.0 |
+| v2 | cold | 481,648 | 620,288 | 1,101,936 | 0.8641 | 1.0 |
+| v2 | warm / warm2 / warm3 | 443,216 / 443,168 / 443,168 | 829,776 / 829,824 / 829,824 | 1,272,992 | 0.9983 | 1.0 |
+
+### G5 (cap trace, 64 conversations x 12 turns)
+
+- U (measured on the baseline's `cap_cold`) is 54.43 GB; the cap_plan
+  estimate was 54.43 GB against the 49.27 GB needed.
+- GPU KV is 11.16 GB.
+- Capacity floor passes: C(0.5)/GPU-KV is 2.44, above the 2.0 minimum.
+- The gate is E_C(0.5) >= 0.9; 0.25 and 0.75 are reported only.
+- H*_C, H_lru and hit are warm-timed hit rates. H*_C and H_lru are computed
+  on each arm's own trace, so they differ slightly between arms.
+
+| C/U | C (GB) | C/GPU-KV | arm | H*_C | H_lru | hit | E_C |
+|---|---|---|---|---|---|---|---|
+| 0.25 | 13.61 | 1.22 | v2 | 0.8645 | 0.5814 | 0.3987 | 0.084 |
+| 0.25 | 13.61 | 1.22 | old | 0.8654 | 0.5815 | 0.3952 | 0.069 |
+| 0.25 | 13.61 | 1.22 | native | 0.8653 | 0.5700 | 0.5285 | 0.287 |
+| 0.5 | 27.22 | 2.44 | v2 | 0.9290 | 0.8569 | 0.8420 | **0.684** |
+| 0.5 | 27.22 | 2.44 | old | 0.9300 | 0.8575 | 0.8324 | 0.681 |
+| 0.5 | 27.22 | 2.44 | native | 0.9292 | 0.8579 | 0.8614 | 0.715 |
+| 0.75 | 40.83 | 3.66 | v2 | 0.9707 | 0.9155 | 0.8758 | 0.669 |
+| 0.75 | 40.83 | 3.66 | old | 0.9708 | 0.9153 | 0.8764 | 0.682 |
+| 0.75 | 40.83 | 3.66 | native | 0.9711 | 0.9146 | 0.9269 | 0.770 |
+
+v2 at C/U 0.5:
+
+| metric | value |
+|---|---|
+| E_C cold | 0.971 |
+| E_C own-local | 0.851 |
+| H_lru/H*_C | 0.859 |
+| freeze/H*_C | 0.623 (the trace separates a frozen store from H*_C) |
+| evictions per pass | 14k-25k blocks |
+| pool used at pass end | at most 26.4 of 27.2 GB |
+| load errors / excess tokens | 0 / 0 |
+| loads_ok, pool_ok | true |
+
+`G2.digest_self.cap` passes for v2 at every fraction.
+
+### G4 (vs the in-run baseline; medians)
+
+Slack: replay warm must be strictly better than baseline; replay cold and
+gsm8k may be at most 2% worse.
+
+| check | baseline | v2 | old | native |
+|---|---|---|---|---|
+| replay warm TTFT p50 (s) | 2.780 / 2.785 | 0.538 / 0.542 | 0.606 / 0.633 | 0.499 / 0.491 |
+| replay warm req/s | 3.169 / 3.166 | 10.033 / 10.023 | 10.056 / 10.233 | 5.855 / 9.767 |
+| replay cold TTFT p50 (s) | 2.973 | 1.254 | 1.340 | 1.537 |
+| replay cold req/s | 3.113 | 6.771 | 6.247 | 4.273 |
+| gsm8k cold (s) | 164.2 | 165.6 | 166.2 | 168.2 (fail) |
+| gsm8k warm (s) | 164.6 | 164.4 | 169.7 (fail) | 174.6 (fail) |
+
+Replay p99 TTFT (s), cold / warm / warm2 / warm3:
+
+| arm | p99 TTFT |
+|---|---|
+| baseline | 6.38 / 6.52 / 6.25 / 6.27 |
+| v2 | 2.99 / 2.14 / 1.81 / 1.82 |
+| old | 5.97 / 2.64 / 2.20 / 1.95 |
+| native | 20.68 / 2.38 / 19.96 / 2.33 |
+
+Verdicts:
+
+| arm | result | failing checks |
+|---|---|---|
+| baseline | passes | none |
+| v2 (required) | fails | `G5.replay_warm` only |
+| old | fails (not required) | `G4.gsm8k_warm.seconds`, `G2.digest_self.cap`, `G5` |
+| native | fails (not required) | `G0.spec` (LBNHC vs LBHNC layout), `G2.digest_vs_baseline.gsm8k`, G4 gsm8k, `G5` |

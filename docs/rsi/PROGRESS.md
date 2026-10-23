@@ -86,7 +86,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | it1b fails the new hard G4 (cold/gsm8k overhead); it2 (async save) in progress |
+| P3 | onboard Qwen3-4B | G0-G4 accepted; G5 fails, E_C 0.684 at LRU level (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)") |
 | P4 | onboard DeepSeek-V2-Lite-Chat | todo |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -493,6 +493,13 @@ names, magic constants that only exist in the old code).
   unchanged on the 24 recorded runs (5580 verdict leaves) apart from the
   new `G2.split_control`, which old records lack. DeepSeek-V2-Lite's
   gate.json must set `"split_invariant": false` (P4's file).
+- G5 official r3 (2026-10-23, .44 GPU5): gate e9f3f33, connector_v2 at
+  8a05b7c (`--under-test-path`, tree verified blob-for-blob afterwards),
+  official, uncontaminated (max timed p99 ratio 3.2x vs the 10x limit).
+  Qwen3-4B connector_v2 passes G0-G4. It fails G5: E_C(0.5) is 0.684 vs
+  0.9, with hit 0.842 vs H*_C 0.929, about LRU level (H_lru 0.857). At
+  C/U 0.25 / 0.75, E_C is 0.084 / 0.669. Tables are in
+  `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)".
 - G5 re-review 2 (accept-with-fixes on 4797a05..e9f3f33) applied in
   91b6a8e..940def4; resolution table in `reviews/G5-gate-rereview2.md`.
   Split-variant G2 is now exact: warm outputs == plain `split` (aligned
