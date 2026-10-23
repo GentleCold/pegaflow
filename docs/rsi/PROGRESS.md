@@ -533,6 +533,15 @@ Each entry: what was added, why, which vectors cover it.
 
 ## Open questions
 
+- For final acceptance (user's final pass; agent review counts as acceptance
+  until then, GATES.md stays DRAFT): the `split_invariant=false` rule replaces
+  cross-split `computed_exact` and exact outputs-vs-baseline-cold on
+  split-variant models (MLA prefill, e.g. DeepSeek-V2-Lite). Instead: warm
+  outputs == plain `split` exactly (aligned prompts reported only), cold ==
+  baseline cold, `computed_exact` only against same-split copies with
+  per-pass coverage >= 0.9; the flag is checked by `G2.split_control` in
+  every run. Needs the user's confirmation.
+
 - "agentx" perf workload: not found in repo; asked the user. Fallback: multi-turn
   agent traces from `/ppio/data_sets/R2EGym-SFT-Trajectories`.
 - Capacity-blind gates (raised 2026-10-23, user asked how the loop would
