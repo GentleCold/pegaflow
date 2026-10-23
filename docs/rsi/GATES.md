@@ -433,8 +433,15 @@ the last accepted run record by hand until `--accepted` exists.
   gsm8k and replay pass (the oracle has unlimited capacity; `cap*` passes are
   meant to evict and are excluded; `native` / `lmcache` have no PegaFlow server: n/a, pass).
   The server runs with
-  `--pool-size 160gb --disable-numa-affinity` (per-NUMA pools give one GPU only
-  `pool_size / numa_nodes`).
+  `--pool-size 64gb --disable-numa-affinity` (per-NUMA pools give one GPU only
+  `pool_size / numa_nodes`; 64gb since 2026-10-24: a 160 GiB pinned pool took
+  2-3 min to allocate, 60-95 s to free, and stalled other processes' JIT;
+  measured U: Qwen3-4B gsm8k 30.3 GiB, replay ~26 GiB, DeepSeek-V2-Lite TP2
+  <= 7.8 GiB). The run fails before any store stage (`PoolTooSmall`) when the
+  uncapped workload's `UniqueEstimate` from the committed spec (replay:
+  prompts + output tokens; gsm8k: prompts, a lower bound), or later the U
+  measured on the baseline's trace, exceeds `--pool-size`;
+  `summary.pool_checks` records each check.
 - G4 (hard since 2026-10-23, user: "性能需要达标才行，需要比基准快"; every
   check is against the baseline arm on the same run, medians over the listed
   passes, `MAX_OVERHEAD = 0.02`):

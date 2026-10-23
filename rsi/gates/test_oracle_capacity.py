@@ -685,6 +685,19 @@ def test_module_files_must_resolve_under_gate_and_venv(tmp_path):
         assert provenance.module_problems(good | {k: bad}, repo, pf, "x"), k
 
 
+@pytest.mark.parametrize("pool,fits", [("64gb", True), ("1kb", False)])
+def test_pool_check_fails_before_an_evicting_store(pool, fits):
+    import argparse
+
+    args = argparse.Namespace(pool_size=pool)
+    u = {"workload": "replay", "unique_bytes": 2048, "how": "estimate"}
+    if fits:
+        assert run_gate.check_pool(args, u)["fits"]
+    else:
+        with pytest.raises(run_gate.PoolTooSmall):
+            run_gate.check_pool(args, u)
+
+
 # ------------------------------------------------------------ split invariance
 
 

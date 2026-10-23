@@ -1434,6 +1434,53 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+class PoolTooSmall(RuntimeError):
+    """An uncapped stage's ``U`` exceeds ``--pool-size``: the store would
+    evict and G3 would measure the pool size, not the connector."""
+
+
+_STORES = ("old", "native", "lmcache", "under_test")
+
+
+def estimate_unique(args, spec: dict[str, Any], wl: str) -> dict[str, Any]:
+    """``UniqueEstimate`` of an uncapped workload before any stage. Replay
+    (``ignore_eos``): prompts + exactly ``--replay-out-tokens`` per request.
+    gsm8k: prompts only, a lower bound (completions stop on data)."""
+    est = UniqueEstimate(spec, args.replay_out_tokens if wl == "replay" else 1)
+    if wl == "replay":
+        for turns in workloads.build_turns(
+            Path(args.replay_file),
+            args.model,
+            args.replay_convs,
+            args.max_model_len - args.replay_out_tokens - 8,
+            args.replay_turns,
+        ):
+            est.add(turns)
+        how = "estimate"
+    else:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        for prompt, _ in workloads.gsm8k_prompts(
+            Path(args.gsm8k_dir), args.shots, args.gsm8k_limit
+        ):
+            est.add([tok(prompt)["input_ids"]])
+        how = "lower bound (prompts only)"
+    return {"workload": wl, "unique_bytes": est.bytes, "how": how}
+
+
+def check_pool(args, u: dict[str, Any]) -> dict[str, Any]:
+    pool = parse_size(args.pool_size)
+    rec = u | {"pool_bytes": pool, "fits": u["unique_bytes"] <= pool}
+    print(f"[pool] {rec}", flush=True)
+    if not rec["fits"]:
+        raise PoolTooSmall(
+            f"{u['workload']}: U {u['unique_bytes'] / 2**30:.1f} GiB ({u['how']}) exceeds "
+            f"--pool-size {args.pool_size}"
+        )
+    return rec
+
+
 def g5_problems(v: dict[str, Any], floor: dict[str, Any], plan: dict[str, Any] | None) -> list[str]:
     """Why a run's G5 cannot be official: the gated store is below the
     capacity floor (a smaller store measures vLLM's GPU cache), or the trace
@@ -1582,7 +1629,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gpu-mem", type=float, default=0.8)
     ap.add_argument("--num-gpu-blocks", type=int, default=0)
     ap.add_argument("--vllm-arg", action="append", default=[], help="extra vllm serve arg")
-    ap.add_argument("--pool-size", default="160gb")
+    ap.add_argument(
+        "--pool-size",
+        default="64gb",
+        help="store size of the uncapped stages (PegaFlow pool, native/lmcache CPU cache); "
+        "the run fails before a store stage whose estimated or measured U exceeds it",
+    )
     ap.add_argument(
         "--pegaflow-server", default=str(REPO / "target" / "release" / "pegaflow-server")
     )
@@ -1653,9 +1705,20 @@ def main(argv: list[str] | None = None) -> int:
     # Before any stage: what the run is about to measure.
     prov = record_provenance(args, run_dir)
     print(f"[gate] provenance {json.dumps(prov, default=str)}", flush=True)
+    pool_checks: list[dict[str, Any]] = []
+    uncapped = [w for w in wls if w != "cap"]
+    if any(arm_kind(a) in _STORES for a in arms) and uncapped:
+        if committed.exists():
+            spec = json.loads(committed.read_text())
+            for w in uncapped:
+                pool_checks.append(check_pool(args, estimate_unique(args, spec, w)))
+        else:
+            print(f"[pool] no committed {committed}: estimate skipped", flush=True)
 
     def stage(arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
         return run_stage(args, gate, arm, wl, out, **kw)
+
+    measured_u: dict[str, dict[str, Any]] = {}
 
     for arm in arms:
         kind = arm_kind(arm)
@@ -1664,6 +1727,19 @@ def main(argv: list[str] | None = None) -> int:
             if wl != "gsm8k" and kind in ("plain", "selftest"):
                 continue
             if wl != "cap":
+                if kind in _STORES and wl not in measured_u:
+                    # Measured on the baseline's trace of the same workload.
+                    base_res = results.get("baseline", {}).get(wl, {})
+                    probe = run_dir / "baseline" / wl / "probe"
+                    if "error" not in base_res and (probe / "spec.json").exists():
+                        u = oracle.unique_bytes(
+                            json.loads((probe / "spec.json").read_text()),
+                            oracle.load_requests(probe / "requests.jsonl"),
+                        )
+                        measured_u[wl] = check_pool(
+                            args, {"workload": wl, "unique_bytes": u, "how": "baseline trace"}
+                        )
+                        pool_checks.append(measured_u[wl])
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
                 continue
             if kind == "baseline":
@@ -1722,6 +1798,7 @@ def main(argv: list[str] | None = None) -> int:
         "rev": git_rev(),
         "under_test_rev": prov.get("under_test", {}).get("rev"),
         "provenance": prov,
+        "pool_checks": pool_checks,
         "args": vars(args),
         "gate": gate,
         "official": not problems,
