@@ -139,7 +139,9 @@ StubSemantics = types.SimpleNamespace(
 
 
 def _native():
-    pytest.importorskip("pegaflow.pegaflow", exc_type=ImportError)
+    ext = pytest.importorskip("pegaflow.pegaflow", exc_type=ImportError)
+    if getattr(ext, "__file__", None) is None:  # file-less stub from tests/unit_stubs.py
+        pytest.skip("native extension not built (unit stub installed)")
     from pegaflow import semantics
 
     return semantics

@@ -10,8 +10,12 @@ from pathlib import Path
 import pytest
 
 # Skip only when the native extension is not built; a built extension that
-# lacks `semantics` must fail loudly.
-pytest.importorskip("pegaflow.pegaflow", exc_type=ImportError)
+# lacks `semantics` must fail loudly. Other test modules may install a
+# file-less stub for `pegaflow.pegaflow` (tests/unit_stubs.py), so a module
+# without `__file__` counts as not built.
+_ext = pytest.importorskip("pegaflow.pegaflow", exc_type=ImportError)
+if getattr(_ext, "__file__", None) is None:
+    pytest.skip("native extension not built (unit stub installed)", allow_module_level=True)
 import pegaflow.semantics as sem  # noqa: E402
 
 VECTORS = Path(__file__).resolve().parents[2] / "pegaflow-semantics" / "vectors"
