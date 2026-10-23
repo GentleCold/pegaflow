@@ -414,6 +414,19 @@ names, magic constants that only exist in the old code).
   0.903, LRU 0.827, local 0.79. Server limit found: reclaim drops 512 blocks
   per round, so a small pool keeps only ~0.5 C resident (GATES.md G5).
 
+- G5 review (APPROVE-WITH-FIXES) applied on `feat/rsi-g5`: pool size must be
+  proven for PegaFlow arms (M1); server `pegaflow_load_bytes_total` must
+  cover every external-hit block, connector-side caches are a violation
+  (M2); `E_C` subtracts the baseline's local hit for the same
+  pass/conversation/turn, per-arm local kept as a diagnostic (S1); a
+  reference arm's crash is recorded, not fatal (S2); `old` and `native` are
+  `required: false` throughout (S3). User capacity concern (slice C 2.24 GiB
+  = 0.22x GPU KV): cap is now its own 64 x 12 trace, baseline runs it first
+  (U + reference locals), fractions 0.25/0.5/0.75 per arm (0.5 gated, rest
+  a curve), official only if C(0.5) >= 2x GPU KV. Freeze policy: warm passes
+  start rotated by j/4; a run whose under-test freeze/H*_C >= 0.9 is not
+  official. G3 re-derived identically on all 45 recorded probe dirs.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

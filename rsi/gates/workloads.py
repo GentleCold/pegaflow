@@ -165,18 +165,21 @@ async def run_replay(
     concurrency: int,
     out_tokens: int,
     xargs: list[dict[str, Any]] | None = None,
+    order: list[int] | None = None,
 ) -> dict[str, Any]:
-    """``xargs[c]`` go to ``vllm_xargs`` of every turn of conversation ``c``."""
+    """``xargs[c]`` go to ``vllm_xargs`` of every turn of conversation ``c``,
+    plus ``rsi_conv`` / ``rsi_turn`` (position, for cross-arm matching).
+    ``order``: conversation start order (default 0..n-1)."""
     import aiohttp
 
     queue: asyncio.Queue[int] = asyncio.Queue()
-    for c in range(len(convs)):
+    for c in order if order is not None else range(len(convs)):
         queue.put_nowait(c)
     ttft: list[float] = []
     e2e: list[float] = []
     prompt_tokens = 0
 
-    async def turn(session: aiohttp.ClientSession, c: int, ids: list[int]) -> None:
+    async def turn(session: aiohttp.ClientSession, c: int, k: int, ids: list[int]) -> None:
         nonlocal prompt_tokens
         body = {
             "model": model,
@@ -186,8 +189,8 @@ async def run_replay(
             "ignore_eos": True,
             "stream": True,
         }
-        if xargs and xargs[c]:
-            body["vllm_xargs"] = xargs[c]
+        if xargs is not None:
+            body["vllm_xargs"] = xargs[c] | {"rsi_conv": c, "rsi_turn": k}
         t0 = time.monotonic()
         first = None
         async with session.post(f"{url}/v1/completions", json=body) as r:
@@ -202,8 +205,8 @@ async def run_replay(
     async def worker(session: aiohttp.ClientSession) -> None:
         while not queue.empty():
             c = queue.get_nowait()
-            for ids in convs[c]:
-                await turn(session, c, ids)
+            for k, ids in enumerate(convs[c]):
+                await turn(session, c, k, ids)
 
     t0 = time.monotonic()
     timeout = aiohttp.ClientTimeout(total=None, sock_read=900)

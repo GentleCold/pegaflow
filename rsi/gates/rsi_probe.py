@@ -25,7 +25,8 @@ Config via ``kv_connector_extra_config``: ``probe_dir`` (required),
 ``digest``: ``"off"`` | ``"all"`` | ``"tagged"`` (only requests sent with
 ``vllm_xargs={"rsi_digest": "full" | "ref" | "hit"}``: every complete block,
 computed blocks only, loaded blocks only). Requests may also carry
-``rsi_pass`` (a label copied into the record). Digests run in ``start_load_kv`` and add GPU
+``rsi_pass`` (a label copied into the record) and ``rsi_conv`` / ``rsi_turn``
+(workload position, copied as ``conv`` / ``turn``). Digests run in ``start_load_kv`` and add GPU
 work and syncs: only tag requests whose timing is not measured.
 
 ``RsiWorkerExt`` (``--worker-extension-cls``) adds ``rsi_poison`` for the
@@ -456,6 +457,10 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 {
                     "req_id": rid,
                     "pass": live.tags.get("rsi_pass"),
+                    # Workload position (replay: conversation, turn) for
+                    # cross-arm matching; None when the workload sets none.
+                    "conv": live.tags.get("rsi_conv"),
+                    "turn": live.tags.get("rsi_turn"),
                     "prompt_len": request.num_prompt_tokens,
                     "num_tokens": len(tokens),
                     "computed": computed,

@@ -81,38 +81,52 @@ full blocks past the last resident checkpoint are useless too. The server's
 LRU (`pegaflow-core/src/cache.rs`) evicts each (hash, group) key on its own,
 so such stranded bytes are possible today.
 
-- Workload: replay (official constants), connector under test (and `old` as a
-  reference when present), each on a fresh PegaFlow server started with
-  `--pool-size C`. Separate `cap` passes: cold, warm, warm2..N like replay.
-- Capacity: `C = CAPACITY_FRACTION x U`, `CAPACITY_FRACTION = 0.5`. `U` = bytes
-  of the distinct (group, key) blocks the unlimited oracle stores over one full
-  replay pass, from the baseline arm's replay trace of the same run and the spec
-  dump's per-group page bytes x layers. Server fragmentation and headroom count
-  against the connector/server; they are part of what an iteration may improve.
+- Workload `cap`: its own multi-turn replay, larger than `replay` so the
+  store matters: `--cap-convs 64 x --cap-turns 12` conversations from the same
+  r2egym file (official). The baseline arm runs it first (`cap_cold`,
+  `cap_warm`, no store) to fix `U` and the per-request reference local hits.
+  Each store arm (under test, `old`, `native`) then runs `cap_cold`,
+  `cap_warm`, `cap_warm2..N` once per capacity fraction, each on a fresh vLLM
+  and a fresh store of `C` bytes. Warm pass `j` starts the conversations
+  rotated by `j/4` of their count, so the passes differ in arrival order.
+- Capacity: `C = f x U`, `f` in `{0.25, 0.5, 0.75}` (official). Only
+  `f = 0.5` is gated; the others are a reported curve. `U` = bytes of the
+  distinct (group, key) blocks the unlimited oracle stores over the baseline
+  `cap_cold` pass. A run is official only if `C(0.5) >= 2 x` vLLM's GPU KV
+  bytes, so G5 measures the external store and not vLLM's own cache. Server
+  fragmentation and headroom count against the connector/server.
+- All external KV must be loaded from the PegaFlow server. A connector-side
+  cache (holding KV in vLLM-process memory or anywhere outside the C-byte
+  server) is a gate violation; G5 checks it through the server's load bytes.
 - Oracle at capacity `H*_C`: the G3 store events, with a store of `C` bytes and
   clairvoyant eviction: an item (group, key, bytes) whose next use is furthest
   in the future goes first; next use = the next request (by first schedule)
   whose unlimited-oracle resolved prefix covers the item; an item never used
   again is not stored. Hits are `semantics.resolve` over present blocks, as in
   G3. This is a strong reference, not a proven optimum; `E_C > 1` is allowed.
-- Reference `H_lru`: the same simulation with group-oblivious LRU and no
-  bypass (reported only; shows what naive eviction gives).
-- Score over the timed `cap` warm passes: `ext_i = max(0, min(actual_i,
-  oracle_i) - local_i)` (capped by the unlimited oracle),
-  `ext*_C,i = max(0, oracle_C,i - local_i)`, `E_C = Σext / Σext*_C`.
+- References `H_lru` (group-oblivious LRU, everything stored) and `H_freeze`
+  (store until full, never evict): reported only, to show how far naive
+  policies are from the bar.
+- Score over the timed cap warm passes, against the baseline's local hit for
+  the same request (`ref`), so an arm cannot raise its own score by keeping
+  less in vLLM's local cache: `ext = max(0, min(actual, oracle) - ref)`
+  (capped by the unlimited oracle), `ext*_C = max(0, oracle_C - ref)`,
+  `E_C = Σext / Σext*_C`.
 - Diagnostics, per group (not gated): resident bytes and stranded bytes at the
   end of each pass (resident blocks that lie on no resolvable prefix of any
-  request in the trace), evictions, write amplification (saved bytes / loaded
-  bytes). Implemented for the two simulated stores (oracle and LRU); the
-  server side reports eviction and save/load byte counters only. TODO: actual
+  request in the trace), evictions, saved / loaded bytes. Implemented for the
+  simulated stores; the server side reports eviction and save/load byte
+  counters and its resident / used bytes at each pass end. TODO: actual
   stranded bytes need a server-side resident-key dump (server change, own PR).
-- Gate: `G5.replay_warm.E_C >= 0.9`; no load errors; the cap passes' digests
-  pass `G2.digest_self` (eviction must never produce a wrong load); `excess`
-  bounded as in G3 against the unlimited oracle; no `E_C` regression vs the last
-  accepted iteration.
+- Gate: `G5.replay_warm.E_C >= 0.9` at `f = 0.5`; no load errors; the cap
+  passes' digests pass `G2.digest_self` (eviction must never produce a wrong
+  load); server load bytes cover every external hit; `excess` bounded as in G3
+  against the unlimited oracle; no `E_C` regression vs the last accepted
+  iteration. A slice-size G5 (below the capacity floor) is a smoke test of
+  flow and digests only; its `E_C` supports no conclusion.
 - Reference arms: `old` and `native` (vLLM `OffloadingConnector` with exactly
-  `C` CPU bytes) record their G5 numbers; phase 2 will gate warm replay and
-  `E_C` against `native`.
+  `C` CPU bytes) record their G5 numbers and are never required; phase 2 will
+  gate warm replay and `E_C` against `native`.
 - Known server limit (slice 2026-10-23, `old` and connector_v2 on the same
   build): reclaim evicts `RECLAIM_BATCH_SIZE = 512` blocks per round
   (`pegaflow-core/src/storage/mod.rs`), so on a small pool each eviction
@@ -155,6 +169,8 @@ LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 ~/kexi/pegaflow/python/.venv/bin/python -m rsi.gates.run_gate \
   --model ~/kexi/models/<model> --tag <model>-it<N> \
   --arms plain,baseline,old,native,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0
+# G5 smoke on a slice (below the capacity floor: not official, no E_C conclusion):
+#   ... --gsm8k-limit 64 --replay-convs 8 --replay-turns 6 --cap-convs 8 --cap-turns 6
 ```
 
 Self-test at onboarding (gsm8k only, 128 questions per self-test arm, no PegaFlow):
@@ -169,14 +185,16 @@ Exit code 0 only for an **official** run in which every required verdict passes.
 A run is official only with the constants of `run_gate.OFFICIAL` (full gsm8k, 8
 shots, 32 x 12 replay, 3 replay passes, pinned scheduler flags), the arms
 `plain`, `baseline` and one connector under test, all three workloads
-(`gsm8k`, `replay`, `cap`), no
+(`gsm8k`, `replay`, `cap`; cap 64 x 12 at fractions 0.25,0.5,0.75), the G5
+capacity floor (`C(0.5) >= 2 x` GPU KV bytes), no
 `--num-gpu-blocks`/`--vllm-arg` override, and committed
 `docs/rsi/models/<model>/{gate.json,spec.json}`. `summary.json` lists
 `not_official_because`. A required verdict that cannot be evaluated is a fail.
 Required verdicts: `baseline` and the connector under test, including
-`G2.digest_self.cap` and `G5.replay_warm`. Not required: `old` (black-box
-reference; its G5 entries carry `reference_only`) and `native`
-(`required: false`).
+`G2.digest_self.cap` and `G5.replay_warm`. Not required (`required: false`,
+every verdict recorded): `old` (black-box reference) and `native`. A crash of
+a reference arm's stage is recorded under `errors` in its verdicts and the
+run continues; a crash of baseline or the connector under test aborts it.
 
 Exit 0 does **not** cover G1 (run `cargo test -p pegaflow-semantics`) or the
 "no regression vs last accepted iteration" clauses of G3/G4: compare against
@@ -263,8 +281,9 @@ the last accepted run record by hand until `--accepted` exists.
   `excess <= one block per request`, no load errors; replay G3 also requires
   G2.digest_self.replay.
 - G3.no_eviction: `pegaflow_cache_block_evictions_total` delta = 0 in every
-  gsm8k and replay pass (the oracle has unlimited capacity; `cap` passes are
-  meant to evict and are excluded). The server runs with
+  gsm8k and replay pass (the oracle has unlimited capacity; `cap*` passes are
+  meant to evict and are excluded; `native` has no PegaFlow server: n/a, pass).
+  The server runs with
   `--pool-size 160gb --disable-numa-affinity` (per-NUMA pools give one GPU only
   `pool_size / numa_nodes`).
 - G4 (hard since 2026-10-23, user: "性能需要达标才行，需要比基准快"; every
@@ -285,48 +304,94 @@ the last accepted run record by hand until `--accepted` exists.
     bytes = `real_page_size_bytes` (unpadded, as digested; `page_size_bytes`
     if absent) x the group's `num_layers` (`UniformTypeKVCacheSpecs` already
     sums its layers: x 1) x TP ranks. Skipped groups (no kv transfer, eagle)
-    hold no bytes.
-  - `U` = bytes of the distinct (group, key) blocks the unlimited oracle stores
-    over the baseline arm's replay `cold` pass of the same run (one full pass
-    over the trace; later passes add no new keys). `C = int(0.5 x U)`.
-    `cap` runs after `gsm8k` and `replay` for every arm; without a baseline
-    replay trace in the run, `cap` is not evaluated (fail).
-  - `cap` stage, per `old` / `native` / under-test arm: fresh vLLM and (except
-    `native`) a fresh PegaFlow server with `--pool-size C`
-    `--disable-numa-affinity`; passes `cap_cold`, `cap_warm` (digested like
-    replay `warm`), `cap_warm2..N` (timed), same settle / reset / poison
-    protocol and conversations as replay; `rsi_pass` = the pass label.
-    `pool_capacity_bytes` (the server's `pegaflow_pool_capacity_bytes` at
-    start) must not exceed `C`; the server allocates the whole pool up
-    front and rounds allocations to 512-byte units and power-of-two-mantissa
-    size classes (at most 1/8 waste): that is server headroom and counts
-    against the server.
-  - Simulated stores over the arm's own cap trace (all `cap_*` passes, in
-    first-schedule order), `C` bytes each:
+    hold no bytes. GPU KV bytes = spec `num_blocks` x Σ block bytes over all
+    groups.
+  - Trace: `--cap-convs` x `--cap-turns` (official 64 x 12) conversations of
+    `--replay-file`, `--replay-out-tokens` outputs, `--concurrency` workers.
+    Every replay request carries `vllm_xargs.rsi_conv` / `rsi_turn`; the probe
+    records them as `conv` / `turn`. Pass `cap_cold` starts conversations in
+    order 0..n-1; warm pass `j` (`cap_warm` = 1, `cap_warmK` = K) starts them
+    rotated by `j * n // 4`.
+  - Baseline cap stage (runs after gsm8k and replay, before any store arm's
+    cap): passes `cap_cold`, `cap_warm` (reset + poison before it, digested
+    like replay `warm`), no connector. `U` = bytes of the distinct (group,
+    key) blocks the unlimited oracle stores over its `cap_cold` pass (every
+    block of the trace appears there; a rotated warm pass adds only differing
+    generated tails, which `U` does not count). Reference local hit
+    `ref(pass, conv, turn)` = the baseline's `local_hit` at that position, from
+    `cap_cold` for `cap_cold` and from `cap_warm` for every warm pass.
+    `G5.capacity_floor` (in `summary.json`, not a verdict): `C(0.5) >= 2 x`
+    the baseline's GPU KV bytes, else `not_official_because: capacity below
+    2x GPU KV`.
+  - Store-arm cap stages, per fraction `f` in `--cap-fractions` (must include
+    0.5; official `0.25,0.5,0.75`), dir `cap` for 0.5 and `capNNN` (percent)
+    otherwise: fresh vLLM and (except `native`) a fresh PegaFlow server with
+    `--pool-size C` `--disable-numa-affinity`, `C = int(f x U)`; passes
+    `cap_cold`, `cap_warm` (digested), `cap_warm2..N` (timed), the replay
+    settle / reset / poison protocol. `pool_capacity_bytes` = the server's
+    `pegaflow_pool_capacity_bytes` at start; the server allocates the whole
+    pool up front and rounds allocations to 512-byte units and
+    power-of-two-mantissa size classes (at most 1/8 waste): server headroom,
+    counts against the server.
+  - Simulated stores over the arm's own cap trace (all its `cap_*` passes, in
+    first-schedule order), `C` bytes each, with `ref` as every request's local
+    hit:
     - `H*_C` (clairvoyant): the next use of an item is the next request whose
       unlimited-oracle resolved prefix `P` needs it (`semantics.needed` at
-      `P`, minus what `needed` at the request's local hit already gives);
-      an arriving item with no next use is not stored; otherwise items whose
-      next use is furthest are evicted first, and an arriving item whose own
-      next use is the furthest is not stored. Greedy under variable item
-      sizes and blind to partial-prefix coherence: a strong reference, not a
-      proven optimum (`E_C > 1` is allowed).
+      `P`, minus what `needed` at `ref` already gives); an arriving item with
+      no next use is not stored; otherwise items whose next use is furthest
+      are evicted first, and an arriving item whose own next use is the
+      furthest is not stored. Greedy under variable item sizes and blind to
+      partial-prefix coherence: a strong reference, not a proven optimum
+      (`E_C > 1` is allowed).
     - `H_lru`: group-oblivious LRU, every item stored, a re-store of a
       resident item does not refresh it, a hit refreshes the blocks loaded.
+    - `H_freeze`: items stored in arrival order until the next one does not
+      fit, never evicted.
     - Hits: `resolve` over resident blocks plus each group's `needed` range
-      at the request's recorded local hit (vLLM holds those), capped at
-      `max(unlimited oracle, local)`.
-  - `E_C = Σ ext / Σ ext*_C` over the timed cap warm passes (`cap_warm2..N`),
-    `ext = max(0, min(actual, oracle) - local)` (unlimited oracle),
-    `ext*_C = max(0, oracle_C - local)`; `None` when `Σ ext*_C = 0` (fails).
-    `lru_vs_oracle_c = Σ max(0, lru - local) / Σ ext*_C`.
-  - `G5.replay_warm`: `E_C >= 0.9`, `excess <= one block per request`
-    (unlimited oracle), no load errors, `pool_capacity_bytes <= C`, and
-    `G2.digest_self.cap` passes (same as `G2.digest_self.replay`, over the cap
-    probe dir). Reported: `U`, `C`, hit / oracle / oracle_C / LRU hit rates,
-    per-pass `pegaflow_cache_block_evictions_total` deltas, per-group stored
-    / not-admitted / evicted counts and bytes and per-pass resident /
-    stranded bytes for both simulated stores.
+      at `ref`, capped at `max(unlimited oracle, ref)`.
+  - Scores per segment (`warm_timed` = `cap_warm2..N`, and per pass):
+    `ext = max(0, min(actual, oracle) - ref)` (unlimited oracle),
+    `ext*_C = max(0, oracle_C - ref)`, `E_C = Σ ext / Σ ext*_C` (`None` when
+    `Σ ext*_C = 0`: fails). Reported: `lru_vs_oracle_c` and
+    `freeze_vs_oracle_c` (`Σ max(0, H - ref) / Σ ext*_C`),
+    `efficiency_c_own_local` (the same `E_C` with the arm's own local hit in
+    place of `ref` for `ext`, `ext*_C` and the Belady run; diagnostic only),
+    `efficiency_c_cold` / `freeze_vs_oracle_c_cold` (`cap_cold`: within-pass
+    multi-turn reuse after vLLM evicted the earlier turn; diagnostic only).
+    `unmatched_requests` = requests without a `ref` (no position tag, or the
+    baseline has no request at that position).
+  - Load proof: `external_hit_bytes(pass)` = Σ over the pass's requests of the
+    bytes of the blocks `needed` at `actual` that `needed` at the request's
+    own local hit does not hold; `loaded_bytes(pass)` = the
+    `pegaflow_load_bytes_total` delta of the pass.
+  - `G5.replay_warm` (gated fraction 0.5): `E_C >= 0.9` on `warm_timed`,
+    `excess <= one block per request` (unlimited oracle, own local, as G3),
+    no load errors, `unmatched_requests == 0`, `G2.digest_self.cap` passes
+    (same as `G2.digest_self.replay`, over the cap probe dir), and for a
+    PegaFlow arm `pool_capacity_bytes` present and `<= C` and Σ
+    `loaded_bytes >= Σ external_hit_bytes` over `warm_timed` (`native`: no
+    server, pool and load proof not applicable). Reported with it: `U`, `C`,
+    hit / oracle / oracle_C / LRU / freeze hit rates, per-pass eviction
+    counter deltas, per-pass server I/O (`saved_bytes`, `loaded_bytes`,
+    `external_hit_bytes`) and end-of-pass resident / used bytes, per-group
+    stored / not-admitted / evicted counts and bytes and per-pass resident /
+    stranded bytes for `H*_C` and `H_lru`.
+  - `G5.curve`: the same evaluation at each other fraction (`E_C`, oracle_C,
+    LRU, freeze, evictions, load proof, digests); never gated.
+  - Why rotate: with identical warm passes a store that fills once and never
+    evicts already holds what the next pass needs. Recorded traces with
+    identical order: `freeze / H*_C` on the warm passes 0.96 (slice,
+    connector_v2) and 0.92-0.99 (32 x 12 `old` arm), so a freeze policy could
+    pass. A step-level vLLM simulation of the 64 x 12 trace (GPU KV 4745
+    blocks, `C = 0.5 U`) gives 0.76-0.77 identical and 0.65-0.72 rotated
+    (`H_lru / H*_C` 0.87-0.89 either way; `cap_cold` alone 0.71); it
+    under-estimates freeze against real traces, so rotation is the gate's
+    mechanism and the self-check below is its guard.
+  - Separation self-check: if `freeze_vs_oracle_c` of the connector under
+    test at the gated fraction is `>= 0.9`, the trace does not separate a
+    frozen store from the bar and the run is not official
+    (`not_official_because: G5 trace does not separate freeze from H*_C`).
 - Self-test arms (`rsi/gates/selftest/connector.py`, full-attention groups
   only): `honest` saves at finish and loads saved prefixes (must pass every G2
   check); `liar` claims every complete unit and loads nothing; `bitflip` flips

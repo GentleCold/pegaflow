@@ -18,9 +18,12 @@ Every arm/workload pair gets fresh servers. Passes: ``cold``, then before each
 warm pass ``/reset_prefix_cache`` (local only) and ``rsi_poison`` (every GPU KV
 byte overwritten), so warm reuse can only come from the connector. Replay runs
 ``--replay-repeats`` warm passes; the first carries digest tags (G2/G3), the
-others are timed for G4. The ``cap`` workload (G5) repeats the replay passes
-(tagged ``cap_<pass>``) on a fresh store of ``C = CAPACITY_FRACTION x U``
-bytes, ``U`` = unique KV bytes of the baseline arm's replay cold pass.
+others are timed for G4. The ``cap`` workload (G5) is its own, larger
+replay (``--cap-convs`` x ``--cap-turns``): the baseline arm runs it first
+(``cap_cold``, ``cap_warm``) to fix ``U`` and the reference local hits, then
+every store arm runs ``cap_cold``, ``cap_warm``, ``cap_warm2..N`` per
+fraction ``f`` on a fresh store of ``C = f x U`` bytes; warm pass ``j``
+starts the conversations rotated by ``j/4`` of their count.
 
 Per-model gate settings (attention backend, batch invariance, extra vLLM args)
 come from ``docs/rsi/models/<model>/gate.json``; the committed spec dump is
@@ -68,6 +71,9 @@ OFFICIAL = {
     "replay_out_tokens": 64,
     "replay_repeats": 3,
     "replay_digest_every": 4,
+    "cap_convs": 64,
+    "cap_turns": 12,
+    "cap_fractions": "0.25,0.5,0.75",
     "concurrency": 32,
     "max_model_len": 8192,
     "max_num_batched_tokens": 2048,
@@ -81,10 +87,12 @@ MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are 
 # prefix cache serves the earlier turns; gsm8k: the shared few-shot prefix) can
 # only tie baseline, so they bound the connector's overhead; warm replay must win.
 MAX_OVERHEAD = 0.02
-# G5: store capacity as a fraction of the trace's unique KV bytes, and the bar
-# against the clairvoyant oracle at that capacity.
+# G5: store capacity as a fraction of the cap trace's unique KV bytes; only
+# CAPACITY_FRACTION is gated, the others are a reported curve. The bar is the
+# clairvoyant oracle at that capacity.
 CAPACITY_FRACTION = 0.5
 MIN_EFFICIENCY_C = 0.9
+MIN_CAPACITY_GPU_KV = 2.0  # official: gated C >= 2 x vLLM GPU KV bytes
 WORKLOADS = ("gsm8k", "replay", "cap")
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 
@@ -315,19 +323,81 @@ def cap_names(repeats: int) -> list[str]:
     return [f"cap_{n}" for n in ["cold", "warm"] + [f"warm{k}" for k in range(2, repeats + 1)]]
 
 
+def cap_order(name: str, n: int) -> list[int]:
+    """Conversation start order of a cap pass. Warm pass ``j`` (``cap_warm`` =
+    1) rotates by ``j * n // 4``, so a store frozen after the cold pass does
+    not see the same arrival order again and recency differs between passes."""
+    stage = name.removeprefix("cap_")
+    j = 0 if stage == "cold" else 1 if stage == "warm" else int(stage.removeprefix("warm"))
+    k = (j * n // 4) % n if n else 0
+    return list(range(k, n)) + list(range(k))
+
+
+def cap_label(f: float) -> str:
+    """Workload dir / result key of capacity fraction ``f``."""
+    return "cap" if f == CAPACITY_FRACTION else f"cap{round(f * 100):03d}"
+
+
+def parse_fractions(s: str) -> list[float]:
+    out = sorted({float(x) for x in s.split(",") if x.strip()})
+    if CAPACITY_FRACTION not in out:
+        raise ValueError(f"--cap-fractions must include the gated {CAPACITY_FRACTION}")
+    if any(not 0 < f <= 1 for f in out):
+        raise ValueError(f"--cap-fractions must be in (0, 1]: {out}")
+    return out
+
+
+def gpu_kv_bytes(spec: dict[str, Any]) -> int:
+    """vLLM's GPU KV bytes: ``num_blocks`` x per-block bytes over all groups."""
+    return spec["kv_cache_config"]["num_blocks"] * sum(oracle.block_bytes(spec))
+
+
+def _pos(r: dict[str, Any]) -> tuple[Any, Any, Any] | None:
+    if r.get("conv") is None or r.get("turn") is None:
+        return None
+    return (r.get("pass"), r["conv"], r["turn"])
+
+
+def reference_locals(reqs: list[dict[str, Any]]) -> dict[str, int]:
+    """Baseline local hit per workload position ``pass/conv/turn``."""
+    return {"/".join(map(str, p)): r["local_hit"] or 0 for r in reqs if (p := _pos(r))}
+
+
+def match_locals(reqs: list[dict[str, Any]], ref: dict[str, int] | None) -> list[int | None]:
+    """Reference local hit per request: the baseline's at the same
+    conversation / turn; ``cap_cold`` -> baseline ``cap_cold``, every warm pass
+    -> baseline ``cap_warm`` (local hits after reset + poison). None if absent."""
+    out: list[int | None] = []
+    for r in reqs:
+        p = _pos(r)
+        if ref is None or p is None:
+            out.append(None)
+            continue
+        label = "cap_cold" if p[0] == "cap_cold" else "cap_warm"
+        out.append(ref.get(f"{label}/{p[1]}/{p[2]}"))
+    return out
+
+
 def run_arm_workload(
-    args, gate, arm: str, workload: str, out: Path, capacity: int = 0
+    args,
+    gate,
+    arm: str,
+    workload: str,
+    out: Path,
+    capacity: int = 0,
+    ref_local: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    """``capacity`` (``cap`` workload): store bytes, for PegaFlow's pool or
-    the native arm's CPU cache. Other workloads use ``--pool-size``."""
+    """``capacity`` (``cap*`` workloads): store bytes, for PegaFlow's pool or
+    the native arm's CPU cache. Other workloads use ``--pool-size``.
+    ``ref_local``: baseline cap local hits (``reference_locals``)."""
     out.mkdir(parents=True, exist_ok=True)
     probe = out / "probe"
     if probe.exists():
         shutil.rmtree(probe)
     kind = arm_kind(arm)
     gsm = workload == "gsm8k"
-    cap = workload == "cap"
-    if cap and capacity <= 0:
+    cap = workload.startswith("cap")
+    if cap and capacity <= 0 and kind != "baseline":
         raise ValueError("cap workload needs a capacity")
     store_bytes = capacity if cap else parse_size(args.pool_size)
     invariant = gsm and bool(gate.get("batch_invariant"))
@@ -371,13 +441,14 @@ def run_arm_workload(
             convs = workloads.build_turns(
                 Path(args.replay_file),
                 args.model,
-                args.replay_convs,
+                args.cap_convs if cap else args.replay_convs,
                 args.max_model_len - args.replay_out_tokens - 8,
-                args.replay_turns,
+                args.cap_turns if cap else args.replay_turns,
             )
             names = ["cold", "warm"] + [f"warm{k}" for k in range(2, args.replay_repeats + 1)]
             if cap:
-                names = cap_names(args.replay_repeats)
+                # Baseline: U (cold) and reference local hits (cold, warm).
+                names = cap_names(args.replay_repeats)[: 2 if kind == "baseline" else None]
         for name in names:
             stage = name.removeprefix("cap_")
             if stage != "cold":
@@ -407,7 +478,13 @@ def run_arm_workload(
                 ]
                 res = asyncio.run(
                     workloads.run_replay(
-                        url, "m", convs, args.concurrency, args.replay_out_tokens, xargs=xs
+                        url,
+                        "m",
+                        convs,
+                        args.concurrency,
+                        args.replay_out_tokens,
+                        xargs=xs,
+                        order=cap_order(name, len(convs)) if cap else None,
                     )
                 )
             time.sleep(2)  # late finish records and metrics land in this pass
@@ -433,11 +510,22 @@ def run_arm_workload(
     spec = json.loads((probe / "spec.json").read_text())
     reqs = oracle.load_requests(probe / "requests.jsonl")
     result["hit"] = oracle.summarize(spec, reqs, {n: {n} for n in names})
-    if cap:
+    if cap and kind == "baseline":
+        result["unique_bytes"] = oracle.unique_bytes(spec, reqs, {"cap_cold"})
+        result["gpu_kv_bytes"] = gpu_kv_bytes(spec)
+        result["ref_local"] = reference_locals(reqs)
+    elif cap:
         timed = {n for n in names if n.removeprefix("cap_") not in ("cold", "warm")}
         result["capacity"] = oracle.summarize_capacity(
-            spec, reqs, capacity, {"warm_timed": timed} | {n: {n} for n in names}
+            spec,
+            reqs,
+            capacity,
+            {"warm_timed": timed} | {n: {n} for n in names},
+            match_locals(reqs, ref_local),
         )
+        result["external_load_bytes"] = {
+            n: oracle.external_load_bytes(spec, reqs, {n}) for n in names
+        }
     errs = probe / "load_errors.jsonl"
     result["load_errors"] = (
         [json.loads(x) for x in errs.read_text().splitlines()] if errs.exists() else []
@@ -590,47 +678,77 @@ def _evictions(metrics: dict[str, float]) -> float:
     return _metric(metrics, "pegaflow_cache_block_evictions_total")
 
 
-def _capacity_verdict(r: dict[str, Any] | None) -> dict[str, Any]:
-    """G5 over the timed cap warm passes."""
+def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> dict[str, Any]:
+    """G5 for one cap stage. ``pegaflow``: the arm stores in a PegaFlow server
+    (pool size and load bytes must be proven). ``gated``: the gated fraction
+    (else the numbers are a reported curve point, ``pass`` informational)."""
     if r is None or "capacity" not in r:
         reason = (r or {}).get("error", "not evaluated")
         return {"pass": False, "reason": reason}
     c = r["capacity"]
     w = c["warm_timed"]
+    cold = c.get("cap_cold", {})
     e = w["efficiency_c"]
     passes = {n: p for n, p in r["passes"].items() if not n.startswith("_")}
-    evicted = {n: _evictions(p.get("pegaflow_metrics", {})) for n, p in passes.items()}
+    pm = {n: p.get("pegaflow_metrics", {}) for n, p in passes.items()}
+    evicted = {n: _evictions(m) for n, m in pm.items()}
     resident_end = {n: p["pegaflow_end"] for n, p in passes.items() if "pegaflow_end" in p}
     io = {
         n: {
-            "saved_bytes": _metric(p.get("pegaflow_metrics", {}), "pegaflow_save_bytes_total"),
-            "loaded_bytes": _metric(p.get("pegaflow_metrics", {}), "pegaflow_load_bytes_total"),
+            "saved_bytes": _metric(m, "pegaflow_save_bytes_total"),
+            "loaded_bytes": _metric(m, "pegaflow_load_bytes_total"),
+            "external_hit_bytes": r.get("external_load_bytes", {}).get(n),
         }
-        for n, p in passes.items()
+        for n, m in pm.items()
     }
     pool = r.get("pool_capacity_bytes")
-    # A server that grants itself more memory than C is not measured at C.
-    pool_ok = pool is None or pool <= r["capacity_bytes"]
+    # A server that grants itself more memory than C is not measured at C;
+    # a PegaFlow arm that cannot show its pool size fails.
+    pool_ok = pool <= r["capacity_bytes"] if pool is not None else not pegaflow
+    # Every external hit must have been loaded from the C-byte server: load
+    # bytes over the scored passes cover the external-hit blocks.
+    scored = [n for n in passes if n.removeprefix("cap_") not in ("cold", "warm")]
+    need = sum(io[n]["external_hit_bytes"] or 0 for n in scored)
+    loaded = sum(io[n]["loaded_bytes"] for n in scored)
+    loads_ok = not pegaflow or (
+        all(io[n]["external_hit_bytes"] is not None for n in scored) and loaded >= need
+    )
     ok = (
         e is not None
         and e >= MIN_EFFICIENCY_C
         and w["excess_tokens"] <= w["excess_limit"]
         and not r["load_errors"]
         and pool_ok
+        and loads_ok
+        and w["unmatched_requests"] == 0
     )
     diag = c["diagnostics"]
     return {
         "pass": ok,
+        "gated": gated,
         "efficiency_c": e,
+        # Within-pass multi-turn reuse (turn k+1 after GPU eviction): reported.
+        "efficiency_c_cold": cold.get("efficiency_c"),
+        "cold_ext_oracle_c_share": cold.get("ext_oracle_c_share"),
+        "freeze_vs_oracle_c_cold": cold.get("freeze_vs_oracle_c"),
+        "efficiency_c_own_local": w["efficiency_c_own_local"],
         "min_efficiency_c": MIN_EFFICIENCY_C,
         "unique_bytes": r.get("unique_bytes"),
         "capacity_bytes": r["capacity_bytes"],
+        "capacity_fraction": r.get("capacity_fraction"),
         "pool_capacity_bytes": pool,
+        "pool_ok": pool_ok,
+        "loads_ok": loads_ok,
+        "loaded_bytes": loaded,
+        "external_hit_bytes": need,
+        "unmatched_requests": w["unmatched_requests"],
         "hit_rate": w["hit_rate"],
         "oracle_hit_rate": w["oracle_hit_rate"],
         "oracle_c_hit_rate": w["oracle_c_hit_rate"],
         "lru_hit_rate": w["lru_hit_rate"],
+        "freeze_hit_rate": w["freeze_hit_rate"],
         "lru_vs_oracle_c": w["lru_vs_oracle_c"],
+        "freeze_vs_oracle_c": w["freeze_vs_oracle_c"],
         "excess_tokens": w["excess_tokens"],
         "excess_limit": w["excess_limit"],
         "load_errors": len(r["load_errors"]),
@@ -724,12 +842,20 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
             "invariant": invariant,
         },
         "G2.digest_self.gsm8k": _digest_verdict(base.get("gsm8k", {}).get("digest_self"), None),
+        "G2.digest_self.cap": _digest_verdict(base.get("cap", {}).get("digest_self"), None)
+        if "cap" in base
+        else {"pass": True, "na": "no cap workload"},
     }
+    base_errors = {wl: r["error"] for wl, r in base.items() if "error" in r}
+    if base_errors:
+        v["baseline"]["errors"] = base_errors
 
-    for label, per_wl in results.items():
+    for label, per_all in results.items():
         kind = "selftest" if label.startswith("selftest-") else label
         if kind in ("plain", "baseline"):
             continue
+        # A crashed stage is recorded under "errors" and evaluates as missing.
+        per_wl = {wl: r for wl, r in per_all.items() if "error" not in r}
         g: dict[str, Any] = {}
         gsm = per_wl.get("gsm8k")
         g["G0.spec"] = g0(run_dir, label, committed)
@@ -779,41 +905,68 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
         if not g["G2.digest_self.replay"]["pass"]:
             g["G3.replay_warm"]["pass"] = False
         evicted = {
-            f"{wl}.{p}": sum(
-                n
-                for k, n in r["passes"][p].get("pegaflow_metrics", {}).items()
-                if k.startswith("pegaflow_cache_block_evictions_total")
-            )
+            f"{wl}.{p}": _evictions(r["passes"][p].get("pegaflow_metrics", {}))
             for wl, r in per_wl.items()
-            if wl != "cap"
+            if not wl.startswith("cap") and "passes" in r
             for p in r["passes"]
             if not p.startswith("_")
         }
         # The oracle has unlimited capacity: an evicting pool measures its size.
-        g["G3.no_eviction"] = {
-            "pass": bool(evicted) and not any(evicted.values()),
-            "evicted": evicted,
-        }
+        if kind == "native":
+            # No PegaFlow server: vLLM's CPU cache exports no eviction counter.
+            g["G3.no_eviction"] = {"pass": True, "na": "native arm has no PegaFlow server"}
+        else:
+            g["G3.no_eviction"] = {
+                "pass": bool(evicted) and not any(evicted.values()),
+                "evicted": evicted,
+            }
         g |= _perf_verdicts(
             rep, base.get("replay"), gsm, base.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
         )
         cap = per_wl.get("cap")
+        pegaflow = kind != "native"
         g["G2.digest_self.cap"] = _digest_verdict(cap and cap.get("digest_self"), 0.0)
-        g["G5.replay_warm"] = _capacity_verdict(cap)
+        g["G5.replay_warm"] = _capacity_verdict(cap, pegaflow, gated=True)
         if not g["G2.digest_self.cap"]["pass"]:
             g["G5.replay_warm"]["pass"] = False
-        if kind == "old":
-            # G5 on the old connector is a black-box reference number only.
-            for k in ("G2.digest_self.cap", "G5.replay_warm"):
-                g[k]["reference_only"] = True
-        g["pass"] = all(
-            x["pass"] for x in g.values() if isinstance(x, dict) and not x.get("reference_only")
+        # Other fractions: a reported curve, never gated.
+        curve = {}
+        for wl in sorted(per_wl):
+            if wl.startswith("cap") and wl != "cap":
+                cv = _capacity_verdict(per_wl[wl], pegaflow, gated=False)
+                cv["digest_self"] = _digest_verdict(per_wl[wl].get("digest_self"), 0.0)["pass"]
+                curve[wl] = {
+                    k: cv.get(k)
+                    for k in (
+                        "pass",
+                        "reason",
+                        "capacity_fraction",
+                        "capacity_bytes",
+                        "efficiency_c",
+                        "oracle_c_hit_rate",
+                        "lru_hit_rate",
+                        "freeze_vs_oracle_c",
+                        "lru_vs_oracle_c",
+                        "hit_rate",
+                        "evicted",
+                        "loads_ok",
+                        "digest_self",
+                    )
+                }
+        g["G5.curve"] = curve
+        errors = {wl: r["error"] for wl, r in per_all.items() if "error" in r}
+        if errors:
+            g["errors"] = errors
+        g["pass"] = not errors and all(
+            x["pass"] for x in g.values() if isinstance(x, dict) and "pass" in x
         )
-        if kind == "native":
-            # Reference arm (phase 1): numbers are recorded, never gated.
+        if kind in ("old", "native"):
+            # Reference arms: every number is recorded, nothing is gated.
             g["required"] = False
         v[label] = g
-    v["baseline"]["pass"] = all(x["pass"] for x in v["baseline"].values() if isinstance(x, dict))
+    v["baseline"]["pass"] = not base_errors and all(
+        x["pass"] for x in v["baseline"].values() if isinstance(x, dict) and "pass" in x
+    )
     return v
 
 
@@ -825,15 +978,20 @@ def git_rev() -> str:
     return (REPO / ".rsi-rev").read_text().strip() if (REPO / ".rsi-rev").exists() else "unknown"
 
 
-def capacity_basis(run_dir: Path) -> int | None:
-    """``U``: unique KV bytes the unlimited oracle stores over the baseline
-    arm's replay cold pass (one full pass over the trace) of this run."""
-    probe = run_dir / "baseline" / "replay" / "probe"
-    if not (probe / "spec.json").exists() or not (probe / "requests.jsonl").exists():
-        return None
-    spec = json.loads((probe / "spec.json").read_text())
-    u = oracle.unique_bytes(spec, oracle.load_requests(probe / "requests.jsonl"), {"cold"})
-    return u or None
+def capacity_floor(base_cap: dict[str, Any] | None) -> dict[str, Any]:
+    """Gated ``C`` vs ``MIN_CAPACITY_GPU_KV`` x vLLM GPU KV bytes (baseline cap)."""
+    if not base_cap or "unique_bytes" not in base_cap:
+        return {"pass": False, "reason": "no baseline cap result"}
+    u, kv = base_cap["unique_bytes"], base_cap["gpu_kv_bytes"]
+    c = int(CAPACITY_FRACTION * u)
+    return {
+        "pass": c >= MIN_CAPACITY_GPU_KV * kv,
+        "unique_bytes": u,
+        "capacity_bytes": c,
+        "gpu_kv_bytes": kv,
+        "capacity_over_gpu_kv": c / kv if kv else None,
+        "min_capacity_over_gpu_kv": MIN_CAPACITY_GPU_KV,
+    }
 
 
 def official_problems(
@@ -870,7 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--workloads",
         default=",".join(WORKLOADS),
-        help="cap (G5) needs the baseline arm's replay in the same run",
+        help="cap (G5) needs the baseline arm in the same run",
     )
     ap.add_argument("--runs-root", default=str(Path.home() / "kexi" / "rsi-runs"))
     ap.add_argument("--gpu", default="0", help="CUDA device ids (comma list, len = tp)")
@@ -900,7 +1058,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--replay-out-tokens", type=int, default=OFFICIAL["replay_out_tokens"])
     ap.add_argument("--replay-repeats", type=int, default=OFFICIAL["replay_repeats"])
     ap.add_argument("--replay-digest-every", type=int, default=OFFICIAL["replay_digest_every"])
+    ap.add_argument("--cap-convs", type=int, default=OFFICIAL["cap_convs"])
+    ap.add_argument("--cap-turns", type=int, default=OFFICIAL["cap_turns"])
+    ap.add_argument(
+        "--cap-fractions",
+        default=OFFICIAL["cap_fractions"],
+        help=f"C/U list; {CAPACITY_FRACTION} is gated, the rest are reported",
+    )
     args = ap.parse_args(argv)
+    try:
+        fractions = parse_fractions(args.cap_fractions)
+    except ValueError as e:
+        ap.error(str(e))
     args.model = str(Path(args.model).expanduser())
     if len(args.gpu.split(",")) != args.tp:
         ap.error(f"--gpu {args.gpu} does not have --tp {args.tp} devices")
@@ -916,40 +1085,70 @@ def main(argv: list[str] | None = None) -> int:
     wls = [w for w in args.workloads.split(",") if w]
     if "baseline" in arms:  # every comparison references the baseline
         arms = ["baseline"] + [a for a in arms if a != "baseline"]
-    if "cap" in wls:  # G5 sizes the store from the baseline replay trace
+    if "cap" in wls:  # G5 sizes every store from the baseline cap trace
         wls = [w for w in wls if w != "cap"] + ["cap"]
     results: dict[str, dict[str, Any]] = {}
+
+    def stage(arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
+        """Run one stage; a reference arm's crash is recorded, not fatal."""
+        try:
+            return run_arm_workload(args, gate, arm, wl, out, **kw)
+        except Exception as e:
+            if arm_kind(arm) not in ("old", "native"):
+                raise
+            print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)
+            return {"arm": arm, "workload": wl, "error": f"{type(e).__name__}: {e}"[:2000]}
+
     for arm in arms:
         kind = arm_kind(arm)
+        label = arm_label(arm)
         for wl in wls:
             if wl != "gsm8k" and kind in ("plain", "selftest"):
                 continue
-            if wl == "cap" and kind == "baseline":
-                continue  # nothing to store
-            label = arm_label(arm)
-            out = run_dir / label / wl
             if wl != "cap":
-                results.setdefault(label, {})[wl] = run_arm_workload(args, gate, arm, wl, out)
+                results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
                 continue
-            u = capacity_basis(run_dir)
-            if u is None:
+            if kind == "baseline":
+                results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
+                continue
+            base_cap = results.get("baseline", {}).get("cap", {})
+            u = base_cap.get("unique_bytes")
+            if not u:
                 results.setdefault(label, {})[wl] = {
                     "arm": arm,
                     "workload": wl,
-                    "error": "no baseline replay trace in this run to size the store",
+                    "error": "no baseline cap trace in this run to size the store",
                 }
                 continue
-            c = int(CAPACITY_FRACTION * u)
-            r = run_arm_workload(args, gate, arm, wl, out, capacity=c)
-            r["unique_bytes"] = u
-            (out / "result.json").write_text(json.dumps(r, indent=1))
-            results.setdefault(label, {})[wl] = r
+            for f in fractions:
+                name = cap_label(f)
+                out = run_dir / label / name
+                r = stage(arm, name, out, capacity=int(f * u), ref_local=base_cap.get("ref_local"))
+                r["unique_bytes"] = u
+                r["capacity_fraction"] = f
+                if out.exists():
+                    (out / "result.json").write_text(json.dumps(r, indent=1))
+                results.setdefault(label, {})[name] = r
 
     def strip(r: dict[str, Any]) -> dict[str, Any]:
-        return {k: v for k, v in r.items() if k != "digest_self"}
+        return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
     problems = official_problems(args, arms, wls, gate_file, committed)
     v = verdicts(results, run_dir, committed)
+    floor = None
+    if "cap" in wls:
+        # Not a verdict: a store smaller than this measures vLLM's GPU cache,
+        # so the run cannot be official (G5 is then a flow + digest smoke).
+        floor = capacity_floor(results.get("baseline", {}).get("cap"))
+        if not floor["pass"]:
+            problems.append(f"capacity below {MIN_CAPACITY_GPU_KV:g}x GPU KV")
+        # The bar must separate a store frozen after its first fill.
+        for label, g in v.items():
+            if label in ("baseline", "old", "native") or label.startswith("selftest-"):
+                continue
+            fz = g.get("G5.replay_warm", {}).get("freeze_vs_oracle_c")
+            if fz is None or fz >= MIN_EFFICIENCY_C:
+                problems.append("G5 trace does not separate freeze from H*_C")
     summary = {
         "tag": args.tag,
         "rev": git_rev(),
@@ -957,6 +1156,7 @@ def main(argv: list[str] | None = None) -> int:
         "gate": gate,
         "official": not problems,
         "not_official_because": problems,
+        "capacity_floor": floor,
         "results": {a: {w: strip(r) for w, r in per.items()} for a, per in results.items()},
         "verdicts": v,
     }

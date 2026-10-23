@@ -306,8 +306,13 @@ def simulate(
     capacity: int,
     policy: str,
     unlimited: list[int] | None = None,
+    local: list[int] | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     """Hit tokens per request (input order) for a store of ``capacity`` bytes.
+
+    ``local[i]``: tokens of request ``i`` vLLM holds itself (default: its
+    recorded ``local_hit``); G5 passes the baseline arm's local hit so an arm
+    cannot raise its bar by lowering its own.
 
     Same store events and visibility as :func:`replay`, same ``resolve``
     scoring; only residency differs.
@@ -323,6 +328,8 @@ def simulate(
     - ``policy="lru"`` (``H_lru``): group-oblivious LRU, every item stored, a
       re-store of a resident item does not refresh it (as the server's
       ``insert`` on an existing key), a hit refreshes the blocks loaded.
+    - ``policy="freeze"``: store until full, never evict (a degenerate policy
+      the gate must reject; reported so the bar's separation is visible).
 
     Diagnostics per group: stored / not admitted / evicted counts and bytes,
     and at the end of each pass (schedule order, ``rsi_pass`` tag) the
@@ -331,7 +338,7 @@ def simulate(
     resident then plus that request's recorded local hit (e.g. a checkpoint
     whose full-attention prefix was evicted).
     """
-    if policy not in ("belady", "lru"):
+    if policy not in ("belady", "lru", "freeze"):
         raise ValueError(f"unknown policy {policy!r}")
     kinds = _active(spec)
     if not kinds:
@@ -341,12 +348,14 @@ def simulate(
     order = _schedule_order(reqs)
     if unlimited is None:
         unlimited = replay(spec, reqs)
+    if local is None:
+        local = [r["local_hit"] or 0 for r in reqs]
 
     # Use positions per item (positions in schedule order, increasing).
     uses: dict[tuple[int, str], list[int]] = {}
     for t, i in enumerate(order):
         r = reqs[i]
-        for item in _external_keys(kinds, r, unlimited[i], r["local_hit"] or 0):
+        for item in _external_keys(kinds, r, unlimited[i], local[i]):
             uses.setdefault(item, []).append(t)
 
     def next_use(item: tuple[int, str], t: int) -> int:
@@ -358,9 +367,9 @@ def simulate(
 
     # Stranded-diagnostic probes: one per distinct (prompt prefix, local hit).
     probes = list(
-        {(r["prompt_len"], r["local_hit"] or 0,
-          tuple(r["keys"][: r["prompt_len"] // r["key_tokens"]])): r
-         for r in reqs}.values()
+        {(r["prompt_len"], local[i],
+          tuple(r["keys"][: r["prompt_len"] // r["key_tokens"]])): (r, local[i])
+         for i, r in enumerate(reqs)}.values()
     )  # fmt: skip
 
     groups = [
@@ -389,7 +398,12 @@ def simulate(
         if size > capacity:
             groups[gi]["not_admitted"] += 1
             return
-        if policy == "lru":
+        if policy == "freeze":
+            if used + size > capacity:
+                groups[gi]["not_admitted"] += 1
+                return
+            resident[item] = 0
+        elif policy == "lru":
             while used + size > capacity:
                 evict(next(iter(resident)))
             resident[item] = 0
@@ -426,9 +440,8 @@ def simulate(
 
     def snapshot() -> dict[str, Any]:
         live: set[tuple[int, str]] = set()
-        for r in probes:
-            local = r["local_hit"] or 0
-            live.update(_needed_keys(kinds, r, _resolve(kinds, r, resident, local)))
+        for r, lo in probes:
+            live.update(_needed_keys(kinds, r, _resolve(kinds, r, resident, lo)))
         res = [0] * len(kinds)
         stranded = [0] * len(kinds)
         for item in resident:
@@ -451,15 +464,15 @@ def simulate(
         if current is not None and label != current and current not in passes:
             passes[current] = snapshot()
         current = label
-        local = r["local_hit"] or 0
+        lo = local[i]
         # Local blocks count as present; never credit more than an unlimited store.
-        hits[i] = min(_resolve(kinds, r, resident, local), max(unlimited[i], local))
+        hits[i] = min(_resolve(kinds, r, resident, lo), max(unlimited[i], lo))
         if policy == "lru":
-            for item in _external_keys(kinds, r, hits[i], local):
+            for item in _external_keys(kinds, r, hits[i], lo):
                 if item in resident:
                     resident.move_to_end(item)
-        else:
-            for item in _external_keys(kinds, r, unlimited[i], local):
+        elif policy == "belady":
+            for item in _external_keys(kinds, r, unlimited[i], lo):
                 if item in resident:
                     nu = next_use(item, t + 1)
                     resident[item] = nu
@@ -476,27 +489,67 @@ def simulate(
     return hits, {"groups": groups, "passes": passes}
 
 
+def external_load_bytes(
+    spec: dict[str, Any], reqs: list[dict[str, Any]], passes: set[str] | None = None
+) -> int:
+    """Bytes of the blocks the requests in ``passes`` loaded through the
+    connector: per request the blocks ``needed`` at its first-schedule
+    computed tokens that its own local hit did not hold."""
+    kinds = _active(spec)
+    if not kinds:
+        return 0
+    sizes = block_bytes(spec)
+    total = 0
+    for r in reqs:
+        if passes is not None and r.get("pass") not in passes:
+            continue
+        a, lo = r["first_computed"] or 0, r["local_hit"] or 0
+        if a > lo:
+            total += sum(sizes[gi] for gi, _ in _external_keys(kinds, r, a, lo))
+    return total
+
+
 def summarize_capacity(
     spec: dict[str, Any],
     reqs: list[dict[str, Any]],
     capacity: int,
     segments: dict[str, set[str]] | None = None,
+    ref_local: list[int | None] | None = None,
 ) -> dict[str, Any]:
     """G5 numbers per segment for a store of ``capacity`` bytes.
 
-    Per request: ``a`` = actual first-schedule computed tokens, ``lo`` =
-    local hit, ``o`` = unlimited oracle, ``oc`` = Belady oracle at capacity,
-    ``lr`` = LRU at capacity.
+    Per request: ``a`` = actual first-schedule computed tokens, ``ref`` =
+    reference local hit (``ref_local[i]``: the baseline arm's local hit for
+    the same workload position; the arm's own local hit where ``None`` or
+    when ``ref_local`` is not given, counted as ``unmatched``), ``o`` =
+    unlimited oracle, ``oc`` / ``lr`` / ``fz`` = Belady / LRU / freeze at
+    capacity (all simulated with ``ref`` as the local hit).
 
-    - ``ext = max(0, min(a, o) - lo)`` (capped by the unlimited oracle, so a
-      connector cannot score above what an unlimited store could serve)
-    - ``ext*_C = max(0, oc - lo)``; ``efficiency_c`` (``E_C``) = Σext / Σext*_C
-    - ``lru_vs_oracle_c`` = Σmax(0, lr - lo) / Σext*_C
+    - ``ext = max(0, min(a, o) - ref)`` (capped by the unlimited oracle, so a
+      connector cannot score above what an unlimited store could serve; a
+      lower own local hit only raises what it has to load)
+    - ``ext*_C = max(0, oc - ref)``; ``efficiency_c`` (``E_C``) = Σext / Σext*_C
+    - ``lru_vs_oracle_c`` / ``freeze_vs_oracle_c`` = Σmax(0, lr|fz - ref) / Σext*_C
+    - ``efficiency_c_own_local``: the same ratio with the arm's own local hit
+      for both ext and ext*_C (diagnostic only).
     - ``*_hit_rate`` = tokens / prompt tokens; ``excess`` as in G3 (unlimited).
     """
     unlimited = replay(spec, reqs)
-    belady, bdiag = simulate(spec, reqs, capacity, "belady", unlimited)
-    lru, ldiag = simulate(spec, reqs, capacity, "lru", unlimited)
+    own = [r["local_hit"] or 0 for r in reqs]
+    ref = list(own)
+    matched = [ref_local is not None] * len(reqs)
+    if ref_local is not None:
+        for i, x in enumerate(ref_local):
+            if x is None:
+                matched[i] = False
+            else:
+                ref[i] = x
+    belady, bdiag = simulate(spec, reqs, capacity, "belady", unlimited, ref)
+    lru, ldiag = simulate(spec, reqs, capacity, "lru", unlimited, ref)
+    freeze, _ = simulate(spec, reqs, capacity, "freeze", unlimited, ref)
+    belady_own = (
+        belady if ref == own else simulate(spec, reqs, capacity, "belady", unlimited, own)[0]
+    )
     kinds = group_kinds(spec)
     block = max((bt for _, g, bt in kinds if g is not None), default=0)
     out: dict[str, Any] = {
@@ -504,31 +557,39 @@ def summarize_capacity(
         "kinds": [label for label, _, _ in kinds],
         "diagnostics": {"oracle_c": bdiag, "lru": ldiag},
     }
+    names = ("prompt", "actual", "local", "ref", "o", "oc", "lr", "fz", "ext", "ext_c",
+             "ext_lru", "ext_fz", "ext_own", "ext_c_own", "excess", "unmatched")  # fmt: skip
     for name, labels in (segments or {"all": None}).items():
         part = [i for i, r in enumerate(reqs) if labels is None or r.get("pass") in labels]
-        t = dict.fromkeys(
-            ("prompt", "actual", "local", "o", "oc", "lr", "ext", "ext_c", "ext_lru", "excess"), 0
-        )
+        t = dict.fromkeys(names, 0)
         for i in part:
             r = reqs[i]
-            a, lo = r["first_computed"] or 0, r["local_hit"] or 0
-            o, oc, lr = unlimited[i], belady[i], lru[i]
+            a, lo, rl = r["first_computed"] or 0, own[i], ref[i]
+            o = unlimited[i]
             t["prompt"] += r["prompt_len"]
             t["actual"] += a
             t["local"] += lo
+            t["ref"] += rl
             t["o"] += o
-            t["oc"] += oc
-            t["lr"] += lr
-            t["ext"] += max(0, min(a, o) - lo)
-            t["ext_c"] += max(0, oc - lo)
-            t["ext_lru"] += max(0, lr - lo)
+            t["oc"] += belady[i]
+            t["lr"] += lru[i]
+            t["fz"] += freeze[i]
+            t["ext"] += max(0, min(a, o) - rl)
+            t["ext_c"] += max(0, belady[i] - rl)
+            t["ext_lru"] += max(0, lru[i] - rl)
+            t["ext_fz"] += max(0, freeze[i] - rl)
+            t["ext_own"] += max(0, min(a, o) - lo)
+            t["ext_c_own"] += max(0, belady_own[i] - lo)
             t["excess"] += max(0, a - max(o, lo))
-        p = t["prompt"]
+            t["unmatched"] += not matched[i]
+        p, ec = t["prompt"], t["ext_c"]
         out[name] = {
             "requests": len(part),
+            "unmatched_requests": t["unmatched"],
             "prompt_tokens": p,
             "hit_tokens": t["actual"],
             "local_hit_tokens": t["local"],
+            "reference_local_tokens": t["ref"],
             "hit_rate": t["actual"] / p if p else 0.0,
             "oracle_tokens": t["o"],
             "oracle_hit_rate": t["o"] / p if p else 0.0,
@@ -536,11 +597,15 @@ def summarize_capacity(
             "oracle_c_hit_rate": t["oc"] / p if p else 0.0,
             "lru_tokens": t["lr"],
             "lru_hit_rate": t["lr"] / p if p else 0.0,
+            "freeze_hit_rate": t["fz"] / p if p else 0.0,
             "ext_tokens": t["ext"],
-            "ext_oracle_c_tokens": t["ext_c"],
+            "ext_oracle_c_tokens": ec,
+            "ext_oracle_c_share": ec / p if p else 0.0,
             "ext_lru_tokens": t["ext_lru"],
-            "efficiency_c": t["ext"] / t["ext_c"] if t["ext_c"] else None,
-            "lru_vs_oracle_c": t["ext_lru"] / t["ext_c"] if t["ext_c"] else None,
+            "efficiency_c": t["ext"] / ec if ec else None,
+            "lru_vs_oracle_c": t["ext_lru"] / ec if ec else None,
+            "freeze_vs_oracle_c": t["ext_fz"] / ec if ec else None,
+            "efficiency_c_own_local": t["ext_own"] / t["ext_c_own"] if t["ext_c_own"] else None,
             "excess_tokens": t["excess"],
             "excess_limit": block * len(part),
         }
