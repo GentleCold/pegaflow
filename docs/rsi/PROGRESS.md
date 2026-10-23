@@ -48,6 +48,16 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
 - Gate changes (`rsi/gates/**`, GATES.md) stay human-owned: agent-written gate
   code lands on its own branch (e.g. `feat/rsi-g5`) and is reviewed before it
   is used to accept anything.
+- Review flow (user, 2026-10-23: "这些评审都不要等我"): nothing blocks on the
+  user. Every review (iteration, gate branch, server branch) is done by an
+  independent review agent; the orchestrator merges gate branches and moves on
+  once that review passes. Server changes still go on their own branch/PR, but
+  the model's iteration continues on that server build. The user does one
+  acceptance pass after all four models are supported, covering the gate PRs,
+  server PRs and model PRs together.
+- Every progress report and ITERATIONS entry includes the hit-rate table
+  (local / external / total hit, oracle H*, E_ext, and at capacity H*_C, H_lru,
+  E_C), not only the perf numbers.
 
 ## Isolation (no reference to existing implementation)
 

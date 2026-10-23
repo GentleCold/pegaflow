@@ -76,8 +76,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    pools, query): keep it Kind-aware and model-agnostic (no model names, no
    per-model branches), run `cargo test`, re-run the `old` arm to show no
    regression. Server code goes on its own branch `feat/rsi-server-<topic>` as
-   a separate PR for HUMAN review (never merge it yourself); the model's
-   acceptance is "pending server review" until it is approved. Connector code
+   a separate PR (never merge it into a model branch yourself); an independent
+   review agent reviews it and the iteration continues on that server build;
+   the user reviews server PRs in the final acceptance pass (do not wait). Connector code
    stays model-agnostic too: per-model differences live only in
    `connector_v2/models/<model>.toml` (see PROGRESS.md "PR policy").
    Policy complexity rules (keep policy growing with Kinds, not with models):
@@ -100,7 +101,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    on earlier models, and the policy complexity rules above (grep `policy.py`
    for model / spec class names, count knobs and lines, unused knobs). Fix or
    justify every finding in ITERATIONS.md.
-7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers.
+7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers:
+   the hit-rate table (local / external / total hit, oracle H*, E_ext; at
+   capacity H*_C, H_lru, E_C) next to the G4 perf table, for the arm under
+   test and the reference arms. Do not wait for the user: the review agent's
+   pass is the acceptance; the user does one acceptance pass at the end.
 
 ## 3. Lessons (append)
 
