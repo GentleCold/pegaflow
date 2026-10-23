@@ -433,8 +433,10 @@ Each entry: what was added, why, which vectors cover it.
 
 ## Open questions
 
-- "agentx" perf workload: not found in repo; asked the user. Fallback: multi-turn
-  agent traces from `/ppio/data_sets/R2EGym-SFT-Trajectories`.
+- "agentx" perf workload: not available. User (2026-10-23): use the R2EGym
+  replay for now. R2EGym (`~/kexi/datasets/r2egym-256.jsonl`, 32 x 12 official)
+  is the G4/G3 replay workload until agentx is provided; results only claim
+  this workload.
 - Capacity-blind gates (raised 2026-10-23, user asked how the loop would
   find "manage SWA and full blocks separately" for DeepSeek-V4.1-Flash):
   every gate runs with an unlimited pool (`G3.no_eviction`), and write
