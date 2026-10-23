@@ -493,6 +493,20 @@ names, magic constants that only exist in the old code).
   unchanged on the 24 recorded runs (5580 verdict leaves) apart from the
   new `G2.split_control`, which old records lack. DeepSeek-V2-Lite's
   gate.json must set `"split_invariant": false` (P4's file).
+- G5 re-review 2 (accept-with-fixes on 4797a05..e9f3f33) applied in
+  91b6a8e..940def4; resolution table in `reviews/G5-gate-rereview2.md`.
+  Split-variant G2 is now exact: warm outputs == plain `split` (aligned
+  prompts reported only), cold == baseline cold, warm computed KV judged
+  against the baseline's `split` pass with coverage >= 0.9 per pass (DSV2
+  honest self-test warm coverage 0 -> 1.0; liar/bitflip/offbyone fail;
+  P4 old and it1 slices pass G2). Provenance: overlay with only `pegaflow`
+  for `--under-test-path`, `G0.provenance` on module files, verified tree
+  revs (blob-for-blob vs GitHub) and binary sha256 in `summary.provenance`.
+  Teardown failures abort the run; SIGTERM/SIGHUP tear stages down;
+  `--pool-size` 64gb with an early U check; untimed `_warmup` request per
+  stage; contaminated timed passes (p99 > 10x baseline) make a run
+  non-official; `G2.digest_groups` fails a transferred group without
+  digests (hybrid / Mamba models fail G2 until Mamba state is digested).
 
 ## Semantics changelog
 

@@ -305,3 +305,58 @@ M1-M3 can change its verdicts:
 S3 could change it only if a reference arm fails teardown. S4 affects the
 record's provenance (server binary and `old`/oracle from the unrecorded
 pegaflow-semantics-rsi tree), not a verdict.
+
+## Resolution (implementer, 5bffd1e..HEAD)
+
+| item | decision | commit | how |
+|---|---|---|---|
+| M1 | fixed | 91b6a8e | With `split_invariant=false` the baseline arm also runs `split`, so warm computed blocks have same-split references. `digest_vs_baseline.gsm8k` requires judged > 0 and `compared / (compared + unmatched_split + unreferenced) >= 0.9` separately in `cold` and `warm` (`computed_by_pass`). `G2.gsm8k_outputs`: cold == baseline cold exactly; warm == plain `split` exactly, except prompts with `prompt_len % cache_hit_alignment_tokens == 0` (reported as `warm_differ_vs_split_aligned`). The rate bound and `SPLIT_MARGIN` are gone. Pre-warm requests are tagged `<pass>_prewarm` and never scored. |
+| M2 | fixed | 144bfd8 | `--under-test-path` is exposed through `<run>/under-test-overlay/` holding only `pegaflow -> DIR/pegaflow`. Every spec dump (scheduler and each worker) records `modules`: probe, worker extension, vllm, torch, pegaflow (+ native module, site/usercustomize if loaded), prefix. `G0.provenance` (every arm and baseline) fails unless probe/extension resolve under REPO, vllm/torch/prefix to the shared venv, pegaflow to the arm's expected dir. |
+| M3 | fixed | 144bfd8 | `provenance.Trees`: verified iff clean git toplevel (`--show-toplevel == root`, `status --porcelain` empty), or `.rsi-rev` whose `git ls-tree -r <rev> python/pegaflow` blob ids equal the files on disk (blob-less fetch from GitHub; untracked native extensions allowed, sha256 recorded). A run with `--under-test-path` and an unverified tree is not official. Host check: 8a05b7c under-test tree verified (63 files). |
+| S1 | open (sign-off) + doc fixed | this commit | Who commits: the model's onboarding agent, on its own branch (DSV2: P4's 1bfb590); the gate owner never commits a model's gate.json. The claim is not trusted: `G2.split_control` fails a wrong claim either way, in-run. GATES.md now says the value is *checked* by the control, not that onboarding cannot write it. The relaxation still needs the user's sign-off per GATES.md:3-4; I have no record of it, so it is open for the coordinator. |
+| S2 | fixed | 91b6a8e | `test_split_variant_still_fails_wrong_loaded_bytes`, plus M1's outputs table (`variant-one-wrong`, `variant-cold`, `variant-missing`). |
+| S3 | fixed | 99146cc | `TeardownError` from `stop()`; `run_stage` re-raises it (also when chained during another error) for reference arms too. |
+| S4 | fixed | 144bfd8 | `summary.provenance`: gate tree, venv `pegaflow` tree (`pegaflow_llm.pth` → pegaflow-semantics-rsi), under-test tree, each verified + native sha256; pegaflow-server sha256 and its tree's `.rsi-rev` (claim). Per-process `pegaflow` files in `G0.provenance.pegaflow_files`. GATES.md sentence replaced. |
+| S5 | documented | 91b6a8e | Fail-closed (false fails only), documented in `digest_compare` and GATES.md; recording every chunk end not needed for a sound gate. |
+| S6 | fixed | 91b6a8e | `cached >= (prompt_tokens - 1) // align * align`, align from the baseline spec dump. |
+| N1 | fixed | 91b6a8e | Control fails when `split_ref != plain cold`, whatever the claim. |
+| N2 | accepted | - | The gate tests are host-only by design (native `pegaflow.semantics`, aiohttp from the shared venv); the source-only command in CLAUDE.md is for `python/tests`, not `rsi/gates`. |
+| N3 | fixed | 39cd826 | Grep assertion: no `ClientSession(`/`TCPConnector(` in `rsi/gates` outside `session()`. |
+| N4 | noted | - | TTFT records from before e9f3f33 are not comparable with later ones at sub-ms level; G4 compares arms within one run only, so no verdict depends on it. |
+
+Also in this range (coordinator requests): 940def4 (G2.digest_groups: a
+transferred group without digest records fails G2; Mamba groups are listed
+as not digested), 8a180e0 (SIGTERM/SIGHUP → `SystemExit`, stage groups torn down), cde6186 (`--pool-size` 64gb, `PoolTooSmall` before a store stage), dc70805 (untimed `_warmup` request per gsm8k/replay stage, isolation asserted), 325fbd0 (contamination: timed replay p99 > 10x baseline → not official).
+
+### Re-judge evidence (offline, gate code 39cd826 + 940def4 rules)
+
+References from other runs (no record has all of them):
+- Baseline gsm8k (cold, warm, split; 1319):
+  `2026-10-23-dsv2-lite-baseline-split-39cd826` (rev 39cd826, GPU 2,3).
+  Same flags as every DSV2 record: TP2, TRITON_MLA, `VLLM_BATCH_INVARIANT=1`,
+  max-model-len 8192, batched 2048, seqs 256, gpu-mem 0.8, concurrency 32,
+  8 shots, seed 42. Its cold outputs equal each old record's baseline cold
+  (0/128 self-test, 0/1319 slices), so batch invariance carries the
+  references across runs.
+- Plain split control: `2026-10-23-dsv2-lite-split-control` (bb75843).
+- Gate settings: P4's `docs/rsi/models/DeepSeek-V2-Lite-Chat/gate.json` at
+  1bfb590 (`split_invariant: false`), not committed on this branch.
+
+| record | arm | digest_self | vs_baseline (warm coverage) | outputs: cold / warm vs split (aligned) | expected | result |
+|---|---|---|---|---|---|---|
+| selftest (8af8fe4) | honest | pass | pass, 1606/1606 = 1.0 | 0 / 0 (0) | pass all | pass |
+| selftest | liar | fail | fail (2168 ext mismatched, 0.004) | 128 / 121 (7) | fail both digests | fail |
+| selftest | bitflip | fail | fail (256 mismatched, 0.002) | 0 / 121 (7) | fail both digests | fail |
+| selftest | offbyone | fail | fail (828 mismatched, 0.014) | 0 / 121 (7) | fail both digests | fail |
+| p4-old-slice (b358ceb) | old | pass | pass, 16310/17492 = 0.932 | 0 / 0 (38) | pass G2 | pass G2 |
+| p4-it1-slice (b358ceb) | v2 | pass | pass, 17482/17482 = 1.0 | 0 / 0 (0) | pass G2 | pass G2 |
+
+Under the new rules the honest arm's warm computed KV is judged (coverage 1.0 vs 0
+before). The negatives now also fail the coverage floor and the exact warm
+outputs. The old connector's 38 warm diffs vs `split` are all aligned prompts
+(reported only); its 1182 unjudged warm blocks are aligned-prompt splits
+(964 other-split, 218 never computed by the baseline). Every arm also fails
+`G0.spec`. That comes only from the `modules` field the new probe adds, which
+old records lack (a spec-only diff). G4/G5 failures on the slices are the
+records' own, unchanged. Qwen3-4B: re-judged all 24 recorded runs with
+39cd826: 864/864 pass flags unchanged.
