@@ -205,3 +205,23 @@ def _check_seal_plan(semantics: Any, decls: list[_Decl]) -> None:
         semantics.seal_plan(sorted(by_rank.items()))
     except ValueError as e:
         raise Unsupported(f"adapter declarations fail seal_plan: {e}") from e
+
+
+def may_zero_or_copy_blocks(kv_cache_config: Any) -> bool:
+    """vLLM may zero new blocks or copy partial prefix hits (copy-on-write)
+    into them at the start of a step.
+
+    vLLM's V2 model runner does both before ``handle_preemptions``, so a
+    pending save of a freed block could read the overwritten bytes. Zeroing:
+    ``needs_kv_cache_zeroing`` (Mamba or mixed-precision KV). Copy-on-write:
+    prefix hits finer than a group's block (``hash_block_size`` smaller than
+    its ``block_size``). Unknown fields count as "may".
+    """
+    if getattr(kv_cache_config, "needs_kv_cache_zeroing", True):
+        return True
+    hash_block_size = getattr(kv_cache_config, "hash_block_size", None)
+    if hash_block_size is None:
+        return True
+    return any(
+        g.kv_cache_spec.block_size != hash_block_size for g in kv_cache_config.kv_cache_groups
+    )

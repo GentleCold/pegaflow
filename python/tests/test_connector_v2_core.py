@@ -21,7 +21,13 @@ import pytest
 
 from pegaflow.connector_v2 import adapters
 from pegaflow.connector_v2.adapters import LayerDecl, LayerView, Parallel, Unsupported
-from pegaflow.connector_v2.core import Scheduler, StepPlan, Worker, build_layout
+from pegaflow.connector_v2.core import (
+    Scheduler,
+    StepPlan,
+    Worker,
+    build_layout,
+    may_zero_or_copy_blocks,
+)
 from pegaflow.connector_v2.core.scheduler import GroupSave, LoadPlan
 from pegaflow.connector_v2.policy import Policy, SaveItem, load_policy
 
@@ -495,6 +501,10 @@ def test_alloc(ext, ids, fail, loads, released):
     [
         # Short hit: loaded before the forward, nothing reported on success.
         pytest.param(True, 256, 0, 1, ((12, False), set(), set()), id="sync-ok"),
+        # S2: no deadline. Until the server signals, its copy may still land,
+        # so a slow load is neither failed (vLLM would recompute into the
+        # blocks) nor done; the worker clock jumps 60 s per read here.
+        pytest.param(True, 256, 0, (5, 1), ((12, False), set(), set()), id="sync-slow-ok"),
         # A failed sync load cannot be a failed receive (vLLM already counts
         # the tokens): every GPU block holding hit tokens is reported invalid.
         pytest.param(True, 256, 4, -1, ((8, False), set(), {11, 12}), id="sync-failed"),
@@ -518,11 +528,71 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
     req = _req()
     matched = sched.get_num_new_matched_tokens(req, num_computed)
     sched.update_state_after_alloc(req, ([10, 11, 12, 13],), matched[0])
-    worker = _worker(StubSemantics, rpc, [FakeLoadState(state=load_state)], layout=layout)
+    polls, load_state = load_state if isinstance(load_state, tuple) else (0, load_state)
+    state = FakeLoadState(state=load_state, polls=polls)
+    worker = _worker(StubSemantics, rpc, [state], layout=layout, clock=JumpClock(60.0))
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     worker.start(sched.take_plan())
     _, recving, _ = worker.poll()
     assert (matched, recving, worker.take_invalid()) == expected
+    worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "load_state,step2,expected2",
+    [
+        pytest.param(1, [("r", 17, 1), ("shared", 17, 1)], [13, 20, 21], id="sync-ok"),
+        # vLLM rewinds r to its first invalid block (token 4) and re-offers
+        # the range; shared holds the invalid block too but is not rewound
+        # (vLLM recomputes a shared block once), so it never saves again.
+        pytest.param(-1, [("r", 4, 13), ("shared", 17, 1)], [11, 12, 13], id="sync-failed"),
+    ],
+)
+def test_sync_load_outcome_gates_saves(load_state, step2, expected2):
+    """M1: the server keeps the first copy of a key, so KV computed on a sync
+    load must not be saved before vLLM has processed the load's outcome
+    (``confirm_steps``: vLLM's max_concurrent_batches), nor ever if vLLM kept
+    a request's KV computed on a failed block.
+
+    Step 0: r sync-loads blocks 1-2 and prefills to 17; other is unrelated.
+    Step 1 (scheduled before step 0's output is processed): r decodes, shared
+    prefills on a local prefix hit on r's blocks 0-1.
+    Step 2: vLLM has processed step 0's outcome.
+    """
+    layout = _layout(StubSemantics, StubFullSpec())
+    rpc = FakeRpc({0: Ready(3, b"L0")})
+    sched = Scheduler(
+        layout,
+        Policy(),
+        rpc,
+        "inst",
+        clock=Clock(),
+        semantics=StubSemantics,
+        sync_loads=True,
+        confirm_steps=2,
+    )
+    tables = {"r": [10, 11, 12, 13], "shared": [10, 11, 20, 21], "other": [30, 31, 32, 33]}
+    for rid in tables:
+        sched.on_new_request(_req(17, 4, rid))
+    req = sched._requests["r"]
+    n, load_async = sched.get_num_new_matched_tokens(req, 4)
+    assert (n, load_async) == (8, False)
+    sched.update_state_after_alloc(req, (tables["r"],), n)
+
+    def step(scheduled):
+        sched.plan_saves(scheduled, lambda rid: (tables[rid],))
+        plan = sched.take_plan()
+        return plan, [b for s in plan.saves for b in s.block_ids]
+
+    load_step, saved0 = step([("r", 12, 5), ("other", 0, 17)])
+    worker = _worker(StubSemantics, rpc, [FakeLoadState(state=load_state)], layout=layout)
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.start(load_step)
+    _, saved1 = step([("r", 17, 1), ("shared", 8, 9)])
+    sched.on_load_errors(worker.take_invalid())  # vLLM processes step 0's output
+    _, saved2 = step(step2)
+    _, saved3 = step([(rid, 17, 1) for rid, _, _ in step2])
+    assert (saved0, saved1, saved2, saved3) == ([30, 31, 32, 33], [], expected2, [])
     worker.shutdown()
 
 
@@ -652,13 +722,18 @@ def test_choose_saves_is_validated(choose, expected):
 
 # --------------------------------------------------------------------- worker
 class FakeLoadState:
-    def __init__(self, ready=True, state=1):
-        self.ready, self.state = ready, state
+    """``polls``: is_ready() calls answering False before it turns ready."""
+
+    def __init__(self, ready=True, state=1, polls=0):
+        self.ready, self.state, self.polls = ready, state, polls
 
     def shm_name(self):
         return "shm"
 
     def is_ready(self):
+        if self.polls:
+            self.polls -= 1
+            return False
         return self.ready
 
     def get_state(self):
@@ -676,8 +751,20 @@ class FakeMark:
             assert self.gate.wait(5), "test never released the compute mark"
 
 
-def _worker(sem, rpc, states, layout=None, mark=FakeMark):
+class JumpClock:
+    """Advances ``step`` seconds per read: any deadline in the code expires."""
+
+    def __init__(self, step):
+        self.now, self.step = 0.0, step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+def _worker(sem, rpc, states, layout=None, mark=FakeMark, clock=None, sync_saves=False):
     it = iter(states)
+    kwargs = {"clock": clock} if clock is not None else {}
     return Worker(
         layout or _layout(sem),
         rpc,
@@ -687,6 +774,8 @@ def _worker(sem, rpc, states, layout=None, mark=FakeMark):
         lambda t: b"ipc",
         lambda: next(it),
         mark,
+        sync_saves=sync_saves,
+        **kwargs,
     )
 
 
@@ -762,21 +851,41 @@ def test_worker_save_by_storage_group():
     worker.shutdown()
 
 
-@pytest.mark.parametrize("rpc_ok", [True, False], ids=["saved", "save-failed"])
-def test_async_save_holds_blocks_until_copied(rpc_ok):
+class _SaverExit(BaseException):
+    """Escapes ``except Exception``: ends the saver thread."""
+
+
+def _save_outcome(outcome):
+    def save(calls, saves):
+        calls.append(saves)
+        if outcome == "raises":
+            raise RuntimeError("rpc broke")
+        if outcome == "saver-dies":
+            raise _SaverExit
+        return outcome == "saved", ""
+
+    return save
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+@pytest.mark.parametrize("outcome", ["saved", "save-failed", "raises", "saver-dies"])
+def test_async_save_holds_blocks_until_copied(outcome):
     """vLLM may reuse a finished request's blocks only after its saves landed.
 
     The step thread never waits on the GPU: the save RPC runs after the
     compute mark. A request that had saves is held at finish and reported in
     finished_sending only once every job submitted before its finish is done,
-    whether or not the server stored the blocks.
+    whether or not the server stored the blocks. S4: a job that raises, or a
+    saver thread that dies, still releases the blocks (a failed save is a
+    future miss) instead of hanging flush; a dead saver drops later saves.
     """
     import threading
 
     gate = threading.Event()
     rpc = FakeRpc()
     calls = []
-    rpc.save = lambda *args: calls.append(args[-1]) or (rpc_ok, "")
+    save = _save_outcome(outcome)
+    rpc.save = lambda *args: save(calls, args[-1])
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=lambda: FakeMark(gate))
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
@@ -804,8 +913,54 @@ def test_async_save_holds_blocks_until_copied(rpc_ok):
     assert len(calls) == 1
     assert worker.poll()[0] == {"saver"}
     assert worker.poll()[0] == set()
-    assert worker.save_stats.failed == (0 if rpc_ok else 1)
+    assert worker.save_stats.failed == (0 if outcome == "saved" else 1)
+    if outcome == "saver-dies":
+        worker._saver.join(5)
+        worker.save(step1)
+        assert worker.flush(5) and len(calls) == 1
+        assert worker.save_stats.failed == 2
     worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "fields,sync",
+    [
+        pytest.param({"needs_kv_cache_zeroing": False, "hash_block_size": 4}, False, id="plain"),
+        pytest.param({"needs_kv_cache_zeroing": True, "hash_block_size": 4}, True, id="zeroing"),
+        # Prefix hits inside a block: vLLM copies the shared tail (CoW).
+        pytest.param({"needs_kv_cache_zeroing": False, "hash_block_size": 2}, True, id="cow"),
+        pytest.param(
+            {"needs_kv_cache_zeroing": False, "hash_block_size": None}, True, id="unknown"
+        ),
+    ],
+)
+def test_layouts_that_zero_or_copy_save_synchronously(fields, sync):
+    """S1: vLLM's V2 model runner zeroes and copies blocks before
+    handle_preemptions, too late for a flush there: such layouts wait for
+    their saves inside wait_for_save."""
+    cfg = _kv_cache_config(StubFullSpec())
+    for name, value in fields.items():
+        setattr(cfg, name, value)
+    assert may_zero_or_copy_blocks(cfg) is sync
+
+    class SlowMark:
+        def synchronize(self):
+            import time
+
+            time.sleep(0.05)
+
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    layout = _layout(StubSemantics, StubFullSpec())
+    worker = _worker(StubSemantics, rpc, [], layout=layout, mark=SlowMark, sync_saves=sync)
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
+    # Sync: done before the next step can zero or copy a block. Async: the
+    # job still waits on the compute mark.
+    assert len(calls) == (1 if sync else 0)
+    worker.shutdown()
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(

@@ -8,8 +8,8 @@ at the legal ``p`` and re-checked against the server answers, and
 bad policy costs hit rate, never correctness.
 
 Knobs live in ``models/<profile>.toml``: ``default.toml`` is loaded first, then
-the selected profile (``kv_connector_extra_config["model_profile"]`` or the
-model architecture, e.g. ``Qwen3ForCausalLM``) overrides it when present.
+the selected profile (``kv_connector_extra_config["model_profile"]``, else
+vLLM's ``model_config.architecture``) overrides it when present.
 """
 
 from __future__ import annotations

@@ -38,12 +38,26 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   - Each request gets its own `load` RPC, so one bad lease fails one request.
   - Short hits (at most `sync_load_tokens`, default 256) are loaded
     synchronously: vLLM schedules the request at once and `start_load_kv`
-    waits for the copy before the forward (~1 ms). Longer hits load
+    waits for the copy before the forward (~1 ms). The wait has no deadline:
+    until the server signals, its copy may still land in the blocks, so the
+    load is neither failed nor done before that. Longer hits load
     asynchronously between steps, so one big copy does not stall the batch.
     A failed sync load is reported as `invalid_block_ids` (the blocks holding
     the hit's tokens), which vLLM recomputes. Sync loads are only used when
     vLLM can recover them: one KV cache group and no block zeroing
     (`needs_kv_cache_zeroing`); otherwise every load is asynchronous.
+    The server keeps the first copy of a key, so nothing computed on a load
+    that may have failed is saved:
+    - a request whose blocks include a sync-loaded block saves nothing until
+      vLLM has processed that step's output (`max_concurrent_batches` plans
+      later); the held range is offered again, from vLLM's rewound point if
+      the load failed;
+    - a request vLLM did not rewind although its computed tokens include a
+      failed block (vLLM recomputes a shared invalid block once, in the
+      first request holding it) never saves again.
+
+    An async load needs neither: vLLM schedules the request only after it
+    processed the failure and reset its computed tokens.
 - **Saves.** Each step, `semantics.saveable(g, before, after)` gives the blocks
   that became storable. `policy.choose_saves` filters them. The saves are
   asynchronous: `wait_for_save` records a CUDA event on the compute stream and
@@ -55,8 +69,16 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     failed);
   - a step whose plan has `flush` (vLLM preempted a request and freed its
     blocks, or the layout has window groups whose blocks are freed while the
-    request runs) waits for all pending saves in `handle_preemptions`, before
-    the step zeroes or writes any block.
+    request runs) waits for all pending saves in `handle_preemptions`. That
+    is before the step's forward writes any block, but vLLM's V2 model runner
+    zeroes new blocks and applies copy-on-write copies before it. So layouts
+    where vLLM may zero (`needs_kv_cache_zeroing`) or copy (`hash_block_size`
+    smaller than a group's `block_size`) blocks save synchronously instead:
+    `wait_for_save` returns once the step's saves are done;
+  - a save that fails, raises, or whose saver thread died still releases its
+    blocks (a failed save is a future miss). A save RPC that hangs blocks
+    `flush` and held requests for good (logged every 10 s): the client has
+    no per-call deadline, and the server may still be copying.
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first;
@@ -108,8 +130,8 @@ the shard. It never decides what to load or save.
 
 `policy.py` is the place to tune behaviour. Knobs are read from
 `models/default.toml`, then from `models/<profile>.toml` if that file exists.
-The profile is `kv_connector_extra_config["model_profile"]`, or the model
-architecture such as `Qwen3ForCausalLM`.
+The profile is `kv_connector_extra_config["model_profile"]`, else vLLM's
+`model_config.architecture`.
 
 - Unknown knobs are an error. Profile names must match `[A-Za-z0-9_.-]+`.
 - The policy can only narrow what semantics allows:

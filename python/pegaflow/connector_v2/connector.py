@@ -24,9 +24,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.outputs import KVConnectorOutput
 
 from .adapters import Parallel
-from .core import Scheduler, StepPlan, Worker, build_layout, endpoint_of, layer_specs
+from .core import (
+    Scheduler,
+    StepPlan,
+    Worker,
+    build_layout,
+    endpoint_of,
+    layer_specs,
+    may_zero_or_copy_blocks,
+)
 from .policy import load_policy
 
 if TYPE_CHECKING:
@@ -139,6 +148,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 self._rpc,
                 self._instance_id,
                 sync_loads=sync_loads,
+                # Steps vLLM schedules before it processes a step's output.
+                confirm_steps=vllm_config.max_concurrent_batches,
             )
             try:
                 self._rpc.start_session_watcher(
@@ -149,6 +160,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         else:
             from pegaflow import PyLoadState
 
+            sync_saves = may_zero_or_copy_blocks(kv_cache_config)
+            logger.info("[PegaKVConnectorV2] saves=%s", "sync" if sync_saves else "async")
             self._worker = Worker(
                 self._layout,
                 self._rpc,
@@ -158,6 +171,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 _ipc_bytes,
                 PyLoadState,
                 _mark_compute,
+                sync_saves=sync_saves,
             )
 
     @property
@@ -207,6 +221,11 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         )
         return PegaConnectorMetadata(self._scheduler.take_plan())
 
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        # Failed sync loads: requests that computed on them must not save.
+        if self._scheduler is not None and connector_output.invalid_block_ids:
+            self._scheduler.on_load_errors(connector_output.invalid_block_ids)
+
     def request_finished(
         self, request: Request, block_ids: list[int]
     ) -> tuple[bool, dict[str, Any] | None]:
@@ -230,8 +249,10 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         self._worker.register(kv_caches, specs)
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
-        # Runs before the step zeroes or writes any KV block: blocks vLLM freed
-        # (preemption) may be reused by this step while a save still reads them.
+        # Blocks vLLM freed (preemption) may be reused by this step while a
+        # save still reads them. Runs before any KV write of the step; on the
+        # V2 model runner after block zeroing and copy-on-write, which is why
+        # layouts with those save synchronously (core.may_zero_or_copy_blocks).
         assert self._worker is not None
         assert isinstance(kv_connector_metadata, PegaConnectorMetadata)
         if kv_connector_metadata.plan.flush:

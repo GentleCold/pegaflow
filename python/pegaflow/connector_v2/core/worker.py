@@ -15,6 +15,11 @@ the copy is done, so:
   returns True) until ``poll`` reports them in ``finished_sending``, which
   happens once every job submitted before vLLM told us they finished is done;
 - a step that reuses a preempted request's blocks first calls ``flush``.
+
+``flush`` runs in vLLM's ``handle_preemptions``, which vLLM's V1 model runner
+calls before it zeroes or copies (copy-on-write) any block, but the V2 runner
+calls after. Layouts where vLLM may zero or copy blocks (``sync_saves``) so
+wait for every save inside ``wait_for_save`` instead, before the next step.
 """
 
 from __future__ import annotations
@@ -70,8 +75,10 @@ class Worker:
     # wait_for_save calls between save-cost log lines.
     SAVE_LOG_EVERY = 500
     SHUTDOWN_FLUSH_S = 30.0
-    # A synchronous load that has not landed by then is reported invalid.
-    SYNC_LOAD_TIMEOUT_S = 30.0
+    # Waits that never give up (sync loads, flush) log this often.
+    STALL_LOG_S = 10.0
+    # Sync-load poll interval: doubles from the first value up to the cap.
+    SYNC_POLL_S = (20e-6, 200e-6)
 
     def __init__(
         self,
@@ -84,7 +91,10 @@ class Worker:
         new_load_state: Callable[[], Any],
         mark_compute: Callable[[], Any],
         clock: Callable[[], float] = time.perf_counter,
+        sync_saves: bool = False,
     ):
+        """``sync_saves``: ``save`` returns only after the step's saves are done
+        (vLLM may zero or copy blocks before ``handle_preemptions`` runs)."""
         self._layout = layout
         self._rpc = rpc
         self._instance_id = instance_id
@@ -94,6 +104,7 @@ class Worker:
         self._new_load_state = new_load_state
         self._mark_compute = mark_compute
         self._clock = clock
+        self._sync_saves = sync_saves
         self._layer_bytes: dict[str, int] = {}  # bytes one block of a layer stores
         self.save_stats = SaveStats(_since=clock())
         # Registered layer names per storage group (index into layout.groups).
@@ -108,6 +119,9 @@ class Worker:
         self._submitted = 0  # step thread only
         self._completed = 0  # saver thread, under _cv
         self._finishing: dict[str, int] = {}  # req -> last job that may read its blocks
+        # The saver thread exited: it reads no block any more, so every hold
+        # is released and later saves are dropped (future misses).
+        self._saver_dead = False
         self._jobs: queue.SimpleQueue[_SaveJob | None] = queue.SimpleQueue()
         self._saver = threading.Thread(
             target=self._save_loop, name="pegaflow-v2-saver", daemon=True
@@ -249,17 +263,27 @@ class Worker:
         return state
 
     def _wait_sync(self, loads: list[tuple[Any, list[int]]]) -> None:
-        """Spin until every sync load landed (the server signals after its copy).
+        """Wait until every sync load reached a final state.
 
         Short by construction (policy ``sync_load_tokens``): ~1 ms per load.
+        There is no deadline: until the server signals, its copy may still
+        land in the blocks, so neither "failed" (vLLM would recompute into
+        them) nor "done" is safe to report. Polls with a growing sleep.
         """
-        deadline = self._clock() + self.SYNC_LOAD_TIMEOUT_S
+        t0 = self._clock()
+        next_log = t0 + self.STALL_LOG_S
         for state, covered in loads:
+            delay, cap = self.SYNC_POLL_S
             while not state.is_ready():
-                if self._clock() > deadline:
-                    break
-                time.sleep(0)  # let the saver thread run
-            if not state.is_ready() or state.get_state() != 1:
+                time.sleep(delay)
+                delay = min(delay * 2, cap)
+                if self._clock() >= next_log:
+                    next_log += self.STALL_LOG_S
+                    logger.warning(
+                        "[PegaKVConnectorV2] sync load still pending after %.0f s",
+                        self._clock() - t0,
+                    )
+            if state.get_state() != 1:
                 logger.warning(
                     "[PegaKVConnectorV2] sync load failed state=%s blocks=%d",
                     state.get_state(),
@@ -274,12 +298,19 @@ class Worker:
 
     # ----------------------------------------------------------------- saves
     def save(self, plan: StepPlan) -> None:
-        """Queue this step's saves behind a mark on the compute stream; never blocks."""
+        """Queue this step's saves behind a mark on the compute stream.
+
+        Never blocks, except with ``sync_saves`` (then it waits for them).
+        """
         t0 = self._clock()
         saves: list[tuple[str, list[int], list[bytes]]] = []
         for gs in plan.saves:
             for name in self._layers[gs.sid]:
                 saves.append((name, gs.block_ids, gs.block_hashes))
+        if saves and self._saver_dead:
+            with self._cv:
+                self.save_stats.failed += 1
+            saves = []
         if saves:
             # The mark covers this step's forward (and draft forward): the
             # saver only reads the blocks after the KV writes completed.
@@ -297,25 +328,56 @@ class Worker:
                 stats.bytes += sum(len(ids) * self._layer_bytes[name] for name, ids, _ in saves)
                 stats.max_pending = max(stats.max_pending, self._submitted - self._completed)
             report = stats.steps >= self.SAVE_LOG_EVERY
+        if saves and self._sync_saves:
+            self.flush()
         if report:
             self.report_save_stats()
 
+    def _settled(self, target: int) -> bool:
+        return self._saver_dead or self._completed >= target
+
     def flush(self, timeout: float | None = None) -> bool:
-        """Block until every submitted save job is done; False on timeout."""
+        """Block until every submitted save job is done; False on timeout.
+
+        Without a timeout it waits for good: a save RPC has no deadline (the
+        client offers none), and a timed-out one may still be copying on the
+        server, so its blocks cannot be handed back early. It logs while stuck.
+        """
         target = self._submitted
         t0 = self._clock()
         with self._cv:
-            if self._completed >= target:
+            if self._settled(target):
                 return True
-            done = self._cv.wait_for(lambda: self._completed >= target, timeout)
+            if timeout is not None:
+                done = self._cv.wait_for(lambda: self._settled(target), timeout)
+            else:
+                while not (
+                    done := self._cv.wait_for(lambda: self._settled(target), self.STALL_LOG_S)
+                ):
+                    logger.error(
+                        "[PegaKVConnectorV2] save flush waiting %.0f s (job %d of %d done)",
+                        self._clock() - t0,
+                        self._completed,
+                        target,
+                    )
             self.save_stats.flushes += 1
             self.save_stats.flush_s += self._clock() - t0
         return done
 
     def _save_loop(self) -> None:
-        while (job := self._jobs.get()) is not None:
-            t0 = self._clock()
-            t1 = t0
+        try:
+            while (job := self._jobs.get()) is not None:
+                self._run_job(job)
+        finally:
+            with self._cv:
+                self._saver_dead = True
+                self._cv.notify_all()
+
+    def _run_job(self, job: _SaveJob) -> None:
+        t0 = self._clock()
+        t1 = t2 = t0
+        ok = False
+        try:
             try:
                 job.ready.synchronize()
             except Exception as e:  # the forward failed: its KV is not valid
@@ -336,6 +398,7 @@ class Worker:
             if not ok:
                 # Best effort: a dropped save is a future miss, not a wrong hit.
                 logger.warning("[PegaKVConnectorV2] save failed: %s", msg)
+        finally:
             with self._cv:
                 stats = self.save_stats
                 stats.wait_s += t1 - t0
@@ -390,7 +453,7 @@ class Worker:
         sending: set[str] = set()
         if self._finishing:
             with self._cv:
-                completed = self._completed
+                completed = self._submitted if self._saver_dead else self._completed
             sending = {r for r, fence in self._finishing.items() if fence <= completed}
             for r in sending:
                 del self._finishing[r]
