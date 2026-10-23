@@ -532,10 +532,12 @@ def run_arm_workload(
             else:
                 # Digest a conversation sample in the untimed passes; all turns
                 # of a sampled conversation, so its references are digested too.
+                # Cap digests every conversation: an evicting store's few
+                # external loads must not all fall outside the sample.
                 timed = stage not in ("cold", "warm")
+                every = 1 if cap else args.replay_digest_every
                 xs = [
-                    {"rsi_pass": name}
-                    | ({} if timed or c % args.replay_digest_every else {"rsi_digest": "full"})
+                    {"rsi_pass": name} | ({} if timed or c % every else {"rsi_digest": "full"})
                     for c in range(len(convs))
                 ]
                 res = asyncio.run(
@@ -682,26 +684,33 @@ def _differ(ref: list[str] | None, got: list[str] | None) -> int | None:
     return sum(a != b for a, b in zip(ref[: len(got)], got, strict=True))
 
 
-def _digest_verdict(d: dict[str, Any] | None, min_judged: float | None) -> dict[str, Any]:
+def _digest_verdict(
+    d: dict[str, Any] | None, min_judged: float | None, vacuous_ok: bool = False
+) -> dict[str, Any]:
     """``min_judged``: fraction of loaded external blocks that must be judged
-    (matched or mismatched, not uncertain); None = no external load required."""
+    (matched or mismatched, not uncertain); None = no external load required.
+    ``vacuous_ok``: no external block in the digested sample is a (flagged)
+    pass, not a fail; for cap, where a store at small C may load nothing in
+    the sampled conversations and its hit rate is scored by G5 instead."""
     if d is None:
         return {"pass": False, "reason": "not evaluated"}
     judged = d["external_matched"] + d["external_mismatched"]
     seen = d["external_compared"] + d["external_uncertain"] + d["external_unreferenced"]
+    vacuous = vacuous_ok and seen == 0
     ok = (
         d["local_mismatched"] == 0
         and d["external_mismatched"] == 0
         and d["local_unreferenced"] == 0
         and d["external_unreferenced"] == 0
     )
-    if min_judged is not None:
+    if min_judged is not None and not vacuous:
         ok = ok and judged > 0 and judged >= min_judged * seen
     if d["invariant"]:
         ok = ok and d["computed_exact"] == d["computed_compared"]
     keys = [k for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)]
     return {
         "pass": ok,
+        **({"vacuous": "no external block in the digested sample"} if vacuous else {}),
         **{k: d[k] for k in keys},
         "first_bad": next((g["first_bad"] for g in d["groups"].values() if g["first_bad"]), None),
     }
@@ -987,7 +996,7 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
         )
         cap = per_wl.get("cap")
         pegaflow = kind not in _OFFLOAD
-        g["G2.digest_self.cap"] = _digest_verdict(cap and cap.get("digest_self"), 0.0)
+        g["G2.digest_self.cap"] = _digest_verdict(cap and cap.get("digest_self"), 0.0, True)
         g["G5.replay_warm"] = _capacity_verdict(cap, pegaflow, gated=True)
         if not g["G2.digest_self.cap"]["pass"]:
             g["G5.replay_warm"]["pass"] = False
@@ -996,7 +1005,8 @@ def verdicts(results: dict[str, dict[str, Any]], run_dir: Path, committed: Path)
         for wl in sorted(per_wl):
             if wl.startswith("cap") and wl != "cap":
                 cv = _capacity_verdict(per_wl[wl], pegaflow, gated=False)
-                cv["digest_self"] = _digest_verdict(per_wl[wl].get("digest_self"), 0.0)["pass"]
+                dv = _digest_verdict(per_wl[wl].get("digest_self"), 0.0, True)
+                cv["digest_self"] = dv["pass"]
                 curve[wl] = {
                     k: cv.get(k)
                     for k in (

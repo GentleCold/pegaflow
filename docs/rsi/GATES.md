@@ -128,6 +128,21 @@ so such stranded bytes are possible today.
   `C` CPU bytes) and `lmcache` (LMCache local CPU backend of exactly `C`
   bytes, 256-token chunks) record their G5 numbers and are never required;
   phase 2 will gate warm replay and `E_C` against `native`.
+- lmcache: not comparable on vLLM 0.32 (wrong KV), 2026-10-23. lmcache 0.5.6
+  (wheel built against torch 2.13.0; ops load under the shared venv's
+  2.13.0+cu130), vLLM 0.32.0, Qwen3-4B, FLASH_ATTN, layout `LBNHC`, LMCache
+  detects `NL_X_NB_BS_NH_CS`. Default adapter (LMCache's "latest dev"):
+  gsm8k cold accuracy 0.859 (= baseline), warm 0 (outputs empty / one
+  token); under batch invariance external digests 64/64 mismatched vs
+  baseline (gsm8k) and 468/468 (replay, self), every one of 36 layers.
+  The wrong blocks are not the poison pattern (per-layer L1 is never the
+  all-0x3F value 24448) and equal no computed copy of any key (so no
+  block / chunk mix-up and not a load after poison); per-layer L1 differs
+  from the right block by 6-46%: wrong bytes, not a reordering of the right
+  ones. vLLM's in-tree adapter (`use_native: true`) does not start with
+  0.5.6 (`ImportError: CudaIPCWrapper` from
+  `lmcache.v1.multiprocess.custom_types`). The arm stays wired
+  (`--arms ...,lmcache`) for a later lmcache; it is not in official runs.
 - Known server limit (slice 2026-10-23, `old` and connector_v2 on the same
   build): reclaim evicts `RECLAIM_BATCH_SIZE = 512` blocks per round
   (`pegaflow-core/src/storage/mod.rs`), so on a small pool each eviction
@@ -356,9 +371,12 @@ the last accepted run record by hand until `--accepted` exists.
     2x GPU KV`.
   - Store-arm cap stages, per fraction `f` in `--cap-fractions` (must include
     0.5; official `0.25,0.5,0.75`), dir `cap` for 0.5 and `capNNN` (percent)
-    otherwise: fresh vLLM and (except `native` / `lmcache`, CPU bytes = `C`) a fresh PegaFlow server with
-    `--pool-size C` `--disable-numa-affinity`, `C = int(f x U)`; passes
-    `cap_cold`, `cap_warm` (digested), `cap_warm2..N` (timed), the replay
+    otherwise: fresh vLLM and (except `native` / `lmcache`, CPU bytes =
+    `C`) a fresh PegaFlow server with `--pool-size C`
+    `--disable-numa-affinity`, `C = int(f x U)`; passes `cap_cold`,
+    `cap_warm` (digested: every conversation, not every 4th as in replay,
+    so an evicting store's few external loads fall in the sample),
+    `cap_warm2..N` (timed), the replay
     settle / reset / poison protocol. `pool_capacity_bytes` = the server's
     `pegaflow_pool_capacity_bytes` at start; the server allocates the whole
     pool up front and rounds allocations to 512-byte units and
@@ -399,7 +417,10 @@ the last accepted run record by hand until `--accepted` exists.
   - `G5.replay_warm` (gated fraction 0.5): `E_C >= 0.9` on `warm_timed`,
     `excess <= one block per request` (unlimited oracle, own local, as G3),
     no load errors, `unmatched_requests == 0`, `G2.digest_self.cap` passes
-    (same as `G2.digest_self.replay`, over the cap probe dir), and for a
+    (as `G2.digest_self.replay` over the cap probe dir, except that a sample
+    with no external block passes flagged `vacuous`: a store that loads
+    nothing at C is not a KV error, its E_C scores it; slice 2026-10-23 had
+    `old` and `native` fail only for that reason), and for a
     PegaFlow arm `pool_capacity_bytes` present and `<= C` and Σ
     `loaded_bytes >= Σ external_hit_bytes` over `warm_timed` (`native` / `lmcache`: no
     server, pool and load proof not applicable). Reported with it: `U`, `C`,

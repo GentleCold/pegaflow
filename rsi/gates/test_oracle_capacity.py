@@ -284,3 +284,20 @@ def test_lmcache_cpu_size_is_exact_bytes(cpu_bytes):
     assert int(float(env["LMCACHE_MAX_LOCAL_CPU_SIZE"]) * 1024**3) == cpu_bytes
     assert env["LMCACHE_LOCAL_CPU"] == "True" and env["LMCACHE_MAX_LOCAL_DISK_SIZE"] == "0"
     assert not any(k in env for k in ("LMCACHE_LOCAL_DISK", "LMCACHE_REMOTE_URL"))
+
+
+@pytest.mark.parametrize(
+    "external,vacuous_ok,ok",
+    [
+        ({}, True, True),  # cap: nothing loaded in the sample is not a KV error
+        ({}, False, False),  # replay: some external load must be judged
+        ({"external_compared": 1, "external_mismatched": 1}, True, False),
+        ({"external_uncertain": 1}, True, False),  # loaded but never judged
+    ],
+    ids=["cap-vacuous", "replay-vacuous", "cap-mismatch", "cap-unjudged"],
+)
+def test_digest_verdict_vacuous_sample(external, vacuous_ok, ok):
+    d = _digest_ok() | {"external_matched": 0} | external
+    v = run_gate._digest_verdict(d, 0.0, vacuous_ok)
+    assert v["pass"] is ok
+    assert ("vacuous" in v) is (ok and vacuous_ok)

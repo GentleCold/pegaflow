@@ -434,6 +434,21 @@ names, magic constants that only exist in the old code).
   reclaim-batch / prefix-oblivious LRU limit (GATES.md G5). Not comparable to
   post-fix runs (different trace, per-arm local, no rotation).
 
+- `lmcache` reference arm (LMCacheConnectorV1, local CPU = pool / C bytes
+  exactly, chunk 256) wired on `feat/rsi-g5`, lmcache 0.5.6 in the overlay
+  `~/kexi/overlays/lmcache` (shared venv untouched). lmcache: not comparable
+  on vLLM 0.32 (wrong KV): smoke `2026-10-23-qwen3-4b-g5-lmcache-smoke` gsm8k
+  warm accuracy 0, external digests 64/64 (gsm8k) and 468/468 (replay)
+  mismatched, not poison and not another key's bytes; the in-tree adapter
+  fails to import (GATES.md G5). Left out of the official run.
+- `G2.digest_self.cap` fail for `old` / `native` on the fix slice was a gate
+  artifact: cap sampled every 4th conversation and their few external loads
+  (old: none; native: 6 requests in convs 2/5/6/7) fell outside it, so
+  `judged > 0` failed with 0 mismatches (connector_v2: 2 sampled). Cap now
+  digests every conversation and an empty sample passes flagged `vacuous`.
+  Under the old rule the pre-fix official run had all three passing (old
+  541/541, native 8567/8585 + 18 uncertain, v2 1375/1375 matched).
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
