@@ -249,6 +249,14 @@ names, magic constants that only exist in the old code).
   - All four arms behave as expected -> the digest gates are not blind.
   - Found by the liar arm: gsm8k answer parsing crashed on garbage digit runs
     (`float('1e999')`); `_norm` keeps non-finite numbers as strings.
+- Commits on feat/semantics-rsi: `feat(rsi): add P0 gate tooling`,
+  `feat(connector): add connector v2 skeleton`.
+- Full official run started: `--tag qwen3-4b-p0-final --arms plain,baseline,old`
+  (log `~/kexi/rsi-runs/p0-final.log`, dir `2026-10-23-qwen3-4b-p0-final`).
+  Baseline gsm8k 0.8582 cold/warm, replay cold TTFT p50 2.84s. Then .3 became
+  unreachable from the jump host ("No route to host", .2 too). NEXT on resume:
+  check whether the run finished (`summary.json`), else rerun the same command;
+  read the old-arm verdicts, record them here, mark P0 done, start P3.
 
 ## Semantics changelog
 
