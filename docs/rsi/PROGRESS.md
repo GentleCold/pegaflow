@@ -67,7 +67,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | it1b slice gate all pass on .44; official run in flight (`p3-it1.log`) |
+| P3 | onboard Qwen3-4B | it1b fails the new hard G4 (cold/gsm8k overhead); it2 (async save) in progress |
 | P4 | onboard DeepSeek-V2-Lite-Chat | todo |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
@@ -324,6 +324,17 @@ names, magic constants that only exist in the old code).
   77 ms, 0 failed. Sync dominates, so S5 async saves are the it2 candidate
   (cold TTFT). Official run (full gsm8k, 32x12 replay) launched on GPU1:
   `~/kexi/rsi-runs/p3-it1.log`. p0-final on GPU0 still running (old arm).
+
+- G4 made hard (user: "性能需要达标才行，需要比基准快"). New checks in
+  `run_gate._perf_verdicts`, defined in GATES.md: warm replay TTFT p50 and
+  req/s strictly better than baseline; cold replay and gsm8k cold/warm wall
+  time at most 2% worse (`MAX_OVERHEAD`). Re-judged the it1b slice offline:
+  warm wins (TTFT 0.10 vs 0.21 s, 6.6 vs 5.5 req/s) but cold replay TTFT
+  0.266 vs 0.211 s (+26%), cold req/s 4.68 vs 5.11 (-8%), gsm8k +4.1% cold /
+  +3.2% warm -> it1b NOT accepted. The official it1 run keeps going on GPU1 as
+  full-scale data (judged with the old G4; re-judge its result.json offline).
+  NEXT: it2 = remove the synchronous save wait (S5), slices on GPU2, by an
+  isolated onboarding agent.
 
 ## Semantics changelog
 

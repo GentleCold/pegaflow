@@ -145,3 +145,8 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   "different bytes give a different namespace" test with each new adapter.
 - Make costs you defer observable in the first gate run (e.g. the worker
   `save stats` line), so the next iteration decides from data.
+- G4 is hard (user, 2026-10-23): a model is not accepted unless the connector
+  beats baseline vLLM on warm replay (TTFT p50 and req/s) and costs at most 2%
+  on cold replay and gsm8k. Read every `G4.*` verdict, not only warm TTFT;
+  the save path's cost shows up in the cold and gsm8k checks.
+

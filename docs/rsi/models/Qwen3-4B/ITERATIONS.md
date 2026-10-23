@@ -192,3 +192,18 @@ async saves, judged by the official run's cold numbers.
 Next: official run `qwen3-4b-p3-it1` on GPU1 (in flight). If it passes, mark
 it1 accepted and start it2 (async save) or move on to P4.
 
+### it1b under the hard G4 (2026-10-23)
+
+G4 became a hard gate (GATES.md). Re-judging the slice above: warm replay
+passes both checks; `G4.replay_cold.ttft_p50` (+26%), `G4.replay_cold.req_per_s`
+(-8%), `G4.gsm8k_cold.seconds` (+4.1%) and `G4.gsm8k_warm.seconds` (+3.2%) fail
+the 2% overhead bound. it1b is not accepted.
+
+## it2 (plan): no synchronous save wait
+
+Hypothesis: the `wait_for_save` path blocks the step on a full device sync
+(3.2 s of a 13.8 s gsm8k window, rpc only 77 ms), so cold steps pay the copy
+inline. Making the save asynchronous with respect to the model step should
+bring cold replay and gsm8k within 2% of baseline without touching warm hits.
+Accept only if every G2/G3 check still passes and the full G4 set passes.
+
