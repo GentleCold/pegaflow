@@ -114,12 +114,14 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         )
         self._rpc = EngineRpcClient(endpoint_of(extra))
         logger.info(
-            "[PegaKVConnectorV2] role=%s instance=%s namespace=%s endpoint=%s groups=%s",
+            "[PegaKVConnectorV2] role=%s instance=%s namespace=%s endpoint=%s groups=%s from=%s",
             role.name,
             self._instance_id,
             self._layout.namespace,
             self._rpc.endpoint(),
             [(g.gid, repr(g.sem)) for g in self._layout.groups],
+            # Which checkout vLLM imported (several trees share one venv).
+            os.path.dirname(__file__),
         )
 
         self._scheduler: Scheduler | None = None

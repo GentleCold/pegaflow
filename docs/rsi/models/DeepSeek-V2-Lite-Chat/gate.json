@@ -1,0 +1,7 @@
+{
+ "attention_backend": null,
+ "batch_invariant": true,
+ "invariant_attention_backend": "TRITON_MLA",
+ "vllm_args": [],
+ "notes": "MLA (one latent KV head, max_tp_shards=1), one KV group, TP2. On sm89 vLLM 0.32 picks TRITON_MLA for dense MLA (FLASH_ATTN_MLA / FLASHMLA need sm90+, FLASHINFER_MLA sm100); TRITON_MLA supports batch invariance (num_kv_splits=1). Provisional until the self-test confirms warm_equals_cold and computed_exact."
+}

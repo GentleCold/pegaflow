@@ -81,6 +81,7 @@ class Adapter(Protocol):
 # vLLM KVCacheSpec class name -> module in this package that exposes ``ADAPTER``.
 _REGISTRY: dict[str, str] = {
     "FullAttentionSpec": "full_attention",
+    "MLAAttentionSpec": "mla_attention",
 }
 
 

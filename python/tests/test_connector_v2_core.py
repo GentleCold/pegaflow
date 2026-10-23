@@ -1282,3 +1282,115 @@ def test_namespace_covers_page_byte_order(sem, full_attention):
     hnc = _layout_of(sem, FullAttentionSpec(), kv_cache_layout="LBHNC")
     assert nhc.namespace != hnc.namespace
     assert nhc.namespace == _layout_of(sem, FullAttentionSpec()).namespace
+
+
+# -------------------------------------------------- adapters/mla_attention.py
+@dataclass(frozen=True)
+class MLAAttentionSpec(FullAttentionSpec):  # registry keys on the class name
+    """Defaults = docs/rsi/models/DeepSeek-V2-Lite-Chat/spec.json (bf16 latent
+    kv_lora_rank 512 + rope 64 = 576, one head, replicated over TP)."""
+
+    num_kv_heads: int = 1
+    head_size: int = 576
+    head_size_v: int = 0
+    page_size_bytes: int = 18432
+    max_tp_shards: int | None = 1
+    cache_dtype_str: str | None = "auto"
+    alignment: int | None = None
+    model_version: str | None = None
+    cache_role: str = "sparse"
+    is_index_group_leader: bool = False
+    non_causal_multi_token_decode: bool = False
+
+
+DSV2_BLOCKS = 6222
+# vLLM 0.32 LBNHC layer view [B, H=1, N, C=576] in bf16 (probe dump, both TP2 ranks).
+DSV2_KV = FakeKV((DSV2_BLOCKS, 1, 16, 576), (9216, 576, 576, 1))
+
+
+@pytest.fixture
+def mla_attention(monkeypatch, sem):
+    from pegaflow.connector_v2.adapters import mla_attention as mod
+
+    adapter = mod.MLAAttentionAdapter(sem)
+    monkeypatch.setattr(mod, "ADAPTER", adapter)
+    return adapter
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "par",
+    [
+        pytest.param(Parallel(), id="tp1"),
+        # DeepSeek-V2-Lite as run by the gate: TP2, vLLM kv_tp_replicas=2.
+        pytest.param(Parallel(tp_size=2, kv_tp_replicas=2), id="tp2"),
+        pytest.param(Parallel(tp_size=4, kv_tp_replicas=4), id="tp4"),
+    ],
+)
+def test_mla_attention_layout(sem, mla_attention, par):
+    spec = MLAAttentionSpec()
+    names, cfg = _attn_cfg(spec, 27)
+    layout = build_layout(cfg, par, {"model": "DeepSeek-V2-Lite-Chat"}, semantics=sem)
+    assert [(g.sem.kind, g.sem.block_tokens) for g in layout.groups] == [("full", 16)]
+    ranks = [dataclasses.replace(par, tp_rank=r) for r in range(par.tp_size)]
+    # Every rank holds the same latent page: one fragment per layer after seal_plan.
+    assert {mla_attention.layer(spec, names[0], r).shard for r in ranks} == {sem.Shard.replicated()}
+    rpc = FakeRpc()
+    _worker(sem, rpc, [], layout=layout).register(
+        dict.fromkeys(names, DSV2_KV), dict.fromkeys(names, spec)
+    )
+    reg = rpc.registered
+    assert set(reg["segments"]) == {1}
+    assert set(reg["bytes_per_block"]) == set(reg["kv_strides"]) == {18432}
+    assert set(reg["num_blocks"]) == {DSV2_BLOCKS}
+    assert (reg["backend"], reg["page_first"]) == ("direct", False)
+
+
+def test_mla_seal_plan_one_writer():
+    """Replicated MLA pages seal as one fragment per layer, written by rank 0."""
+    sem = _native()
+    spec = MLAAttentionSpec()
+    from pegaflow.connector_v2.adapters import mla_attention as mod
+
+    adapter = mod.MLAAttentionAdapter(sem)
+    ranks = []
+    for r in range(2):
+        d = adapter.layer(spec, "l0", Parallel(tp_rank=r, tp_size=2, kv_tp_replicas=2))
+        ranks.append((r, [sem.Region("l0", 0, list(d.segments), d.shard)]))
+    plan = sem.seal_plan(ranks)
+    (frag,) = plan.fragments(0)
+    assert (frag.holders, frag.writer, frag.bytes) == ([0, 1], 0, 18432)
+    assert plan.is_writer(0, 0, 0) and not plan.is_writer(1, 0, 0)
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("max_tp_shards", None),
+        ("max_tp_shards", 2),
+        ("alignment", 576),
+        ("model_version", "deepseek_v4"),
+        ("cache_role", "indexer"),
+        ("is_index_group_leader", True),
+        ("cache_dtype_str", "fp8_ds_mla"),
+        ("state_content_bytes", 656),
+        ("kv_quant_mode", 1),
+        ("page_size_padded", 18944),
+        ("non_causal_multi_token_decode", True),
+        ("sliding_window", 4096),
+        ("head_size_v", 128),
+    ],
+)
+def test_mla_attention_rejects_unvalidated_specs(sem, mla_attention, field, value):
+    spec = dataclasses.replace(MLAAttentionSpec(), **{field: value})
+    _, cfg = _attn_cfg(spec, 2)
+    with pytest.raises(Unsupported):
+        build_layout(cfg, Parallel(tp_size=2, kv_tp_replicas=2), {"model": "m"}, semantics=sem)
+
+
+def test_mla_and_full_attention_never_share_a_namespace(sem, full_attention, mla_attention):
+    """Equal page sizes, different bytes: the spec class is part of the namespace."""
+    mla = MLAAttentionSpec()
+    full = FullAttentionSpec(num_kv_heads=1, head_size=288, page_size_bytes=18432)
+    assert _layout_of(sem, mla).namespace != _layout_of(sem, full).namespace

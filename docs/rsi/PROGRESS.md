@@ -97,7 +97,7 @@ names, magic constants that only exist in the old code).
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted pending review: it2d official run (`2026-10-23-qwen3-4b-p3-it2d`, rev 8a05b7c) passes every v2 verdict; it2d review running; G5 waits for the gate rerun |
-| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
+| P4 | onboard DeepSeek-V2-Lite-Chat (TP2, MLA) | in progress (branch `feat/rsi-deepseek-v2-lite`, `models/DeepSeek-V2-Lite-Chat/ITERATIONS.md`) |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
 
@@ -584,6 +584,19 @@ names, magic constants that only exist in the old code).
   Save stats: 0 failed, 0 flushes, max 3 pending, step-thread submit 13-16 ms.
   Qwen3-4B: G0-G4 accepted pending the it2d review; G5 waits for the gate
   rerun.
+
+- P4 start (isolated onboarding agent, DeepSeek-V2-Lite-Chat, MLA, TP2 on
+  .44 GPU pairs 0,1 / 2,3; worktree `.worktrees/rsi-deepseek-v2-lite`, branch
+  `feat/rsi-deepseek-v2-lite` from `feat/semantics-rsi` 8af8fe4; remote dir
+  `~/kexi/pegaflow-rsi-deepseek-v2-lite`). Plan: (1) self-test at TP2
+  (plain, baseline, 4 selftest arms, 128 gsm8k) to get spec.json + gate.json;
+  (2) map MLAAttentionSpec -> (Kind, Shard, unit) from the dump and vLLM
+  0.32 source; (3) adapter for `MLAAttentionSpec` (the registry dispatches
+  by exact class name, so the full_attention adapter does not apply); (4)
+  slices, then one official run with `old`; (5) Qwen3-4B slice if shared code
+  changes. Runs import connector_v2 from the P4 remote tree (PYTHONPATH),
+  native `.so` copied from `pegaflow-semantics-rsi`, server binary reused.
+  Record: `docs/rsi/models/DeepSeek-V2-Lite-Chat/ITERATIONS.md`.
 
 ## Semantics changelog
 
