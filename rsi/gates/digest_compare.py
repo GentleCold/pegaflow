@@ -2,7 +2,8 @@
 
 Each digested block (all layers of one group on one rank) is tagged from the
 request's *last* schedule episode in ``requests.jsonl`` (the bytes held at
-finish come from it):
+finish come from it), or, for a state record (``episode`` set: a Mamba align
+state digested in its step), from that episode:
 
 - ``local``: ``covered <= local_hit`` (vLLM's own prefix cache);
 - ``external``: ``local_hit < covered <= start`` (loaded by the connector);
@@ -22,6 +23,11 @@ in REF. A local or external block is
   ``uncertain_preempted`` counts those whose only undigested computations
   are preempted episodes of digested requests (no untagged computation);
 - ``unreferenced`` when REF never computed the key.
+
+For state groups (``spec.json`` ``probe.state_groups``) a state at length e
+is computed only by an episode with a step ending exactly on e, so those
+episodes are its computations; every one of them is digested in its step,
+preempted or not.
 
 Computed blocks are compared against the other computed copies: ``exact``
 when equal to one of them; under batch invariance every copy must be exact.
@@ -84,29 +90,51 @@ def computed_ranges(r: dict[str, Any]) -> list[tuple[int, int]]:
 Split = tuple[int, tuple[int, ...]]  # episode start, chunk ends before the block
 
 
+def _episode_views(r: dict[str, Any]) -> list[tuple[int, int, list[int]]]:
+    """Per episode: (local hit, start, its ``progress`` chunk ends)."""
+    eps = r["episodes"]
+    out = []
+    for k, (step, local, start) in enumerate(eps):
+        nxt = eps[k + 1][0] if k + 1 < len(eps) else None
+        ends = [p[1] for p in r["progress"] if p[0] >= step and (nxt is None or p[0] < nxt)]
+        out.append((local or 0, start, ends))
+    return out
+
+
+def state_groups(probe_dir: Path) -> set[int]:
+    """Groups the probe digests per step (Mamba align state), from spec.json."""
+    f = probe_dir / "spec.json"
+    if not f.exists():
+        return set()
+    return {int(g) for g in json.loads(f.read_text()).get("probe", {}).get("state_groups", [])}
+
+
 def records(
     probe_dir: Path,
 ) -> Iterator[tuple[Key, str, tuple[str, ...], list[float], str, Split]]:
     """(key, tag, per-layer exact digests, per-layer l1, req_id, split) per
-    digested block; ``split`` = (start of the last episode, its ``progress``
-    chunk ends below the block's end)."""
-    last: dict[str, tuple[int, int, list[int]]] = {}
+    digested block; ``split`` = (start of the episode, its ``progress`` chunk
+    ends below the block's end). The episode is the record's ``episode``
+    (state records, digested in their step), else the last one (finish)."""
+    views: dict[str, list[tuple[int, int, list[int]]]] = {}
     for r in _requests(probe_dir):
         if r["episodes"]:
-            step, local, start = r["episodes"][-1]
-            ends = [p[1] for p in r["progress"] if p[0] >= step]
-            last[r["req_id"]] = (local or 0, start, ends)
+            views[r["req_id"]] = _episode_views(r)
     layers: dict[tuple[str, int], list[str]] = {}
     for f in sorted(probe_dir.glob("digest-*.jsonl")):
         for line in f.read_text().splitlines():
             if not line.strip():
                 continue
             rec = json.loads(line)
-            if rec["req_id"] not in last:
+            if rec["req_id"] not in views:
                 raise ValueError(f"{f}: digested request {rec['req_id']} not in requests.jsonl")
             if layers.setdefault((rec["rank"], rec["group"]), rec["layers"]) != rec["layers"]:
                 raise ValueError(f"{f}: layer list of group {rec['group']} changed")
-            local, start, ends = last[rec["req_id"]]
+            eps = views[rec["req_id"]]
+            ep = rec.get("episode", len(eps) - 1)
+            if not 0 <= ep < len(eps):
+                raise ValueError(f"{f}: {rec['req_id']} has no episode {ep}")
+            local, start, ends = eps[ep]
             for blk in rec["blocks"]:
                 c = blk["covered"]
                 tag = "local" if c <= local else "external" if c <= start else "computed"
@@ -129,23 +157,36 @@ class Reference:
             if tag == "computed":
                 self.copies[key].setdefault(exact, [0, l1])[0] += 1
                 self.split_copies[(key, split)].setdefault(exact, [0, l1])[0] += 1
-        # prefix key -> number of (request, episode) that computed its block end
-        self.computers: Counter[str] = Counter()
+        # (kind, prefix key) -> number of (request, episode) that computed it.
+        # Kind "block": a block end crossed by the episode's compute; kind
+        # "state" (state groups): a step of the episode ended exactly on it,
+        # the only way a state at that length exists.
+        self.state_groups = state_groups(probe_dir)
+        self.computers: Counter[tuple[str, str]] = Counter()
         # Of those, computations whose bytes were never digested: a preempted
         # (non-last) episode of a digested request, or an untagged request.
-        self.preempted: Counter[str] = Counter()
-        self.untagged: Counter[str] = Counter()
+        # State records are digested per episode, so for "state" only
+        # untagged requests count.
+        self.preempted: Counter[tuple[str, str]] = Counter()
+        self.untagged: Counter[tuple[str, str]] = Counter()
         for r in _requests(probe_dir):
             kt = r["key_tokens"]
             ranges = computed_ranges(r)
+            views = _episode_views(r) if r["episodes"] else []
             for k, (start, end) in enumerate(ranges):
+                ends = set(views[k][2]) if k < len(views) else set()
                 for e in range((start // kt + 1) * kt, end + 1, kt):
                     key = r["keys"][e // kt - 1]
-                    self.computers[key] += 1
-                    if r.get("digest") is None:
-                        self.untagged[key] += 1
-                    elif k + 1 < len(ranges):
-                        self.preempted[key] += 1
+                    kinds = ["block"] + (["state"] if e in ends else [])
+                    for kind in kinds:
+                        self.computers[(kind, key)] += 1
+                        if r.get("digest") is None:
+                            self.untagged[(kind, key)] += 1
+                        elif k + 1 < len(ranges) and kind == "block":
+                            self.preempted[(kind, key)] += 1
+
+    def kind(self, key: Key) -> tuple[str, str]:
+        return ("state" if key[1] in self.state_groups else "block", key[2])
 
     def occurrences(self, key: Key) -> int:
         return sum(c[0] for c in self.copies.get(key, {}).values())
@@ -180,7 +221,7 @@ def _rel_l1(a: list[float], b: list[float]) -> float:
 
 def _uncertain(g: dict[str, Any], tag: str, ref: Reference, key: Key) -> None:
     g[f"{tag}_uncertain"] += 1
-    k = key[2]
+    k = ref.kind(key)
     if not ref.untagged[k] and ref.occurrences(key) + ref.preempted[k] >= ref.computers[k]:
         g[f"{tag}_uncertain_preempted"] += 1
 
@@ -234,7 +275,7 @@ def compare(
                 g["max_rel_l1"] = max(g["max_rel_l1"], rel)
             continue
         if not copies:
-            if ref.computers[key[2]]:
+            if ref.computers[ref.kind(key)]:
                 _uncertain(g, tag, ref, key)
             else:
                 g[f"{tag}_unreferenced"] += 1
@@ -242,7 +283,7 @@ def compare(
         g[f"{tag}_compared"] += 1
         if exact in copies:
             g[f"{tag}_matched"] += 1
-        elif invariant or ref.occurrences(key) >= ref.computers[key[2]]:
+        elif invariant or ref.occurrences(key) >= ref.computers[ref.kind(key)]:
             g[f"{tag}_mismatched"] += 1
             if g["first_bad"] is None:
                 best = min(copies, key=lambda d: sum(x != y for x, y in zip(d, exact, strict=True)))

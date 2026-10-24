@@ -1733,6 +1733,66 @@ def test_g0_spec_ignores_module_paths(tmp_path):
     assert not run_gate.g0(tmp_path, "arm", committed)["pass"]
 
 
+# ------------------------------------------------- Mamba align state records
+
+
+def _state_probe(tmp_path, warm_byte: str, preempt: bool):
+    """Group 1 is a state group (probe ``state_groups``), group 0 full.
+
+    - ``a`` (cold): a step ends on 2 blocks; the probe digested that state in
+      its step (record ``episode`` 0). With ``preempt``, ``a`` is preempted
+      after it and recomputes from 0 in episode 1, which crosses 2 blocks
+      without ending a step there (no state computed).
+    - ``b`` (warm): starts at 2 blocks (loaded state, ``warm_byte``) and digests
+      that start state as episode 0; its full blocks at finish as usual."""
+    import json
+
+    a = _req("p", 3, 1, "cold") | {"req_id": "a", "digest": "full"}
+    a["progress"] = [[1, 2 * BT], [2, 3 * BT + 1]]
+    a["episodes"] = [[1, 0, 0]]
+    if preempt:
+        a["episodes"].append([5, 0, 0])
+        a["progress"] += [[5, 3 * BT + 1]]
+    b = _req("p", 3, 10, "warm") | {"req_id": "b", "digest": "full"}
+    b["episodes"], b["progress"] = [[10, 0, 2 * BT]], [[10, 3 * BT + 1]]
+
+    def rec(rid, gid, covered, byte, **kw):
+        blk = {"key": f"p:{covered // BT - 1}", "covered": covered, "exact": [byte], "l1": [1.0]}
+        return {"req_id": rid, "rank": "pp0-tp0", "group": gid, "layers": ["l0"], "blocks": [blk]} | kw  # fmt: skip
+
+    digests = [
+        rec("a", 1, 2 * BT, "S", episode=0),
+        rec("b", 1, 2 * BT, warm_byte, episode=0),
+        *(rec(rid, 0, c, f"F{c}") for rid in ("a", "b") for c in (BT, 2 * BT, 3 * BT)),
+    ]
+    probe = _probe(tmp_path, [a, b], digests)
+    (probe / "spec.json").write_text(json.dumps({"probe": {"state_groups": [1]}}))
+    return probe
+
+
+@pytest.mark.parametrize(
+    "warm_byte,preempt,matched,mismatched",
+    [("S", False, 1, 0), ("X", False, 0, 1), ("S", True, 1, 0), ("X", True, 0, 1)],
+    ids=["match", "wrong-state", "match-preempted", "wrong-state-preempted"],
+)
+def test_state_records_tagged_by_their_episode(tmp_path, warm_byte, preempt, matched, mismatched):
+    """A state digested in a preempted episode is that episode's computation
+    (not the last episode's), and a state exists only where a step ended:
+    episode 1 crossing 2 blocks mid-chunk computes no state, so the reference
+    stays exhaustive and a wrong loaded state is mismatched, not uncertain."""
+    from rsi.gates import digest_compare
+
+    probe = _state_probe(tmp_path, warm_byte, preempt)
+    d = digest_compare.compare(probe, probe, invariant=False)
+    g = d["groups"]["1"]
+    assert (g["external_matched"], g["external_mismatched"], g["external_uncertain"]) == (matched, mismatched, 0)  # fmt: skip
+    assert g["computed_compared"] == 0  # one computed copy: nothing to compare it with
+    full = d["groups"]["0"]
+    assert full["external_matched"] == 2 and full["external_mismatched"] == 0
+    v = run_gate._digest_verdict(d, 0.9)
+    assert v["pass"] is (mismatched == 0)
+
+
 # ------------------------------------------------------------ split invariance
 
 
