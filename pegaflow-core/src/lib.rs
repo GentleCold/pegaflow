@@ -627,9 +627,9 @@ impl PegaEngine {
     }
 
     /// Tie each group-encoded block to the group 0 block at the same position
-    /// (same raw hash) so eviction keeps a resume point's groups together.
-    /// Group 0 is the prefix chain every resume point needs; the server knows
-    /// no more of a group's kind than that.
+    /// (same raw hash), so eviction never leaves a group block whose position
+    /// is gone. Group 0 is the prefix chain every resume point needs; the
+    /// server knows no more of a group's kind than that.
     fn link_group_members(&self, namespace: &str, raw: &[Vec<u8>], encoded: &[Vec<u8>]) {
         let pairs: Vec<(&[u8], &[u8])> = raw
             .iter()

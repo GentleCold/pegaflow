@@ -1,9 +1,4 @@
-use std::{
-    cmp::Reverse,
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::{cmp::Reverse, collections::HashMap, sync::Arc, time::Instant};
 
 use hashlink::LruCache;
 use parking_lot::Mutex;
@@ -83,9 +78,14 @@ struct ReadCacheInner {
 
 /// Dependencies between resident blocks, learned from queries: a block's
 /// parent is the block it extends (the previous block of a prefix query) or,
-/// for another cache group, the attention block at the same position. A
-/// resume point needs a block and every ancestor, so tail-first eviction only
+/// for a cache group > 0, the group 0 block at the same position. A resume
+/// point needs a block and every ancestor, so tail-first eviction only
 /// evicts blocks without resident children.
+///
+/// The server knows group ids, not group kinds. A group block is therefore
+/// a leaf under its position: it may leave alone (a window group's block of
+/// an early position is never needed again), but never outlives its
+/// position, which would leave it as weight no resume point can use.
 ///
 /// Links exist only while both ends are resident; evicting either end drops
 /// them.
@@ -93,9 +93,6 @@ struct ReadCacheInner {
 struct ChainLinks {
     parent: HashMap<BlockKey, BlockKey>,
     children: HashMap<BlockKey, Vec<BlockKey>>,
-    /// Blocks linked to a position block as other-group data of the same
-    /// resume point rather than as the next chain block.
-    members: HashSet<BlockKey>,
 }
 
 impl ChainLinks {
@@ -124,7 +121,6 @@ impl ChainLinks {
     /// Forget every link of a block leaving the cache. Returns whether it
     /// still had resident children.
     fn unlink(&mut self, key: &BlockKey) -> bool {
-        self.members.remove(key);
         if let Some(parent) = self.parent.remove(key) {
             self.drop_child(&parent, key);
         }
@@ -133,24 +129,8 @@ impl ChainLinks {
         };
         for child in &children {
             self.parent.remove(child);
-            self.members.remove(child);
         }
         !children.is_empty()
-    }
-
-    /// The block whose subtree eviction of `key` starts from: a group
-    /// member goes with its position block. The server does not know a
-    /// group's kind, so it keeps every group's data of a position as long as
-    /// the position: right for full-attention groups, which every later
-    /// resume point needs, and only conservative for window or checkpoint
-    /// groups.
-    fn eviction_root(&self, key: &BlockKey) -> BlockKey {
-        if self.members.contains(key)
-            && let Some(position) = self.parent.get(key)
-        {
-            return position.clone();
-        }
-        key.clone()
     }
 }
 
@@ -263,10 +243,10 @@ impl ReadCache {
         (hit, blocks)
     }
 
-    /// Record each resident `(position, member)` pair as one resume point:
-    /// `member` is another cache group's block at the chain position of
-    /// `position`. The member takes the position's depth and is evicted no
-    /// later than it. Pairs with a non-resident end are ignored.
+    /// Record each resident `(position, member)` pair: `member` is a cache
+    /// group > 0 block at the chain position of the group 0 block `position`.
+    /// The member takes the position's depth and is evicted no later than it.
+    /// Pairs with a non-resident end are ignored.
     pub(super) fn link_group_members(&self, pairs: &[(BlockKey, BlockKey)]) {
         let mut inner = self.inner.lock();
         for (position, member) in pairs {
@@ -274,7 +254,6 @@ impl ReadCache {
                 continue;
             }
             inner.links.link(position, member);
-            inner.links.members.insert(member.clone());
             let depth = depth_of(&inner, position);
             if let Some(metadata) = resident_metadata_mut(&mut inner, member) {
                 metadata.depth = depth;
@@ -918,8 +897,7 @@ fn evict_candidates(
         if !inner.cache.contains_key(&candidate) {
             continue;
         }
-        let root = inner.links.eviction_root(&candidate);
-        evict_subtree(inner, &root, batch_size, removed);
+        evict_subtree(inner, &candidate, batch_size, removed);
     }
 }
 
@@ -1364,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_first_keeps_resume_point_groups_together_and_skips_pinned_leaves() {
+    fn group_blocks_leave_before_their_position_and_pins_hold_the_chain() {
         let cache = make_cache().with_tail_window_percent(100);
         let positions = keys(1, 2);
         let members: Vec<BlockKey> = positions
@@ -1381,13 +1359,13 @@ mod tests {
                 .zip(members.iter().cloned())
                 .collect::<Vec<_>>(),
         );
-        // The deepest resume point leaves as a unit, other group first.
+        // The deepest position goes first, its group block before it.
         assert_eq!(
             evict_order(&cache, 2),
             vec![members[1].clone(), positions[1].clone()]
         );
 
-        // A held member keeps its position (and so the chain) resident.
+        // A held group block keeps its position resident.
         let held = cache.peek_blocks(std::slice::from_ref(&members[0]));
         assert!(cache.remove_lru_batch(1).is_empty());
         drop(held);

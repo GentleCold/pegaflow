@@ -553,9 +553,9 @@ impl StorageEngine {
             .await
     }
 
-    /// Record that each resident `(position block, group block)` pair is one
-    /// resume point: the group block (another cache group's data at the same
-    /// position) is evicted no later than the position block.
+    /// Tie each resident group > 0 block to the group 0 block at the same
+    /// position (`(position, member)` hashes, already group-encoded): the
+    /// group block is evicted no later than its position.
     pub(crate) fn link_group_blocks(&self, namespace: &str, pairs: &[(&[u8], &[u8])]) {
         if pairs.is_empty() {
             return;
