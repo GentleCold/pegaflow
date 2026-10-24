@@ -252,10 +252,12 @@ bandwidth.
   part's writer for all its layers or for none. Ranks that hold the same
   part then share one storage rank. The server sees `tp_size = parts`; for
   MLA at TP2 that is `tp_size 1`, with both devices registering
-  `tp_rank 0`. This is the registration contract pegaflow-core's
-  `mla_replica_registration_seals` test covers: one slot per layer, sealed
-  once both devices have registered. Every other layout gets the identity
-  mapping (Qwen3-4B TP1: unchanged).
+  `tp_rank 0`. The mapping is derived from seal_plan's holders and writer
+  plus the public `register_context_batch(tp_rank, tp_size)` call, and from
+  nothing else. The it2 gate log confirms the result:
+  `storage_rank=0 writer=True/False`, and the server stores 27 x 18432 B
+  per block. No pegaflow-core instance or slot code was read for this.
+  Every other layout gets the identity mapping (Qwen3-4B TP1: unchanged).
 - `core/worker.py`: register, save and load use the storage rank. Only the
   writer (`Fragment.writer`, the first holder) saves. Every holder loads
   into its own GPU from the same slot.
