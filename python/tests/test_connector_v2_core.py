@@ -1056,9 +1056,10 @@ class StepClock:
     ],
 )
 def test_save_batching(batch_steps, steps, expected, monkeypatch):
-    """Policy save_batch_steps: consecutive steps' saves go out as one save RPC
-    per layer list, released by the step bound or the staleness cap; nothing
-    is lost."""
+    """Policy save_batch_steps: consecutive steps' saves go out as one save RPC,
+    released by the step bound or the staleness cap; nothing is lost. Each
+    step keeps its own layer entry in the RPC (the server pins one region per
+    entry: one entry per layer for many steps strands evicted bytes)."""
     monkeypatch.setattr(Worker, "SAVE_HOLD_MAX_S", 10e-3)
     calls = []
     rpc = FakeRpc()
@@ -1083,8 +1084,9 @@ def test_save_batching(batch_steps, steps, expected, monkeypatch):
         clock.now += advance_ms / 1e3
     worker._jobs.put(None)  # stop the saver after what was released so far
     worker._saver.join(5)
-    assert [[ids for _, ids, _ in c] for c in calls] == [[e] for e in expected]
-    assert all(c[0][2] == [b"h%d" % b for b in e] for c, e in zip(calls, expected, strict=True))
+    assert [[ids for _, ids, _ in c] for c in calls] == [[[b] for b in e] for e in expected]
+    assert [[h for _, _, h in c] for c in calls] == [[[b"h%d" % b] for b in e] for e in expected]
+    assert all(name == "layers.0.attn" for c in calls for name, _, _ in c)
     assert worker.save_stats.rpcs == len(expected)
 
 
@@ -1129,7 +1131,7 @@ def test_kv_pressure_sends_held_saves(kv_usage, threshold, send, caplog):
     assert worker.save_stats.pressure_rpcs == (1 if send else 0)
     assert worker.save_stats.kv_usage_unknown_steps == (1 if kv_usage is None else 0)
     assert worker.flush(5)
-    assert [[ids for _, ids, _ in c] for c in calls] == [[[11, 12]]]
+    assert [[ids for _, ids, _ in c] for c in calls] == [[[11], [12]]]
     worker.shutdown()
 
 
@@ -1148,7 +1150,7 @@ def test_merged_save_rpc_stays_under_size_budget(monkeypatch):
     for b in (1, 2, 3):
         worker.save(StepPlan(saves=[GroupSave(0, [b], [b"h%d" % b])]))
     assert worker.flush(5)
-    assert [[ids for _, ids, _ in c] for c in calls] == [[[1, 2]], [[3]]]
+    assert [[ids for _, ids, _ in c] for c in calls] == [[[1], [2]], [[3]]]
     assert worker.save_stats.rpcs == 2
     worker.shutdown()
 

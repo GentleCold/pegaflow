@@ -423,7 +423,12 @@ class Worker:
 
         The compute stream is in order, so the last mark covers every earlier
         step's forward, and completing the last sequence number completes them
-        all. The same layer's blocks from several steps go in one entry.
+        all. Each step keeps its own layer entries (a layer may appear once per
+        held step), so the server sees the same entries as unbatched saves.
+        The server pins one region per entry, freed only once all of its
+        blocks are evicted: folding steps into one entry per layer makes
+        regions span more requests and strands more evicted bytes (P4 batching
+        A/B, docs/rsi/models/DeepSeek-V2-Lite-Chat/ITERATIONS.md).
         """
         if not self._held:
             return
@@ -431,13 +436,7 @@ class Worker:
         self._held_bytes = 0
         job = jobs[-1]
         if len(jobs) > 1:
-            merged: dict[str, tuple[list[int], list[bytes]]] = {}
-            for j in jobs:
-                for name, ids, hashes in j.saves:
-                    entry = merged.setdefault(name, ([], []))
-                    entry[0].extend(ids)
-                    entry[1].extend(hashes)
-            job = _SaveJob(job.seq, job.ready, [(n, i, h) for n, (i, h) in merged.items()])
+            job = _SaveJob(job.seq, job.ready, [s for j in jobs for s in j.saves])
         with self._cv:
             self.save_stats.rpcs += 1
         self._jobs.put(job)
