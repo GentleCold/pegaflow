@@ -507,12 +507,16 @@ names, magic constants that only exist in the old code).
     - 0.5: H4 0.699-0.719, H5 0.763-0.769; hit 0.861 -> 0.889, against
       H_lru 0.857 and H\*_C 0.929.
     - 0.75: H4 0.748-0.757, H5 0.760-0.792.
-    - 0.25: regresses, H4 0.170-0.194, H5 0.129-0.163, with hit unchanged.
-      Window 0 recovers it and 10% does not. Likely cause: unknown-depth
-      blocks go first. Recorded as a tradeoff.
+    - 0.25: regresses, H4 0.170-0.194, H5 0.129-0.163.
+      Window 0 recovers it and 10% does not. The cause is unknown: the
+      loss is in previously hit (known-depth) blocks, and H5 serves more
+      never-hit blocks than H4. The earlier "unknown depth first"
+      explanation is withdrawn. Old's hit drops up to 0.02 in one of two
+      runs.
   - No-cap replay and gsm8k: no warm-TTFT regression, accuracy 0.8594 on
     every arm. cargo test, clippy and check.sh were run from a git archive
     of 81fdb6d; only the known ssd_cache and ruff-format failures remain.
+    Master 75dfa4c fails the same 11 ssd_cache tests on .44 (log kept).
   - G5 has no hard threshold any more. At 0.5 and 0.75 the hit is within
     0.04 of H\*_C and above LRU, which is judged close enough.
 

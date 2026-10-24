@@ -68,20 +68,35 @@ Depth and links come from what the server sees, with no model knowledge:
   resident hit prefix with its index in the query and links it to the
   previous block. The index is relative to the query offset, so it orders
   blocks within a chain. That is all eviction needs.
-- Remote prefix-only transfers and membership fetches learn nothing. Their
-  key lists are not this node's chains.
+- Remote prefix-only transfers learn nothing, and membership fetches learn
+  no chain links (only the group links of §Group coherence). Their key
+  lists are not this node's chains.
 - Links exist only while both ends are resident. Evicting a block drops its
-  links.
-- `pegaflow_cache_evictions_with_resident_children` counts evictions of a
-  block that still had a resident dependent. Tail-first keeps it at 0;
-  plain LRU (window 0) does not.
+  links, and full cleanup resets them. The eviction-order table test
+  checks that both link maps are empty once every block has gone, in
+  several orders, including parent-first via the reclaimable LRU.
+- The invariant covers known dependents only: a block is never evicted
+  while a retained block linked under it is resident. Some blocks have no
+  parent link yet, and their parent can go first and strand them:
+  - a newly saved block that no group 0 prefix query has hit yet (the
+    newest turn, decode tails, SSD/RDMA prefetch inserts);
+  - the children of a head that was evicted and saved again. They lost
+    their link when the head left, and stay unlinked until a query hits
+    through them.
+
+  This is the 0.04-0.10 stranded share in the H5 attribution.
+- `pegaflow_cache_evictions_with_resident_children` counts pressure
+  evictions of a block that still had a known resident dependent. It is
+  nonzero under plain LRU (window 0), in the reclaimable class's LRU, and
+  in a tail-first round that falls back to LRU because pins cover the
+  window. Full cleanup never counts.
 
 ## Recency refresh in the server (checked in code)
 
 | operation | refreshes LRU recency | code |
 |---|---|---|
 | prefix query (`query_prefetch`, group 0) | yes, each block of the hit prefix | `ReadCache::get_prefix_blocks` via `prefetch.rs` `full_prefix_scan` |
-| membership query (group > 0) | yes, each hit | `get_blocks_aligned` via `get_membership` |
+| membership query (group > 0) | yes, each hit | `get_group_members` via `get_membership` |
 | membership fetch (group > 0, with fetch) | yes, each block of the hit prefix | `get_prefix_blocks` |
 | serving a remote transfer | yes | `get_blocks` / `get_prefix_blocks` |
 | re-saving a resident block | yes | `insert_block`, `AlreadyExists` |
@@ -113,15 +128,37 @@ last few, Checkpoint only p. The server cannot tell which.
 The rule is: a group block never outlives its position.
 - A membership query or fetch for group g > 0 ties each resident
   `key(hash, g)` to the resident group 0 block `hash`. The group block
-  becomes a leaf under its position and takes the position's depth.
+  becomes a leaf under its position and takes the position's depth. The
+  membership query links its hits under the lookup's own lock, and builds
+  position keys for hits only.
+- A position no prefix query has covered has unknown depth, so its linked
+  members also take unknown depth and rank first. With a hybrid model,
+  members of positions that were saved but not yet requeried are therefore
+  early victims.
 - So when a position is chosen, its group blocks go before it. A position is
   never evicted while its group data stays as weight no resume point can
-  use.
+  use. This holds within the retained class. A demoted (reclaimable) block
+  is evicted by plain LRU, whatever is linked to it.
 - A group block may leave on its own before its position. A window group's
   early blocks are never needed again, so they should be able to go, and a
   rule that kept group data together with its position would pin them.
 - What this does not do: it does not evict a position because one of its
-  Full group blocks went. That would need the kind.
+  Full group blocks went. That would need the kind. A Full member at
+  position p that leaves early breaks every resume point at or past p.
+  The group 0 chain from p on, and the deeper members, then become bytes
+  no resume point can use, and nothing evicts them early.
+
+Client contract (the server cannot enforce it without kinds): a client
+must refresh every group block a resume point needs at least as often as
+that point's group 0 position. In practice, whenever it prefix-queries
+group 0 over a range of positions, it also membership-queries each
+group g > 0 over the blocks of that range it would load. Members age by
+their own queries only, so a client that refreshes group 0 over a wider
+range than group g makes the members go first while the descendant rule
+keeps their positions. I did not read the connectors (out of scope for
+this work), so whether they meet this is unchecked. No hybrid model has
+run with the window on. That is why the window is opt-in, and one hybrid
+G5 cap run is the bar before 25 becomes the default.
 
 The first commit (7791c30) took the position along with a group block.
 81fdb6d dropped that: for a window group, it would have evicted attention
@@ -183,8 +220,11 @@ Rejected:
 At the gated C/U 0.5, H5 raises E_C from 0.699-0.719 (H4) to 0.763-0.769
 on both arms, and hit from 0.861 to 0.889. That is above LRU (H_lru 0.857)
 and 0.04 below the offline bound (H\*_C 0.929). At 0.75 it gains
-+0.01-0.03 E_C. At 0.25 it loses 0.01-0.05 E_C, with hit unchanged; this is
-recorded as a tradeoff below. No-cap warm TTFT and gsm8k do not regress.
++0.01-0.03 E_C. At 0.25 it loses 0.01-0.05 E_C, and old's hit drops by up
+to 0.02 in one of two runs. The cause is not known (§The 0.25 regression),
+and it is one reason the window is opt-in. No-cap warm TTFT and gsm8k do
+not regress. One cap pair rerun on the review-fixed build (10e7afa,
+window passed explicitly) is in §Rerun after the review fixes.
 
 ## Gate (G5 cap, official r3 plan)
 
@@ -243,11 +283,16 @@ GPU:
 - At 0.75, H5 adds +0.01-0.03 E_C, and hit rises from 0.915-0.917 to
   0.930-0.935.
 - At 0.25, E_C drops: old 0.174-0.179 to 0.129-0.147, v2 0.170-0.194 to
-  0.159-0.163. Hit does not move beyond run-to-run spread (H4
-  0.442-0.459, H5 0.430-0.464). See the next section.
+  0.159-0.163. Old's hit drops up to 0.02 in one of two runs: H5 0.430 /
+  0.457 against 0.451-0.459 for every LRU run (H4 0.451 / 0.458, w0
+  0.459). v2's hit does not drop (H4 0.459 / 0.442, H5 0.464 / 0.458).
+  See §The 0.25 regression.
 - Both servers have 0 dead blocks at every pass end.
-  `pegaflow_cache_evictions_with_resident_children` is 0 on every H5 run,
-  so H5 never evicted a block that had a resident dependent.
+  `pegaflow_cache_evictions_with_resident_children` is not exported by any
+  H5 25% run. An OTel counter that is never added is not exported, and the
+  same binary exports it at window 0. So H5 never evicted a block that had
+  a known (query-linked) resident dependent. Unlinked dependents are not
+  counted (see the metric's doc).
 - Cap warm TTFT p50 does not regress: at 0.5, H5 is 2.07-2.28 s (old) and
   2.10-2.17 s (v2), against H4's 2.22-2.30 and 2.20-2.28 s.
 
@@ -276,39 +321,77 @@ the logged hit. Shares are of ext\*_C:
 
 ### The 0.25 regression
 
-What the runs show:
+The cause is not known. What the runs show:
 - It is the policy, not the build. The same binary with
   `--tail-window-percent 0` (plain LRU) gives 0.179 / 0.180 at 0.25 and
-  0.698 / 0.706 at 0.5, both at H4's level. It also logs 38-58k evictions
-  with resident children per run, which default H5 never does.
+  0.698 / 0.706 at 0.5, both at H4's level. At window 0 the counter
+  `pegaflow_cache_evictions_with_resident_children` is 38.3k (old cap025)
+  and 57.7k (v2 cap) per run, summed over the four passes in
+  `result.json`. No H5 25% run exports it.
 - It is not the window size. 10% gives 0.152 / 0.161 at 0.25 and 0.734 /
   0.735 at 0.5. A smaller window does not recover 0.25, and it gives up
   half of the 0.5 gain.
-- It shows in E_C, not in hit. Server-served tokens past the baseline's
-  local hit (the part E_C credits) drop from 360-376 to 264-307 per request
-  (old), and from 366-420 to 337-352 (v2) (`sim/split.py`). Hit rate counts
-  every served token, and stays within the run spread.
-- In the first pair's old H5 run, 22% of the credited blocks had never been
-  hit by an earlier query, against 6-7% in the other three 0.25 runs of
-  that pair (`sim/unknown.py`). Those blocks have unknown depth, which H5
-  evicts first.
+- It shows mostly in E_C. Server-served tokens past the baseline's local
+  hit (the part E_C credits) drop from 360-376 to 264-307 per request
+  (old), and from 366-420 to 337-352 (v2) (`sim/split.py`). Old's hit
+  drops up to 0.02 in one of the two runs (above). v2's hit does not
+  drop.
+- The loss is in blocks of known depth. `sim/unknown.py` splits each run's
+  credited blocks (timed passes, past the baseline's local hit, capped by
+  the unlimited oracle) into those that no earlier query had hit (still at
+  unknown depth on H5) and those an earlier query had hit (known depth).
+  Rerun for these notes on 10.1.0.44 (`out/unknown/`). The numbers equal
+  the reviewer's rerun; the counts are credited x share, rounded:
 
-Likely cause (old arm): at 0.25 the cache holds about a quarter of the
-working set, so a conversation's blocks rarely survive past its next turn.
-Much of what can still serve was written by the previous turn and not yet
-requeried, so it has unknown depth, and H5 puts unknown depth first in
-line. This fits the old numbers. It does not explain v2's smaller drop
-(0.01-0.03), which is inside H4's own v2 spread at 0.25 (0.170-0.194). Ranking unknown depth last instead (sim `subfg-sh`) is worse
-at every capacity: 0.640 / 0.702 at 0.5 against 0.753 / 0.767, because
-then decode tails and never-requeried blocks pile up. The sim cannot model
-0.25 well enough (match 0.20-0.38) to tune a rule for it, and a rule keyed
-to eviction pressure would need its own gate runs.
+| arm | run | credited | never hit before | never-hit blocks | previously hit blocks |
+|---|---|---|---|---|---|
+| old | H4 `cap3-h4` | 21978 | 0.074 | 1.6k | 20.4k |
+| old | H5 `cap3-h5` | 16121 | 0.217 | 3.5k | 12.6k |
+| old | H4 `cap3-h4-b` | 22958 | 0.112 | 2.6k | 20.4k |
+| old | H5 `cap3-h5-b` | 18736 | 0.159 | 3.0k | 15.8k |
+| old | H5 w0 | 22769 | 0.082 | 1.9k | 20.9k |
+| old | H5 w10 | 19247 | 0.069 | 1.3k | 17.9k |
+| v2 | H4 `cap3-h4` | 25622 | 0.070 | 1.8k | 23.8k |
+| v2 | H5 `cap3-h5` | 20564 | 0.061 | 1.3k | 19.3k |
+| v2 | H4 `cap3-h4-b` | 22328 | 0.055 | 1.2k | 21.1k |
+| v2 | H5 `cap3-h5-b` | 21463 | 0.070 | 1.5k | 20.0k |
+| v2 | H5 w0 | 24100 | 0.046 | 1.1k | 23.0k |
+| v2 | H5 w10 | 21626 | 0.098 | 2.1k | 19.5k |
+
+  - In both pairs, H5 on old serves more never-hit blocks than H4 (3.5k
+    against 1.6k, and 3.0k against 2.6k), not fewer. The whole loss is in
+    previously hit blocks: -7.8k in the first pair and -4.6k in the
+    second.
+  - w10 shows the same: fewer never-hit blocks than H4 (1.3k), and still
+    2.5k fewer previously hit ones.
+  - v2 has no share difference (H5 0.061 / 0.070 against H4 0.070 /
+    0.055). Its smaller loss is also in previously hit blocks (-4.5k and
+    -1.1k).
+
+An earlier version of this section blamed unknown-depth blocks being
+evicted first. That contradicts the table: if it were the cause, H5's
+never-hit count would fall, and it rises. That version also cited only the
+first pair. The explanation is withdrawn.
+
+One hypothesis fits the data and is not verified: on old, the chain heads
+under vLLM's local hit are queried once and never loaded. Tail-first keeps
+them while their descendants are resident (by design,
+`queried_never_loaded_head_outlives_its_resident_descendants`), and pays
+for them with deep, known-depth tails. At 0.5 that trade wins, because the
+kept heads serve after vLLM drops its local copy. At 0.25 the space
+they take is the difference, and LRU drops them for free while vLLM still
+holds them locally. It does not explain v2's loss, since v2 queries from
+block 0. Testing it needs the server's resident set per pass, or a sim
+that matches H5 at 0.25. Neither exists: attribution match there is
+0.20-0.38. Ranking unknown depth last (sim `subfg-sh`) is worse at every
+capacity, 0.640 / 0.702 at 0.5 against 0.753 / 0.767, so that is not the
+fix either.
 
 Tradeoff, not fixed: at 0.25 the store serves little under any policy (E_C
 0.13-0.19, hit 0.43-0.46 against H_lru 0.57-0.60). H5 loses 0.01-0.05 E_C
-there and no measurable hit. At 0.5 it gains +0.06 E_C and +0.03 hit, and
-at 0.75 +0.01-0.03 E_C and +0.015 hit. The default stays 25. A deployment
-that runs far below its working set can use `--tail-window-percent 0`.
+there, and old's hit drops up to 0.02 in one of two runs. At 0.5 it gains
++0.06 E_C and +0.03 hit, and at 0.75 +0.01-0.03 E_C and +0.015 hit. The
+server default is 0 (opt-in, §What changes); 25 is the evaluated setting.
 
 ### Hit rate: close enough?
 
@@ -333,8 +416,8 @@ attribution) and scan end (0.01).
 
 Judgment: at 0.5 and 0.75 the hit rate is close enough. It beats LRU and is
 within 0.04 of the offline bound. At 0.25 neither policy is close (hit
-0.43-0.46 against 0.86); that point is capacity-bound, and H5 does not
-change its hit rate.
+0.43-0.46 against 0.86). That point is capacity-bound, and H5 lowers old's
+hit there by up to 0.02 in one of two runs.
 
 ## Warm TTFT and correctness (no-cap)
 
@@ -366,8 +449,15 @@ sha256s match `git show 81fdb6d:<file>`.
   `queried_never_loaded_head_outlives_its_resident_descendants` and
   `group_blocks_leave_before_their_position_and_pins_hold_the_chain`. Every
   other target passes, 378 tests passed in all. `ssd_cache` fails all 11 with
-  "pinned pool exhausted", as on master and every earlier branch run on
-  this host.
+  "pinned pool exhausted", as on every earlier branch run on this host.
+  Master fails it the same way. `~/kexi/rsi-tools/server-evict-tail/master-ssd.sh`
+  ran `cargo test -p pegaflow-core --test ssd_cache` once from a
+  `git archive` of master 75dfa4c (tar sha256 597a473b…, same on both
+  ends), on GPU7, pgid 2615128, 2026-10-24 08:29:56 - 08:30:24 UTC. It
+  gave 0 passed, 11 failed, all at `harness.rs:379` with `save:
+  Storage("pinned pool exhausted while allocating block buffer")`. The log
+  is in `~/kexi/logs/rsi-server-evict-tail-master-75dfa4c-ssd_cache/`
+  (`cargo-test-ssd_cache.log`, sha256 b97b82b6…).
 - `cargo-test-ignored.log`: 4 passed. `cargo-test-ignored-cuda12.log`: 3
   passed.
 - `clippy-cuda13.log`: clean.
@@ -381,16 +471,21 @@ help text (it now points at this doc).
 
 ## Open risks
 
-- 0.25 regression, above.
+- 0.25 regression, above. The cause is unknown.
 - Memory: a linked block costs a parent-map entry (two `BlockKey`s) and a
   slot in its parent's children list, a few hundred bytes with 32-byte
   hashes. That is under 0.02% of a 2.25 MiB block, but it grows with the
   resident count, not bytes.
-- A pressure round scans the window under the cache lock: it collects w
-  entries (w = 25% of the class, about 2.9k at 11.5k blocks), selects the
-  deepest 4 x batch, and sorts only those. The cap runs show no TTFT cost,
-  but a 160 GB pool of small blocks scans far more per round.
-- Group > 0 linking is unit-tested only. No hybrid model has run on H5.
+- A pressure round scans the window under the cache lock: it collects up to
+  4096 entries (25% of the class is about 2.9k at 11.5k blocks), selects
+  the deepest 4 x batch, and sorts only those. At 2.6M resident blocks that
+  is about 1.4 ms per round against 0.8 ms for LRU (§What changes). The
+  reclaim loop still has no round cap, as on H4.
+- Decode backup with the window on is untested end to end. M1 is a unit
+  test only; no gate run has a MetaServer, and reclaimable evictions are 0
+  in every gate run.
+- Group > 0 linking is unit-tested only. No hybrid model has run on H5, and
+  the client contract in §Group coherence is unchecked.
 - Depth is the hit-prefix index of the latest query, so it shifts when a
   chain is requeried from another offset (old: 6-21% of queries start past
   its local hit, 6-10% before it; `sim/offsets.py`). Order within a chain stays right, but depths of two
