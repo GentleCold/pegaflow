@@ -1732,10 +1732,109 @@ What this does and does not show:
   digest cannot judge, not on a wrong block.
 
 I did not edit the gate (it is gate-owned), and I did not rerun to get a
-pass. Whether to rerun MF5, or to treat this as the gate allowance's
-noise, is for the coordinator and the gate owner. old fails G4.gsm8k_warm
-(+2.01%) and native fails it too (+5.22%) in this run; v2 passes both
-gsm8k verdicts.
+pass. old fails G4.gsm8k_warm (+2.01%) and native fails it too (+5.22%)
+in this run; v2 passes both gsm8k verdicts.
+
+### MF5 note: where the 4879 preempted-uncertain blocks come from (run data only, no GPU)
+
+Verdict: the rise is variance, not a connector behaviour change. No fix,
+no rerun yet; the reviewer decides whether a recorded rerun is warranted.
+
+The gate's definition (`rsi/gates/digest_compare.py`):
+- The digest records only a request's *last* schedule episode (module
+  docstring, `records`). A computation in an earlier, preempted episode
+  of a digested request is counted in `Reference.preempted`
+  (lines 133 to 148: `elif k + 1 < len(ranges)`).
+- A loaded (local or external) block is `uncertain` when the reference
+  has no digested copy that equals it and the reference is not
+  exhaustive (lines 236 to 241, 257 to 258).
+- It is `uncertain_preempted` when the key has no untagged computation
+  and digested copies plus preempted episodes account for every
+  computation of the key (`_uncertain`, lines 181 to 185). So the only
+  undigested bytes of that key were computed in a preempted episode.
+- `run_gate._digest_verdict` (lines 1559 to 1567) allows at most
+  `MAX_PREEMPTED_UNCERTAIN = 0.01` of the loaded blocks.
+
+So yes: these are blocks whose stored copy can only have come from a
+preempted episode's KV. That KV is valid. It was computed before the
+preemption, and the scheduler's preemption flush (`plan_saves`:
+`preempted` sets `flush`) completes the save before vLLM reuses the
+blocks. The gate just has no digest of those bytes to judge them
+against. old produces the same category on the same trace.
+
+The attribution below reuses the gate's own `digest_compare` (`records`,
+`Reference`) on each run's cap(0.5) probe dir, so the counts are exactly
+the gate's. Script: `~/kexi/tmp/dsv2-p4/p4_uncertain.py` on .44.
+
+Totals by C/U in MF5 (v2):
+
+| C/U | local uncertain_preempted | external uncertain_preempted |
+|---|---|---|
+| 0.25 | 780 | 163 |
+| 0.5 | 1519 | 3360 |
+| 0.75 | 951 | 4832 |
+
+Only the 0.5 run is gated (exhaustive digest). Its 4879 blocks are
+1.008% of the loaded blocks.
+
+Per pass at 0.5. Each cell is vLLM preemptions / preempted-episode block
+computations (exposure) / uncertain_preempted loads:
+
+| run (tree) | cap_cold | cap_warm | cap_warm2 | cap_warm3 | total | share |
+|---|---|---|---|---|---|---|
+| MF2 v2 (d56fcb2) | 5 / 250 / 62 | 6 / 128 / 879 | 7 / 709 / 799 | 7 / 1094 / 528 | 2268 | 0.51% |
+| A/B A v2 (d56fcb2) | 6 / 410 / 459 | 4 / 575 / 1020 | 4 / 281 / 441 | 5 / 476 / 629 | 2549 | 0.57% |
+| A/B B v2 (706006c) | 4 / 66 / 266 | 6 / 204 / 1139 | 5 / 153 / 998 | 4 / 262 / 154 | 2557 | 0.53% |
+| it6 cap v2 (b5cf567) | 7 / 182 / 166 | 6 / 119 / 924 | 6 / 338 / 1894 | 4 / 66 / 205 | 3189 | 0.66% |
+| MF5 v2 (a1e7fd2) | 5 / 46 / 103 | 7 / 399 / 1925 | 4 / 187 / 1623 | 6 / 99 / 1228 | 4879 | 1.01% |
+| MF2 old | 5 / 81 / 280 | 3 / 154 / 287 | 2 / 17 / 106 | 3 / 63 / 358 | 1031 | 0.22% |
+| MF5 old | 9 / 259 / 788 | 4 / 90 / 321 | 4 / 246 / 1232 | 5 / 906 / 1864 | 4205 | 0.88% |
+
+Findings:
+1. Preemptions do not explain the count. Preemptions per pass are 2 to 9
+   in every run. Exposure is lower in MF5 (731 block computations) than in
+   MF2 (2181), yet MF5 has twice the uncertain loads. Within a run, the
+   pass with the most preemptions is not the one with the most uncertain
+   loads (MF2 warm2: 7 preemptions, 799; MF5 warm: 7, 1925).
+2. Which request is preempted decides the count. An uncertain load is a
+   block computed only in a preempted episode, times the number of later
+   requests that load it. A preempted early turn of a long conversation
+   is reloaded by every later turn of that conversation:
+   - MF5: conv 60 turn 3 is preempted in cap_warm, and turns 3 to 6
+     each load 253 of its blocks. Conv 13 alone is 2178 of the 4879
+     (45%).
+   - The top conversation's share in the other v2 runs is 32% (MF2), 38%
+     (A), 38% (B) and 34% (it6 cap). In MF5 old it is 40% (conv 27).
+3. The same code moves 4x between runs. old has no code change between
+   MF2 and MF5 and goes from 0.22% to 0.88%. v2 before it6 ran three
+   times at 0.51 to 0.57%. it6 ran twice, at 0.66% and 1.01%. Both are
+   inside the spread old shows by itself.
+4. it6 does not change what is saved. Between d56fcb2 (MF2) and a1e7fd2
+   (MF5), `connector_v2` differs only in `Worker._release_held`
+   (`scheduler.py` diff: 0 lines). The scheduler alone picks which
+   (block, hash) pairs are saved, including after a preemption. it6 only
+   concatenates the held steps' entries instead of folding them, and
+   the unit tests check that every id and hash is still sent once, in
+   order. So the coordinator's concern, saving blocks across a
+   preemption that were not saved before, is ruled out by construction.
+   The "own request, earlier episode" category, a request reloading what
+   its preempted episode saved, is the same size: 672 (MF2) vs 729
+   (MF5).
+5. The one category it6 can plausibly enlarge is retention across a pass.
+   Blocks computed only in a preempted episode can stay in the store long
+   enough to be loaded a pass later. That happened in MF5 (1386 loads, of
+   which 726 are conv 13 turn 1, preempted in cap_warm and loaded in
+   cap_warm3) and in the it6 cap run (261, one request). It did not
+   happen in MF2, A or B, although B (batching off) has it6's resident/C.
+   This follows from a store that keeps more. It is not a save-policy
+   change, and the blocks are valid KV.
+
+Conclusion: variance in which turns get preempted. v2's save behaviour
+is the same as before it6. A rerun would most likely land in the 0.5 to
+0.9% band, but that is not a reason to rerun for a pass. Whether a
+recorded rerun is warranted is for the reviewer. Not saving across a
+preemption would only shrink the gate's unjudged share: it would drop
+valid hits, and old saves these blocks too.
 
 ### G4 (vs same-run baseline)
 
