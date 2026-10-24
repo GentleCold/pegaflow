@@ -489,15 +489,26 @@ def test_unique_estimate_counts_shared_prefix_once():
         ),  # fmt: skip
         pytest.param({"replay_skip": 0}, "replay_skip", True, id="replay-skip-0"),
         pytest.param({"replay_skip": 32}, "replay_skip=32 (held-out", False, id="held-out"),
+        pytest.param(
+            {"arm": "pegaflow.connector_v2:C"}, "arm under test", True, id="pegaflow-module"
+        ),  # fmt: skip
+        pytest.param(
+            {"arm": "rsi.gates.myconn:C"},
+            "arm under test rsi.gates",
+            False,
+            id="rsi-module-under-test",
+        ),  # fmt: skip
     ],
 )
 def test_official_args(tmp_path, over, key, ok):
     """cap_fractions compare as sets; ``--replay-skip`` > 0 is a held-out
-    slice of the trace, never official."""
+    slice of the trace, never official; the arm under test's module must be
+    in the ``pegaflow`` package (M8: the only one the snapshot holds)."""
     import argparse
 
+    arm = over.pop("arm", "pegaflow.m:C")
     args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python"} | over))  # fmt: skip
-    probs = run_gate.official_problems(args, ["plain", "baseline", "m:C"], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
+    probs = run_gate.official_problems(args, ["plain", "baseline", arm], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
     assert any(p.startswith(key) for p in probs) is not ok, probs
 
 
@@ -1184,14 +1195,24 @@ def test_official_needs_under_test_path(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "recorded,ok",
-    [("snap", True), (None, False), ("venv", False)],
-    ids=["from-snapshot", "not-recorded", "from-elsewhere"],
+    "arm,recorded,ok",
+    [
+        pytest.param("pegaflow.connector_v2:C", "snap", True, id="under-test-from-snapshot"),
+        pytest.param("pegaflow.connector_v2:C", None, False, id="under-test-not-recorded"),
+        pytest.param("pegaflow.connector_v2:C", "venv", False, id="under-test-from-venv"),
+        pytest.param("pegaflow.connector_v2:C", "gate", False, id="under-test-from-gate"),
+        pytest.param("rsi.gates.myconn:C", "gate", False, id="rsi-module-under-test-from-gate"),
+        pytest.param("rsi.gates.myconn:C", "snap", True, id="rsi-module-under-test-from-snapshot"),
+        pytest.param("selftest:honest", "gate", True, id="selftest-from-gate"),
+        pytest.param("selftest:honest", "snap", False, id="selftest-from-snapshot"),
+    ],
 )
-def test_connector_module_must_come_from_the_snapshot(tmp_path, recorded, ok):
+def test_connector_module_must_come_from_the_snapshot(tmp_path, arm, recorded, ok):
     """Import-tree provenance: the probe records ``__file__`` of the arm's
-    connector module; it must lie in the arm's snapshot (the gate tree for
-    ``rsi.*`` self-tests)."""
+    connector module. Its root is chosen by arm kind (M8): only the declared
+    self-test arms resolve under the gate tree; an arm under test must
+    resolve under its snapshot whatever its module name (an ``rsi.*`` one
+    in the gate tree is never staged or scanned)."""
     import json
     import sys
 
@@ -1207,19 +1228,23 @@ def test_connector_module_must_come_from_the_snapshot(tmp_path, recorded, ok):
         "pegaflow": str(snap / "__init__.py"),
         "prefix": sys.prefix,
     }
-    mod = "pegaflow.connector_v2"
+    mod = run_gate.expected_connector(arm)
+    where = {"snap": snap, "venv": tmp_path / "venv" / "pegaflow", "gate": run_gate.REPO / "rsi"}
     if recorded:
-        where = snap if recorded == "snap" else tmp_path / "venv" / "pegaflow"
-        files[f"connector:{mod}"] = str(where / "connector_v2" / "__init__.py")
+        files[f"connector:{mod}"] = str(where[recorded] / "conn" / "__init__.py")
     probe = tmp_path / "ut" / "gsm8k" / "probe"
     probe.mkdir(parents=True)
     (probe / "spec.json").write_text(json.dumps({"modules": files}))
-    assert run_gate.expected_connector(f"{mod}:PegaKVConnectorV2") == mod
+    root = run_gate.connector_root(arm, snap.resolve())
+    v = run_gate.g0_provenance(tmp_path, "ut", snap.resolve(), mod, root)
+    assert v["pass"] is ok, v
     assert run_gate.expected_connector("selftest:honest") == "rsi.gates.selftest.connector"
     assert run_gate.expected_connector("native") is None
-    v = run_gate.g0_provenance(tmp_path, "ut", snap.resolve(), mod)
-    assert v["pass"] is ok, v
-    cfg = run_gate.kv_transfer_config(f"{mod}:PegaKVConnectorV2", probe, "tagged")
+
+
+def test_connector_under_test_is_wired_to_the_probe(tmp_path):
+    mod = "pegaflow.connector_v2"
+    cfg = run_gate.kv_transfer_config(f"{mod}:PegaKVConnectorV2", tmp_path, "tagged")
     probe_cfg = cfg["kv_connector_extra_config"]["connectors"][1]
     assert probe_cfg["kv_connector_extra_config"]["connector_modules"] == [mod]
 

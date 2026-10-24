@@ -1103,14 +1103,26 @@ def expected_connector(arm: str) -> str | None:
     return None
 
 
+def connector_root(arm: str, pegaflow_dir: Path | None) -> Path | None:
+    """Where an arm's connector module must resolve, by arm kind (M8), never
+    by module name: the declared self-test arms -> the gate tree; every other
+    arm (the arm under test whatever its module, ``old``) -> its expected
+    ``pegaflow`` dir (the snapshot for the arm under test)."""
+    return REPO.resolve() if arm_kind(arm) == "selftest" else pegaflow_dir
+
+
 def g0_provenance(
-    run_dir: Path, label: str, pegaflow_dir: Path | None, connector: str | None = None
+    run_dir: Path,
+    label: str,
+    pegaflow_dir: Path | None,
+    connector: str | None = None,
+    root: Path | None = None,
 ) -> dict[str, Any]:
     """Every spec dump of the arm (scheduler and workers, every workload)
     recorded its module files; they resolve under the gate tree, the shared
     venv and the arm's expected ``pegaflow``. ``connector``: the arm's
-    connector module, which must be recorded and resolve under the gate tree
-    (``rsi.*``) or the arm's ``pegaflow`` (anything else)."""
+    connector module, which must be recorded and resolve under ``root``
+    (``connector_root``)."""
     dumps = sorted((run_dir / label).glob("*/probe/spec*.json"))
     if not dumps:
         return {"pass": False, "reason": "no spec dump"}
@@ -1125,7 +1137,6 @@ def g0_provenance(
         pegaflow_files |= {files[k] for k in ("pegaflow", "pegaflow.pegaflow") if files.get(k)}
         if connector is not None:
             f = files.get(f"connector:{connector}")
-            root = REPO.resolve() if connector.startswith("rsi.") else pegaflow_dir
             if not f:
                 problems.append(f"{where}: connector module {connector} not recorded")
             elif root is None or not provenance.under(f, root):
@@ -1588,8 +1599,9 @@ def verdicts(
     committed: Path,
     gate: dict[str, Any] | None = None,
     pegaflow_dirs: dict[str, Path | None] | None = None,
-    connectors: dict[str, str | None] | None = None,
+    connectors: dict[str, tuple[str | None, Path | None]] | None = None,
 ) -> dict[str, Any]:
+    """``connectors``: label -> (connector module, ``connector_root``)."""
     v: dict[str, Any] = {}
     connectors = connectors or {}
     split_inv = bool((gate or {}).get("split_invariant", True))
@@ -1644,9 +1656,8 @@ def verdicts(
         gsm = per_wl.get("gsm8k")
         g["G0.spec"] = g0(run_dir, label, committed)
         if pegaflow_dirs is not None:
-            g["G0.provenance"] = g0_provenance(
-                run_dir, label, pegaflow_dirs.get(label), connectors.get(label)
-            )
+            mod, root = connectors.get(label, (None, None))
+            g["G0.provenance"] = g0_provenance(run_dir, label, pegaflow_dirs.get(label), mod, root)
         g["G2.digest_self.gsm8k"] = _digest_verdict(gsm and gsm["digest_self"], MIN_JUDGED_GSM8K)
         g["G2.digest_groups"] = digest_groups(run_dir / label / "gsm8k" / "probe")
         vs_base = (
@@ -1989,6 +2000,12 @@ def official_problems(
         out.append(f"workloads {wls} != {','.join(WORKLOADS)}")
     if args.num_gpu_blocks or args.vllm_arg:
         out.append("--num-gpu-blocks / --vllm-arg override")
+    for a in arms:
+        mod = a.split(":")[0]
+        if arm_kind(a) == "under_test" and not (mod == "pegaflow" or mod.startswith("pegaflow.")):
+            # M8: the snapshot holds only ``pegaflow``; a module elsewhere
+            # (e.g. ``rsi.*`` in the gate tree) is never staged or scanned.
+            out.append(f"arm under test {a}: module {mod} is outside the pegaflow package")
     if "under_test" in kinds and not args.under_test_path:
         # Without it the arm imports the venv's (unverified, unsnapshotted)
         # pegaflow tree: G0.provenance would accept any file there.
@@ -2436,7 +2453,9 @@ def main(argv: list[str] | None = None) -> int:
         if not iso_rec["available"]:
             problems.append("arm under test not isolated (isolate.py needs Linux and root)")
     dirs = {arm_label(a): expected_pegaflow(args, arm_kind(a)) for a in arms}
-    connectors = {arm_label(a): expected_connector(a) for a in arms}
+    connectors = {
+        arm_label(a): (expected_connector(a), connector_root(a, dirs[arm_label(a)])) for a in arms
+    }
     v = verdicts(results, run_dir, committed, gate, dirs, connectors)
     floor = None
     if "cap" in wls:

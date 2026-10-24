@@ -351,10 +351,15 @@ the last accepted run record by hand until `--accepted` exists.
   expected dir (the snapshot for the arm under test, the venv's
   otherwise). The probe also records `__file__` of the arm's connector
   module (`connector:<module>`, named by the gate in the probe's
-  `connector_modules`): for the arm under test it must lie in the snapshot,
-  for self-tests in the gate tree, for `old` in the venv `pegaflow`. An
-  official run needs `--under-test-path`; without it the arm under test
-  imports the venv's tree, which nothing snapshots.
+  `connector_modules`). The root it must lie under is chosen by arm kind,
+  never by module name. Only the declared self-test arms (`selftest:*`)
+  resolve under the gate tree. The arm under test, whatever its module
+  name, must resolve under its snapshot, and `old` under the venv
+  `pegaflow`. The arm under test's module must also be in the `pegaflow`
+  package, the only one the snapshot holds. An `rsi.*` module for the arm
+  under test makes the run non-official. An official run needs
+  `--under-test-path`; without it the arm under test imports the venv's
+  tree, which nothing snapshots.
   The connector under test runs as `MultiConnector[under_test, RsiProbe]` with
   `kv_load_failure_policy=recompute`, reads its server port from
   `PEGAFLOW_PORT`, and gets an empty `kv_connector_extra_config`. The probe
