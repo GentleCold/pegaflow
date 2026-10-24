@@ -334,3 +334,61 @@ feat/rsi-g5 should not merge into feat/semantics-rsi as-is, because M4
 fails every new run's G0. With M4 fixed (one line plus a test), it can
 merge. M5-M7 must land before the next `--under-test-path` run counts as
 official.
+
+## Resolution (implementer, d6a5da0..HEAD)
+
+| item | decision | commit | how |
+|---|---|---|---|
+| M4 | fixed | c7f7520 | `"modules"` is in `_VOLATILE`; `G0.provenance` judges it. Test: two dumps differing only in `modules` pass `g0`. GPU3 run below: `G0.spec` passes on current code. |
+| M5 | fixed | 2ae965f | `provenance.Trees` walks every file under the subpath (including `__pycache__`, without following symlinks). A tree verifies only if each file is a tracked regular blob with the same id, or is the one native module (sha256 recorded). Symlinks, untracked or ignored files, any other `.so`, and any `.pyc` are rejected; `.pyc` is allowed only with `pycache_ok`, which is used only for the gate and venv trees under `PYTHONPYCACHEPREFIX`. The arm imports `<run>/under-test-overlay/pegaflow`, a copy of the rev's blobs plus the native module, verified again after the copy. Every stage process gets a fresh `PYTHONPYCACHEPREFIX`. Table test of the five bypasses. |
+| M6 | fixed | 95998cf | `provenance_problems`: an unverified gate, venv `pegaflow` or under-test tree makes the run non-official. |
+| M7a | fixed (deterrence) | 5fca1b7, e15dc5e, 198f595 | `isolate.py`: in a private mount namespace the runs root is under a tmpfs, and only `<run>/<arm>` (rw) and the snapshot (ro) are bound back. Block devices and `/dev/{mem,kmem,port}` are masked. SYS_ADMIN, SYS_PTRACE and 7 more caps are dropped from the bounding set; IPC_LOCK, SYS_RESOURCE and SYS_NICE are kept. The helper execs in place, so the pid and pgid stay the same. The residual (uid 0 with DAC_OVERRIDE: not a boundary) is stated in GATES.md and `summary.isolation.residual`. The command line is in `summary.isolation.command_prefix`. Tests: the arm cannot read the other arms, `/proc/<gate>/root` or `cwd`, cannot `setns`, and cannot `umount`; its group is torn down. |
+| M7b | fixed | 5fca1b7, e15dc5e | `provenance.scan` over the snapshot, including the native module's strings. `SCAN_PATTERNS` covers rsi, the probe, poison, run artifacts, `sys.modules` writes, gc, trace/audit and import hooks. A hit not on the gate-owned `SCAN_ALLOWLIST` (path, pattern, reason) makes the run non-official. Hits go to `summary.scan`. |
+| M7c | fixed | 5fca1b7 | GATES.md "Boundary (M7)" section. The skill's review checklist adds "no instrument or run-artifact access; read every `summary.scan` hit". |
+| M7d | fixed | 5fca1b7 | `VLLM_PLUGINS=""` for every vLLM. Completions are read client-side over HTTP. |
+| import tree | fixed | 456ee0f | The probe records `connector:<module>` `__file__`. `G0.provenance` requires it under the arm's snapshot (or the gate tree for `rsi.*`). An official run with an under-test arm needs `--under-test-path`. |
+| S7 | fixed | e5f7e68 | A missing token record is not aligned. digest_compare counts `unjudged_nonaligned` per pass. Warm coverage requires it to be 0. |
+| S8 | fixed | d90ac5d (docs), 93a654f | Contamination is two-sided: the baseline's p99 is also checked against 10x the median of the arms' p99. |
+| S9 | fixed + open question | 1b640f7 (docs), 47cbd44 | `G4.warmup_seconds` per workload, value vs baseline, reported and not gated. It is listed in PROGRESS "Open questions" for sign-off. |
+| S10 | noted | - | Fail-closed; P5 informed by the coordinator. |
+| N5 | fixed | 7d477c5 | The Popen-to-registration window is deferred (`_STOP["teardown"]`). The `try:` and `finally:` bytecode windows leave the group in `_LIVE`, which `stop_live` (atexit) stops. Subprocess test for both windows. |
+| N6 | accepted | - | Covered by `check_stop()`, as the review says. |
+
+Also in this range (coordinator requests):
+- c6d6145, adc8143: stage ports are leased from the reserved range 20000-29999 under flocks in `~/kexi/rsi-ports`, and vLLM gets a leased `VLLM_PORT` block. EADDRINUSE on any bind is a `PortRace` naming the port. It is not retried. Lease files are recorded in `stage-error.json` and `summary.port_leases`, and leases are released on every exit path.
+- 23e618b: CUDA toolchain preflight. Every nvcc on `PATH` or `CUDA_HOME` must have torch's CUDA major. Recorded as `summary.cuda_env`.
+- b3d43b4: `--replay-skip N`. N > 0 is a held-out slice, never official (`summary.held_out`).
+
+### GPU3 run (current code, 7d477c5)
+
+Run `2026-10-24-qwen3-4b-g5-gpu3-7d477c5-b` on GPU3 with a 16gb pool. Arms: plain, baseline, and `pegaflow.connector_v2:PegaKVConnectorV2`. Under test is 8a05b7c: a git-archive extraction plus its `.so`, no pyc. Workload: gsm8k with limit 64. It ran 02:07:41Z-02:14:40Z and is non-official only for the limit and the workload set.
+- G0 on current code passes:
+  - Arm: `G0.spec` passes (0 diffs) and `G0.provenance` passes. Every pegaflow file and the connector module resolve under the overlay.
+  - Baseline: `G0.provenance` passes.
+  - Provenance is verified for the gate (7d477c5, 75 files), the venv (056eb4b) and the under-test tree (8a05b7c, .so sha256 equal to the source).
+  - Scan: nothing flagged.
+- The arm served inside the isolation:
+  - Line 1 of the arm's `vllm.log` and `pegaflow.log` is the `isolate.py` prefix.
+  - gsm8k cold and warm accuracy 0.8594, the same as baseline and plain.
+  - `G3.gsm8k_warm` passes: E 1.0, external hit 0.978, 0 load errors.
+- Teardown: the vllm group was gone after SIGTERM in 1.0 s and the pegaflow-server group in 7.0 s. No process was left and GPU3 was at 1 MiB. All 4 leases were released.
+- pegaflow-server log:
+  - Pinned pool: 16.00 GiB requested; `allocatable_size=16.0 GiB`.
+  - 0 WARN or ERROR lines. No mlock or registration errors.
+  - CUDA IPC: 36 layers registered, then "Session opened". At teardown it "dropped 36 CUDA tensors".
+- Attempt 1 (`-7d477c5`, 02:00Z) failed in the baseline FlashInfer JIT: the system nvcc 12.2 does not support `--compress-mode`. The cause was my launch env, which lacked `CUDA_HOME=~/kexi/cuda13`. 23e618b now refuses this.
+
+### Qwen3-4B re-judge (39cd826 vs b3d43b4)
+
+The earlier "24 runs, 864/864" covered the records on disk at the time. It is now redone over all 49 Qwen3-4B records with a baseline arm.
+
+How: both judge trees were extracted with `git archive`. Each record's `result.json` was judged with `digest_self` recomputed by that judge's `digest_compare`, then `verdicts(results, run, committed, gate)`. The script is `~/kexi/rsi-runs/scratch/rejudge_qwen3.py`. Output is in `~/kexi/rsi-runs/scratch/rejudge-qwen3/`.
+
+- 33 records judged by both, 82 arm verdicts:
+  - 1080 common pass flags: 1079 unchanged, 1 changed. The changed flag is `G0.spec` on the GPU3 run (False -> True). That is M4: 39cd826 compares `modules`.
+  - Overall arm pass changes: 0.
+  - G3: all 147 G3 verdict dicts are identical, numbers included.
+  - 82 flags exist only in the new judge. All are `G2.digest_groups`, which 940def4 added after 39cd826:
+    - 56 pass.
+    - 26 fail, all on records without a gsm8k stage (replay-only or cap-only). Those records were already failing overall and are non-official.
+- 16 records fail to judge under both judges with the same `KeyError: 'efficiency_c_own_local'`. They predate 20e6b58's cap fields. This is not a judge difference.
