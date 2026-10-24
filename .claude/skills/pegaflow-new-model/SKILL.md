@@ -60,8 +60,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    The connector under test must read `PEGAFLOW_PORT` and tolerate an empty
    `kv_connector_extra_config`; vLLM is started with
    `kv_load_failure_policy=recompute`.
-5. **Optimize**: if hit efficiency E, capacity efficiency E_C (G5) or perf is
-   below target, form a hypothesis from metrics (fallbacks per group, unused
+5. **Optimize**: hit-rate levels (E_ext, E_C) are reported, not gated (user,
+   2026-10-24; GATES.md "Hit rate"). Write a "hit-rate judgment" in
+   ITERATIONS.md for every accepted run: measured hit rate vs H* / H*_C and
+   the reference arms (H_lru, old, native), every gap explained, and whether
+   it is close enough. If it is not, or perf is below target, form a hypothesis from metrics (fallbacks per group, unused
    loads, write amplification, stranded bytes per group, save/load time), change
    the lowest layer that fixes it, rerun. One hypothesis per iteration, record
    result even if negative. Hypothesis checklist (extend it when you find more):
@@ -97,7 +100,8 @@ connector is a black-box baseline (run it, read its numbers, not its code).
      (semantics, human-reviewed) or a server change (separate PR) instead.
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
-   gate integrity (nothing relaxed), copying from the old connector, regressions
+   gate integrity (nothing relaxed), the hit-rate judgment (numbers against
+   `summary.hit_report`, gaps explained), copying from the old connector, regressions
    on earlier models, the policy complexity rules above (grep `policy.py`
    for model / spec class names, count knobs and lines, unused knobs), and
    that the connector does not touch the probe (no instrument or run-artifact

@@ -86,8 +86,12 @@ OFFICIAL = {
     "max_num_seqs": 256,
 }
 ACC_TOL = 0.01
-MIN_EFFICIENCY = 0.95
-ORACLE_FLOOR = {"gsm8k": 0.5, "replay": 0.5}  # warm oracle hit rate, else E is vacuous
+# Hit-rate levels are reported, never gated (user, 2026-10-24: "命中率那块，不要
+# 设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多"). These are the
+# former bars, kept as reference points next to the numbers (``reported``);
+# the onboarding agent judges the hit rate in ITERATIONS.md (GATES.md).
+MIN_EFFICIENCY = 0.95  # G3 E_ext reference
+ORACLE_FLOOR = {"gsm8k": 0.5, "replay": 0.5}  # warm oracle hit rate below it: E says little
 MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are judged
 # G4: passes with nothing to reuse from PegaFlow (replay cold: vLLM's own
 # prefix cache serves the earlier turns; gsm8k: the shared few-shot prefix) can
@@ -97,7 +101,11 @@ MAX_OVERHEAD = 0.02
 # CAPACITY_FRACTION is gated, the others are a reported curve. The bar is the
 # clairvoyant oracle at that capacity.
 CAPACITY_FRACTION = 0.5
-MIN_EFFICIENCY_C = 0.9
+MIN_EFFICIENCY_C = 0.9  # G5 E_C reference (reported, not gated)
+# Workload validity, not a bar on the arm: a trace on which a store frozen
+# after its first fill reaches this share of ``H*_C`` cannot separate a policy
+# from that bar, so the run is not official (``g5_problems``).
+FREEZE_SEPARATION = 0.9
 MIN_CAPACITY_GPU_KV = 2.0  # official: gated C >= 2 x vLLM GPU KV bytes
 CAP_MIN_CONVS = 64
 CAP_FLOOR_MARGIN = 1.1  # the auto size aims 10% above the floor (estimate vs measured U)
@@ -1599,24 +1607,33 @@ def digest_groups(probe: Path) -> dict[str, Any]:
     return {"pass": bool(need) and not missing, "groups": need, "undigested": missing}
 
 
+def _reported(**levels: tuple[float | None, float]) -> dict[str, Any]:
+    """Hit-rate levels (value, former bar): reported next to the verdict,
+    never part of ``pass``. ``below``: the value is missing or under it."""
+    return {
+        k: {"value": v, "reference": ref, "below": v is None or v < ref}
+        for k, (v, ref) in levels.items()
+    }
+
+
 def _hit_verdict(r: dict[str, Any] | None, workload: str) -> dict[str, Any]:
+    """G3: ``pass`` = correctness only (excess within one block per request,
+    no load errors); ``E_ext`` and the oracle hit rate are ``reported``."""
     if r is None:
         return {"pass": False, "reason": "not evaluated"}
     w = r["hit"]["warm"]
-    floor = ORACLE_FLOOR[workload]
     e = w["efficiency"]
-    ok = (
-        e is not None
-        and e >= MIN_EFFICIENCY
-        and w["oracle_hit_rate"] >= floor
-        and w["excess_tokens"] <= w["excess_limit"]
-        and not r["load_errors"]
-    )
+    ok = w["excess_tokens"] <= w["excess_limit"] and not r["load_errors"]
     return {
         "pass": ok,
+        "reported": _reported(
+            efficiency=(e, MIN_EFFICIENCY),
+            oracle_hit_rate=(w["oracle_hit_rate"], ORACLE_FLOOR[workload]),
+        ),
         "efficiency": e,
         "oracle_hit_rate": w["oracle_hit_rate"],
-        "oracle_floor": floor,
+        "hit_rate": w["hit_rate"],
+        "local_hit_rate": w["local_hit_tokens"] / w["prompt_tokens"] if w["prompt_tokens"] else 0.0,
         "external_hit_rate": w["external_hit_rate"],
         "excess_tokens": w["excess_tokens"],
         "excess_limit": w["excess_limit"],
@@ -1661,7 +1678,9 @@ def _missing_fields(r: dict[str, Any], paths: tuple[str, ...]) -> list[str]:
 def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> dict[str, Any]:
     """G5 for one cap stage. ``pegaflow``: the arm stores in a PegaFlow server
     (pool size and load bytes must be proven). ``gated``: the gated fraction
-    (else the numbers are a reported curve point, ``pass`` informational)."""
+    (else the numbers are a reported curve point, ``pass`` informational).
+    ``pass`` is correctness and measurement validity only; ``E_C`` (and the
+    LRU / freeze shares) are ``reported``."""
     if r is None or "capacity" not in r:
         reason = (r or {}).get("error", "not evaluated")
         return {"pass": False, "reason": reason}
@@ -1700,9 +1719,7 @@ def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> 
         all(io[n]["external_hit_bytes"] is not None for n in scored) and loaded >= need
     )
     ok = (
-        e is not None
-        and e >= MIN_EFFICIENCY_C
-        and w["excess_tokens"] <= w["excess_limit"]
+        w["excess_tokens"] <= w["excess_limit"]
         and not r["load_errors"]
         and pool_ok
         and loads_ok
@@ -1712,13 +1729,13 @@ def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> 
     return {
         "pass": ok,
         "gated": gated,
+        "reported": _reported(efficiency_c=(e, MIN_EFFICIENCY_C)),
         "efficiency_c": e,
         # Within-pass multi-turn reuse (turn k+1 after GPU eviction): reported.
         "efficiency_c_cold": cold.get("efficiency_c"),
         "cold_ext_oracle_c_share": cold.get("ext_oracle_c_share"),
         "freeze_vs_oracle_c_cold": cold.get("freeze_vs_oracle_c"),
         "efficiency_c_own_local": w["efficiency_c_own_local"],
-        "min_efficiency_c": MIN_EFFICIENCY_C,
         "unique_bytes": r.get("unique_bytes"),
         "capacity_bytes": r["capacity_bytes"],
         "capacity_fraction": r.get("capacity_fraction"),
@@ -2007,6 +2024,34 @@ def verdicts(
     return v
 
 
+_HIT_KEYS = {
+    "G3.gsm8k_warm": ("hit_rate", "local_hit_rate", "external_hit_rate", "oracle_hit_rate", "efficiency"),
+    "G3.replay_warm": ("hit_rate", "local_hit_rate", "external_hit_rate", "oracle_hit_rate", "efficiency"),
+    "G5.replay_warm": ("hit_rate", "oracle_hit_rate", "oracle_c_hit_rate", "lru_hit_rate",
+                       "freeze_hit_rate", "efficiency_c", "lru_vs_oracle_c", "freeze_vs_oracle_c"),
+}  # fmt: skip
+
+
+def hit_report(v: dict[str, Any]) -> dict[str, Any]:
+    """Every hit-rate number per arm (H, H*, E_ext, H*_C, H_lru, freeze, E_C),
+    marked ``reported``: no hit-rate level is gated; the onboarding agent
+    judges them in ITERATIONS.md and the review agent checks that judgment."""
+    out: dict[str, Any] = {}
+    for label, g in v.items():
+        if label == "baseline" or not isinstance(g, dict):
+            continue
+        arm = {
+            k: {f: g[k].get(f) for f in fields} | {"below_reference": [
+                n for n, x in g[k].get("reported", {}).items() if x["below"]
+            ]}
+            for k, fields in _HIT_KEYS.items()
+            if isinstance(g.get(k), dict) and "reason" not in g[k]
+        }  # fmt: skip
+        if arm:
+            out[label] = {"status": "reported"} | arm
+    return out
+
+
 def git_rev(root: Path = REPO) -> str:
     with suppress(Exception):
         return subprocess.check_output(
@@ -2153,7 +2198,7 @@ def g5_problems(v: dict[str, Any], floor: dict[str, Any], plan: dict[str, Any] |
         if label in _REFERENCE or label.startswith("selftest-"):
             continue
         fz = g.get("G5.replay_warm", {}).get("freeze_vs_oracle_c")
-        if fz is None or fz >= MIN_EFFICIENCY_C:
+        if fz is None or fz >= FREEZE_SEPARATION:
             out.append("G5 trace does not separate freeze from H*_C")
     return out
 
@@ -2769,12 +2814,16 @@ def main(argv: list[str] | None = None) -> int:
         "cap_plan": getattr(args, "cap_plan", None),
         "results": {a: {w: strip(r) for w, r in per.items()} for a, per in results.items()},
         "verdicts": v,
+        "hit_report": hit_report(v),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
     print(
         json.dumps(
             {"official": not problems, "problems": problems, "verdicts": v}, indent=1, default=str
         )
+    )
+    print(
+        f"[gate] hit rates (reported, not gated) {json.dumps(summary['hit_report'], default=str)}"
     )
     print(f"run record: {run_dir}")
     required = [x for x in v.values() if x.get("required", True)]
