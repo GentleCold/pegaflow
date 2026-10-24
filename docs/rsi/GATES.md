@@ -264,6 +264,12 @@ stage ends, on every path: success, exception, stop signal, teardown. Every
 failed stage writes `stage-error.json` (arm, workload, exception type,
 error, `port_leases`) in its dir. `summary.port_leases` lists every lease of
 the run (log, ports, block, lock files, leased/released times).
+CUDA toolchain preflight: vLLM / FlashInfer JIT-build kernels with the
+`nvcc` of `CUDA_HOME` or `PATH`, so a run is official only when every nvcc
+found there has the venv torch's CUDA major. A missing nvcc, or a
+`CUDA_HOME` without one, makes the run non-official.
+`summary.cuda_env` records torch's CUDA version, `CUDA_HOME`,
+`LD_LIBRARY_PATH`, `PATH`, and the path and version of each nvcc.
 
 Stopping a run: `kill -TERM -<run_gate pgid>` (or `-INT`, `-HUP`; launched
 with `setsid`, the gate's pgid is its pid). Each aborts the whole run: the

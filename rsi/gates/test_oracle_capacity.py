@@ -767,6 +767,41 @@ def test_stop_signal_in_a_launch_window_still_stops_the_group(tmp_path, where):
         assert "left by a signal window" in gate.stdout, gate.stdout
 
 
+@pytest.mark.parametrize(
+    "path_ver,home_ver,problem",
+    [
+        pytest.param("13.0", "13.0", None, id="both-match"),
+        pytest.param(None, "13.0", None, id="home-only"),
+        pytest.param("12.2", None, "is CUDA 12.2, torch is CUDA 13.0", id="path-12-attempt-1"),
+        pytest.param("13.0", "12.2", "is CUDA 12.2", id="home-mismatch"),
+        pytest.param(None, None, "no nvcc", id="none"),
+    ],
+)
+def test_cuda_env_must_match_torch(tmp_path, path_ver, home_ver, problem):
+    """GPU3 attempt 1: the system nvcc 12.2 on PATH, torch on CUDA 13, and
+    FlashInfer's JIT failed mid-run. Every nvcc a stage can pick must have
+    torch's CUDA major; paths and versions are recorded."""
+
+    def nvcc(d, ver):
+        b = d / "bin"
+        b.mkdir(parents=True)
+        f = b / "nvcc"
+        f.write_text(f"#!/bin/sh\necho 'Cuda compilation tools, release {ver}, V{ver}.1'\n")
+        f.chmod(0o755)
+        return d
+
+    env = {"PATH": "/nonexistent", "LD_LIBRARY_PATH": "/x/lib"}
+    if path_ver:
+        env["PATH"] = str(nvcc(tmp_path / "p", path_ver) / "bin")
+    if home_ver:
+        env["CUDA_HOME"] = str(nvcc(tmp_path / "h", home_ver))
+    rec = run_gate.cuda_env(env, torch_cuda="13.0")
+    assert rec["nvcc_path_version"] == path_ver and rec["nvcc_cuda_home_version"] == home_ver
+    assert rec["LD_LIBRARY_PATH"] == "/x/lib"
+    got = run_gate.cuda_problems(rec)
+    assert (problem in " ".join(got)) if problem else not got, got
+
+
 # ------------------------------------------------------------ provenance
 
 

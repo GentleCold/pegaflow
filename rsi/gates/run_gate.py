@@ -1990,6 +1990,67 @@ def official_problems(
     return out
 
 
+def _nvcc_version(nvcc: str | None) -> str | None:
+    if not nvcc:
+        return None
+    try:
+        out = subprocess.run([nvcc, "--version"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"release (\d+\.\d+)", out)
+    return m.group(1) if m else None
+
+
+def cuda_env(env: dict[str, str] | None = None, torch_cuda: str | None = None) -> dict[str, Any]:
+    """The CUDA toolchain every stage inherits (vLLM / FlashInfer JIT-compile
+    kernels with the ``nvcc`` of ``CUDA_HOME`` or ``PATH``): paths, nvcc
+    versions and the venv torch's CUDA version (from a subprocess, so the
+    gate never imports torch)."""
+    env = dict(os.environ) if env is None else env
+    if torch_cuda is None:
+        with suppress(OSError, subprocess.SubprocessError):
+            torch_cuda = subprocess.run(
+                [sys.executable, "-c", "import torch; print(torch.version.cuda)"],
+                capture_output=True, text=True, timeout=300, env=env,
+            ).stdout.strip() or None  # fmt: skip
+    home = env.get("CUDA_HOME") or None
+    home_nvcc = str(Path(home) / "bin" / "nvcc") if home else None
+    path_nvcc = shutil.which("nvcc", path=env.get("PATH", ""))
+    return {
+        "torch_cuda": torch_cuda,
+        "CUDA_HOME": home,
+        "LD_LIBRARY_PATH": env.get("LD_LIBRARY_PATH"),
+        "PATH": env.get("PATH"),
+        "nvcc_path": path_nvcc,
+        "nvcc_path_version": _nvcc_version(path_nvcc),
+        "nvcc_cuda_home": home_nvcc,
+        "nvcc_cuda_home_version": _nvcc_version(home_nvcc)
+        if home_nvcc and Path(home_nvcc).is_file()
+        else None,  # fmt: skip
+    }
+
+
+def cuda_problems(rec: dict[str, Any]) -> list[str]:
+    """Official only with one CUDA major for torch and every nvcc a stage can
+    pick (a mismatched nvcc fails a JIT build mid-run, or builds kernels for
+    another toolkit)."""
+    major = (rec.get("torch_cuda") or "").split(".")[0]
+    if not major:
+        return ["CUDA env: torch CUDA version unknown"]
+    out = []
+    if rec.get("CUDA_HOME") and rec.get("nvcc_cuda_home_version") is None:
+        out.append(f"CUDA env: CUDA_HOME={rec['CUDA_HOME']} has no working bin/nvcc")
+    found = [
+        (k, rec[f"{k}_version"]) for k in ("nvcc_path", "nvcc_cuda_home") if rec.get(f"{k}_version")
+    ]
+    if not found:
+        out.append("CUDA env: no nvcc on PATH or under CUDA_HOME (JIT kernels cannot build)")
+    for k, ver in found:
+        if ver.split(".")[0] != major:
+            out.append(f"CUDA env: {rec[k]} is CUDA {ver}, torch is CUDA {rec['torch_cuda']}")
+    return out
+
+
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -2255,6 +2316,9 @@ def main(argv: list[str] | None = None) -> int:
     # Before any stage: what the run is about to measure.
     prov = record_provenance(args, run_dir)
     print(f"[gate] provenance {json.dumps(prov, default=str)}", flush=True)
+    cuda = cuda_env()
+    cuda_bad = cuda_problems(cuda)
+    print(f"[gate] cuda env {json.dumps(cuda)} problems {cuda_bad}", flush=True)
     pool_checks: list[dict[str, Any]] = []
     uncapped = [w for w in wls if w != "cap"]
     if any(arm_kind(a) in _STORES for a in arms) and uncapped:
@@ -2341,6 +2405,7 @@ def main(argv: list[str] | None = None) -> int:
         for c in contaminated
     ]
     problems += provenance_problems(prov)
+    problems += cuda_bad
     scan = scan_record(args)
     problems += [f"static scan hit not on the allowlist: {h['id']}" for h in scan["flagged"]]
     iso_rec = None
@@ -2371,6 +2436,7 @@ def main(argv: list[str] | None = None) -> int:
         "pool_checks": pool_checks,
         "contamination": contaminated,
         "isolation": iso_rec,
+        "cuda_env": cuda,
         "scan": scan,
         "port_leases": release_leases(),
         "args": vars(args),
