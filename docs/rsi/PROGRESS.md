@@ -598,6 +598,20 @@ names, magic constants that only exist in the old code).
   native `.so` copied from `pegaflow-semantics-rsi`, server binary reused.
   Record: `docs/rsi/models/DeepSeek-V2-Lite-Chat/ITERATIONS.md`.
 
+- P4 it4/it5 (2026-10-24, connector-only, no semantics or server change):
+  save batching is a model-agnostic policy knob, on by default:
+  `save_batch_steps = 32`, `save_batch_ms = 1000`, and
+  `save_batch_max_kv_usage = 0.9`, which sends held saves at once when vLLM's
+  GPU KV usage is at least 90%. Sync-save layouts skip batching.
+  - Unpressured DSV2 TP2 3x (`it5-rep-01`): cold p50 -1.9 to +0.6% vs
+    baseline (G4 passes 3/3), against +5% for batching off.
+  - Pressured DSV2 (`--num-gpu-blocks 1200`): without the KV-pressure send,
+    the batch hold cost +53% cold p50. With it, the default is level with
+    batching off, with no added preemptions.
+  - Qwen3-4B TP1: no regression (`it4-nonreg`, `it4-qrep-b`).
+  - Gate issue seen: a vLLM `--port` bind race (`EADDRINUSE`) killed one
+    run_gate (`qwen3-4b-p4-it4-qrep`).
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

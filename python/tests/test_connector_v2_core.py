@@ -1036,6 +1036,42 @@ def test_save_batching(batch_steps, batch_ms, steps, expected):
     assert worker.save_stats.rpcs == len(expected)
 
 
+@pytest.mark.parametrize(
+    "kv_usage,threshold,send",
+    [
+        pytest.param(0.3, 0.9, False, id="low"),
+        pytest.param(0.9, 0.9, True, id="at-threshold"),
+        pytest.param(1.0, 1.01, False, id="disabled"),
+    ],
+)
+def test_kv_pressure_sends_held_saves(kv_usage, threshold, send):
+    """Under GPU KV pressure, held saves go out in the step's RPC instead of
+    waiting for the batch bound: finished requests held for the batch keep
+    blocks that waiting requests need. The step does not wait for them."""
+    layout = _layout(StubSemantics, StubFullSpec())
+    sched, _ = _sched(
+        StubSemantics, {}, policy=Policy(save_batch_max_kv_usage=threshold), layout=layout
+    )
+    sched.plan_saves([], lambda rid: None, kv_usage=kv_usage)
+    pressured = sched.take_plan()
+    assert pressured.send_saves is send and pressured.flush is False
+
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    worker = _worker(StubSemantics, rpc, [], layout=layout)
+    worker._batch_steps, worker._batch_s = 32, 1.0
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
+    pressured.saves = [GroupSave(0, [12], [b"h2"])]
+    worker.save(pressured)
+    assert len(worker._held) == (0 if send else 2)
+    assert worker.save_stats.pressure_rpcs == (1 if send else 0)
+    assert worker.flush(5)
+    assert [[ids for _, ids, _ in c] for c in calls] == [[[11, 12]]]
+    worker.shutdown()
+
+
 def test_save_batching_flush_and_finish_fence():
     """A held job counts as submitted: a request finishing after it is held
     until the batch is sent and copied, and flush (preemption, shutdown)
@@ -1088,11 +1124,15 @@ def test_layouts_that_zero_or_copy_save_synchronously(fields, sync):
     rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=SlowMark, sync_saves=sync)
+    # Save batching on (the shipped default): sync saves must ignore it.
+    worker._batch_steps, worker._batch_s = 32, 1.0
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
-    # Sync: done before the next step can zero or copy a block. Async: the
-    # job still waits on the compute mark.
+    # Sync: done before the next step can zero or copy a block, in its own
+    # RPC. Async: the job is held (batched) or still waits on the mark.
     assert len(calls) == (1 if sync else 0)
+    assert worker.save_stats.rpcs == (1 if sync else 0)
+    assert len(worker._held) == (0 if sync else 1)
     worker.shutdown()
     assert len(calls) == 1
 

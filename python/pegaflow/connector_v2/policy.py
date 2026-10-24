@@ -51,10 +51,14 @@ class Policy:
     sync_load_tokens: int = 256
     # Merge consecutive steps' saves into one save RPC: send when the oldest
     # held step has seen save_batch_steps steps or waited save_batch_ms,
-    # whichever comes first (<= 0 disables that bound). Preemption flushes
-    # and shutdown send at once.
-    save_batch_steps: int = 1
-    save_batch_ms: float = 0.0
+    # whichever comes first (<= 0 disables that bound), or when the GPU KV
+    # cache is under pressure. Preemption flushes and shutdown send at once.
+    save_batch_steps: int = 32
+    save_batch_ms: float = 1000.0
+    # Send held saves at once while vLLM's GPU KV cache usage (0..1, after
+    # the step's allocations) is at or above this: finished requests held
+    # for a batch keep blocks that waiting requests need. > 1 disables it.
+    save_batch_max_kv_usage: float = 0.9
 
     def accept(self, p: int, present: Sequence[frozenset[int]]) -> int:
         """Hit length to use, <= ``p``; ``present[sid]`` = blocks the server has."""

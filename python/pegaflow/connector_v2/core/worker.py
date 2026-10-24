@@ -69,6 +69,7 @@ class SaveStats:
     max_pending: int = 0  # jobs queued or running at submit time
     failed: int = 0  # jobs that did not store their blocks
     rpcs: int = 0  # save RPCs issued (one per released batch)
+    pressure_rpcs: int = 0  # of those, sent early on KV pressure (StepPlan.send_saves)
     sent: int = 0  # finished requests reported in finished_sending
     sent_wait_s: float = 0.0  # their total time held between finish and report
     max_sent_wait_s: float = 0.0
@@ -360,6 +361,11 @@ class Worker:
             self._held_steps += 1
             if self._release_due(t0):
                 self._release_held()
+            elif plan.send_saves:
+                # KV pressure: held finished requests keep blocks vLLM needs.
+                with self._cv:
+                    self.save_stats.pressure_rpcs += 1
+                self._release_held()
         t1 = self._clock()
         with self._cv:
             stats = self.save_stats
@@ -378,8 +384,11 @@ class Worker:
 
     def _release_due(self, now: float) -> bool:
         steps, wait_s = self._batch_steps, self._batch_s
-        if steps <= 1 and wait_s <= 0:
-            return True  # no batching
+        if self._sync_saves or (steps <= 1 and wait_s <= 0):
+            # No batching. Sync saves wait for every step's copy before the
+            # next step (vLLM may zero or copy the blocks), so nothing could
+            # be merged anyway.
+            return True
         return (steps > 0 and self._held_steps >= steps) or (
             wait_s > 0 and now - self._held_since >= wait_s
         )
@@ -495,8 +504,8 @@ class Worker:
         logger.info(
             "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
             "blocks=%d bytes=%d submit_ms=%.1f flushes=%d flush_ms=%.1f wait_ms=%.1f "
-            "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d rpcs=%d sent=%d "
-            "sent_wait_ms=%.1f max_sent_wait_ms=%.1f",
+            "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d rpcs=%d pressure_rpcs=%d "
+            "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f",
             self._par.tp_rank,
             now - s._since,
             s.steps,
@@ -512,6 +521,7 @@ class Worker:
             s.max_pending,
             s.failed,
             s.rpcs,
+            s.pressure_rpcs,
             s.sent,
             s.sent_wait_s * 1e3,
             s.max_sent_wait_s * 1e3,

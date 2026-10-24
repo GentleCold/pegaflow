@@ -63,13 +63,17 @@ class StepPlan:
     vLLM holds for our saves (report them in ``finished_sending`` once every
     save that may read them is done), and ``flush`` asks the worker to finish
     every pending save before this step touches any KV (vLLM freed blocks a
-    pending save may still read, e.g. on preemption).
+    pending save may still read, e.g. on preemption). ``send_saves`` asks the
+    worker to send its held (batched) saves with this step's, without
+    waiting for them: vLLM's GPU KV cache is under pressure, and finished
+    requests held for batched saves keep blocks that waiting requests need.
     """
 
     loads: list[LoadPlan] = field(default_factory=list)
     saves: list[GroupSave] = field(default_factory=list)
     finished: list[str] = field(default_factory=list)
     flush: bool = False
+    send_saves: bool = False
 
 
 @dataclass(frozen=True)
@@ -400,12 +404,17 @@ class Scheduler:
         scheduled: list[tuple[str, int, int]],
         block_ids_of: Callable[[str], tuple[list[int], ...] | None],
         preempted: Iterable[str] = (),
+        kv_usage: float = 0.0,
     ) -> None:
         """``scheduled``: (req_id, num_computed_before_step, num_scheduled_tokens).
 
         ``preempted``: requests vLLM preempted (and whose blocks it freed) since
         the last plan. Their blocks may be reallocated in this very step, so
         the workers must finish pending saves before the step runs.
+
+        ``kv_usage``: vLLM's GPU KV cache usage (0..1) after this step's
+        allocations. At or above the policy's ``save_batch_max_kv_usage`` the
+        workers send held saves this step (``StepPlan.send_saves``).
 
         A request whose blocks include an unconfirmed sync-load block saves
         nothing yet (its range is offered again once the outcome is visible).
@@ -423,6 +432,8 @@ class Scheduler:
             self._plan.flush = True
             self._saving.discard(req_id)  # the flush covers its old blocks
         self._plan.flush |= self._flush_always
+        if kv_usage >= self._policy.save_batch_max_kv_usage:
+            self._plan.send_saves = True
         if self._saves_disabled:
             return
         items: list[SaveItem] = []

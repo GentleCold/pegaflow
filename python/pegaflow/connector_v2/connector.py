@@ -230,10 +230,13 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens, strict=True)
         )
         block_state = scheduler_output.kv_connector_block_state
+        # vLLM binds its cache manager after construction (bind_kv_cache_manager).
+        kv_cache_manager = getattr(self, "_kv_cache_manager", None)
         self._scheduler.plan_saves(
             scheduled,
             block_state.get_block_ids if block_state is not None else lambda _: None,
             scheduler_output.preempted_req_ids or (),
+            kv_usage=kv_cache_manager.usage if kv_cache_manager is not None else 0.0,
         )
         return PegaConnectorMetadata(self._scheduler.take_plan())
 

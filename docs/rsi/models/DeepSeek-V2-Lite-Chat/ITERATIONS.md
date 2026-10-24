@@ -788,3 +788,209 @@ Findings:
   spread). The pressure-based flush the coordinator suggested is not
   needed at this load (no waiting, KV under 30%). It is the fallback if
   G5's cap run shows added preemptions or lower E_C.
+
+### Sync saves skip batching
+
+Layouts whose saves are synchronous (vLLM may zero or copy the blocks
+after the step, e.g. hybrid models) wait for every step's copy before the
+next step, so nothing can be merged. `_release_due` now returns True when
+`sync_saves` is set, whatever the knobs say.
+`test_layouts_that_zero_or_copy_save_synchronously` sets 32 steps / 1 s on
+the worker and checks that a sync layout sends its RPC in the same step
+(`rpcs == 1`, nothing held) while an async layout holds it. 172 core
+tests pass.
+
+### Qwen3-4B TP1 non-regression (`2026-10-23-qwen3-4b-p4-it4-nonreg`, GPU 0, 64gb, rev it4-default-32-1000-wip)
+
+Arms: plain, baseline, KOff (batching off), v2 with the shipped default
+(32 steps / 1000 ms, confirmed in the log). gsm8k is the full 1319.
+
+| arm | pass | gsm8k acc | gsm8k cold / warm s | replay cold p50 | vs baseline | cold req/s | warm / warm2 / warm3 p50 | RPCs (4 passes) | hold mean / max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| plain | | 0.8582 | 149.4 / 151.3 | | | | | | |
+| baseline | pass | 0.8582 | 172.4 / 173.3 | 0.2194 | | 5.016 | 0.2225 / 0.2195 / 0.2192 | | |
+| KOff | pass | 0.8582 | 173.3 / 171.2 | 0.2150 | -2.0% | 4.990 | 0.1259 / 0.0962 / 0.0941 | 521 | 23 / 154 |
+| v2 default | pass | 0.8582 | 172.7 / 170.9 | 0.2197 | +0.1% | 5.009 | 0.1500 / 0.0944 / 0.0918 | 51 | 249 / 1124 |
+
+Every verdict passes for both saving arms. G2: gsm8k outputs 0 differ,
+digests 0 mismatched (v2: 6903 external / 169918 local matched). G3:
+E_ext 1.0, excess 0, load_errors 0, no eviction. Hits: gsm8k warm local
+0.917 / ext 0.075 / total 0.992 / H* 0.992; replay warm local 0.730 / ext
+0.268 / total 0.998 / H* 0.998, the same for KOff and v2. Max waiting 0,
+max KV usage 30%, no request preempted more than once.
+
+v2's first warm pass (p50 0.150, p99 0.413) is slower than KOff's (0.126 /
+0.204), while warm2 / warm3 match. The gate scores warm2 / warm3, so G4
+passes either way, but a warm cost from the hold would matter. The per
+request probe shows the same steps-to-first-prefill in both arms (mean
+7.4, max 14), the same hits, and no extra episodes, so no request loaded
+less or waited on a save. A host check found two co-tenant servers
+allocating pinned pools during that pass: the server agent's 25 GiB pool
+(GPU 6, 23:27:21 to 23:27:39) and P5's 64 GiB pool (GPU 4,5, 23:27:43 to
+23:28:41). v2's warm pass ran 23:27:38 to 23:27:45.
+
+Repeat (`2026-10-23-qwen3-4b-p4-it4-qrep-b`, GPU 0, replay only, the
+shipped default 3x plus KOff):
+
+| arm | cold p50 | vs baseline | cold req/s | warm / warm2 / warm3 p50 | warm p99 | RPCs | hold mean / max ms |
+|---|---|---|---|---|---|---|---|
+| baseline | 0.2178 | | 5.015 | 0.2224 / 0.2264 / 0.2197 | 0.723 | | |
+| KOff | 0.2178 | 0.0% | 4.998 | 0.1072 / 0.0954 / 0.0910 | 0.190 | 466 | 21 / 149 |
+| KD | 0.2180 | +0.1% | 5.005 | 0.1103 / 0.0967 / 0.0938 | 0.181 | 51 | 251 / 1106 |
+| KDb | 0.2191 | +0.6% | 5.002 | 0.1105 / 0.0948 / 0.0931 | 0.183 | 51 | 248 / 1092 |
+| KDc | 0.2180 | +0.1% | 5.001 | 0.1077 / 0.0950 / 0.0921 | 0.185 | 51 | 248 / 1092 |
+
+All four saving arms pass G4 replay (the gsm8k G4 verdicts are
+unevaluable because the run is replay only). Same hits, E_ext 1.0, excess
+0, no eviction, max waiting 3, max KV usage 30%. The first warm pass is
+0.108 to 0.111 for the default against 0.107 for KOff, so the 0.150 above
+was that pass alone and not the hold. On Qwen3-4B TP1 the RPC count does
+not move cold (KOff is at baseline): the cold cost is a TP2 effect (the
+NCCL SHM all-reduce, see it3b). Batching neither helps nor hurts here.
+
+The first attempt (`2026-10-23-qwen3-4b-p4-it4-qrep`) died in its third
+arm. vLLM's API server failed with `OSError: [Errno 98] Address already
+in use` on the port the gate picked, and run_gate exited with it. This is
+a race between the gate's free-port pick and vLLM's bind while other
+agents start servers. It is a gate issue (reported, not edited). The
+baseline and KOff arms it finished agree with the repeat.
+
+### Pressured check (`2026-10-24-dsv2-lite-p4-it4-press-01`, GPU 0,1, 64gb, `--num-gpu-blocks 1200`, run_gate pgid 2131540, 00:11:42 to 00:25:10Z)
+
+`--num-gpu-blocks 1200` (vLLM's override; the profiled size is 6074) is a
+non-official flag, recorded here. It puts 19,200 tokens of GPU KV under
+8 conversations of up to 7.6k tokens. Arms: baseline, KOff (batching off),
+KD (the shipped default, 32 steps / 1000 ms). A read-only sidecar
+(`~/kexi/rsi-tools/metrics_poll.py`) scraped each vLLM server's
+`/metrics` every 0.5 s: `num_preemptions_total`, `num_requests_waiting`,
+`kv_cache_usage_perc`. Host check: no other pegaflow server started or
+stopped during the cold passes (P5 ended 00:12:03, before the first
+cold pass at 00:13:59).
+
+| arm | cold p50 | vs baseline | cold req/s | warm / warm2 / warm3 p50 | warm p99 | preemptions (4 passes) | max waiting | samples KV >= 90% | RPCs | hold mean / max ms (cold) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline | 0.4193 | | 4.317 | 0.410 / 0.397 / 0.395 | 1.505 | 4 | 6 | 18 | | |
+| KOff | 0.2968 | -29.2% | 5.017 | 0.152 / 0.134 / 0.134 | 0.940 | 4 | 4 | 20 | 541 | 17 / 71 |
+| KD | 0.4537 | +8.2% | 4.658 | 0.163 / 0.140 / 0.130 | 1.093 | 3 | 6 | 21 | 74 | 376 / 926 |
+
+Every saving arm: G2 replay digests 0 mismatched, G3 E_ext 1.0, excess 0,
+load_errors 0, no eviction. Cold hits: local 0.56 / ext 0.21 / total 0.77
+for both saving arms (baseline 0.56 local only). Warm hits: total 0.998,
+H* 0.998; the local / external split moves (KOff ext 0.546, KD ext 0.468 /
+0.458 / 0.395) because which turns still sit in GPU KV after the poison
+is timing-dependent at this size.
+
+Under pressure the saving arms beat baseline in cold: a turn that vLLM's
+small GPU cache already dropped is a pegaflow hit (ext 0.21). Batching
+makes that much worse:
+- KD cold is 0.454 against KOff's 0.297 (+53%), and req/s 4.66 against
+  5.02. It is behind baseline too (+8.2%).
+- Preemptions do not explain it (3 vs 4) and nor do the hits (the same
+  ext 0.21 in cold). The difference is the hold: in cold a finished
+  request waits a mean of 376 ms (max 926 ms) for `finished_sending`
+  against 17 ms (max 71 ms) for KOff, and vLLM cannot free its blocks
+  in that time. With KV usage at 90 to 100%, those are the blocks the
+  waiting next turn needs, so the next turn may queue behind the batch
+  bound. This is the likely reading, not a measured one: the sidecar
+  shows waiting requests in every arm (baseline in 36 of 115 samples),
+  and vLLM's usage counts held blocks as used, so it cannot separate
+  "waiting on held blocks" from "waiting on live blocks". The it5 run
+  tests it directly.
+- Warm is close (KD within 7% of KOff on p50, warm3 better), because warm
+  saves almost nothing (the blocks are already stored).
+
+So holding blocks costs real latency under KV pressure. Per the
+coordinator's rule, this needs a pressure-based flush before the default
+can stay on.
+
+## it5 (2026-10-24): send held saves under KV pressure
+
+Hypothesis: sending held saves at once on steps where vLLM's GPU KV cache
+is nearly full removes the batching cost under pressure (KD back to KOff
+or better in the pressured check), while leaving the unpressured cold
+gain intact (KV usage stays under 30% there, so the flush never fires).
+
+Design (one knob, computed from scheduler state):
+- `Policy.save_batch_max_kv_usage` (default.toml `0.9`; > 1 disables).
+  The connector's `build_connector_meta` reads vLLM's
+  `kv_cache_manager.usage` (vLLM binds the manager via
+  `bind_kv_cache_manager`; this is the same value vLLM exports as
+  `kv_cache_usage_perc`, measured after the step's allocations) and
+  passes it to `Scheduler.plan_saves(kv_usage=...)`.
+- At or above the threshold the step's plan carries `send_saves=True`.
+  The worker then sends its held jobs together with this step's save,
+  without waiting for them (unlike `flush`, the step does not block).
+  The finished requests' `finished_sending` follows as soon as that copy
+  lands.
+- `save stats` gains `pressure_rpcs` (RPCs sent early because of
+  pressure).
+- Unit test `test_kv_pressure_sends_held_saves` (low / at-threshold /
+  disabled): the scheduler sets `send_saves` only at or above the
+  threshold, never `flush`; the worker sends both held steps in one RPC
+  when it is set and keeps holding when it is not. 210 tests pass
+  (connector_v2 core + semantics bindings), ruff clean.
+
+### Pressured check with the KV-pressure send (`2026-10-24-dsv2-lite-p4-it4-press-02`, GPU 0,1, 64gb, `--num-gpu-blocks 1200`, run_gate pgid 2151580, 00:35:21 to 00:53:20Z, rev it4-default-32-1000-kv090)
+
+The same settings as press-01, with the it5 tree (`save_batch_max_kv_usage
+= 0.9`, confirmed in the `save stats` lines). KD and KDb are the shipped
+default twice. Host check: P5's Qwen3-4B servers (GPU 4) started at
+00:37:26 and 00:42:03. Their 64 GiB pool allocations overlap baseline's
+and KOff's cold passes, not KD's or KDb's. KD and KDb are judged
+against KOff from both runs.
+
+| arm | cold p50 | vs baseline | cold req/s | warm / warm2 / warm3 p50 | warm p99 | preemptions | max waiting | RPCs (pressure) | hold mean / max ms (cold) |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline | 0.4193 | | 4.304 | 0.417 / 0.394 / 0.397 | 1.563 | 4 | 5 | | |
+| KOff | 0.3031 | -27.7% | 4.995 | 0.149 / 0.143 / 0.155 | 0.967 | 5 | 8 | 549 | 17 / 72 |
+| KD | 0.3201 | -23.7% | 4.854 | 0.154 / 0.144 / 0.147 | 0.981 | 3 | 6 | 273 (230) | 258 / 920 |
+| KDb | 0.2900 | -30.8% | 4.903 | 0.157 / 0.140 / 0.142 | 0.984 | 3 | 5 | 279 (237) | 267 / 920 |
+| press-01 KOff | 0.2968 | | 5.017 | 0.152 / 0.134 / 0.134 | 0.940 | 4 | 4 | 541 | 17 / 71 |
+| press-01 KD (no pressure send) | 0.4537 | | 4.658 | 0.163 / 0.140 / 0.130 | 1.093 | 3 | 6 | 74 | 376 / 926 |
+
+Every saving arm: replay digests 0 mismatched, E_ext 1.0, excess 0,
+load_errors 0, no eviction, cold total hit 0.769, warm total 0.998 /
+H* 0.998. Preemptions and max waiting come from the sidecar and are
+cumulative over the arm's four passes.
+
+Findings:
+- The pressure send closes the press-01 gap. Cold p50 goes from 0.454 to
+  0.320 / 0.290, against KOff's 0.297 / 0.303. Warm is level with KOff.
+  No added preemptions (3 against KOff's 4 / 5) and no deeper queue.
+- Cold req/s stays 2 to 3% below KOff (4.85 / 4.90 against 5.00 / 5.02)
+  in both runs, while still 13% above baseline. The cold hold mean is
+  still about 260 ms. Most of it is held while KV usage is under 90%,
+  where the pressure send does not fire. A lower threshold would cut
+  that further at the price of more RPCs; not tried (one hypothesis per
+  iteration).
+- The pressure send fires on most RPCs in this setting (230 of 273):
+  under this pressure the default behaves like a step-sized batch of
+  about 2 steps, which is the intent.
+
+### it5 3x in-run repeat, unpressured (`2026-10-24-dsv2-lite-p4-it5-rep-01`, GPU 0,1, 64gb, run_gate pgid 2169351, 00:54:26 to 01:16:00Z, rev it5-kv090)
+
+Arms: baseline, KOff, and the shipped default (32 steps / 1000 ms / KV
+0.9) three times (KD / KDb / KDc). Host check: no other pegaflow server
+started or stopped from 00:54 to the end of the run.
+
+| arm | cold p50 | vs baseline | cold req/s | vs baseline | G4 cold p50 / req/s | warm2 / warm3 p50 | RPCs (cold) | pressure RPCs | hold mean / max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline | 0.1904 | | 5.696 | | | 0.164 / 0.164 | | | |
+| KOff | 0.2000 | +5.0% | 5.581 | -2.0% | fail / fail | 0.096 / 0.108 | 168 | | 11 / 97 |
+| KD | 0.1916 | +0.6% | 5.671 | -0.4% | pass / pass | 0.107 / 0.109 | 14 | 0 | 309 / 1070 |
+| KDb | 0.1876 | -1.5% | 5.666 | -0.5% | pass / pass | 0.097 / 0.106 | 14 | 0 | 244 / 1066 |
+| KDc | 0.1867 | -1.9% | 5.679 | -0.3% | pass / pass | 0.095 / 0.109 | 15 | 0 | 308 / 1068 |
+
+Every saving arm: replay digests 1382 external / 7094 local matched, 0
+mismatched; E_ext 1.0, excess 0, load_errors 0, no eviction; warm hits
+local 0.705 / ext 0.293 / total 0.998 / H* 0.998; `flushes=0`; max KV
+usage 28%, so the pressure send never fired (`pressure_rpcs=0`), as
+intended. G4 replay passes 3 of 3 for the default (cold p50 -1.9% to
++0.6%, cold req/s -0.3% to -0.5%) and fails for KOff. Every arm's
+overall verdict is False only because this run is replay only: the gsm8k
+verdicts are unevaluable.
+
+Order fix after this run (unit-tested, not in the run's tree): the
+worker checked `send_saves` before the batch bound, so a step where both
+fired counted as a pressure RPC. Now the bound is checked first;
+`pressure_rpcs` counts only early sends. Behaviour is unchanged.

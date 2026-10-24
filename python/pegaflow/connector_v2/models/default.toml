@@ -24,5 +24,10 @@ sync_load_tokens = 256
 # time-slices with vLLM's. Batching delays a finished request's
 # finished_sending (its blocks stay held) by up to that bound. Preemption
 # flushes and shutdown send at once.
-save_batch_steps = 1
-save_batch_ms = 0.0
+save_batch_steps = 32
+save_batch_ms = 1000.0
+
+# Held saves are sent at once on steps where vLLM's GPU KV cache usage
+# (0..1, after the step's allocations) is at least this: the held finished
+# requests' blocks are then what waiting requests need. > 1 disables it.
+save_batch_max_kv_usage = 0.9
