@@ -736,6 +736,25 @@ def arm_kind(arm: str) -> str:
     return "selftest" if arm.startswith("selftest:") else "under_test"
 
 
+# The venv's pegaflow ``vllm.general_plugins`` entry point (python/pyproject.toml).
+PEGAFLOW_PLUGIN = "pegaflow"
+
+
+def vllm_plugins(arm: str) -> str:
+    """``VLLM_PLUGINS`` of an arm's vLLM processes: "" (no plugin) except for
+    the ``old`` reference arm, which gets the pegaflow plugin alone.
+
+    vLLM 0.32's API server rebuilds each MultiConnector child's stats by
+    class name through the connector registry
+    (``MultiConnector.build_kv_connector_stats`` ->
+    ``KVConnectorFactory.get_connector_class_by_name``). ``PegaKVConnector``
+    reports stats and only the pegaflow plugin registers its name, so
+    without it every request of the old arm is an HTTP 500. The other arms'
+    children report no stats (probe, selftest, the arm under test today) or
+    are vLLM builtins registered under their class name (native, lmcache)."""
+    return PEGAFLOW_PLUGIN if arm_kind(arm) == "old" else ""
+
+
 def arm_label(arm: str) -> str:
     if arm.startswith("selftest:"):
         return "selftest-" + arm.split(":", 1)[1]
@@ -819,8 +838,9 @@ def vllm_server(
     # No ``vllm.general_plugins`` (M7d): the pegaflow plugin would run a
     # tree's code in every vLLM process, the API server included. Every arm
     # names its connector by module path; the only other plugins in the venv
-    # are vLLM's LoRA resolvers (unused). Same for every arm.
-    env["VLLM_PLUGINS"] = ""
+    # are vLLM's LoRA resolvers (unused). The ``old`` reference arm is the
+    # exception: it needs the plugin's connector names (``vllm_plugins``).
+    env["VLLM_PLUGINS"] = vllm_plugins(arm)
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONPATH"] = ":".join(x for x in (str(REPO), env.get("PYTHONPATH")) if x)
     env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
@@ -2731,6 +2751,7 @@ def main(argv: list[str] | None = None) -> int:
         "scan": scan,
         "port_leases": release_leases(),
         "args": vars(args),
+        "vllm_plugins": {arm_label(a): vllm_plugins(a) for a in arms},
         "gate": gate,
         "official": not problems,
         "held_out": args.replay_skip > 0,
