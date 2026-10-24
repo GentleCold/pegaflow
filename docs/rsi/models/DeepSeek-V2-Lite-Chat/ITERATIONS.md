@@ -1106,10 +1106,10 @@ From now on:
 
 The setup:
 - `"official": true`, `not_official_because: []`.
-- Gate tree `~/kexi/p4-gate-65dc1cc`. Its `rsi/` is identical to
-  feat/semantics-rsi 3068d06 (the rsi-g5 merge). It adds this model's
+- Gate tree `~/kexi/p4-gate-07f5d96`. Its `rsi/` is identical to
+  feat/semantics-rsi d16b990 (the rsi-g5 merge). It adds this model's
   gate.json and spec.json.
-- Under test: `--under-test-path ~/kexi/p4-ut-65dc1cc/python`, rev 65dc1cc.
+- Under test: `--under-test-path ~/kexi/p4-ut-07f5d96/python`, rev 07f5d96.
   Both trees came from `git archive` and carry no pyc. The snapshot is
   verified, the static scan has 0 flags and the provenance watch saw no
   change.
@@ -1123,7 +1123,7 @@ The setup:
 `old` failed every stage with an HTTP 500. vLLM 0.32's MultiConnector
 looks up `PegaKVConnector` in its registry to rebuild kv stats, and the
 gate's `VLLM_PLUGINS=""` left the name unregistered. That was a gate
-regression, fixed in 81e8f87 (feat/semantics-rsi 4fa78a0). `old` is
+regression, fixed in 3fe119c (feat/semantics-rsi fff1d9b). `old` is
 `required: false`, so the run stays official. `old`'s numbers come from
 the supplementary run below.
 
@@ -1147,9 +1147,9 @@ the supplementary run below.
 
 When this run was judged, the E_C bar was still hard, so the run's own
 summary has v2 `pass: false`, on `G5.replay_warm` only. Since
-2026-10-24 (2af374a) hit-rate levels are reported, not gated.
-I re-judged the record offline with the 4fa78a0 `verdicts()` /
-`hit_report()`. The output is `~/kexi/tmp/dsv2-p4/mf1-rejudge-4fa78a0.json`,
+2026-10-24 (86d83fd) hit-rate levels are reported, not gated.
+I re-judged the record offline with the fff1d9b `verdicts()` /
+`hit_report()`. The output is `~/kexi/tmp/dsv2-p4/mf1-rejudge-fff1d9b.json`,
 and the run dir is unchanged. The result:
 - v2 `pass: true`.
 - The only verdict that changed is `G5.replay_warm`, from false to true.
@@ -1273,9 +1273,9 @@ Judgment, after the coordinator's review of this section:
 
 The setup:
 - `"official": true`, `not_official_because: []`.
-- Gate tree `~/kexi/p4-gate-d25fcc8`, whose `rsi/` is identical to
-  feat/semantics-rsi 4fa78a0 (old-arm plugin fix, hit rate reported). Under
-  test: d25fcc8 (`~/kexi/p4-ut-d25fcc8`).
+- Gate tree `~/kexi/p4-gate-d56fcb2`, whose `rsi/` is identical to
+  feat/semantics-rsi fff1d9b (old-arm plugin fix, hit rate reported). Under
+  test: d56fcb2 (`~/kexi/p4-ut-d56fcb2`).
 - Base server, sha256 d1970ead, the same binary as it2d and G5 r3.
 - Arms plain, baseline, old, v2. Workloads gsm8k (1319), replay (32 x 12)
   and cap (64 x 12).
@@ -1322,7 +1322,7 @@ and all pass, as they did for it2d.
 
 | arm | C/U | hit | H*_C | H_lru | E_C | resident/C (4 passes) |
 |---|---|---|---|---|---|---|
-| v2 MF2 (d25fcc8) | 0.25 | 0.368 | 0.865 | 0.588 | 0.029 | 0.64 to 0.73 |
+| v2 MF2 (d56fcb2) | 0.25 | 0.368 | 0.865 | 0.588 | 0.029 | 0.64 to 0.73 |
 | old MF2 | 0.25 | 0.392 | 0.862 | 0.583 | 0.068 | 0.82 to 0.91 |
 | v2 r3 (8a05b7c) | 0.25 | 0.399 | 0.865 | 0.581 | 0.084 | 0.74 to 0.87 |
 | v2 MF2 | 0.5 | 0.777 | 0.929 | 0.857 | 0.592 | 0.59 to 0.69 |
