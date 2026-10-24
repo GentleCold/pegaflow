@@ -317,9 +317,12 @@ def stage(under_test: Path, dest: Path, trees: Trees) -> dict[str, Any]:
 
 # M7(b): instrument / run-artifact access a connector has no reason for
 # (GATES.md, "Boundary"). A hit is not a verdict: the run is non-official
-# until a reviewer clears the hit's id (``--scan-cleared``).
+# unless the hit is on ``SCAN_ALLOWLIST``. ``rsi`` matches the gate package
+# as code (``import rsi``, ``from rsi``, ``"rsi.``, ``rsi.gates``,
+# ``rsi/gates``), not a path that merely contains ``rsi`` (``docs/rsi/``,
+# a ``*-rsi/`` build dir).
 SCAN_PATTERNS = {
-    "rsi": r"\brsi\b",
+    "rsi": r"\b(import|from)\s+rsi\b|[\"']rsi[.\"']|\brsi[./]gates\b",
     "rsi_probe": r"rsi_probe",
     "RsiProbe": r"RsiProbe",
     "RsiWorkerExt": r"RsiWorkerExt",
@@ -370,3 +373,22 @@ def scan(pkg_dir: Path) -> list[dict[str, Any]]:
                 else:
                     hits.append({"id": f"{rel}:{i}:{name}", "text": line.strip()[:200]})
     return hits
+
+
+# Reviewed scan hits (path glob relative to the snapshot root, pattern name,
+# reason). Adding an entry is a gate change: review agent sign-off, as for
+# any GATES.md change. Allowlisted hits are recorded in ``summary.scan``.
+SCAN_ALLOWLIST: list[dict[str, str]] = []
+
+
+def allowlisted(
+    hit: dict[str, Any], allow: list[dict[str, str]] | None = None
+) -> dict[str, str] | None:
+    """The ``SCAN_ALLOWLIST`` entry (or ``allow``'s) covering ``hit``."""
+    import fnmatch
+
+    path, _, name = hit["id"].split(":", 2)  # <file>:<line|strings>:<pattern>
+    for a in SCAN_ALLOWLIST if allow is None else allow:
+        if fnmatch.fnmatchcase(path, a["path"]) and a["pattern"] == name:
+            return a
+    return None

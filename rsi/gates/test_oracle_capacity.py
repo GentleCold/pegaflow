@@ -782,6 +782,12 @@ for how in ("root", "cwd"):
     except OSError:
         seen[how] = False
 try:
+    fd = os.open(f"/proc/{gate_pid}/ns/mnt", os.O_RDONLY)
+    os.setns(fd, 0)
+    seen["setns"] = True
+except OSError:
+    seen["setns"] = False
+try:
     import ctypes
     seen["umount"] = ctypes.CDLL(None, use_errno=True).umount2(base.encode(), 2) == 0
 except Exception:
@@ -811,7 +817,7 @@ def test_isolated_arm_cannot_read_other_arms(tmp_path):
     assert cmd[0] == sys.executable and "--hide" in cmd
     out = subprocess.check_output(cmd, text=True, timeout=60)
     seen = eval(out)  # noqa: S307 - our own child's repr
-    assert seen == {"baseline_dir": False, "own_dir": True, "root": False, "cwd": False, "umount": False}, seen  # fmt: skip
+    assert seen == {"baseline_dir": False, "own_dir": True, "root": False, "cwd": False, "setns": False, "umount": False}, seen  # fmt: skip
     assert (arm / "written.txt").read_text() == "ok"  # rw bind reaches the host dir
     assert os.path.exists(base / "baseline" / "gsm8k" / "warm-outputs.json")  # host unchanged
 
@@ -879,13 +885,25 @@ def _pgid(pid: int) -> int | None:
     [
         ("x = 1\n", None),
         ("from rsi.gates import rsi_probe\n", "rsi"),
+        ("see docs/rsi/models/Qwen3-4B/ITERATIONS.md, built in pegaflow-semantics-rsi/\n", None),
+        ("m = importlib.import_module('rsi.gates.x')\n", "rsi"),
         ("import sys\nsys.modules['rsi.gates.rsi_probe'] = None\n", "sys.modules write"),
         ("import gc\nobjs = gc.get_objects()\n", "gc introspection"),
         ("p = run_dir / 'baseline' / 'gsm8k' / 'warm-outputs.json'\n", "-outputs.json"),
         ("glob('digest-*.jsonl')\n", "digest-"),
         ("sys.meta_path.insert(0, Finder())\n", "import hook"),
     ],
-    ids=["clean", "rsi-import", "sys-modules", "gc", "outputs", "digests", "meta-path"],
+    ids=[
+        "clean",
+        "rsi-import",
+        "rsi-in-paths",
+        "rsi-module-string",
+        "sys-modules",
+        "gc",
+        "outputs",
+        "digests",
+        "meta-path",
+    ],
 )
 def test_static_scan_flags_instrument_access(tmp_path, body, hit):
     """M7(b): a snapshot that names the instrument or run artifacts, or
@@ -902,10 +920,12 @@ def test_static_scan_flags_instrument_access(tmp_path, body, hit):
     hits = provenance.scan(pkg)
     names = {h["id"].rsplit(":", 1)[1] for h in hits}
     assert (hit in names) if hit else not names, hits
-    args = argparse.Namespace(under_test_path="x", under_test_overlay=str(tmp_path / "ov"), scan_cleared=[])  # fmt: skip
-    assert bool(run_gate.scan_record(args)["uncleared"]) is bool(hit)
-    args.scan_cleared = [h["id"] for h in hits]
-    assert run_gate.scan_record(args)["uncleared"] == []
+    args = argparse.Namespace(under_test_path="x", under_test_overlay=str(tmp_path / "ov"))
+    assert bool(run_gate.scan_record(args)["flagged"]) is bool(hit)
+    allow = [{"path": "pegaflow/conn.py", "pattern": n, "reason": "test"} for n in names]
+    rec = run_gate.scan_record(args, allow)
+    assert rec["flagged"] == [] and len(rec["allowlisted"]) == len(hits)
+    assert all(h["reason"] == "test" for h in rec["allowlisted"])
     (pkg / "conn.py").write_text("x = 1\n")
     (pkg / "pegaflow.so").write_bytes(b"\x7fELF\x00\x01rsi_poison\x00")
     assert [h["id"] for h in provenance.scan(pkg)] == ["pegaflow/pegaflow.so:strings:rsi_poison"]

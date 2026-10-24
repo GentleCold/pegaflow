@@ -232,6 +232,14 @@ def fresh_pycache(run_dir: Path, labels: list[str]) -> None:
 
 
 ISOLATE = Path(__file__).resolve().parent / "isolate.py"
+# What hiding does not stop (GATES.md "Boundary"): it is deterrence.
+ISOLATION_RESIDUAL = (
+    "deterrence, not a boundary: the arm runs as root in the host pid / IPC / "
+    "network namespaces; it can write any host file outside the hidden runs root "
+    "(gate tree, venv), and /proc/<pid>/root and nsenter are closed only by the "
+    "dropped CAP_SYS_PTRACE / CAP_SYS_ADMIN, which a root process can regain by "
+    "other routes. The controls are the static scan, provenance and the review."
+)
 
 
 def isolation_available() -> bool:
@@ -1747,18 +1755,24 @@ _PROVENANCE_ROLES = {
 }
 
 
-def scan_record(args) -> dict[str, Any]:
-    """M7(b): static scan of the snapshot the arm under test imports."""
+def scan_record(args, allow: list[dict[str, str]] | None = None) -> dict[str, Any]:
+    """M7(b): static scan of the snapshot the arm under test imports; hits
+    on ``provenance.SCAN_ALLOWLIST`` are recorded with their reason."""
     if not getattr(args, "under_test_path", ""):
-        return {"scanned": None, "hits": [], "uncleared": []}
+        return {"scanned": None, "allowlisted": [], "flagged": []}
     hits = provenance.scan(Path(args.under_test_overlay) / "pegaflow")
-    cleared = set(args.scan_cleared)
+    allowed, flagged = [], []
+    for h in hits:
+        a = provenance.allowlisted(h, allow)
+        if a is None:
+            flagged.append(h)
+        else:
+            allowed.append(h | {"reason": a["reason"]})
     return {
         "scanned": str(Path(args.under_test_overlay) / "pegaflow"),
         "patterns": provenance.SCAN_PATTERNS,
-        "hits": hits,
-        "cleared": sorted(cleared),
-        "uncleared": [h for h in hits if h["id"] not in cleared],
+        "allowlisted": allowed,
+        "flagged": flagged,
     }
 
 
@@ -1851,12 +1865,6 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="python dir put first on PYTHONPATH of the connector-under-test arm only "
         "(e.g. another tree's python/); its rev (.rsi-rev / git) is recorded",
-    )
-    ap.add_argument(
-        "--scan-cleared",
-        action="append",
-        default=[],
-        help="static-scan hit id (summary.scan) a reviewer cleared (M7b); repeatable",
     )
     ap.add_argument("--concurrency", type=int, default=OFFICIAL["concurrency"])
     ap.add_argument("--settle", type=float, default=5.0)
@@ -2006,12 +2014,16 @@ def main(argv: list[str] | None = None) -> int:
     ]
     problems += provenance_problems(prov)
     scan = scan_record(args)
-    problems += [f"static scan hit not cleared by a reviewer: {h['id']}" for h in scan["uncleared"]]
+    problems += [f"static scan hit not on the allowlist: {h['id']}" for h in scan["flagged"]]
     iso_rec = None
     if any(arm_kind(a) == "under_test" for a in arms):
         label = next(arm_label(a) for a in arms if arm_kind(a) == "under_test")
         iso_rec = isolation(args, run_dir / label)
-        iso_rec |= {"available": isolation_available(), "command_prefix": isolation_prefix(iso_rec)}
+        iso_rec |= {
+            "available": isolation_available(),
+            "command_prefix": isolation_prefix(iso_rec),
+            "residual": ISOLATION_RESIDUAL,
+        }
         if not iso_rec["available"]:
             problems.append("arm under test not isolated (isolate.py needs Linux and root)")
     dirs = {arm_label(a): expected_pegaflow(args, arm_kind(a)) for a in arms}

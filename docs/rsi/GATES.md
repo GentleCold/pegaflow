@@ -193,8 +193,16 @@ output, they do not edit it.
 | `test_oracle_capacity.py` | G5 oracle contract on synthetic traces (`python -m pytest rsi/gates/test_oracle_capacity.py`, no GPU) |
 | `workloads.py` | gsm8k, multi-turn replay, Prometheus scrape |
 | `run_gate.py` | orchestrator: arms x workloads, cold/warm passes, verdicts |
-
+| `provenance.py` | tree verification, under-test snapshot, static scan + allowlist |
+| `isolate.py` | runs the arm under test with the runs root hidden (mount namespace) |
 | `selftest/connector.py` | gate self-test connector: `honest` / `liar` / `bitflip` / `offbyone` |
+
+Trees on the host carry no bytecode by construction (M5 rejects any `.pyc`
+in the tree under test): extract a rev with
+`git archive <rev> | tar -x -C <dir>` plus `echo <rev> > <dir>/.rsi-rev`,
+or sync a checkout with `tar --exclude=__pycache__ --exclude='*.pyc'`. Then
+build the native module in place (`maturin develop` / copy
+`pegaflow<EXT_SUFFIX>` into `python/pegaflow/`).
 
 Usage (on the 4090 host 10.1.0.44, from the feature dir, shared venv):
 
@@ -338,16 +346,26 @@ the last accepted run record by hand until `--accepted` exists.
     place, so `stop` signals and waits for the same process group as before.
     The command prefix is in `summary.isolation`. A run whose arm under test
     could not be isolated (not Linux, not root) is not official.
+    Residual: this is deterrence, not a boundary. The arm runs as root in
+    the host pid / IPC / network namespaces and can write any host file
+    outside the hidden runs root (gate tree, venv). `/proc/<pid>/root` and
+    `nsenter` are closed only by the dropped `CAP_SYS_PTRACE` /
+    `CAP_SYS_ADMIN`, and a root process can regain those by other routes.
+    The controls are the static scan, provenance and the review
+    (`summary.isolation.residual` says the same).
   - Static scan (b). `provenance.scan` scans the snapshot, every text line
     and the strings of the native module, for `provenance.SCAN_PATTERNS`:
     names of the instrument (`rsi`, `rsi_probe`, `RsiProbe`, `RsiWorkerExt`,
     `rsi_poison`) and of run artifacts (`rsi-runs`, `probe_dir`, `digest-`,
     `-outputs.json`, `-tokens.json`, `requests.jsonl`), plus runtime
     patching (`sys.modules` writes, `gc.get_objects`/referrers, trace /
-    audit hooks, `sys.meta_path` / `path_hooks`, `importlib.reload`). A hit
-    makes the run non-official until a reviewer reads it and clears its id
-    (`--scan-cleared <id>`, recorded in `summary.scan`). Clearing is a review
-    decision, logged in the model's ITERATIONS.md.
+    audit hooks, `sys.meta_path` / `path_hooks`, `importlib.reload`). `rsi`
+    matches the gate package as code (`import rsi`, `from rsi`, a `"rsi.`
+    string, `rsi.gates` / `rsi/gates`), not a path containing `rsi`. A hit
+    makes the run non-official unless it is on `provenance.SCAN_ALLOWLIST`
+    (path glob + pattern + reason; adding an entry is a gate change, with
+    review sign-off). Allowlisted hits are recorded with their reason in
+    `summary.scan.allowlisted`, the others in `summary.scan.flagged`.
   - No plugins (d). Every vLLM process runs with `VLLM_PLUGINS=""`: no
     `vllm.general_plugins` entry point runs (the venv's `pegaflow` plugin
     would run a tree's code in every vLLM process, the API server included).

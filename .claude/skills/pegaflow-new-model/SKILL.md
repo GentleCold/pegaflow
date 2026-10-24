@@ -86,12 +86,16 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    on earlier models, and that the connector does not touch the probe (no
    instrument or run-artifact access: `RsiProbe`, `RsiWorkerExt`,
    `rsi_poison`, `sys.modules`, digests, outputs; GATES.md "Boundary"). It
-   reads every `summary.scan` hit before any `--scan-cleared`. Fix or justify
+   reads every `summary.scan` hit (flagged and allowlisted). Fix or justify
    every finding in ITERATIONS.md.
 7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers.
 
 ## 3. Lessons (append)
 
+- A tree for `--under-test-path` must hold no `.pyc` (the snapshot check
+  rejects it, fail-closed): extract with `git archive <rev> | tar -x` or sync
+  with `tar --exclude=__pycache__ --exclude='*.pyc'`, never import from it
+  before the run.
 - vLLM 0.32 + flashinfer-python 0.7.0.post1: remove stale `flashinfer-cubin`
   (version check aborts startup; no 0.7 cubin on PyPI).
 - A cuda-13 server build aborts in preflight when the unversioned
