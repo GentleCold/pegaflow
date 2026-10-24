@@ -3,7 +3,8 @@
   "block_size": 16,
   "cache_dtype": "auto",
   "enable_prefix_caching": true,
-  "mamba_cache_mode": "none"
+  "mamba_cache_mode": "none",
+  "prefix_cache_retention_interval": 0
  },
  "dtype": "bfloat16",
  "hf": {
@@ -143,6 +144,7 @@
   "kv_cache_layout": "LBNHC",
   "kv_tp_replicas": 1,
   "num_blocks": 4745,
+  "prefix_cache_retention_interval": 0,
   "prefix_cacheable_group_ids": [
    0
   ],

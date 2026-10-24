@@ -1973,6 +1973,44 @@ def test_outputs_exact_against_same_split(split_inv, cold, warm, vs_split, ok):
     assert v["pass"] is ok, v
 
 
+def test_outputs_reported_not_gated_without_batch_invariance():
+    """batch_invariant=false: no warm reference shares the warm pass's batch
+    composition, so differing completions are reported, never a pass/fail."""
+    v = run_gate._outputs_verdict({"cold": 3, "warm": 7}, False, True, (5, 1))
+    assert (v["pass"], v["gated"], v["warm_differ"], v["warm_differ_vs_split"]) == (
+        True,
+        False,
+        7,
+        5,
+    )
+
+
+_RET = ["--mamba-cache-mode", "align", "--prefix-cache-retention-interval", "528"]
+
+
+@pytest.mark.parametrize(
+    "cmd,ok",
+    [
+        (["vllm", "serve", "m", "--seed", "42", *_RET], True),
+        (["vllm", "serve", "m", *_RET, "--prefix-cache-retention-interval", "0"], False),
+        (["vllm", "serve", "m", "--mamba-cache-mode", "align"], False),
+        (None, False),  # not recorded
+    ],
+    ids=["applied", "overridden-later", "missing", "unrecorded"],
+)
+def test_gate_vllm_args_applied_to_every_stage(cmd, ok):
+    gate = {"vllm_args": _RET}
+    good = {"vllm_cmd": ["vllm", "serve", "m", *_RET]}
+    results = {
+        "plain": {"gsm8k": good},
+        "baseline": {"gsm8k": good, "cap": {"error": "crashed"}},  # crash: G2 judges it
+        "selftest-honest": {"gsm8k": {} if cmd is None else {"vllm_cmd": cmd}},
+    }
+    v = run_gate.gate_args_verdict(results, gate)
+    assert v["pass"] is ok, v
+    assert set(v["bad"]) <= {"selftest-honest/gsm8k"}
+
+
 def test_split_differ_separates_aligned_prompts():
     ctrl = {"n": 4, "split_outputs": ["a", "b", "c", "d"], "aligned": [False, True, False, True]}
     assert run_gate.split_differ(ctrl, ["a", "x", "c", "d"]) == (0, 1)
