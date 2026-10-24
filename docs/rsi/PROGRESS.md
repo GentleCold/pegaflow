@@ -515,6 +515,39 @@ names, magic constants that only exist in the old code).
   non-official; `G2.digest_groups` fails a transferred group without
   digests (hybrid / Mamba models fail G2 until Mamba state is digested).
 
+### 2026-10-24
+
+- G5 re-review 3 (M4-M7, S7-S9, N5) applied in c7f7520..b3d43b4. The
+  resolution table is in `reviews/G5-gate-rereview3.md`.
+  - Every new run passes `G0.spec` again (M4).
+  - The arm under test imports a verified snapshot of the rev's blobs.
+    Symlinks, untracked files, extra `.so` and pyc all reject the tree.
+    Trees for `--under-test-path` must be pyc-free (`git archive`).
+  - Unverified gate and venv trees make a run non-official.
+  - The arm runs in a private mount namespace that hides the other arms,
+    with SYS_ADMIN and SYS_PTRACE dropped. This is deterrence, not a
+    boundary (uid 0).
+  - A static scan of the snapshot flags instrument access.
+  - `VLLM_PLUGINS=""` for every vLLM.
+  - Gate fixes and run hygiene:
+    - The connector module's import path is checked.
+    - The aligned-prompt exemption is exact.
+    - Contamination is two-sided.
+    - `G4.warmup_seconds` is reported.
+    - Stage ports are leased (`PortRace`, never retried).
+    - CUDA toolchain preflight.
+    - `--replay-skip` for held-out slices (never official).
+- GPU3 run on 7d477c5 (02:07:41Z-02:14:40Z, gsm8k 64, 16gb pool):
+  - G0.spec and G0.provenance pass.
+  - connector_v2 at 8a05b7c served inside the isolation: accuracy equal to
+    baseline, G3 E 1.0.
+  - The namespaced groups were torn down.
+  - The server log shows the full 16 GiB pool and 36 CUDA IPC layers
+    registered, with no errors.
+- The Qwen3-4B re-judge (39cd826 vs b3d43b4, 49 records) left the G3
+  numbers unchanged (147/147) and overall passes unchanged. The only flag
+  change is M4's `G0.spec` fix.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
