@@ -1359,6 +1359,93 @@ resident drop and the hit gap go away, batching costs G5 and the default
 has to change (for example, a byte cap well below 16 MiB, or batching
 off when the store is near full).
 
+## Batching A/B for the G5 regression (Qwen3-4B, cap only, GPU 0, base server d1970ead, 64gb)
+
+Hypothesis: save batching (default on since 3e6f7a3) causes MF2's G5
+regression against 8a05b7c.
+
+Setup:
+- The gate tree for both runs is ce645d7. Each run has a same-run baseline,
+  cap auto with 64 convs x 12 turns (the r3 plan), and C(0.5) = 27.2 GB.
+- Non-official only because the arms and workloads are cap-only.
+- A: under test d56fcb2 (the MF2 tree, `save_batch_steps = 32`), tag
+  `qwen3-4b-p4-ab-a-d56fcb2`, pgid 2829266, 12:02:53 to 12:48:34Z.
+- B: `exp/p4-batch-off` 706006c, exactly one line changed
+  (`save_batch_steps = 1`), tag `qwen3-4b-p4-ab-b-706006c`, pgid 2870135,
+  12:51:31 to 13:35:30Z.
+
+| tree | C/U | hit | H*_C | H_lru | E_C | server insertions | resident/C |
+|---|---|---|---|---|---|---|---|
+| r3, 8a05b7c (no batching) | 0.5 | 0.842 | 0.929 | 0.857 | 0.684 | 93357 | 0.76 to 0.83 |
+| MF2, d56fcb2 | 0.5 | 0.777 | 0.929 | 0.857 | 0.592 | 124661 | 0.59 to 0.69 |
+| A, d56fcb2 | 0.5 | 0.794 | 0.930 | 0.857 | 0.596 | 122955 | 0.68 to 0.72 |
+| B, batching off | 0.5 | 0.837 | 0.929 | 0.857 | 0.692 | 93731 | 0.80 to 0.82 |
+| A | 0.25 | 0.367 | 0.863 | 0.578 | 0.025 | 352361 | 0.71 to 0.73 |
+| B | 0.25 | 0.405 | 0.862 | 0.583 | 0.100 | 321802 | 0.79 to 0.96 |
+| A | 0.75 | 0.867 | 0.970 | 0.915 | 0.677 | 83772 | 0.65 to 0.72 |
+| B | 0.75 | 0.879 | 0.971 | 0.916 | 0.689 | 79562 | 0.74 to 0.81 |
+
+Batching is the cause. With it off, v2 is back at its 8a05b7c level at
+every fraction (0.5: 0.837 vs 0.842), and A reproduces MF2. Both runs
+have excess 0, 0 unmatched and 0 load errors, so correctness is the same.
+
+The mechanism, per pass at 0.5 (end of pass):
+
+| | used/C | resident/C | dead = used - resident | ext share | hit |
+|---|---|---|---|---|---|
+| A cold / warm / warm2 / warm3 | 0.99 / 0.96 / 0.87 / 0.95 | 0.68 / 0.68 / 0.69 / 0.72 | 0.31 / 0.28 / 0.18 / 0.23 | 0.391 / 0.348 / 0.325 / 0.286 | 0.779 / 0.771 / 0.796 / 0.792 |
+| B cold / warm / warm2 / warm3 | 0.97 / 1.00 / 0.96 / 0.97 | 0.81 / 0.80 / 0.82 / 0.80 | 0.16 / 0.20 / 0.14 / 0.17 | 0.451 / 0.421 / 0.384 / 0.326 | 0.842 / 0.857 / 0.854 / 0.820 |
+
+- At the same pool use, A keeps about 0.12 C fewer bytes resident. The
+  pinned-but-not-resident share is 0.25 C vs 0.17 C. That matches the base
+  server's pinned-region limitation (PROGRESS "Server limitations": a save
+  call takes one region per layer, freed only when the call's last block
+  is evicted). Bigger save calls pin more dead bytes.
+- Per cap stage, from the tp0 save stats at 0.5:
+  - A sends 4076 RPCs, 3988 of them pressure sends, at 1.26 steps and
+    31.7 blocks/layer per RPC.
+  - B sends 5042 RPCs at 1.00 steps and 19.0 blocks per RPC.
+  - KV usage is about 99%, so the pressure send fires nearly every step,
+    and the merge itself is small (1.26 steps).
+- The loop amplifies the merge. Fewer resident blocks means more misses
+  and more recompute, so A saves 35% more blocks (129k vs 95.6k per
+  layer). That means bigger calls, which pin more dead bytes.
+- Preemptions are the same in both runs (2 to 8 per pass).
+- Local hit is the same (0.386 vs 0.391 cold). The whole gap is external
+  hit, i.e. what the store kept.
+- The delay explanation (a held save landing after the next turn's query)
+  does not fit holds of 1.26 steps.
+
+This is a connector cost on top of a server limitation: the server's
+region granularity makes save-call size matter, and batching made the
+calls bigger.
+
+More precisely, what matters is the entry, not the call. The save handler
+(`pegaflow-server` `save`, read for its request shape only) passes each
+`SaveLayer` entry through as one `LayerSave`, and the PROGRESS limitation
+says one region is pinned per layer entry. `_release_held` folded every
+held step's blocks for a layer into one entry. So a merged RPC pinned one
+region spanning several steps' requests, and that region stays pinned
+until the last of those requests' blocks is evicted. Per step, a region
+holds one step's blocks.
+
+## it6 (2026-10-24): batched saves keep one entry per step
+
+Hypothesis: sending held steps in one RPC but keeping each step's own
+layer entries gives the server the same regions as unbatched saves. That
+should restore resident/C and the G5 hit (A/B arm B), while keeping the
+fewer RPCs that the cold-TTFT gain comes from (it3b/it4: the cost scales
+with how often the server submits work on the GPU, not with bytes).
+
+Change (worker only, no policy knob): `_release_held` concatenates the
+held jobs' `(layer, ids, hashes)` entries in step order instead of folding
+them per layer. The wire size is unchanged (the 16 MiB budget already
+counted each step's entries separately). The server's GPU copy is one
+batch task per call either way. Unit tests: `test_save_batching`,
+`test_kv_pressure_sends_held_saves` and
+`test_merged_save_rpc_stays_under_size_budget` now assert one entry per
+held step.
+
 ## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
 
 Arms: plain, baseline, KOff, v2 with the shipped default (32 steps /
