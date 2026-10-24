@@ -261,6 +261,31 @@ def test_capacity_verdict_requires_pool_and_load_proof():
     assert not run_gate._capacity_verdict(short, pegaflow=True, gated=True)["loads_ok"]
 
 
+@pytest.mark.parametrize(
+    "drop",
+    [
+        "capacity.warm_timed.efficiency_c_own_local",  # pre-20e6b58 records
+        "capacity.warm_timed.excess_tokens",
+        "capacity.diagnostics.lru",
+        "capacity_bytes",
+        "load_errors",
+    ],
+)
+def test_capacity_record_without_a_field_fails_not_crashes(drop):
+    """S13: a cap record lacking a field the verdict reads fails with
+    "cannot evaluate: missing <field>" instead of raising (which would lose
+    every other verdict of the run, and its summary.json)."""
+    r = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    *path, key = drop.split(".")
+    d = r
+    for k in path:
+        d = d[k]
+    del d[key]
+    v = run_gate._capacity_verdict(r, pegaflow=True, gated=True)
+    assert v["pass"] is False and v["reason"].startswith("cannot evaluate: missing "), v
+    assert drop in v["reason"]
+
+
 def test_verdicts_reference_arms_not_required_and_errors_isolated(tmp_path):
     good = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
     good["digest_self"] |= {"external_compared": 1}

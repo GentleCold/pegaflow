@@ -1500,6 +1500,32 @@ def _evictions(metrics: dict[str, float]) -> float:
     return _metric(metrics, "pegaflow_cache_block_evictions_total")
 
 
+_WARM_TIMED_FIELDS = (
+    "efficiency_c", "efficiency_c_own_local", "excess_tokens", "excess_limit",
+    "unmatched_requests", "hit_rate", "oracle_hit_rate", "oracle_c_hit_rate",
+    "lru_hit_rate", "freeze_hit_rate", "lru_vs_oracle_c", "freeze_vs_oracle_c",
+)  # fmt: skip
+# Every field ``_capacity_verdict`` reads by index (dotted paths).
+_CAPACITY_FIELDS = (
+    "passes", "capacity_bytes", "load_errors", "capacity.warm_timed",
+    *(f"capacity.warm_timed.{k}" for k in _WARM_TIMED_FIELDS),
+    "capacity.diagnostics.oracle_c.groups", "capacity.diagnostics.oracle_c.passes",
+    "capacity.diagnostics.lru.groups", "capacity.diagnostics.lru.passes",
+)  # fmt: skip
+
+
+def _missing_fields(r: dict[str, Any], paths: tuple[str, ...]) -> list[str]:
+    out = []
+    for path in paths:
+        x: Any = r
+        for k in path.split("."):
+            if not isinstance(x, dict) or k not in x:
+                out.append(path)
+                break
+            x = x[k]
+    return out
+
+
 def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> dict[str, Any]:
     """G5 for one cap stage. ``pegaflow``: the arm stores in a PegaFlow server
     (pool size and load bytes must be proven). ``gated``: the gated fraction
@@ -1507,6 +1533,12 @@ def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> 
     if r is None or "capacity" not in r:
         reason = (r or {}).get("error", "not evaluated")
         return {"pass": False, "reason": reason}
+    # S13: a record without a field this verdict needs (e.g. written before
+    # the field existed) cannot be evaluated, which is a fail, not a crash
+    # that loses every other verdict of the run.
+    missing = _missing_fields(r, _CAPACITY_FIELDS)
+    if missing:
+        return {"pass": False, "reason": f"cannot evaluate: missing {', '.join(missing)}"}
     c = r["capacity"]
     w = c["warm_timed"]
     cold = c.get("cap_cold", {})
