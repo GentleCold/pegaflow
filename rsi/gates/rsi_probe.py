@@ -378,6 +378,10 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 "cache_dtype": _jsonable(cc.cache_dtype),
                 "enable_prefix_caching": cc.enable_prefix_caching,
                 "mamba_cache_mode": _jsonable(getattr(cc, "mamba_cache_mode", None)),
+                # Which Mamba / sliding-window states vLLM retains (and offers).
+                "prefix_cache_retention_interval": _jsonable(
+                    getattr(cc, "prefix_cache_retention_interval", None)
+                ),
             },
             "kv_cache_config": {
                 "num_blocks": kv_cache_config.num_blocks,
@@ -385,6 +389,9 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 "cache_hit_alignment_tokens": kv_cache_config.cache_hit_alignment_tokens,
                 "kv_cache_layout": kv_cache_config.kv_cache_layout,
                 "kv_tp_replicas": kv_cache_config.kv_tp_replicas,
+                "prefix_cache_retention_interval": _jsonable(
+                    getattr(kv_cache_config, "prefix_cache_retention_interval", None)
+                ),
                 "transfer_group_ids": list(kv_cache_config.transfer_group_ids),
                 "prefix_cacheable_group_ids": list(kv_cache_config.prefix_cacheable_group_ids),
                 "groups": groups,

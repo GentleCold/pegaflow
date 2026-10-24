@@ -930,9 +930,10 @@ def vllm_server(
         cmd += ["--kv-transfer-config", json.dumps(cfg)]
     if args.num_gpu_blocks:
         cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks)]
+    vllm_cmd = cmd  # before the isolation prefix: summary.json records it per stage
     cmd = isolated(args, arm, log, cmd)
     url = f"http://127.0.0.1:{port}"
-    return url, launched(cmd, env, log, f"{url}/health", 900, lease)
+    return url, launched(cmd, env, log, f"{url}/health", 900, lease), vllm_cmd
 
 
 def reset_prefix_cache(url: str) -> None:
@@ -1063,7 +1064,7 @@ def run_arm_workload(
                 args, out / "pegaflow.log", str(capacity) if cap else args.pool_size, arm
             )
             stack.enter_context(cm)
-        url, cm = vllm_server(
+        url, cm, result["vllm_cmd"] = vllm_server(
             args,
             gate,
             arm,
@@ -1288,6 +1289,39 @@ def g0(run_dir: Path, label: str, committed: Path) -> dict[str, Any]:
     else:
         diffs.append(f"committed spec dump {committed} missing")
     return {"pass": not diffs, "diffs": diffs[:20], "num_diffs": len(diffs)}
+
+
+def _flag_values(argv: list[str]) -> list[tuple[str, str | None]]:
+    """``--flag value`` / bare ``--flag`` pairs of a CLI argument list."""
+    out = []
+    for i, a in enumerate(argv):
+        if a.startswith("--"):
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            out.append((a, None if nxt is None or nxt.startswith("--") else nxt))
+    return out
+
+
+def gate_args_verdict(
+    results: dict[str, dict[str, Any]], gate: dict[str, Any] | None
+) -> dict[str, Any]:
+    """G0.vllm_args: every stage's vLLM ran with gate.json's ``vllm_args``
+    in force (the last occurrence of each flag carries the gate's value, so
+    a later ``--vllm-arg`` cannot silently override it)."""
+    want = _flag_values(list((gate or {}).get("vllm_args", [])))
+    bad: dict[str, list[str]] = {}
+    for label, per in results.items():
+        for wl, r in per.items():
+            if "error" in r:
+                continue
+            cmd = r.get("vllm_cmd")
+            if cmd is None:
+                bad[f"{label}/{wl}"] = ["vllm command not recorded"]
+                continue
+            got = dict(_flag_values(cmd))  # last occurrence wins, as in argparse
+            miss = [f"{f} {v}" for f, v in want if f not in got or got[f] != v]
+            if miss:
+                bad[f"{label}/{wl}"] = miss
+    return {"pass": not bad, "vllm_args": (gate or {}).get("vllm_args", []), "bad": bad}
 
 
 def expected_pegaflow(args, kind: str) -> Path | None:
@@ -1547,7 +1581,11 @@ def _outputs_verdict(
     out: dict[str, Any] = {"invariant": invariant, "split_invariant": split_inv}
     out |= {f"{p}_differ": d for p, d in diffs.items()}
     if not invariant:
-        return {"pass": True} | out
+        # No same-batch-composition reference exists for a warm pass (its
+        # batches depend on load timing), so completions are reported only;
+        # G2.gsm8k (accuracy) and the byte-exact digest checks gate.
+        out["warm_differ_vs_split"], out["warm_differ_vs_split_aligned"] = split_diffs
+        return {"pass": True, "gated": False} | out
     if split_inv:
         return {"pass": all(d == 0 for d in diffs.values())} | out
     out["warm_differ_vs_split"], out["warm_differ_vs_split_aligned"] = split_diffs
@@ -1935,6 +1973,8 @@ def verdicts(
         },
         "G2.digest_self.gsm8k": _digest_verdict(base.get("gsm8k", {}).get("digest_self"), None),
         "G2.digest_groups": digest_groups(base_probe),
+        # gate.json's vllm_args (e.g. mamba_cache_mode, retention) on every arm.
+        "G0.vllm_args": gate_args_verdict(results, gate),
         **(
             {"G0.provenance": g0_provenance(run_dir, "baseline", pegaflow_dirs.get("baseline"))}
             if pegaflow_dirs is not None

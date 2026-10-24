@@ -546,7 +546,13 @@ the last accepted run record by hand until `--accepted` exists.
   `batch_invariant` (established by `G2.batch_control`, see below),
   `split_invariant` (default true, established by
   `G2.split_control`, see below), `invariant_attention_backend`,
-  `attention_backend`, `vllm_args` (e.g. `mamba_cache_mode`). Pinned for every arm:
+  `attention_backend`, `vllm_args` (e.g. `mamba_cache_mode`,
+  `prefix_cache_retention_interval`), applied to every arm's vLLM and
+  checked by `G0.vllm_args` (baseline verdicts: each stage's recorded
+  `vllm_cmd` in summary.json carries every gate.json flag with its value as
+  the last occurrence). The spec dump records `cache.mamba_cache_mode` and
+  `prefix_cache_retention_interval` (cache config and `KVCacheConfig`), so
+  `G0.spec` also pins them per probed arm against the committed dump. Pinned for every arm:
   `--max-num-batched-tokens 2048 --max-num-seqs 256 --enable-prefix-caching
   --seed 42 --generation-config vllm`, `PYTHONHASHSEED=0`.
 - Passes: each arm x workload gets fresh vLLM (+ fresh PegaFlow for `old` and
@@ -631,7 +637,8 @@ the last accepted run record by hand until `--accepted` exists.
   the probe digests), so a hybrid model fails G2 until Mamba state is
   digested (the honest self-test needs it too).
 - G2.gsm8k: `|acc(pass) - acc(baseline cold)| <= 0.01` for cold and warm.
-  G2.gsm8k_outputs (when gate.json declares invariance): every completion equals
+  G2.gsm8k_outputs (when gate.json declares batch invariance; otherwise
+  reported only, see `G2.batch_control`): every completion equals
   baseline cold, cold and warm; with `split_invariant=false`: every cold
   completion equals baseline cold (same split), and every warm completion
   equals the plain arm's `split` completion of the same prompt, except on
@@ -692,9 +699,16 @@ the last accepted run record by hand until `--accepted` exists.
   0.32 cannot be batch invariant on GDN (Qwen3.5): the backend selector
   rejects `VLLM_BATCH_INVARIANT` for Mamba backends without
   `supports_batch_invariance`, and plain vLLM batched vs alone flips a
-  completion. With `batch_invariant=false` the loaded-block digest checks
-  stay exact because gsm8k digests every computation (the reference is
-  exhaustive: `digest_compare`), and only accuracy is compared on outputs.
+  completion. So `false` with an invariant control (alone == batched),
+  or `true` with any divergence, fails the run with the reason named.
+  Output rule with `batch_invariant=false`: a warm pass's batches depend on
+  load timing, so no reference shares its batch composition, and
+  `G2.warm_equals_cold` / `G2.gsm8k_outputs` report the differ counts
+  (`gated: false`; vs baseline cold, and `warm_differ_vs_split`) without
+  gating. G2.gsm8k (accuracy within 0.01) gates, and every digest check
+  stays byte-exact and hard: gsm8k digests every computation, so the
+  reference is exhaustive (`digest_compare`) and a loaded block or state
+  that equals no computed copy is `mismatched`.
 - G3 (`oracle.py`): replays `requests.jsonl` with unlimited capacity. A block
   ending at token e is stored at the first step whose `progress` reaches e
   (checkpoint groups: only a step ending exactly on e) and is visible to
