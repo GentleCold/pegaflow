@@ -65,21 +65,26 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
 
 Measured on Qwen3-4B G5 (single Full group); details and numbers in
 `feat/rsi-server-reclaim:docs/rsi/server/reclaim-eviction.md` and
-`feat/rsi-server-evict-tail:docs/rsi/server/evict-tail.md`.
+`feat/rsi-server-evict-tail:docs/rsi/server/evict-tail.md`. Current plan
+(r3, C(0.5) = 11536 blocks) at C/U 0.5: base server E_C 0.664-0.684,
+H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
++0.10 at 0.25 and +0.06 at 0.75; H5 costs 0.01-0.08 E_C at 0.25.
 
 - Reclaim drops a fixed `RECLAIM_BATCH_SIZE = 512` blocks per round. On a
   small pool one round frees about half of the cache (1019-block slice: 502
-  resident after cap_cold). Proposal H1 sizes rounds to `resident / 64`.
+  resident after cap_cold). Proposal H1: `clamp(resident / 64, 1, 512)`.
 - Pinned-region fragmentation: a layer-first save call takes one region per
   layer, freed only when the call's last block is evicted, so dead bytes
-  stay pinned (official cap: 400-900 blocks of 5873 lost; the main cause of
-  E_C ~0.1-0.25 before H3). Proposal H3: one region per saved block.
+  stay pinned. Large on the older 32-conv plan (C = 5873 blocks: residency
+  after cap_cold 5473 v2 / 4750 old, E_C 0.1-0.25 before H3), small on r3
+  (see the E_C line above). Proposal H3: one region per saved block.
 - H3's many small copies cost warm TTFT with per-range `cuMemcpyAsync`.
   Proposal H4: one `cuMemcpyBatchAsync` per transfer.
-- Eviction is plain LRU per (hash, group) key and not prefix-aware: heads
-  served from vLLM's local cache age out first and strand the tail for a
-  lookup from block 0 (stranded share of the miss: 13-21%). Proposal H5:
-  opt-in tail-first eviction in the retained class.
+- Eviction is plain LRU per (hash, group) key. On r3 most of the gap to
+  tail-first is fully evicted ranges (0.28 -> 0.23 of ext*_C), not
+  stranding (1.7% v2 / 2.5% old). Heads aging out mostly hits `old`, which
+  queries from its local hit and never refreshes them; v2 queries from
+  block 0. Proposal H5: opt-in tail-first eviction in the retained class.
 - Not group-coherent: a resume point needs every group, but each group key
   is evicted on its own (matters for hybrid models; not measured yet).
 
