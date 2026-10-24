@@ -486,10 +486,15 @@ the last accepted run record by hand until `--accepted` exists.
     only registers connector names (lazy imports). The other arms' children
     report no stats (probe, selftest, `connector_v2` today), or are vLLM
     builtins registered under their class names (native
-    `OffloadingConnector`, lmcache `LMCacheConnectorV1`). An arm under test
-    whose connector starts reporting stats hits the same lookup and fails
-    loudly (HTTP 500), never silently; it does not get the plugin.
-    `summary.vllm_plugins` records each arm's value.
+    `OffloadingConnector`, lmcache `LMCacheConnectorV1`). If the connector
+    under test starts reporting stats, it hits the same lookup and fails
+    loudly (HTTP 500 on every request), never silently. The fix is in that
+    connector: its own module registers its class under its class name when
+    it is imported (`KVConnectorFactory.register_connector(name, __name__,
+    name)`). vLLM imports that module in the API server by module path. The
+    arm under test never gets the plugin, which would run the venv's
+    `pegaflow` code in the arm's processes. `summary.vllm_plugins` records
+    each arm's value.
   - Independent signal. Completions are read by the gate *client-side*, from
     the `/v1/completions` HTTP response (`workloads.run_gsm8k`), and judged
     in the gate process. What the gate judges from and writes itself (pass

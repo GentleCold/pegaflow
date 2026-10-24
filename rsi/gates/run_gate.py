@@ -751,7 +751,15 @@ def vllm_plugins(arm: str) -> str:
     reports stats and only the pegaflow plugin registers its name, so
     without it every request of the old arm is an HTTP 500. The other arms'
     children report no stats (probe, selftest, the arm under test today) or
-    are vLLM builtins registered under their class name (native, lmcache)."""
+    are vLLM builtins registered under their class name (native, lmcache).
+
+    An arm under test whose connector starts reporting stats hits the same
+    500 (loud, never silent). The fix is in the connector, not here: its own
+    module registers its class under its class name at import
+    (``KVConnectorFactory.register_connector(cls_name, __name__, cls_name)``;
+    the module is imported in the API server by module path). Never enable
+    the plugin for the arm under test: it would run the venv's pegaflow code
+    in the arm's processes."""
     return PEGAFLOW_PLUGIN if arm_kind(arm) == "old" else ""
 
 
