@@ -1101,6 +1101,15 @@ From now on:
   waiting-queue signal. Neither has been tried.
 - The gate port race (vLLM `EADDRINUSE` on the gate's chosen port) is
   with the gate owner.
+- DSV2 G5 at C/U 0.25 / 0.75: v2 it6 is 0.092 / 0.025 below old on the
+  same server, with resident/C 0.06 to 0.15 below old's. The untested
+  candidate is one save entry per (group, request) in `plan_saves`. See
+  "G5 hit-rate judgment (final)".
+- No official run has been made on b5cf567 (it6). The official G0 to G4
+  evidence is MF1 (07f5d96) and MF2 (d56fcb2). it6 changes only how held
+  entries are concatenated, and its runs pass every correctness check they
+  evaluate (replay and cap digests, E_ext, excess, load errors). gsm8k
+  was not rerun.
 
 ## MF1: official run (`2026-10-24-dsv2-lite-p4-mf1`, GPU 0,1, TP2, 64gb, run_gate pgid 2454295, 05:40:44 to 08:09:39Z)
 
@@ -1262,12 +1271,14 @@ Judgment, after the coordinator's review of this section:
 - G5 on this server is not close enough. v2 is below H_lru and below
   native at every capacity (0.5: 0.765 vs 0.847 / 0.852; 0.25: 0.428 vs
   0.673 / 0.570). That is "差太多", too far off.
-- Cache-resident 0.6 to 0.77 C while the pool is 0.92 to 1.0 used is the
-  pool fragmentation the server's H3/H4 work fixed for Qwen3-4B. MF1 ran
-  the base server (sha256 d1970ead...), so the attribution is still open.
-- A cap-only run on the H4 server is pending. That run decides it: if v2
-  is still below native there, I look for a connector-side cause (the TP2
-  single-writer save, or the batch hold delaying saves past eviction).
+- Cache-resident 0.6 to 0.77 C while the pool is 0.92 to 1.0 used means
+  pinned bytes stranded in regions with evicted blocks.
+- Superseded: the server stays at base (user decision, 2026-10-24), and
+  the H4 run was cancelled. Points 2 and 3 above wrongly put the whole gap
+  on the server. The old supplement (old reaches H_lru on the same
+  server) and the batching A/B show that most of it is connector-side:
+  batched saves folded several steps into one entry per layer. The final
+  judgment is under "G5 hit-rate judgment (final)".
 
 ## MF2: official Qwen3-4B non-regression (`2026-10-24-qwen3-4b-p4-mf2`, GPU 0, TP1, 64gb, run_gate pgid 2605995, 08:12:35 to 10:29:34Z)
 
@@ -1359,6 +1370,42 @@ resident drop and the hit gap go away, batching costs G5 and the default
 has to change (for example, a byte cap well below 16 MiB, or batching
 off when the store is near full).
 
+## DSV2 old supplement (`2026-10-24-dsv2-lite-p4-old-supp`, GPU 0,1, TP2, 64gb, run_gate pgid 2749223, 10:33:40 to 12:01:04Z)
+
+Run setup:
+- Arms plain, baseline, old. Workloads gsm8k, replay, cap. The gate tree
+  `rsi/` is identical to 4fa78a0 (old-arm plugin fix).
+- Base server d1970ead.
+- Cap plan 76 x 12, the same as MF1. C(0.5) = 6.87 GB, 2.27x GPU KV.
+- Non-official only because there is no under-test arm, which is the
+  purpose of this run.
+
+Verdicts:
+- old passes every verdict: G0, G2 (gsm8k 10390 ext matched, cap 490342
+  matched with 6224 uncertain, 0 mismatched), G3 (E_ext 1.0, excess
+  1230 / 210), G4, and G5 loads/pool.
+- old's replay warm p50 is 0.388 s vs baseline 0.929. Cold p50 is 0.698
+  vs 0.909.
+
+| arm (run) | C/U | hit | H*_C | H_lru | E_C | resident/C |
+|---|---|---|---|---|---|---|
+| old (old-supp) | 0.25 | 0.531 | 0.853 | 0.667 | 0.192 | 0.85 to 0.94 |
+| v2 (MF1, 07f5d96) | 0.25 | 0.428 | 0.853 | 0.673 | 0.007 | 0.59 to 0.72 |
+| native (MF1) | 0.25 | 0.570 | 0.855 | 0.657 | 0.266 | |
+| old | 0.5 | 0.845 | 0.925 | 0.847 | 0.609 | 0.85 to 0.94 |
+| v2 (MF1) | 0.5 | 0.765 | 0.925 | 0.847 | 0.513 | 0.64 to 0.77 |
+| native (MF1) | 0.5 | 0.852 | 0.924 | 0.847 | 0.631 | |
+| old | 0.75 | 0.889 | 0.968 | 0.917 | 0.638 | 0.85 to 0.94 |
+| v2 (MF1) | 0.75 | 0.855 | 0.968 | 0.917 | 0.581 | 0.66 to 0.76 |
+| native (MF1) | 0.75 | 0.934 | 0.968 | 0.917 | 0.713 | |
+
+On the same base server and the same trace, old keeps 0.85 to 0.94 C
+resident and reaches H_lru at 0.5 (0.845 vs 0.847). v2 keeps 0.64 to
+0.77 C. Most of v2's shortfall against H_lru is therefore not a server
+ceiling. The server lets a connector reach H_lru at this capacity, and
+the difference is in what v2 sends. MF1's v2 ran with batching on
+(07f5d96; its connector_v2 is identical to d56fcb2, the Qwen A/B's arm A).
+
 ## Batching A/B for the G5 regression (Qwen3-4B, cap only, GPU 0, base server d1970ead, 64gb)
 
 Hypothesis: save batching (default on since 3e6f7a3) causes MF2's G5
@@ -1444,7 +1491,180 @@ counted each step's entries separately). The server's GPU copy is one
 batch task per call either way. Unit tests: `test_save_batching`,
 `test_kv_pressure_sends_held_saves` and
 `test_merged_save_rpc_stays_under_size_budget` now assert one entry per
-held step.
+held step. 213 tests pass (connector_v2 core + semantics bindings, on
+.44), ruff 0.14.0 check and format are clean. Commit 43a3759, tree
+b5cf567.
+
+### Qwen3-4B cap (`2026-10-24-qwen3-4b-p4-it6-cap-b5cf567`, GPU 0, 64gb, run_gate pgid 2935988, 14:08:44 to 14:55:26Z)
+
+Same setup as the A/B: gate ce645d7, base server d1970ead, arms
+baseline + v2, cap 64 x 12 auto. Under test b5cf567, verified. The run is
+non-official only because it is cap-only. Excess 0 and load errors 0 at
+every fraction. Save stats (tp0, 0.5): 4023 RPCs, 3944 of them pressure
+sends, failed 0.
+
+| tree | C/U | hit | H*_C | H_lru | E_C | resident/C (4 passes) | insertions (4 passes) | RPCs |
+|---|---|---|---|---|---|---|---|---|
+| A, merged per layer | 0.25 | 0.367 | 0.863 | 0.578 | 0.025 | 0.71 to 0.73 | 352361 | |
+| B, batching off | 0.25 | 0.405 | 0.862 | 0.583 | 0.100 | 0.79 to 0.96 | 321802 | |
+| it6 | 0.25 | 0.396 | 0.865 | 0.580 | 0.080 | 0.74 to 0.93 | 323799 | |
+| A | 0.5 | 0.794 | 0.930 | 0.857 | 0.596 | 0.68 to 0.72 | 122955 | 4076 |
+| B | 0.5 | 0.837 | 0.929 | 0.857 | 0.692 | 0.80 to 0.82 | 93731 | 5042 |
+| it6 | 0.5 | 0.843 | 0.930 | 0.857 | 0.688 | 0.77 to 0.83 | 93161 | 4023 |
+| r3, 8a05b7c | 0.5 | 0.842 | 0.929 | 0.857 | 0.684 | 0.76 to 0.83 | 93357 | |
+| A | 0.75 | 0.867 | 0.970 | 0.915 | 0.677 | 0.65 to 0.72 | 83772 | |
+| B | 0.75 | 0.879 | 0.971 | 0.916 | 0.689 | 0.74 to 0.81 | 79562 | |
+| it6 | 0.75 | 0.878 | 0.970 | 0.915 | 0.682 | 0.74 to 0.81 | 79286 | |
+
+Per pass at 0.5 (cold / warm / warm2 / warm3):
+- it6 hit 0.843 / 0.851 / 0.855 / 0.831, ext share 0.455 / 0.440 / 0.528
+  / 0.471.
+- B hit 0.842 / 0.857 / 0.854 / 0.820, ext 0.451 / 0.444 / 0.528 / 0.469.
+
+The hypothesis holds. With the same batching, about 4000 RPCs and 98%
+pressure sends as A, it6 is level with unbatched B and with 8a05b7c at
+every fraction. Resident/C, insertions and the per-pass external hit come
+back with it. The G5 regression came from the per-layer folding, not from
+holding or merging RPCs. The RPC count is A's, so the submission
+frequency that it4's cold gain rests on is unchanged. The DSV2 run below
+checks that directly.
+
+### DSV2 replay + cap (`2026-10-24-dsv2-lite-p4-it6-b5cf567`, GPU 0,1, TP2, 64gb, run_gate pgid 2972151, 14:57:45 to 16:16:58Z)
+
+Run setup:
+- Arms baseline, native, v2. Workloads replay (32 x 12) and cap.
+- Gate ce645d7, base server d1970ead, under test b5cf567 (verified).
+- Cap auto chose 74 x 12 this time (MF1: 76), so C(0.5) = 6.66 GB, 2.20x
+  GPU KV.
+- Non-official only because of the arms and workloads (no plain, no
+  gsm8k).
+
+Correctness: the v2 replay digests match 26200 with 0 mismatched, cap
+494906 matched (5458 uncertain), 0 mismatched. G3 replay E_ext is 1.0
+with excess 0, and there is no eviction. Every replay G4 verdict passes:
+
+| arm | replay cold p50 | vs baseline | cold req/s | warm2 / warm3 p50 | warm req/s |
+|---|---|---|---|---|---|
+| baseline | 0.909 | | 5.37 | 0.927 / 0.924 | 5.41 / 5.42 |
+| native | 0.541 | -40.5% | 8.75 | 0.281 / 0.295 | 13.14 / 13.03 |
+| v2 it6 | 0.621 | -31.6% | 8.59 | 0.302 / 0.306 | 12.28 / 12.55 |
+
+| arm (run, plan) | C/U | hit | H*_C | H_lru | E_C | local | resident/C |
+|---|---|---|---|---|---|---|---|
+| v2 it6 (74) | 0.25 | 0.439 | 0.854 | 0.652 | 0.038 | 0.389 | 0.79 to 0.88 |
+| native (74) | 0.25 | 0.557 | 0.857 | 0.642 | 0.257 | 0.411 | |
+| old (old-supp, 76) | 0.25 | 0.531 | 0.853 | 0.667 | 0.192 | 0.419 | 0.85 to 0.94 |
+| v2 MF1 (76) | 0.25 | 0.428 | 0.853 | 0.673 | 0.007 | 0.405 | 0.59 to 0.72 |
+| v2 it6 | 0.5 | 0.844 | 0.925 | 0.848 | 0.643 | 0.393 | 0.77 to 0.86 |
+| native | 0.5 | 0.851 | 0.925 | 0.849 | 0.655 | 0.411 | |
+| old | 0.5 | 0.845 | 0.925 | 0.847 | 0.609 | 0.425 | 0.85 to 0.94 |
+| v2 MF1 | 0.5 | 0.765 | 0.925 | 0.847 | 0.513 | 0.401 | 0.64 to 0.77 |
+| v2 it6 | 0.75 | 0.864 | 0.968 | 0.918 | 0.623 | 0.392 | 0.78 to 0.80 |
+| native | 0.75 | 0.934 | 0.968 | 0.918 | 0.734 | 0.433 | |
+| old | 0.75 | 0.889 | 0.968 | 0.917 | 0.638 | 0.428 | 0.85 to 0.94 |
+| v2 MF1 | 0.75 | 0.855 | 0.968 | 0.917 | 0.581 | 0.405 | 0.66 to 0.76 |
+
+Save stats (tp0, cap 0.5): 3651 RPCs, 3578 of them pressure sends, failed
+0. Server insertions per warm pass at 0.5: v2 it6 25.8k to 26.3k, old
+26.8k to 27.1k, v2 MF1 33.5k to 36.2k.
+
+At C/U 0.5, v2 goes from 0.765 to 0.844, level with old (0.845), H_lru
+(0.848) and native (0.851). Resident/C rises from 0.64 to 0.77 to 0.77
+to 0.86, and insertions fall to old's level. At 0.25 and 0.75 a gap
+remains (see the final judgment).
+
+### DSV2 cold check, unpressured (`2026-10-24-dsv2-lite-p4-it6-cold-b5cf567`, GPU 0,1, 64gb, run_gate pgid 3009442, 16:19:22 to 16:27:24Z)
+
+This uses the same 8 x 6 replay-only setting as it5-rep-01 (max KV usage
+about 28%, no pressure sends), where batching's cold gain was measured.
+Arms baseline + v2 b5cf567. Non-official (replay only, non-official
+replay size).
+
+| arm | cold p50 | vs baseline | cold req/s | warm2 / warm3 p50 | RPCs per pass (tp0) |
+|---|---|---|---|---|---|
+| baseline | 0.1880 | | 5.701 | 0.164 / 0.164 | |
+| v2 it6 | 0.1871 | -0.5% | 5.692 | 0.103 / 0.109 | 14 / 15 / 15 / 9 |
+| it5-rep-01 KD x3 (folded entries) | 0.1867 to 0.1916 | -1.9 to +0.6% | 5.666 to 5.679 | | 14 / 14 / 15 |
+| it5-rep-01 KOff (no batching) | 0.2000 | +5.0% | 5.581 | | 168 |
+
+All four replay G4 verdicts pass. Digests: 1382 matched, 0 mismatched.
+E_ext is 1.0, excess 0, no eviction. The RPC count and the cold result
+are the same as the folded-entry default, so it6 keeps the cold-TTFT
+gain.
+
+## G5 hit-rate judgment (final, base server d1970ead)
+
+The references are same-run native, old (the old supplement for DSV2,
+MF2 for Qwen3-4B) and H_lru, with H*_C as the ceiling.
+
+Qwen3-4B (it6 cap run, 64 x 12):
+
+| C/U | v2 it6 | old (MF2) | H_lru | H*_C | resident/C v2 / old |
+|---|---|---|---|---|---|
+| 0.25 | 0.396 | 0.392 | 0.580 | 0.865 | 0.74 to 0.93 / 0.82 to 0.91 |
+| 0.5 | 0.843 | 0.840 | 0.857 | 0.930 | 0.77 to 0.83 / 0.75 to 0.83 |
+| 0.75 | 0.878 | 0.879 | 0.915 | 0.970 | 0.74 to 0.81 / 0.71 to 0.85 |
+
+Qwen3-4B judgment: close enough.
+- v2 equals old at every fraction, is 0.014 below H_lru at 0.5, and is
+  level with its own 8a05b7c (0.842). The MF2 regression is gone.
+- The rest of the gap to H_lru is the shared base-server limit. Both
+  connectors keep only 0.71 to 0.93 C resident, against the LRU model's
+  1.0 C.
+- At 0.25 both are about 0.18 below H_lru, by the same amount. That is a
+  server attribution shared by both connectors: PROGRESS "Server
+  limitations" lists the fixed 512-block reclaim batch (H1) and
+  region fragmentation (H3) as largest on small pools. It is not
+  measured further here.
+
+DSV2 (it6 run, 74 x 12; old and MF1 at 76 x 12; H_lru differs by at most
+0.02 between the plans):
+
+| C/U | v2 it6 | native | old | H_lru | H*_C | resident/C v2 / old |
+|---|---|---|---|---|---|---|
+| 0.25 | 0.439 | 0.557 | 0.531 | 0.652 | 0.854 | 0.79 to 0.88 / 0.85 to 0.94 |
+| 0.5 | 0.844 | 0.851 | 0.845 | 0.848 | 0.925 | 0.77 to 0.86 / 0.85 to 0.94 |
+| 0.75 | 0.864 | 0.934 | 0.889 | 0.918 | 0.968 | 0.78 to 0.80 / 0.93 to 0.94 |
+
+DSV2 judgment: close enough at the gated point, 0.5.
+- v2 is level with native, old and H_lru (0.844 vs 0.851 / 0.845 /
+  0.848).
+- Every external hit is verified, and excess is 0.
+
+At 0.25 and 0.75 a gap remains, and here is what is known about it:
+- Server part. native has no PegaFlow server. It beats H_lru at 0.75
+  (0.934 vs 0.918), so its store is not plain LRU, and it is not a
+  base-server comparison.
+- Against old on the same server, v2 trails by 0.092 at 0.25 and 0.025
+  at 0.75. That is the residual connector part.
+- Its signature: v2 keeps 0.06 to 0.15 C less resident than old at equal
+  pool use (used/C 0.94 to 0.99).
+  - The local hit is lower too (0.389 to 0.393 vs old's 0.419 to 0.428),
+    which is about 0.03 of the 0.25 gap. vLLM-side prefix reuse differs
+    between the connectors, which is not a store effect.
+  - The rest is external hit. At 0.25, v2's E_C is 0.038 vs old's 0.192.
+    Per pass, ext is 0.03 to 0.07 vs 0.04 to 0.13.
+- Candidate mechanism, not tested: the same one as it6, one level down.
+  A step's save entry still mixes every request that saved in that step.
+  The base server frees such a region only when the last of those
+  requests' blocks is evicted. old's save shape is a black box, but its
+  resident/C shows it strands less.
+- The next lever would be one entry per (group, request) in
+  `Scheduler.plan_saves`. That is one more iteration and two more cap
+  runs. I have not done it. The user's guidance is not to chase hit
+  rate past "not too far off", and 0.5 is level.
+- With 0.25 at 0.09 below old, the reviewer decides whether that counts
+  as "差太多" (too far off).
+
+Server vs connector for MF1's DSV2 gap at 0.5 (v2 0.765 vs native
+0.852):
+- Connector, from the batching fold: +0.079. it6 at 0.844 is v2 itself
+  with only that change, and resident/C goes from 0.64-0.77 to 0.77-0.86.
+- Remaining to native: 0.007, within run-to-run noise. Remaining to
+  H_lru: 0.004.
+- So at 0.5 none of the MF1 gap is left for the server once v2 sends
+  per-step entries. Point 2 of the MF1 judgment (all of it is server
+  retention) was wrong.
 
 ## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
 

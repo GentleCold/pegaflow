@@ -141,7 +141,7 @@ names, magic constants that only exist in the old code).
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
-| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge |
+| P4 | onboard DeepSeek-V2-Lite-Chat | final review requested (`feat/rsi-deepseek-v2-lite`, TP2): official MF1 (DSV2, 07f5d96) and MF2 (Qwen3-4B nonreg, d56fcb2) pass G0-G4; it6 (43a3759) fixes the batching G5 regression; G5 at C/U 0.5 v2 0.844 vs old 0.845 / native 0.851 (DSV2), 0.843 vs old 0.840 (Qwen3-4B) |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
 
@@ -687,6 +687,25 @@ names, magic constants that only exist in the old code).
     the rsi-g5 merge.
   - Gate issue seen: a vLLM `--port` bind race (`EADDRINUSE`) killed one
     run_gate (`qwen3-4b-p4-it4-qrep`).
+- P4 official runs and G5 (2026-10-24, connector-only, base server
+  d1970ead; record `models/DeepSeek-V2-Lite-Chat/ITERATIONS.md`):
+  - MF1 `2026-10-24-dsv2-lite-p4-mf1` (07f5d96) and MF2
+    `2026-10-24-qwen3-4b-p4-mf2` (d56fcb2) are official and pass G0-G4.
+    MF2 is no regression vs it2d. The DSV2 old supplement
+    (`...-dsv2-lite-p4-old-supp`) has old passing everything.
+  - G5 regressed with batching (Qwen3-4B 0.5: 0.777 vs 0.842 at 8a05b7c).
+    A/B (`...-ab-a-d56fcb2` / `...-ab-b-706006c`): batching off restores
+    it.
+  - Cause: `_release_held` folded every held step into one save entry
+    per layer. The base server pins one region per entry until its last
+    block is evicted (see "Server limitations").
+  - it6 (43a3759) keeps one entry per held step. Same RPC count, DSV2
+    8 x 6 cold p50 -0.5% vs baseline.
+  - G5 at C/U 0.5 after it6:
+    - Qwen3-4B 0.843 (old 0.840, H_lru 0.857).
+    - DSV2 0.844 (old 0.845, native 0.851, H_lru 0.848).
+  - DSV2 still trails old by 0.09 at 0.25 and 0.025 at 0.75. This is
+    open and listed in the review request.
 - P3 it2e non-regression (fc06c9b):
   - Slice `2026-10-23-qwen3-4b-p3-it2e-slice`: all correctness and replay
     verdicts pass. gsm8k cold failed at +9.9%. A 10 s zero-throughput stall
