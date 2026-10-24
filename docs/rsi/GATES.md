@@ -222,11 +222,12 @@ output, they do not edit it.
 | `digest_compare.py` | G2.1 byte comparison of digested blocks |
 | `oracle.py` | G3 `H*` replay through `semantics.resolve`; G5 `U`, `H*_C` (clairvoyant) and `H_lru` capacity simulation |
 | `test_oracle_capacity.py` | G5 oracle and gate contract on synthetic traces, no GPU (command below) |
+| `test_probe_steps.py` | probe and self-test connector step logic on synthetic scheduler outputs (CPU; imports vllm, torch) |
 | `workloads.py` | gsm8k, multi-turn replay, Prometheus scrape |
 | `run_gate.py` | orchestrator: arms x workloads, cold/warm passes, verdicts |
 | `provenance.py` | tree verification, under-test snapshot, static scan + allowlist |
 | `isolate.py` | runs the arm under test with the runs root hidden (mount namespace) |
-| `selftest/connector.py` | gate self-test connector: `honest` / `liar` / `bitflip` / `offbyone` |
+| `selftest/connector.py` | gate self-test connector: `honest` / `liar` / `bitflip` / `offbyone` / `sync` |
 
 Tests. They need `pytest`, `requests` and a built `pegaflow.semantics` (the
 native module), so they run in a venv where `python/` is built. Everything
@@ -240,8 +241,10 @@ cd .. && PYTHONPATH=. python/.venv/bin/python -m pytest -q -p no:cacheprovider r
 ```
 
 The full suite is the gate's test run, signal and teardown tests (real
-subprocesses) included: 164 tests in about 45 s on the 4090 host. Nothing is
-deselected. The isolation tests (`isolate.py`) need Linux and root and skip
+subprocesses) included: 282 tests in about 52 s on the 4090 host. Nothing is
+deselected. PR CI does not run them (it runs `python/tests` only); they are
+a manual gate for every change under `rsi/gates` until CI does (PROGRESS,
+user acceptance item). The isolation tests (`isolate.py`) need Linux and root and skip
 elsewhere. The shared venv on the GPU hosts already has the built
 `pegaflow`, so there only the last line is needed.
 
@@ -265,7 +268,8 @@ LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 ```
 
 Self-test at onboarding (gsm8k, 128 questions per self-test arm, no PegaFlow;
-add `preempt` to judge loads after preemption, required on hybrid models):
+add `preempt` to judge loads after preemption; on models with a Mamba state
+group the honest arm fails without it, and add `selftest:sync`):
 
 ```bash
 ... run_gate --model ... --tag <model>-selftest \
@@ -280,7 +284,13 @@ shots, 32 x 12 replay, 3 replay passes, pinned scheduler flags), the arms
 (`gsm8k`, `replay`, `cap`; cap `auto` x 12 at fractions 0.25,0.5,0.75), the G5
 capacity floor (`C(0.5) >= 2 x` GPU KV bytes), no
 `--num-gpu-blocks`/`--vllm-arg` override, and committed
-`docs/rsi/models/<model>/{gate.json,spec.json}`. A run is also not official
+`docs/rsi/models/<model>/{gate.json,spec.json}`. On a model with a Mamba
+state group (committed spec) `preempt` is a required workload too: gsm8k
+loads a single prefix there (below), and `preempt` is the only official
+stage that judges every resumed episode's state load. Loads of many state
+keys are judged by cap (exhaustive) and replay (sampled); neither has run on
+Qwen3.5-4B yet, not even baseline: that coverage comes with the P5 it2
+official run. A run is also not official
 when it is contaminated: any arm's G4-timed replay pass (`cold`, `warm2..`)
 has p99 TTFT `> 10x` the in-run baseline's p99 for the same pass, or the
 baseline's p99 is `> 10x` the median of the arms' p99 for that pass (a
@@ -595,15 +605,22 @@ the last accepted run record by hand until `--accepted` exists.
   tagged from that episode instead:
   - Mamba state groups in `mamba_cache_mode=align` (spec.json
     `probe.state_groups`): vLLM frees a block-end state once compute moves
-    past it, so none is left at finish. The probe digests a state in
-    `wait_for_save` of the step that holds it: the states vLLM offers
-    (`kv_connector_block_state.boundary_state_offloads`, for requests that
-    step computes, boundary above the episode start) and each episode's
-    start state (block `start / block_size - 1`: the local hit or what a
-    connector loaded). `requests.jsonl` `states` lists `[episode, covered,
+    past it, so none is left at finish. The probe digests a state in the
+    step that holds it. Offers (`kv_connector_block_state.boundary_state_offloads`,
+    for requests that step computes, boundary above the episode start) are
+    digested in `wait_for_save`, after the forward wrote them. Each
+    episode's start state (block `start / block_size - 1`: the local hit or
+    what a connector loaded) is digested in `handle_preemptions`, which
+    vLLM 0.32 calls every step before `_update_states`, `preprocess_mamba`
+    (whose align precopy copies exactly that block into the running state
+    the forward reads) and a synchronous `start_load_kv`. So the digest is
+    of the bytes the forward computes from: a load landing after the
+    precopy (sync, or an async one reported done before its copy landed)
+    is `mismatched`. `requests.jsonl` `states` lists `[episode, covered,
     group, what]`; `what` other than `offer` / `start` is a skip
-    (`not_offered`: a step ended on a boundary vLLM did not offer, e.g.
-    past the prompt; `start_*`: a start state not digestable). A state
+    (`not_offered`: a step ended on a boundary vLLM offered neither in
+    that step nor in the next one, e.g. past the prompt; `start_*`: a
+    start state not digestable). A state
     exists only where a step ended exactly on the boundary, so the
     reference counts only those computations (`digest_compare`).
     `state_skipped` reports the skips; any `start_*` fails the digest
@@ -633,6 +650,20 @@ the last accepted run record by hand until `--accepted` exists.
   without the block dim, stride, dtype) equal the baseline's, and the
   baseline's equals the committed `spec.json`. Volatile fields (`num_blocks`,
   tensor `size`, `layer_stride`, model path, `max_model_len`) are excluded.
+  The dump includes the effective `compilation` config (mode, backend,
+  `inductor_compile_config`, `cudagraph_mode`; the gsm8k stage's), so a
+  compile override is caught here as well as by `G0.vllm_args`, whose
+  parser reads every spelling vLLM accepts (`--flag=value`, `_` for `-`,
+  abbreviations, `-cc`, dotted keys).
+- Record vs gate rev (S1): a run record is judged by the gate rev it ran
+  under. When an offline re-judge with a later rev meets a check whose
+  inputs the record lacks because the gate did not produce them yet, the
+  check is `{"pass": true, "na": "record predates this check"}` (with
+  `would_be`), never a retroactive fail: `G0.vllm_args` (no stage has a
+  `vllm_cmd`), `G2.batch_control` (plain gsm8k ran without an `alone`
+  pass), the committed `compilation` block in `G0.spec` (dump without one)
+  and the self-test sabotage count. A record that has them is judged in
+  full.
 - G2 controls (baseline arm): `plain_equals_baseline` (gsm8k cold completions
   identical: the probe changes nothing), `warm_equals_cold` (under invariance:
   reset + poison change nothing), `digest_self.gsm8k` (no local mismatch).
@@ -656,8 +687,8 @@ the last accepted run record by hand until `--accepted` exists.
   `probe.digest_skipped_groups`. The probe lists a `MambaSpec` group there
   outside `mamba_cache_mode=align` (a state block is the running state) or
   with speculative blocks; align-mode state groups are digested per step.
-- G2.preempt (when `--workloads` includes `preempt`; not part of the
-  official profile): the first 32 gsm8k prompts, each decoding exactly 640
+- G2.preempt (when `--workloads` includes `preempt`; part of the official
+  profile on state-group models only): the first 32 gsm8k prompts, each decoding exactly 640
   tokens (`ignore_eos`, no stop), cold then warm, on a GPU pool of
   `preempt_gpu_blocks` blocks (4 requests of 2048 tokens, at least one
   `max_model_len` request; `max_num_seqs` capped at the block count, which
@@ -666,11 +697,24 @@ the last accepted run record by hand until `--accepted` exists.
   Passes iff the exhaustive digest verdict passes (as `G2.digest_self.cap`,
   judged >= 0.9 for an arm), vLLM preempted some request
   (`preempted_requests > 0`), and some load of a resumed episode was
-  compared (`after_preemption`). Required for the honest self-test when run;
-  a negative arm is judged by the gsm8k digest checks. On Qwen3.5-4B (40
+  compared (`after_preemption`). Required for the honest self-test when run
+  and, on state-group models, always (missing = fail); a negative arm is
+  judged by the gsm8k digest checks. On Qwen3.5-4B (40
   blocks) the baseline preempts 16 of 64 requests and judges 62 resumed
   loads, 0 mismatched.
-- G2.gsm8k: `|acc(pass) - acc(baseline cold)| <= 0.01` for cold and warm.
+- G2.gsm8k: accuracy within 0.01 of the baseline at the same batch
+  composition, for every arm, the honest self-test included. Batch
+  invariant: `|acc(pass) - acc(baseline cold)| <= 0.01` for cold and warm.
+  `batch_invariant=false`: batched accuracy moves with load timing (honest
+  warm vs baseline cold on Qwen3.5-4B, n=128: -1.56 / -0.78 / +0.78 pp in
+  three runs), so the gated pass is `alone_ref` (the first 64 prompts one
+  at a time, after reset + poison) vs baseline `alone_ref`, and the batched
+  deltas are reported (`batched_delta_pp`). One request at a time is the
+  composition every arm shares, so an honest arm loads at the baseline's
+  split and computes the same numbers (baseline and plain `alone_ref`
+  agree in every logprob); the tolerance stays 0.01 and is no longer
+  inside batch noise. `alone_ref_differ` (completions vs baseline
+  `alone_ref`) is reported.
   G2.gsm8k_outputs (when gate.json declares batch invariance; otherwise
   reported only, see `G2.batch_control`): every completion equals
   baseline cold, cold and warm; with `split_invariant=false`: every cold
@@ -748,23 +792,38 @@ the last accepted run record by hand until `--accepted` exists.
   `same_start` reports pairs whose two passes started at the same point
   (no split compared there); on Qwen3.5-4B gsm8k every prompt's last full
   block is the shared prefix (1056), so the split claim rests on the P5
-  control and is not exercised by this workload. G2.gsm8k (accuracy within 0.01) gates, and every digest check
+  control and is not exercised by this workload. `G2.split_control`
+  reports `vacuous` (and `measured_invariant: null`) when `same_start >=
+  0.9 n` with no divergence; the verdict is unchanged (it can only fail a
+  right load, never pass a wrong one). G2.gsm8k (accuracy within 0.01) gates, and every digest check
   stays byte-exact and hard: gsm8k digests every computation, so the
   reference is exhaustive (`digest_compare`) and a loaded block or state
   that equals no computed copy is `mismatched`.
+- Compile cache (S5): every arm has its own `VLLM_CACHE_ROOT`,
+  `<run>/.compile-cache/<label>` (torch compile artifacts and the Inductor
+  cache vLLM keeps under it; `TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`
+  and `FLASHINFER_WORKSPACE_BASE` point inside it too), emptied before
+  the arm's first stage and shared by its later stages. The isolated arm
+  under test gets only its own bound rw. So no arm loads an artifact another
+  arm or an earlier run wrote, and a tampered artifact can only change its
+  own arm's numbers, which the baseline comparisons judge. Each arm
+  compiles once per config (gsm8k and the others differ), a few minutes per
+  arm.
 - Compile determinism (`gsm8k_vllm_args`). vLLM 0.32 compiles the model
-  once per config hash (`~/.cache/vllm/torch_compile_cache/<hash>`, reused
-  by later runs). `VllmConfig.compute_hash` appends
+  once per config hash (`<cache root>/torch_compile_cache/<hash>`; before
+  S5 the global `~/.cache/vllm`, reused by later runs). `VllmConfig.compute_hash` appends
   `kv_transfer_config.compute_hash()` iff a connector is configured, and
   that hash has no factors, so every connector arm (baseline, selftest,
   the arm under test) shares one compile and plain has another (`old` a
   third: its `VLLM_PLUGINS` differ). Inductor picks some kernel configs by
   benchmarking at compile time, so two compiles of one config need not
   match. On Qwen3.5-4B they do not: concurrency 1, greedy, first sampled
-  token of gsm8k prompt 0, `-0.388626` vs `-0.390268` between two fresh
-  compiles of the plain config, and the numbers follow the artifact
+  token of gsm8k prompt 0, the plain artifact compiled earlier into the
+  global cache gives `-0.388626` and the plain config compiled fresh twice
+  gives `-0.390268` both times, and the numbers follow the artifact
   (loading the other compile's cache swaps them; GPU5 probe 2026-10-24,
-  `~/kexi/tmp/rsi-gate-hybrid-test/numerics`). In selftest run
+  `~/kexi/tmp/rsi-gate-hybrid-test/numerics`). So it is nondeterminism
+  across compile times, not within one. In selftest run
   `qwen3.5-4b-selftest-aa42a44` plain and baseline therefore differed from
   the first token in all 64 `alone_ref` requests (12 completions), which
   failed `G2.plain_equals_baseline` and `G2.split_control`. The two
@@ -972,11 +1031,22 @@ the last accepted run record by hand until `--accepted` exists.
   and align-mode Mamba state groups): `honest` saves full blocks at finish and
   states when vLLM offers them (in `wait_for_save` of that step), and serves
   the longest prefix whose full blocks and states (every state group) are
-  saved (must pass every G2 check); `liar` claims every complete unit and
+  saved (must pass G0 and every G2 check, `G2.gsm8k` and, on state-group
+  models, `G2.preempt` included); `liar` claims every complete unit and
   loads nothing; `bitflip` flips one byte of the first loaded block (state
   groups: an exponent bit of the first packed state); `offbyone` loads block
-  i+1 into slot i (state groups: another saved state). On state-group models
-  every load is async: vLLM's align-mode precopy runs before a synchronous
-  `start_load_kv` and would overwrite the loaded state.
-  Each negative arm must fail both G2 digest checks; output deltas are reported
-  only (one flipped byte need not change a greedy completion).
+  i+1 into slot i (state groups: the same prefix's state of the next state
+  group, same shapes, other layers: it does not depend on another saved
+  prefix, which gsm8k on Qwen3.5-4B never has). On state-group models
+  every load is async except `sync`'s: vLLM's align-mode precopy runs before
+  a synchronous `start_load_kv`, so `sync` (honest bytes, synchronous
+  loads) computes from a stale state and corrupts the state groups only.
+  The connector reports what it corrupted per group
+  (`<stage>/selftest/sabotage-*.jsonl`, `result.sabotage`). A negative arm
+  passes (is caught) only if G0 passes and `G2.caught_per_group` passes:
+  every group it corrupts (all transferred groups; `sync`: the state
+  groups), each judged on its own, has a load that equals no reference
+  (mismatched or unreferenced) in both `G2.digest_self.gsm8k` and
+  `G2.digest_vs_baseline.gsm8k`, and a nonzero sabotage count there.
+  Preempt per-group counts are reported. Output deltas are reported only
+  (one flipped byte need not change a greedy completion).

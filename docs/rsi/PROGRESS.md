@@ -815,6 +815,21 @@ names, magic constants that only exist in the old code).
   numbers unchanged (147/147) and overall passes unchanged. The only flag
   change is M4's `G0.spec` fix.
 
+### 2026-10-25
+
+- Hybrid gate review (`reviews/hybrid-gate.md`, ACCEPT-WITH-FIXES at
+  8789dde) fixes on feat/rsi-gate-hybrid; resolution in the review file's
+  response section:
+  - M1: start states digested in `handle_preemptions`, before the Mamba
+    precopy and any sync load; new `selftest:sync` arm.
+  - M2: negative arms judged per group (`G2.caught_per_group`), real
+    offbyone state sabotage, sabotage counts.
+  - S1: records judged by the gate rev they ran under (`na: record
+    predates`). S2: `G2.gsm8k` gated on `alone_ref` without batch
+    invariance, honest arm included. S3: `preempt` official on
+    state-group models. S4: flag parser spellings, compile config in the
+    spec dump. S5: per-arm compile cache. S6: tests (282).
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
@@ -858,6 +873,14 @@ Each entry: what was added, why, which vectors cover it.
   save-path cost (first save, gRPC setup) now lands outside
   `G4.replay_cold` and `G4.gsm8k_cold`. It is reported per arm vs baseline
   as `G4.warmup_seconds` (not gated). Needs the user's confirmation.
+- For final acceptance: add rsi/gates tests to CI. PR CI runs
+  `python/tests` only (`ci.yml`), so the 282 gate tests
+  (`rsi/gates/test_oracle_capacity.py`, `test_probe_steps.py`) are a manual
+  gate today: whoever changes `rsi/gates` runs them (GATES.md
+  "Implementation"). They need the built `pegaflow.semantics`, and
+  `test_probe_steps.py` needs vllm + torch (CPU), so the CI job needs the
+  native build. Workflows are not edited by agents; needs the user's
+  decision.
 - Capacity-blind gates (raised 2026-10-23, user asked how the loop would
   find "manage SWA and full blocks separately" for DeepSeek-V4.1-Flash):
   every gate runs with an unlimited pool (`G3.no_eviction`), and write
