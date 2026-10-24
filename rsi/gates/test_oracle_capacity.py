@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -283,6 +284,50 @@ def test_capacity_record_without_a_field_fails_not_crashes(drop):
     v = run_gate._capacity_verdict(r, pegaflow=True, gated=True)
     assert v["pass"] is False and v["reason"].startswith("cannot evaluate: missing "), v
     assert drop in v["reason"]
+
+
+def _g3_result(e: float | None, oracle_rate: float, excess: int, errors: int) -> dict:
+    warm = {"efficiency": e, "oracle_hit_rate": oracle_rate, "excess_tokens": excess,
+            "excess_limit": 16, "external_hit_rate": 0.5, "hit_rate": 0.6,
+            "local_hit_tokens": 10, "prompt_tokens": 100}  # fmt: skip
+    return {"hit": {"warm": warm}, "load_errors": [{}] * errors}
+
+
+@pytest.mark.parametrize(
+    "e,oracle_rate,excess,errors,ok,below",
+    [
+        (1.0, 0.99, 0, 0, True, []),
+        (0.5, 0.99, 0, 0, True, ["efficiency"]),  # low E_ext: reported, not gated
+        (None, 0.2, 0, 0, True, ["efficiency", "oracle_hit_rate"]),
+        (1.0, 0.99, 17, 0, False, []),  # excess beyond one block per request
+        (1.0, 0.99, 0, 1, False, []),  # load errors
+    ],
+    ids=["at-bar", "low-e", "no-e-low-oracle", "excess", "load-errors"],
+)
+def test_g3_hit_level_is_reported_correctness_is_gated(e, oracle_rate, excess, errors, ok, below):
+    """User, 2026-10-24: no hard hit-rate threshold. E_ext and the oracle hit
+    rate are reported with their reference; excess and load errors still fail."""
+    v = run_gate._hit_verdict(_g3_result(e, oracle_rate, excess, errors), "replay")
+    assert v["pass"] is ok
+    assert [k for k, x in v["reported"].items() if x["below"]] == below
+    assert v["efficiency"] == e and v["oracle_hit_rate"] == oracle_rate
+
+
+def test_g5_low_e_c_is_reported_not_gated():
+    """A capacity record whose E_C is far below 0.9 passes G5 on correctness
+    and validity; the number and its reference stay in the verdict and in the
+    run's hit report."""
+    r = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    r["capacity"]["warm_timed"]["efficiency_c"] = 0.3
+    v = run_gate._capacity_verdict(r, pegaflow=True, gated=True)
+    assert v["pass"] and v["efficiency_c"] == 0.3
+    assert v["reported"]["efficiency_c"] == {"value": 0.3, "reference": 0.9, "below": True}
+    r["load_errors"] = [{}]
+    assert not run_gate._capacity_verdict(r, pegaflow=True, gated=True)["pass"]
+    rep = run_gate.hit_report({"baseline": {}, "X": {"G5.replay_warm": v}})
+    assert rep["X"]["status"] == "reported"
+    assert rep["X"]["G5.replay_warm"]["efficiency_c"] == 0.3
+    assert rep["X"]["G5.replay_warm"]["below_reference"] == ["efficiency_c"]
 
 
 def test_verdicts_reference_arms_not_required_and_errors_isolated(tmp_path):
@@ -1369,6 +1414,50 @@ def test_connector_under_test_is_wired_to_the_probe(tmp_path):
     cfg = run_gate.kv_transfer_config(f"{mod}:PegaKVConnectorV2", tmp_path, "tagged")
     probe_cfg = cfg["kv_connector_extra_config"]["connectors"][1]
     assert probe_cfg["kv_connector_extra_config"]["connector_modules"] == [mod]
+
+
+@pytest.mark.parametrize(
+    "arm,plugins",
+    [
+        ("old", run_gate.PEGAFLOW_PLUGIN),
+        ("plain", ""),
+        ("baseline", ""),
+        ("native", ""),
+        ("lmcache", ""),
+        ("selftest:honest", ""),
+        ("pegaflow.connector_v2:PegaKVConnectorV2", ""),
+    ],
+)
+def test_only_the_old_arm_loads_the_pegaflow_plugin(tmp_path, monkeypatch, arm, plugins):
+    """vLLM's API server looks MultiConnector children up by registered
+    name to rebuild their stats; ``PegaKVConnector`` is registered only by
+    the pegaflow plugin. Every other arm runs with no plugin (M7d)."""
+    # The name is the venv package's entry point (python/pyproject.toml).
+    eps = (
+        (run_gate.REPO / "python/pyproject.toml")
+        .read_text()
+        .split('[project.entry-points."vllm.general_plugins"]\n', 1)[1]
+    )
+    assert eps.startswith(f'{run_gate.PEGAFLOW_PLUGIN} = "pegaflow.vllm_plugin:register"')
+    seen: dict[str, str] = {}
+
+    class _Lease:
+        ports, block = [20001], [20010]
+
+    def launched(cmd, env, log, url, timeout, lease):
+        seen["plugins"] = env["VLLM_PLUGINS"]
+        return None
+
+    monkeypatch.setattr(run_gate, "PortLease", lambda *a, **kw: _Lease())
+    monkeypatch.setattr(run_gate, "launched", launched)
+    monkeypatch.setattr(run_gate, "isolated", lambda args, arm, log, cmd: cmd)
+    args = SimpleNamespace(
+        gpu="0", model="m", tp=1, max_model_len=8, max_num_batched_tokens=8, max_num_seqs=1,
+        gpu_mem=0.5, vllm_arg=[], num_gpu_blocks=0, under_test_path="",
+        lmcache_overlay=str(tmp_path),
+    )  # fmt: skip
+    run_gate.vllm_server(args, {}, arm, tmp_path / "probe", False, None, tmp_path / "log", 1 << 30)
+    assert seen["plugins"] == plugins == run_gate.vllm_plugins(arm)
 
 
 def test_module_files_must_resolve_under_gate_and_venv(tmp_path):

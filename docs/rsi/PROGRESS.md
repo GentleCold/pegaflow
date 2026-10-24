@@ -59,6 +59,21 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
   (local / external / total hit, oracle H*, E_ext, and at capacity H*_C, H_lru,
   E_C), not only the perf numbers.
 
+### Gate changes
+
+- 2026-10-24, user (human gate owner): "命中率那块，不要设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多".
+  Hit-rate levels are reported, not gated: G3 `E_ext >= 0.95` and
+  `oracle_hit_rate >= 0.5`, G5 `E_C >= 0.9`, the G2 "> 0.9 of oracle" item
+  and the no-`H`/`E_C`-regression clauses. Every number is still computed
+  (`reported` per verdict, `summary.hit_report`). Correctness and run
+  validity stay hard and unchanged. The onboarding agent writes a hit-rate
+  judgment in ITERATIONS.md; the review agent checks it (GATES.md "Hit
+  rate"). Branch `fix/rsi-gate-old-plugin`.
+- 2026-10-24: the `old` reference arm runs with `VLLM_PLUGINS=pegaflow` (vLLM
+  0.32 looks MultiConnector children up by registered name to rebuild stats;
+  P4 MF1 got HTTP 500 on every old-arm request). Every other arm keeps `""`.
+  Branch `fix/rsi-gate-old-plugin` 81e8f87.
+
 ## Isolation (no reference to existing implementation)
 
 Forbidden for onboarding agents (read or grep):
@@ -96,7 +111,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 fails, E_C 0.684 at LRU level (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"); server work in `feat/rsi-server-reclaim` / `feat/rsi-server-evict-tail` |
+| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), 0.76 with the H5 server build; hit-rate judgment pending; server work in `feat/rsi-server-reclaim` / `feat/rsi-server-evict-tail` |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
