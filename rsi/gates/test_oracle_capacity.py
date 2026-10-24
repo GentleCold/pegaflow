@@ -479,7 +479,7 @@ def test_unique_estimate_counts_shared_prefix_once():
 def test_official_cap_fractions_compare_as_sets(tmp_path, given, ok):
     import argparse
 
-    args = argparse.Namespace(**(run_gate.OFFICIAL | {"cap_fractions": given, "num_gpu_blocks": 0, "vllm_arg": []}))  # fmt: skip
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"cap_fractions": given, "num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python"}))  # fmt: skip
     probs = run_gate.official_problems(args, ["plain", "baseline", "m:C"], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
     assert any(p.startswith("cap_fractions") for p in probs) is not ok
 
@@ -929,6 +929,57 @@ def test_static_scan_flags_instrument_access(tmp_path, body, hit):
     (pkg / "conn.py").write_text("x = 1\n")
     (pkg / "pegaflow.so").write_bytes(b"\x7fELF\x00\x01rsi_poison\x00")
     assert [h["id"] for h in provenance.scan(pkg)] == ["pegaflow/pegaflow.so:strings:rsi_poison"]
+
+
+def test_official_needs_under_test_path(tmp_path):
+    """An arm under test without ``--under-test-path`` imports the venv's
+    pegaflow (no snapshot, no verification): never official."""
+    import argparse
+
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": ""}))  # fmt: skip
+    probs = run_gate.official_problems(args, ["plain", "baseline", "m:C"], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
+    assert any(p.startswith("--under-test-path missing") for p in probs), probs
+
+
+@pytest.mark.parametrize(
+    "recorded,ok",
+    [("snap", True), (None, False), ("venv", False)],
+    ids=["from-snapshot", "not-recorded", "from-elsewhere"],
+)
+def test_connector_module_must_come_from_the_snapshot(tmp_path, recorded, ok):
+    """Import-tree provenance: the probe records ``__file__`` of the arm's
+    connector module; it must lie in the arm's snapshot (the gate tree for
+    ``rsi.*`` self-tests)."""
+    import json
+    import sys
+
+    from rsi.gates import provenance
+
+    snap = tmp_path / "ov" / "pegaflow"
+    purelib = provenance.venv_purelib()
+    files = {
+        "rsi.gates.rsi_probe": str(run_gate.REPO / "rsi/gates/rsi_probe.py"),
+        "worker_extension": str(run_gate.REPO / "rsi/gates/rsi_probe.py"),
+        "vllm": str(purelib / "vllm/__init__.py"),
+        "torch": str(purelib / "torch/__init__.py"),
+        "pegaflow": str(snap / "__init__.py"),
+        "prefix": sys.prefix,
+    }
+    mod = "pegaflow.connector_v2"
+    if recorded:
+        where = snap if recorded == "snap" else tmp_path / "venv" / "pegaflow"
+        files[f"connector:{mod}"] = str(where / "connector_v2" / "__init__.py")
+    probe = tmp_path / "ut" / "gsm8k" / "probe"
+    probe.mkdir(parents=True)
+    (probe / "spec.json").write_text(json.dumps({"modules": files}))
+    assert run_gate.expected_connector(f"{mod}:PegaKVConnectorV2") == mod
+    assert run_gate.expected_connector("selftest:honest") == "rsi.gates.selftest.connector"
+    assert run_gate.expected_connector("native") is None
+    v = run_gate.g0_provenance(tmp_path, "ut", snap.resolve(), mod)
+    assert v["pass"] is ok, v
+    cfg = run_gate.kv_transfer_config(f"{mod}:PegaKVConnectorV2", probe, "tagged")
+    probe_cfg = cfg["kv_connector_extra_config"]["connectors"][1]
+    assert probe_cfg["kv_connector_extra_config"]["connector_modules"] == [mod]
 
 
 def test_module_files_must_resolve_under_gate_and_venv(tmp_path):

@@ -322,7 +322,12 @@ the last accepted run record by hand until `--accepted` exists.
   and the interpreter prefix; probe and extension must resolve under the gate
   tree, vLLM / torch / prefix to the shared venv, and `pegaflow` to the arm's
   expected dir (the snapshot for the arm under test, the venv's
-  otherwise).
+  otherwise). The probe also records `__file__` of the arm's connector
+  module (`connector:<module>`, named by the gate in the probe's
+  `connector_modules`): for the arm under test it must lie in the snapshot,
+  for self-tests in the gate tree, for `old` in the venv `pegaflow`. An
+  official run needs `--under-test-path`; without it the arm under test
+  imports the venv's tree, which nothing snapshots.
   The connector under test runs as `MultiConnector[under_test, RsiProbe]` with
   `kv_load_failure_policy=recompute`, reads its server port from
   `PEGAFLOW_PORT`, and gets an empty `kv_connector_extra_config`. The probe

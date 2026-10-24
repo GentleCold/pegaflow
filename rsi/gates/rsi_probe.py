@@ -60,11 +60,14 @@ _CHUNK_BYTES = 64 << 20  # bound on the uint8 chunk; int64 temporaries are 8x th
 _MASK = 2**64 - 1
 
 
-def module_files() -> dict[str, Any]:
+def module_files(connector_modules: list[str] = ()) -> dict[str, Any]:
     """Files this process resolved its instrument and runtime from (G0
     provenance): the probe, the worker extension, vLLM, torch, ``pegaflow``
     (imported, or where it would resolve) and its native extension if
-    loaded, ``site/usercustomize`` if loaded, and the interpreter prefix."""
+    loaded, ``site/usercustomize`` if loaded, the interpreter prefix, and
+    ``connector:<module>`` for each module the gate names in
+    ``connector_modules`` (the arm's connector, stacked before the probe in
+    ``MultiConnector``, so already imported)."""
     import importlib.util
     import sys
 
@@ -86,6 +89,8 @@ def module_files() -> dict[str, Any]:
     for name in ("pegaflow.pegaflow", "sitecustomize", "usercustomize"):
         if file_of(name):
             out[name] = file_of(name)
+    for name in connector_modules:
+        out[f"connector:{name}"] = file_of(name)
     return out
 
 
@@ -233,6 +238,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             raise ValueError(f"RsiProbe digest must be off|all|tagged, got {self._digest!r}")
         self._groups = kv_cache_config.kv_cache_groups
         self._skip_groups = self._undigestable_groups(vllm_config)
+        self._connector_modules = [str(m) for m in extra.get("connector_modules", [])]
 
         if role == KVConnectorRole.SCHEDULER:
             self._live: dict[str, _Live] = {}
@@ -328,7 +334,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 "tensors": tensors,
             },
             "probe": {"digest_skipped_groups": {str(k): v for k, v in self._skip_groups.items()}},
-            "modules": module_files(),
+            "modules": module_files(self._connector_modules),
         }
         (self._dir / "spec.json").write_text(json.dumps(dump, indent=1, sort_keys=True))
 
@@ -372,7 +378,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             "device": str(first.device) if first is not None else None,
             "raw_bytes": self._raw.numel() if self._raw is not None else 0,
             "layers": layers,
-            "modules": module_files(),
+            "modules": module_files(self._connector_modules),
         }
         (self._dir / f"spec-{self._rank}.json").write_text(
             json.dumps(out, indent=1, sort_keys=True)

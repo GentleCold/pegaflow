@@ -57,7 +57,7 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _under(path: str | None, root: Path) -> bool:
+def under(path: str | None, root: Path) -> bool:
     if not path:
         return False
     p = Path(path).resolve()
@@ -81,23 +81,23 @@ def module_problems(
 ) -> list[str]:
     out = []
     for k in ("rsi.gates.rsi_probe", "worker_extension"):
-        if k in files and not _under(files[k], repo.resolve()):
+        if k in files and not under(files[k], repo.resolve()):
             out.append(f"{where}: {k} = {files[k]} not under the gate tree {repo}")
     if "rsi.gates.rsi_probe" not in files:
         out.append(f"{where}: probe module file not recorded")
     purelib = venv_purelib()
     for k in ("vllm", "torch"):
-        if not _under(files.get(k), purelib):
+        if not under(files.get(k), purelib):
             out.append(f"{where}: {k} = {files.get(k)} not in the shared venv {purelib}")
     if Path(files.get("prefix") or "").resolve() != Path(sys.prefix).resolve():
         out.append(f"{where}: interpreter prefix {files.get('prefix')} != {sys.prefix}")
     for k in ("sitecustomize", "usercustomize"):
         f = files.get(k)
-        if f and not (_under(f, purelib) or _under(f, Path(sys.base_prefix).resolve())):
+        if f and not (under(f, purelib) or under(f, Path(sys.base_prefix).resolve())):
             out.append(f"{where}: {k} = {f} outside the venv / base interpreter")
     for k in ("pegaflow", "pegaflow.pegaflow"):
         f = files.get(k)
-        if f and (pegaflow_dir is None or not _under(f, pegaflow_dir)):
+        if f and (pegaflow_dir is None or not under(f, pegaflow_dir)):
             out.append(f"{where}: {k} = {f} not under the arm's pegaflow {pegaflow_dir}")
     return out
 
