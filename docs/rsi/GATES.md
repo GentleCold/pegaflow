@@ -346,12 +346,17 @@ the last accepted run record by hand until `--accepted` exists.
     place, so `stop` signals and waits for the same process group as before.
     The command prefix is in `summary.isolation`. A run whose arm under test
     could not be isolated (not Linux, not root) is not official.
-    Residual: this is deterrence, not a boundary. The arm runs as root in
-    the host pid / IPC / network namespaces and can write any host file
-    outside the hidden runs root (gate tree, venv). `/proc/<pid>/root` and
-    `nsenter` are closed only by the dropped `CAP_SYS_PTRACE` /
-    `CAP_SYS_ADMIN`, and a root process can regain those by other routes.
-    The controls are the static scan, provenance and the review
+    Residual: this is deterrence, not a boundary. What holds (tested in
+    `test_isolated_arm_cannot_read_other_arms`): with those capabilities out
+    of the bounding set, opening `/proc/<pid>/ns/*` or `/proc/<pid>/root` of
+    a full-capability process fails the kernel's ptrace access check
+    (EACCES), so `setns` / `nsenter` into the host mount namespace and reads
+    through `/proc/<gate pid>/root` fail, and the tmpfs cannot be unmounted.
+    What does not hold: the arm stays uid 0 with `CAP_DAC_OVERRIDE` in the
+    host pid / IPC / network namespaces, so it can write any host file outside
+    the runs root. That includes code that later stages or other root
+    processes run with full capabilities (gate tree, venv, system files). The
+    controls for that are the static scan, provenance and the review
     (`summary.isolation.residual` says the same).
   - Static scan (b). `provenance.scan` scans the snapshot, every text line
     and the strings of the native module, for `provenance.SCAN_PATTERNS`:

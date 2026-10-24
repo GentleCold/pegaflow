@@ -234,11 +234,17 @@ def fresh_pycache(run_dir: Path, labels: list[str]) -> None:
 ISOLATE = Path(__file__).resolve().parent / "isolate.py"
 # What hiding does not stop (GATES.md "Boundary"): it is deterrence.
 ISOLATION_RESIDUAL = (
-    "deterrence, not a boundary: the arm runs as root in the host pid / IPC / "
-    "network namespaces; it can write any host file outside the hidden runs root "
-    "(gate tree, venv), and /proc/<pid>/root and nsenter are closed only by the "
-    "dropped CAP_SYS_PTRACE / CAP_SYS_ADMIN, which a root process can regain by "
-    "other routes. The controls are the static scan, provenance and the review."
+    "deterrence, not a boundary. Mechanism: private mount namespace (runs root "
+    "under tmpfs) and a bounding set without CAP_SYS_ADMIN, CAP_SYS_PTRACE, "
+    "CAP_SYS_MODULE, CAP_SYS_RAWIO, CAP_SYS_CHROOT, CAP_SYS_BOOT, CAP_MKNOD, CAP_BPF, "
+    "CAP_CHECKPOINT_RESTORE; opening /proc/<pid>/ns/* or /proc/<pid>/root of a "
+    "full-cap process then fails the kernel's ptrace access check (EACCES), so "
+    "setns / nsenter into the host mount namespace fail (tested), and the cover "
+    "cannot be unmounted. Not covered: the arm stays uid 0 with CAP_DAC_OVERRIDE "
+    "in the host pid / IPC / network namespaces, so it can write any host file "
+    "outside the runs root, including code that later stages or other root "
+    "processes run with full capabilities (gate tree, venv, system files). The "
+    "controls for that are the static scan, provenance and the review."
 )
 
 
