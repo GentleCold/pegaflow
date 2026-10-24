@@ -27,7 +27,7 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
 | adapter (per KVCacheSpec type) | Python | onboarding agent |
 | policy (what to save/load/prefetch) | Python | onboarding agent (main RSI surface) |
 | semantics (`pegaflow-semantics`: needed/resolve/saveable/key/seal_plan) | Rust, PyO3 | agent proposes, review agent + human audit |
-| server (storage only) | Rust | onboarding agent may propose a change when a gate shows a server limit (e.g. group-incoherent eviction); must stay model-agnostic (Kind-aware, never model-name-aware), keep `cargo test` green and the `old` arm unregressed; always its own PR, human review required (see "PR policy") |
+| server (storage only) | Rust | not changed by agents (user, 2026-10-24): gates run on the base server; a server limit is attributed and listed in "Server limitations" below for a human to decide |
 | gates (`docs/rsi/GATES.md`, `rsi/gates/`) | — | human only; agents may add checks, never relax |
 
 ## PR policy (user, 2026-10-23)
@@ -40,11 +40,14 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
   accepted run) is one branch `feat/rsi-<model>` and one PR, stacked on the
   previous one. #473 is the observation PR for the foundation (semantics,
   gates, connector core) + Qwen3-4B.
-- Server changes (`pegaflow-core`, `pegaflow-server`, proto) are always a
-  separate branch `feat/rsi-server-<topic>` and a separate PR, human-reviewed;
-  agents never merge them. The model PR that needs one states the dependency
-  and runs its gates against that server build; the model is "accepted
-  pending server review" until a human approves the server PR.
+- Server stays at the base version (user, 2026-10-24: "server还是保持原始版本，
+  把server的局限问题汇报给人就行，gate不要被server受限，命中率不用过度追求最高，
+  因为淘汰策略不一定是全局最优的"). Every gate run uses the pegaflow-server
+  built from `feat/semantics-rsi`. Agents do not write or tune server code;
+  they attribute a server-caused gap and list it under "Server limitations".
+  A model is never blocked or held "pending server" because of one. The
+  earlier server work (H1-H5, PRs GentleCold/pegaflow#3 and #4) is parked as
+  a proposal for the human; nothing depends on it.
 - Gate changes (`rsi/gates/**`, GATES.md) stay human-owned: agent-written gate
   code lands on its own branch (e.g. `feat/rsi-g5`) and is reviewed before it
   is used to accept anything.
@@ -58,6 +61,28 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
 - Every progress report and ITERATIONS entry includes the hit-rate table
   (local / external / total hit, oracle H*, E_ext, and at capacity H*_C, H_lru,
   E_C), not only the perf numbers.
+
+### Server limitations (report to the human, do not fix)
+
+Measured on Qwen3-4B G5 (single Full group); details and numbers in
+`feat/rsi-server-reclaim:docs/rsi/server/reclaim-eviction.md` and
+`feat/rsi-server-evict-tail:docs/rsi/server/evict-tail.md`.
+
+- Reclaim drops a fixed `RECLAIM_BATCH_SIZE = 512` blocks per round. On a
+  small pool one round frees about half of the cache (1019-block slice: 502
+  resident after cap_cold). Proposal H1 sizes rounds to `resident / 64`.
+- Pinned-region fragmentation: a layer-first save call takes one region per
+  layer, freed only when the call's last block is evicted, so dead bytes
+  stay pinned (official cap: 400-900 blocks of 5873 lost; the main cause of
+  E_C ~0.1-0.25 before H3). Proposal H3: one region per saved block.
+- H3's many small copies cost warm TTFT with per-range `cuMemcpyAsync`.
+  Proposal H4: one `cuMemcpyBatchAsync` per transfer.
+- Eviction is plain LRU per (hash, group) key and not prefix-aware: heads
+  served from vLLM's local cache age out first and strand the tail for a
+  lookup from block 0 (stranded share of the miss: 13-21%). Proposal H5:
+  opt-in tail-first eviction in the retained class.
+- Not group-coherent: a resume point needs every group, but each group key
+  is evicted on its own (matters for hybrid models; not measured yet).
 
 ### Gate changes
 
@@ -111,7 +136,7 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), 0.76 with the H5 server build; hit-rate judgment pending; server work in `feat/rsi-server-reclaim` / `feat/rsi-server-evict-tail` |
+| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
