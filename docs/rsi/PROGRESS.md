@@ -645,7 +645,10 @@ names, magic constants that only exist in the old code).
     unprimed recompute up to rounding, every load byte-equal to the saved
     page after poisoning the GPU cache, outputs equal (order2: 6/6; order3
     with 6 preemptions: 5/6; p4 diverges at token 152 before its own
-    preemption, open, see ITERATIONS it2 plan item 3).
+    preemption). Rerun at 863cc99 as order4 (review should-fix 2): 27/27
+    checkpoint and 29/29 full loads byte-equal, p4 flips at token 152 by
+    one bf16 step and matches the unprimed alone run. The no-connector
+    batch control is still open (ITERATIONS it2 plan item 3).
   - Non-regression on c4c1615: the Qwen3-4B slice
     (`2026-10-24-qwen3-4b-p5-it1-nonreg-b`, GPU4) passes every verdict, with
     the same deltas as P3 it2e. The DSV2 TP2 slice

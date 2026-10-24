@@ -306,6 +306,46 @@ extension of another prompt. Phases:
 
 Run dirs: `~/kexi/rsi-runs/2026-10-24-qwen3.5-4b-p5-it1-order2`, `...-order3`.
 
+Provenance (review should-fix 2): order2 and order3 ran on the working
+copy before c4c1615 was committed, and no revision was recorded. They are
+superseded by order4.
+
+#### order4: order3 rerun at the committed revision
+
+`~/kexi/rsi-runs/2026-10-24-qwen3.5-4b-p5-it1-order4`, GPU4 only, pgid
+2321219, 02:45:06Z-02:50:41Z host UTC. The run dir's `config` file
+records rev 863cc99 (c4c1615 plus the per-request `hit stats` fix), the
+start and end times, and the knobs. The `from=` lines point at
+`~/kexi/pegaflow-rsi-qwen35/python`. Config: order3's (16 GPU blocks in A,
+300 output tokens in every phase including R, 2 GB pool), plus
+`P5_SAVE_FULL=1` (full-group saves captured as well) and `P5_LOGPROBS=2`.
+
+| Check | Result |
+|---|---|
+| checkpoint saves from offers | R 42/42, A 39 saves from 78 offers, all offered |
+| saved (A) vs unprimed recompute (R) | 42 states in both: max conv 0.0703, ssm 0.125 (control between two states: 9.67 / 12.4) |
+| checkpoint loads (C, after poison) vs A's saves | 27/27 byte-equal |
+| full-attention loads (C) vs A's saves, all layers | 29/29 byte-equal, including `a2bb744a` (both loads of p4) |
+| preemptions | A: reqs 1, 3, 5; C: 7, 11 (p4), 12 |
+| hit stats | `{"lookups": 21}` (it was 1445 per call), no miss |
+| outputs C == A | 5/6; p4 diverges at output token 152 again |
+
+p4 at token 152: A picks 16809 (logprob -0.8195) over 6704 (-0.9445), and
+C picks 6704 (-0.7964) over 16809 (-0.9214). The top-2 margin is 0.125 in
+both, one bf16 step at logit magnitudes 16 to 32. C's completion equals
+R's (p4 alone, unprimed, no loads). A (cold but batched) is the odd one
+out. p3 also differs between the batched phases (A == C) and R. With
+every loaded byte equal to its save and a one-ulp flip, cause (c) is
+excluded for this run, and batch composition (a) is the remaining
+explanation. The no-connector batch control (it2 item 3, leg 1) has not
+run yet.
+
+Analyzer fix: a preempted request reloads into reused GPU block ids, so
+pairing loads by `(req, sid, block_id)` mixed up two loads of the same
+request (a first pass reported 4 false full-block mismatches). Each load
+is now paired with its own load plan. order2 and order3 give the same
+checkpoint counts (18/18, 27/27) with the fix.
+
 ### Shared-core non-regression: Qwen3-4B slice (GPU4)
 
 `~/kexi/rsi-runs/2026-10-24-qwen3-4b-p5-it1-nonreg-b` (rev c4c1615, full
@@ -450,6 +490,10 @@ captured. Candidate causes:
 - (b) split non-invariance: GDN prefill resumed at 1584 is chunked
   differently from a run through, like MLA on DSV2;
 - (c) a wrong full-attention block in `[0, 1584)`.
+
+Status: leg 2 ran as order4 at 863cc99 (see the it1 ordering check).
+Every full and checkpoint load is byte-equal, and the margin at the
+divergence is one bf16 step. Leg 1 remains.
 
 Both legs always run.
 - Leg 1, no connector (in-process driver, GPU only, plain vLLM, same
