@@ -2011,6 +2011,31 @@ def test_gate_vllm_args_applied_to_every_stage(cmd, ok):
     assert set(v["bad"]) <= {"selftest-honest/gsm8k"}
 
 
+_DET = ["--compilation-config", '{"inductor_compile_config":{"deterministic":true}}']
+
+
+@pytest.mark.parametrize(
+    "gsm,other,ok",
+    [
+        ([*_RET, *_DET], _RET, True),
+        (_RET, _RET, False),  # gsm8k stage without its compile flag
+        ([*_RET, *_DET, "--compilation-config", "{}"], _RET, False),  # overridden later
+    ],
+    ids=["gsm8k-only", "missing-on-gsm8k", "overridden-later"],
+)
+def test_gsm8k_vllm_args_apply_to_gsm8k_stages_only(gsm, other, ok):
+    """gate.json ``gsm8k_vllm_args``: required on every gsm8k stage, not on
+    the others (replay/cap/preempt keep vLLM's default compile)."""
+    gate = {"vllm_args": _RET, "gsm8k_vllm_args": _DET}
+    results = {
+        label: {"gsm8k": {"vllm_cmd": ["vllm", *gsm]}, "preempt": {"vllm_cmd": ["vllm", *other]}}
+        for label in ("plain", "baseline")
+    }
+    v = run_gate.gate_args_verdict(results, gate)
+    assert v["pass"] is ok, v
+    assert all(k.endswith("/gsm8k") for k in v["bad"]), v
+
+
 def test_split_differ_separates_aligned_prompts():
     ctrl = {"n": 4, "split_outputs": ["a", "b", "c", "d"], "aligned": [False, True, False, True]}
     assert run_gate.split_differ(ctrl, ["a", "x", "c", "d"]) == (0, 1)

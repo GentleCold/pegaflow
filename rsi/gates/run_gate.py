@@ -868,9 +868,11 @@ def vllm_server(
     log,
     cpu_bytes: int = 0,
     num_gpu_blocks: int = 0,
+    gsm8k: bool = False,
 ):
     """``num_gpu_blocks``: the stage's own GPU KV pool (preempt), else
-    ``--num-gpu-blocks``."""
+    ``--num-gpu-blocks``. ``gsm8k``: the stage also gets gate.json's
+    ``gsm8k_vllm_args`` (the cross-arm exact comparisons run there)."""
     lease = PortLease(1, block=VLLM_PORT_BLOCK, log=log)
     (port,) = lease.ports
     env = os.environ.copy()
@@ -943,6 +945,7 @@ def vllm_server(
         "rsi.gates.rsi_probe.RsiWorkerExt",
         *backend,
         *gate.get("vllm_args", []),
+        *(gate.get("gsm8k_vllm_args", []) if gsm8k else []),
         *args.vllm_arg,
     ]
     if arm_kind(arm) == "plain":
@@ -1118,6 +1121,7 @@ def run_arm_workload(
             out / "vllm.log",
             store_bytes if kind in _OFFLOAD else 0,
             args.preempt_blocks if pre else 0,
+            gsm8k=gsm,
         )
         stack.enter_context(cm)
         if kind == "lmcache":
@@ -1358,9 +1362,12 @@ def gate_args_verdict(
     results: dict[str, dict[str, Any]], gate: dict[str, Any] | None
 ) -> dict[str, Any]:
     """G0.vllm_args: every stage's vLLM ran with gate.json's ``vllm_args``
-    in force (the last occurrence of each flag carries the gate's value, so
-    a later ``--vllm-arg`` cannot silently override it)."""
-    want = _flag_values(list((gate or {}).get("vllm_args", [])))
+    in force, and every gsm8k stage also with ``gsm8k_vllm_args`` (the last
+    occurrence of each flag carries the gate's value, so a later
+    ``--vllm-arg`` cannot silently override it)."""
+    gate = gate or {}
+    every = _flag_values(list(gate.get("vllm_args", [])))
+    gsm = _flag_values(list(gate.get("gsm8k_vllm_args", [])))
     bad: dict[str, list[str]] = {}
     for label, per in results.items():
         for wl, r in per.items():
@@ -1370,11 +1377,17 @@ def gate_args_verdict(
             if cmd is None:
                 bad[f"{label}/{wl}"] = ["vllm command not recorded"]
                 continue
+            want = every + (gsm if wl == "gsm8k" else [])
             got = dict(_flag_values(cmd))  # last occurrence wins, as in argparse
             miss = [f"{f} {v}" for f, v in want if f not in got or got[f] != v]
             if miss:
                 bad[f"{label}/{wl}"] = miss
-    return {"pass": not bad, "vllm_args": (gate or {}).get("vllm_args", []), "bad": bad}
+    return {
+        "pass": not bad,
+        "vllm_args": gate.get("vllm_args", []),
+        "gsm8k_vllm_args": gate.get("gsm8k_vllm_args", []),
+        "bad": bad,
+    }
 
 
 def expected_pegaflow(args, kind: str) -> Path | None:

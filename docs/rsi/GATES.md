@@ -752,16 +752,42 @@ the last accepted run record by hand until `--accepted` exists.
   stays byte-exact and hard: gsm8k digests every computation, so the
   reference is exhaustive (`digest_compare`) and a loaded block or state
   that equals no computed copy is `mismatched`.
-  Qwen3.5-4B runs with `--compilation-config {"mode":0}` (gate.json
-  `vllm_args`; no torch.compile, CUDA graphs kept). An inductor compile of
-  this model is not reproducible: two fresh compiles of one config give
-  different logits at concurrency 1. vLLM caches the first compile per
-  config hash, and that hash includes `kv_transfer_config`, so an arm with
-  a connector and one without ran different kernels, and plain vs baseline
-  `alone_ref` differed from the first sampled token (selftest run
-  `qwen3.5-4b-selftest-aa42a44`). With mode 0, plain, baseline and a
-  repeated plain give identical logprobs, so the exact controls above
-  compare connectors, not compile artifacts.
+- Compile determinism (`gsm8k_vllm_args`). vLLM 0.32 compiles the model
+  once per config hash (`~/.cache/vllm/torch_compile_cache/<hash>`, reused
+  by later runs). `VllmConfig.compute_hash` appends
+  `kv_transfer_config.compute_hash()` iff a connector is configured, and
+  that hash has no factors, so every connector arm (baseline, selftest,
+  the arm under test) shares one compile and plain has another (`old` a
+  third: its `VLLM_PLUGINS` differ). Inductor picks some kernel configs by
+  benchmarking at compile time, so two compiles of one config need not
+  match. On Qwen3.5-4B they do not: concurrency 1, greedy, first sampled
+  token of gsm8k prompt 0, `-0.388626` vs `-0.390268` between two fresh
+  compiles of the plain config, and the numbers follow the artifact
+  (loading the other compile's cache swaps them; GPU5 probe 2026-10-24,
+  `~/kexi/tmp/rsi-gate-hybrid-test/numerics`). In selftest run
+  `qwen3.5-4b-selftest-aa42a44` plain and baseline therefore differed from
+  the first token in all 64 `alone_ref` requests (12 completions), which
+  failed `G2.plain_equals_baseline` and `G2.split_control`. The two
+  artifacts' recorded autotune choices differ in two pointwise kernels
+  only, which cannot change values; the choice that does is not pinned.
+  `inductor_compile_config.deterministic=true` (no benchmark-driven
+  choices) makes three fresh compiles, plain twice and baseline once,
+  give identical logprobs. gate.json `gsm8k_vllm_args` is appended to
+  `vllm_args` on every arm's gsm8k stage, where the cross-arm exact
+  comparisons run (`G2.plain_equals_baseline`, `G2.split_control`,
+  `G2.gsm8k_outputs`, `digest_vs_baseline`). Replay, cap and preempt
+  stages keep vLLM's default compile: they compare arms by timing and
+  hit rate (G3/G4/G5), and their digests are judged within the stage's own
+  process (`digest_self`, `G2.preempt`). `G4.gsm8k_{cold,warm}.seconds`
+  times both sides under the gsm8k config (as on Qwen3-4B, where gsm8k
+  runs `VLLM_BATCH_INVARIANT=1`); `G4.replay_*` runs the default config.
+  `G0.vllm_args` requires each gsm8k flag as the last occurrence on every
+  gsm8k stage. Qwen3-4B and DeepSeek-V2-Lite set no `gsm8k_vllm_args`:
+  their plain and connector compiles currently in the cache made the same
+  choices (the artifacts differ only in hash-bearing files and an
+  autotune timing field), which is why their controls pass. A recompile
+  can choose differently. That fails loud (plain vs baseline differ),
+  never passes a wrong load: connector arms share one compile.
 - G3 (`oracle.py`): replays `requests.jsonl` with unlimited capacity. A block
   ending at token e is stored at the first step whose `progress` reaches e
   (checkpoint groups: only a step ending exactly on e) and is visible to
