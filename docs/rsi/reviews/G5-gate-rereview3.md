@@ -290,7 +290,7 @@ Fix (tighten, cheap):
    - One-sided: S8. A run made non-official must still be recorded, so
      retrying until a run is clean is visible.
 10. digest_groups (940def4)
-    - Required in `v["baseline"]` (ANDed), on every arm (ANDed in `g`), and
+    - Required in `v["baseline"]` (joined with AND), on every arm (AND in `g`), and
       in the honest self-test expectation.
     - The test needs native `pegaflow.semantics` (`group_kinds`), so it did
       not run locally.

@@ -76,13 +76,14 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    - scan resistance: one-pass sweeps must not flush reused prefixes;
    - save cost: no synchronous wait on the model step.
    Do not block a model on hit-rate level alone; correctness checks stay hard.
-   The server is in scope when the evidence points there (eviction, admission,
-   pools, query): keep it Kind-aware and model-agnostic (no model names, no
-   per-model branches), run `cargo test`, re-run the `old` arm to show no
-   regression. Server code goes on its own branch `feat/rsi-server-<topic>` as
-   a separate PR (never merge it into a model branch yourself); an independent
-   review agent reviews it and the iteration continues on that server build;
-   the user reviews server PRs in the final acceptance pass (do not wait). Connector code
+   Do not chase the highest hit rate: no eviction policy is globally optimal,
+   so H*_C is a ceiling, not a target.
+   The server is out of scope (user, 2026-10-24): gates run on the base
+   pegaflow-server built from `feat/semantics-rsi`, and agents do not change
+   or tune it. When the evidence points at the server (eviction, admission,
+   pools, allocator, query), attribute the gap with numbers, add it to
+   PROGRESS.md "Server limitations" and go on; a gap the server causes is
+   explained, not fixed, and never blocks a model. Connector code
    stays model-agnostic too: per-model differences live only in
    `connector_v2/models/<model>.toml` (see PROGRESS.md "PR policy").
    Policy complexity rules (keep policy growing with Kinds, not with models):
@@ -225,3 +226,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   Never give a sync load a deadline: the server's copy may still land.
 - A 64-question gsm8k slice cannot resolve a 2% bound (~10 s of wall time);
   use the full 1319 questions in slices when a G4 gsm8k check is the target.
+- PR CI must pass (user, 2026-10-24). Before reporting a branch done, run
+  `./scripts/check.sh` (fmt, typos, clippy, cargo check) on the remote and
+  the default Python unit gate. CI runs `cz check` on every commit of the PR,
+  merge commits included: name a merge `Merge branch '<src>' into <dst>`
+  (git's default) or use a commitizen type (`chore(rsi): merge ...`), never
+  `merge(...)`. Locally: `typos` and `cz` install from PyPI into a temp venv.
