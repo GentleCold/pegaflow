@@ -57,6 +57,11 @@ pub(crate) const DEFAULT_BACKUP_RECLAIMABLE_PERCENT: u64 = 10;
 const BACKUP_SCAN_FACTOR: usize = 4;
 /// Default tail-first window: the oldest quarter of a class.
 pub(crate) const DEFAULT_TAIL_WINDOW_PERCENT: u64 = 25;
+/// Most retained entries one tail-first pass looks at, for the window and
+/// again for the pinned-leaf fallback, so a pressure round holds the cache
+/// lock for a bounded scan whatever the resident count. In the sim the
+/// oldest 4096 blocks did as well as the oldest 25%.
+const TAIL_WINDOW_MAX_BLOCKS: usize = 4096;
 /// Tail-first candidates cloned per block a batch still wants.
 const TAIL_CANDIDATE_FACTOR: usize = 4;
 /// Sort rank of a block whose chain depth was never observed (decode tails,
@@ -830,13 +835,18 @@ fn deepest_retained_child(inner: &ReadCacheInner, key: &BlockKey) -> Option<Bloc
 
 /// Tail-first eviction within the retained class.
 ///
-/// Candidates are the oldest `window_percent` of the class (at least the
-/// blocks still wanted), deepest chain position first, oldest first among
-/// equals. Taking a candidate evicts its retained subtree leaves first, so no
-/// block is evicted while a retained block that depends on it stays
-/// resident. A subtree whose next leaf is pinned by a load or transfer is
-/// skipped. If pins exhaust the candidates, the rest of the class is tried in
-/// LRU order under the same rule.
+/// Candidates are the oldest `window_percent` of the class, at most
+/// [`TAIL_WINDOW_MAX_BLOCKS`] and at least the blocks still wanted, deepest
+/// chain position first, oldest first among equals. Taking a candidate
+/// evicts its retained subtree leaves first, so no block is evicted while a
+/// retained block that depends on it stays resident. A subtree whose next
+/// leaf is pinned by a load or transfer is skipped.
+///
+/// If pins exhaust the candidates, the oldest [`TAIL_WINDOW_MAX_BLOCKS`]
+/// entries are searched for unpinned leaves. If that finds nothing either,
+/// the round falls back to plain LRU, so reclaim never gives up where LRU
+/// would have made progress; those evictions may strand descendants and are
+/// counted in `pegaflow_cache_evictions_with_resident_children`.
 fn remove_retained_tail_first(
     inner: &mut ReadCacheInner,
     batch_size: usize,
@@ -849,8 +859,9 @@ fn remove_retained_tail_first(
     if len == 0 || wanted == 0 {
         return;
     }
+    let before = removed.len();
     let share = (len as u128 * u128::from(window_percent) / 100) as usize;
-    let window = share.max(wanted).min(len);
+    let window = share.min(TAIL_WINDOW_MAX_BLOCKS).max(wanted).min(len);
     // Clone only the keys the batch can use: a subtree yields at least one
     // victim unless pinned, so a few per wanted block is plenty.
     let take = wanted.saturating_mul(TAIL_CANDIDATE_FACTOR);
@@ -874,14 +885,22 @@ fn remove_retained_tail_first(
     };
     evict_candidates(inner, candidates, batch_size, removed);
     if removed.len() < batch_size {
-        // Pins cover the window: fall back to the class's leaves in LRU
-        // order. Leaves need no walk, so a fully pinned class costs one scan.
+        // Pins cover the candidates: take unpinned leaves in LRU order. Only
+        // the victims are cloned, and the scan is capped like the window.
+        let wanted = batch_size - removed.len();
         let leaves: Vec<BlockKey> = class_lru_ref(inner, class)
             .iter()
-            .filter(|(key, _)| deepest_retained_child(inner, key).is_none())
+            .take(TAIL_WINDOW_MAX_BLOCKS.max(wanted))
+            .filter(|(key, _)| {
+                inner.cache.is_cache_owned_only(key) && deepest_retained_child(inner, key).is_none()
+            })
+            .take(wanted)
             .map(|(key, _)| key.clone())
             .collect();
         evict_candidates(inner, leaves, batch_size, removed);
+    }
+    if removed.len() == before {
+        remove_lru_batch_from_class(inner, class, batch_size, removed);
     }
 }
 
@@ -1377,6 +1396,60 @@ mod tests {
         }
     }
 
+    /// Lock-hold bench for review M2: one pressure round on a 160 GiB pool of
+    /// 64 KiB blocks (about 2.6M resident). Prints per-round time of
+    /// `remove_lru_batch` (lock hold plus the metrics after it, so an upper
+    /// bound) for plain LRU and tail-first, with nothing pinned and with the
+    /// oldest blocks pinned as a decode backup pull or P2P serve would.
+    #[test]
+    #[ignore = "bench: builds 2.6M resident blocks; run with --release --nocapture"]
+    fn tail_first_round_lock_hold_at_2_6m_blocks() {
+        const RESIDENT: usize = 2_600_000;
+        const CHAIN: usize = 64;
+        const BATCH: usize = 512;
+        const ROUNDS: usize = 20;
+        const PINNED: usize = 8192;
+        let hash = |chain: usize, pos: usize| {
+            let mut hash = vec![0u8; 32];
+            hash[..8].copy_from_slice(&(chain as u64).to_le_bytes());
+            hash[8..16].copy_from_slice(&(pos as u64).to_le_bytes());
+            BlockKey::new("ns".into(), hash)
+        };
+        for (id, percent, pinned) in [
+            ("lru", 0, 0),
+            ("tail25", 25, 0),
+            ("lru_oldest_pinned", 0, PINNED),
+            ("tail25_oldest_pinned", 25, PINNED),
+        ] {
+            let cache = make_cache().with_tail_window_percent(percent);
+            for chain in 0..RESIDENT / CHAIN {
+                let keys: Vec<BlockKey> = (0..CHAIN).map(|pos| hash(chain, pos)).collect();
+                insert_all(&cache, &keys);
+                cache.get_prefix_blocks(&keys, true);
+            }
+            let oldest: Vec<BlockKey> = (0..pinned).map(|i| hash(i / CHAIN, i % CHAIN)).collect();
+            let held = cache.peek_blocks(&oldest);
+            let mut times = Vec::with_capacity(ROUNDS);
+            let mut evicted = 0;
+            for _ in 0..ROUNDS {
+                let start = Instant::now();
+                let removed = cache.remove_lru_batch(BATCH);
+                times.push(start.elapsed());
+                evicted += removed.len();
+            }
+            drop(held);
+            times.sort_unstable();
+            let mean = times.iter().sum::<Duration>() / ROUNDS as u32;
+            println!(
+                "{id}: resident {RESIDENT}, batch {BATCH}, {ROUNDS} rounds, evicted {evicted}, \
+                 per round mean {mean:?} p50 {:?} max {:?}",
+                times[ROUNDS / 2],
+                times[ROUNDS - 1]
+            );
+            assert_eq!(evicted, BATCH * ROUNDS, "{id}");
+        }
+    }
+
     #[test]
     fn queried_never_loaded_head_outlives_its_resident_descendants() {
         // The old connector queries from vLLM's local hit, so the chain head
@@ -1435,14 +1508,18 @@ mod tests {
             vec![members[1].clone(), positions[1].clone()]
         );
 
-        // A held group block keeps its position resident.
+        // A held group block keeps its position resident while anything else
+        // can go: the newer chain head `other` (same depth) goes instead.
+        let other = keys(2, 1);
+        insert_all(&cache, &other);
+        assert_eq!(cache.get_prefix_blocks(&other, true).0, 1);
         let held = cache.peek_blocks(std::slice::from_ref(&members[0]));
-        assert!(cache.remove_lru_batch(1).is_empty());
+        assert_eq!(evict_order(&cache, 1), other);
+        // With nothing else left, the round falls back to plain LRU, as H4
+        // would, and skips only the held block itself.
+        assert_eq!(evict_order(&cache, 1), vec![positions[0].clone()]);
         drop(held);
-        assert_eq!(
-            evict_order(&cache, 2),
-            vec![members[0].clone(), positions[0].clone()]
-        );
+        assert_eq!(evict_order(&cache, 1), vec![members[0].clone()]);
     }
 
     #[test]
