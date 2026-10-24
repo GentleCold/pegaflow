@@ -552,36 +552,130 @@ with run_gate.launched(cmd, {}, out / "sleeper.log", f"http://127.0.0.1:{port}/"
 
 def test_port_leases_are_exclusive_and_released(tmp_path):
     """Stage ports: leased under per-port flocks, so two gate runs never get
-    the same port; released when the stage ends."""
+    the same port (single or vLLM's contiguous ``VLLM_PORT`` block); released
+    when the stage ends, with the lease files in the record."""
     p = run_gate.free_port()
     a = run_gate.PortLease(1, tmp_path, (p, p))
     with pytest.raises(RuntimeError, match="no 1 free ports"):
         run_gate.PortLease(1, tmp_path, (p, p))
+    assert a.record["files"] == [str(tmp_path / str(p))] and a.record["released_at"] is None
     a.release()
+    assert a.record["released_at"] is not None
     b = run_gate.PortLease(1, tmp_path, (p, p))
     assert b.ports == a.ports == [p]
     b.release()
+    lo = 20000 + p % 5000
+    c = run_gate.PortLease(1, tmp_path, (lo, lo + 9), block=4)
+    assert len(set(c.block)) == 4 and c.block == list(range(c.block[0], c.block[0] + 4))
+    assert c.ports[0] not in c.block
+    with pytest.raises(RuntimeError, match="contiguous"):
+        run_gate.PortLease(1, tmp_path, (c.block[0], c.block[-1]), block=4)
+    c.release()
 
 
-def test_port_race_fails_the_stage_naming_the_port(tmp_path):
-    """Another process binds the leased port before the stage does: the stage
-    fails with ``PortRace`` naming the port (not retried), the lease is
-    released, and run_stage records the cause in the stage dir."""
+class _Dead:
+    pid = 4242
+
+    def poll(self):
+        return 1
+
+
+@pytest.mark.parametrize(
+    "line,ports",
+    [
+        pytest.param("OSError: [Errno 98] Address already in use", [], id="no-port"),
+        pytest.param(
+            "OSError: [Errno 98] error while attempting to bind on address ('0.0.0.0', 33641): address already in use",
+            [33641],
+            id="uvicorn",
+        ),  # fmt: skip
+        pytest.param(
+            "torch.distributed.DistNetworkError: The server socket has failed to listen on any local network address. port: 29500, useIpv6: false, code: -98, name: EADDRINUSE, message: address already in use",
+            [29500],
+            id="tcpstore",
+        ),  # fmt: skip
+        pytest.param(
+            "zmq.error.ZMQError: Address already in use (addr='tcp://127.0.0.1:20017')",
+            [20017],
+            id="zmq",
+        ),  # fmt: skip
+        pytest.param(
+            'Error: Os { code: 98, kind: AddrInUse, message: "Address in use" } (os error 98) binding 127.0.0.1:21000',
+            [21000],
+            id="rust",
+        ),  # fmt: skip
+    ],
+)
+def test_any_bind_failure_is_a_port_race(tmp_path, line, ports):
+    """EADDRINUSE on any bind in a stage log (the gate's leased port or one
+    vLLM / torch / ZMQ / the server picked itself) is a PortRace naming the
+    parsed port, whether the gate leased it, and the lease files."""
+    p = ports[0] if ports else run_gate.free_port()
+    lease = run_gate.PortLease(1, tmp_path / "locks", (p, p))
+    log = tmp_path / "vllm.log"
+    log.write_text(f"INFO starting\n{line}\n")
+    race = run_gate.port_race(log, [lease], _Dead())
+    assert isinstance(race, run_gate.PortRace)
+    msg = str(race)
+    assert (f"{p} (leased)" in msg) if ports else ("unknown" in msg), msg
+    assert str(tmp_path / "locks" / str(p)) in msg and "not retried" in msg
+    log.write_text("RuntimeError: CUDA out of memory\n")
+    assert run_gate.port_race(log, [lease], _Dead()) is None
+    lease.release()
+
+
+def test_port_race_fails_the_stage_naming_the_port(tmp_path, monkeypatch):
+    """Another process binds the leased port after the lease, before the
+    stage does: the stage fails with ``PortRace`` naming the port (not
+    retried), its leases are released, and run_stage writes the cause and
+    the lease files to ``stage-error.json``."""
+    import json
     import socket
 
     p = run_gate.free_port()
-    lease = run_gate.PortLease(1, tmp_path / "locks", (p, p))
-    squatter = socket.socket()
-    squatter.bind(("127.0.0.1", p))
-    squatter.listen()
+    locks, out = tmp_path / "locks", tmp_path / "stage"
     cmd = [sys.executable, "-c", f"import socket; socket.socket().bind(('127.0.0.1', {p}))"]
-    try:
-        log, url = tmp_path / "vllm.log", f"http://127.0.0.1:{p}/x"
-        with pytest.raises(run_gate.PortRace, match=str(p)), run_gate.launched(cmd, {}, log, url, 30, lease):  # fmt: skip
+    squatter = socket.socket()
+    got: list[run_gate.PortLease] = []
+
+    def stage(args, gate, arm, wl, out, **kw):
+        got.append(run_gate.PortLease(1, locks, (p, p)))
+        squatter.bind(("127.0.0.1", p))  # the race: taken after the lease
+        squatter.listen()
+        out.mkdir(parents=True)
+        with run_gate.launched(cmd, {}, out / "vllm.log", f"http://127.0.0.1:{p}/x", 30, got[0]):
             pass
+
+    monkeypatch.setattr(run_gate, "run_arm_workload", stage)
+    try:
+        with pytest.raises(run_gate.PortRace, match=f"{p} \\(leased\\)"):
+            run_gate.run_stage(None, {}, "baseline", "gsm8k", out)
     finally:
         squatter.close()
-    assert lease._fds == []
+    assert got[0]._fds == [] and got[0].record["released_at"] is not None
+    err = json.loads((out / "stage-error.json").read_text())
+    assert err["type"] == "PortRace" and f"{p} (leased)" in err["error"]
+    assert err["port_leases"][-1]["files"] == [str(locks / str(p))]
+
+
+def test_leases_are_released_on_every_exit_path(tmp_path, monkeypatch):
+    """A stage that raises before it launches, or is stopped by a signal
+    (SystemExit), releases every lease it took."""
+    p = run_gate.free_port()
+
+    def take_then(exc):
+        def stage(args, gate, arm, wl, out, **kw):
+            run_gate.PortLease(1, tmp_path, (p, p))
+            raise exc
+
+        return stage
+
+    for exc in (ValueError("before launch"), SystemExit(143)):
+        monkeypatch.setattr(run_gate, "run_arm_workload", take_then(exc))
+        with pytest.raises(type(exc)):
+            run_gate.run_stage(None, {}, "baseline", "gsm8k", tmp_path / "s")
+        assert run_gate._LEASES[-1]._fds == []
+        run_gate.PortLease(1, tmp_path, (p, p)).release()  # free again
 
 
 def test_sigterm_tears_down_launched_groups(tmp_path):

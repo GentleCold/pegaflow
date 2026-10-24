@@ -249,10 +249,21 @@ arms: the next stage would start on a live GPU).
 Stage ports (vLLM, pegaflow-server gRPC / HTTP) are leased from the
 host-reserved range 20000-29999 (`ip_local_reserved_ports`: never an
 ephemeral port) under per-port `flock` files in `~/kexi/rsi-ports`, each
-bind-checked at lease time and released after teardown. A stage process
-that dies with EADDRINUSE before it is healthy fails the stage with
-`PortRace` naming the port; it is never retried. Every failed stage writes
-`stage-error.json` (arm, workload, exception type, error) in its dir.
+bind-checked at lease time. vLLM also gets a leased block of 8 contiguous
+ports as `VLLM_PORT`: its own TCP ports (`get_open_port`) scan up from
+there. On CUDA, TP>1 rendezvous goes through a file store and the engine
+core's ZMQ sockets are `ipc://` paths, so the block is normally unused.
+A stage process that fails before it is healthy, with EADDRINUSE on any bind
+in its log (a leased port, or one vLLM / torch / ZMQ / the server picked
+itself), fails the stage with `PortRace`. The error names each port parsed
+from the failing lines, plus any leased port another process holds once
+the stage process is dead. If no port is found, it names "unknown". It also
+records whether the gate leased each port, the lease files and the failing
+line. A port race is never retried. A stage's leases are released when the
+stage ends, on every path: success, exception, stop signal, teardown. Every
+failed stage writes `stage-error.json` (arm, workload, exception type,
+error, `port_leases`) in its dir. `summary.port_leases` lists every lease of
+the run (log, ports, block, lock files, leased/released times).
 
 Stopping a run: `kill -TERM -<run_gate pgid>` (or `-INT`, `-HUP`; launched
 with `setsid`, the gate's pgid is its pid). Each aborts the whole run: the

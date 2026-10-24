@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -135,8 +136,17 @@ PORT_LOCK_DIR = Path.home() / "kexi" / "rsi-ports"
 
 
 class PortRace(RuntimeError):
-    """A leased port was taken by another process before the stage bound it.
-    Fail-closed: the stage fails with this reason and is never retried."""
+    """A stage process failed to bind a port (EADDRINUSE): another process
+    took it. Fail-closed: the stage fails with this reason, never retried."""
+
+
+# vLLM's own TCP ports (``get_open_port``: a TCP rendezvous / DP master,
+# fault-tolerance sentinel) scan upward from ``VLLM_PORT`` when it is set,
+# so a contiguous leased block pinned there keeps them in the reserved range
+# and out of other gate runs. On CUDA, TP>1 rendezvous through a file store
+# (no TCP master port) and the engine core's ZMQ sockets are ``ipc://``
+# paths, so the block is normally unused.
+VLLM_PORT_BLOCK = 8
 
 
 def port_free(port: int) -> bool:
@@ -149,56 +159,149 @@ def port_free(port: int) -> bool:
     return True
 
 
-class PortLease:
-    """``n`` ports of ``rng``, held until ``release`` (or the gate's exit:
-    the kernel drops the flocks); each was free at lease time."""
+# Every lease of this gate process (``record``): summary.json ``port_leases``.
+_LEASES: list[PortLease] = []
 
-    def __init__(self, n: int, lock_dir: Path | None = None, rng: tuple[int, int] = PORT_RANGE):
-        import fcntl
+
+class PortLease:
+    """``n`` ports of ``rng`` plus, if ``block``, ``block`` contiguous ones
+    (``.block``), held until ``release`` (or the gate's exit: the kernel
+    drops the flocks); each was free at lease time. ``log``: the stage
+    process the ports are for (recorded)."""
+
+    def __init__(
+        self,
+        n: int,
+        lock_dir: Path | None = None,
+        rng: tuple[int, int] = PORT_RANGE,
+        block: int = 0,
+        log: Path | None = None,
+    ):
         import random
 
-        lock_dir = lock_dir or PORT_LOCK_DIR
-        lock_dir.mkdir(parents=True, exist_ok=True)
+        self.lock_dir = lock_dir or PORT_LOCK_DIR
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
         self.ports: list[int] = []
+        self.block: list[int] = []
         self._fds: list[int] = []
-        order = list(range(rng[0], rng[1] + 1))
-        random.shuffle(order)
-        for port in order:
-            if len(self.ports) == n:
-                break
-            fd = os.open(lock_dir / str(port), os.O_RDWR | os.O_CREAT, 0o644)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(fd)
-                continue
-            if not port_free(port):
-                os.close(fd)  # in use by a process outside the lock protocol
-                continue
-            os.ftruncate(fd, 0)
-            os.write(fd, f"{os.getpid()}\n".encode())
-            self.ports.append(port)
-            self._fds.append(fd)
-        if len(self.ports) < n:
+        self.record: dict[str, Any] = {
+            "log": str(log) if log else None,
+            "pid": os.getpid(),
+            "leased_at": time.time(),
+            "released_at": None,
+        }
+        try:
+            if block:
+                starts = list(range(rng[0], rng[1] - block + 2, block))
+                random.shuffle(starts)
+                for b in starts:
+                    got = [self._take(q) for q in range(b, b + block)]
+                    if all(got):
+                        self.block = list(range(b, b + block))
+                        break
+                    for fd in got:
+                        if fd:
+                            self._fds.remove(fd)
+                            os.close(fd)
+                if not self.block:
+                    raise RuntimeError(f"no {block} contiguous free ports in {rng} (lock dir {self.lock_dir})")  # fmt: skip
+            order = [q for q in range(rng[0], rng[1] + 1) if q not in self.block]
+            random.shuffle(order)
+            for q in order:
+                if len(self.ports) == n:
+                    break
+                if self._take(q):
+                    self.ports.append(q)
+            if len(self.ports) < n:
+                raise RuntimeError(f"no {n} free ports in {rng} (lock dir {self.lock_dir})")
+        except BaseException:
             self.release()
-            raise RuntimeError(f"no {n} free ports in {rng} (lock dir {lock_dir})")
+            raise
+        self.record |= {
+            "ports": self.ports,
+            "block": self.block,
+            "files": [str(self.lock_dir / str(q)) for q in self.ports + self.block],
+        }
+        _LEASES.append(self)
+
+    def _take(self, port: int) -> int | None:
+        import fcntl
+
+        fd = os.open(self.lock_dir / str(port), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        if not port_free(port):
+            os.close(fd)  # in use by a process outside the lock protocol
+            return None
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        self._fds.append(fd)
+        return fd
 
     def release(self) -> None:
         for fd in self._fds:
             with suppress(OSError):
                 os.close(fd)
+        if self._fds or self.record.get("released_at") is None:
+            self.record["released_at"] = time.time()
         self._fds = []
 
 
-def check_port_race(log: Path, ports: list[int], proc: subprocess.Popen) -> None:
-    """A stage process died before it was healthy: if its log shows a bind
-    failure, raise ``PortRace`` naming its leased ports."""
-    text = log.read_text(errors="replace")[-20000:] if log.exists() else ""
-    if "Address already in use" in text or "EADDRINUSE" in text:
-        raise PortRace(
-            f"port race: {log.name} (pid {proc.pid}) could not bind its leased port(s) "
-            f"{ports}: EADDRINUSE, taken by another process after the lease (not retried)"
-        )
+def release_leases(since: int = 0) -> list[dict[str, Any]]:
+    """Release every lease from ``_LEASES[since:]`` (idempotent): a stage's
+    leases once it is over, whatever way it ended (a lease whose stage never
+    launched included); their records."""
+    for lease in _LEASES[since:]:
+        lease.release()
+    return [lease.record for lease in _LEASES[since:]]
+
+
+_BIND_FAIL = re.compile(r"address already in use|EADDRINUSE|errno 98\b|os error 98\b", re.I)
+_BIND_PORT = (
+    re.compile(r"\(\s*['\"][^'\"]*['\"]\s*,\s*(\d{1,5})\s*\)"),  # ('0.0.0.0', 8000)
+    re.compile(r"\bport[\s:=]+(\d{1,5})\b", re.I),  # torch TCPStore: port: 29500
+    re.compile(
+        r"(?:tcp://|\b)(?:\d{1,3}(?:\.\d{1,3}){3}|localhost|\*|\[[0-9a-f:]*\]):(\d{1,5})\b", re.I
+    ),  # fmt: skip
+)
+
+
+def port_race(log: Path, leases: list[PortLease], proc: subprocess.Popen) -> PortRace | None:
+    """A stage process failed before it was healthy: if its log shows a bind
+    failure (any bind: the gate's leased ports or a port vLLM / the server
+    picked itself), a ``PortRace`` naming the port(s) parsed from the failing
+    lines plus any leased port another process now holds (or "unknown"),
+    whether the gate leased them, and the lease files."""
+    text = log.read_text(errors="replace")[-50000:] if log.exists() else ""
+    lines = text.splitlines()
+    hit = [i for i, line in enumerate(lines) if _BIND_FAIL.search(line)]
+    if not hit:
+        return None
+    ports: list[int] = []
+    for i in hit:
+        for line in lines[max(0, i - 2) : i + 1]:  # the address is often a line above
+            for rx in _BIND_PORT:
+                ports += [int(m) for m in rx.findall(line) if 0 < int(m) < 65536]
+    leased = {q for lease in leases for q in lease.ports + lease.block}
+    files = [f for lease in leases for f in lease.record.get("files", [])]
+    # A bare bind error often names no port. A leased port still bound once
+    # the stage process is dead is held by another process: the raced one.
+    held = sorted(q for q in leased if not port_free(q)) if proc.poll() is not None else []
+    ports = sorted(set(ports) | set(held))
+    where = (
+        ", ".join(f"{q} ({'leased' if q in leased else 'not leased by the gate'})" for q in ports)
+        if ports
+        else "unknown (not in the log)"
+    )
+    return PortRace(
+        f"port race: {log.name} (pid {proc.pid}, exit {proc.poll()}) failed to bind: "
+        f"EADDRINUSE on port {where}; leased ports held by another process: {held}; "
+        f"gate leases {sorted(leased)} (files {files}); "
+        f"failing line: {lines[hit[0]].strip()[:300]!r}; not retried"
+    )
 
 
 def wait_http(url: str, proc: subprocess.Popen, timeout: float, log: Path) -> None:
@@ -234,9 +337,10 @@ def launched(
             try:
                 try:
                     wait_http(health, proc, timeout, log)
-                except RuntimeError:
-                    if lease is not None and proc.poll() is not None:
-                        check_port_race(log, lease.ports, proc)
+                except Exception as e:  # died or hung: a bind failure is a PortRace
+                    race = port_race(log, [lease] if lease else [], proc)
+                    if race is not None:
+                        raise race from e
                     raise
                 yield proc
             finally:
@@ -379,7 +483,7 @@ def isolation_prefix(iso: dict[str, Any]) -> list[str]:
 
 
 def pegaflow_server(args, log: Path, pool_size: str, arm: str = "old"):
-    lease = PortLease(2)
+    lease = PortLease(2, log=log)
     grpc, http = lease.ports
     env = os.environ.copy()
     pycache_env(env, log)
@@ -522,11 +626,12 @@ def vllm_server(
     log,
     cpu_bytes: int = 0,
 ):
-    lease = PortLease(1)
+    lease = PortLease(1, block=VLLM_PORT_BLOCK, log=log)
     (port,) = lease.ports
     env = os.environ.copy()
     pycache_env(env, log)
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
+    env["VLLM_PORT"] = str(lease.block[0])  # vLLM's own ports: from the leased block
     env["VLLM_SERVER_DEV_MODE"] = "1"  # /reset_prefix_cache, /collective_rpc
     # No ``vllm.general_plugins`` (M7d): the pegaflow plugin would run a
     # tree's code in every vLLM process, the API server included. Every arm
@@ -1986,20 +2091,25 @@ def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
     its teardown failed (the next stage would share a live GPU) or a stop
     signal was received (whatever the exception became on the way)."""
     check_stop()
+    since = len(_LEASES)
     try:
         return run_arm_workload(args, gate, arm, wl, out, **kw)
     except Exception as e:
-        check_stop()
         # Every failed stage leaves its cause in the run record (a port race
-        # names the port); a required arm's failure still aborts the run.
+        # names the port and the lease files); a required arm's failure still
+        # aborts the run.
         with suppress(OSError):
             out.mkdir(parents=True, exist_ok=True)
             err = {"arm": arm, "workload": wl, "type": type(e).__name__, "error": str(e)[:4000]}
+            err["port_leases"] = release_leases(since)
             (out / "stage-error.json").write_text(json.dumps(err, indent=1))
+        check_stop()
         if arm_kind(arm) not in _RECORD_ONLY or _teardown_failed(e):
             raise
         print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)
         return {"arm": arm, "workload": wl, "error": f"{type(e).__name__}: {e}"[:2000]}
+    finally:
+        release_leases(since)  # also on a stop signal, before the gate exits
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2229,6 +2339,7 @@ def main(argv: list[str] | None = None) -> int:
         "contamination": contaminated,
         "isolation": iso_rec,
         "scan": scan,
+        "port_leases": release_leases(),
         "args": vars(args),
         "gate": gate,
         "official": not problems,
