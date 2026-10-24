@@ -387,7 +387,6 @@ def _raise(*_):
             [b"L0"],
             id="server-error-is-miss",
         ),
-        pytest.param(HIT, Policy(min_hit_tokens=16), 0, (0, False), [b"L0", b"L1"], id="min-hit"),
         pytest.param(
             {0: Ready(3, b"L0"), 1: Ready(1, b"L1", [2])},
             Policy(),
@@ -649,6 +648,56 @@ def test_sync_load_outcome_gates_saves(load_state, steps, preempted, expected):
         later.append(step(scheduled, preempted if i == 0 else ()))
     assert (saved0, saved1, later) == ([30, 31, 32, 33], [], expected)
     worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "event,expected",
+    [
+        # "other" saved before the failure: its blocks may still be read by an
+        # in-flight job, so a preemption must still flush and a finish must
+        # still hold its blocks until finished_sending.
+        pytest.param("preempt", {"flush": True, "finished": []}, id="preempted-still-flushes"),
+        pytest.param("finish", {"held": True, "finished": ["other"]}, id="finished-still-held"),
+        # S1: later short hits load async (a failed async load is never cached).
+        pytest.param("new-hit", {"hit": (8, True)}, id="later-loads-async"),
+    ],
+)
+def test_lifecycle_after_saves_disabled(event, expected):
+    layout = _layout(StubSemantics, StubFullSpec())
+    rpc = FakeRpc({0: Ready(3, b"L0")})
+    sched = Scheduler(
+        layout,
+        Policy(),
+        rpc,
+        "inst",
+        clock=Clock(),
+        semantics=StubSemantics,
+        sync_loads=True,
+        confirm_steps=2,
+    )
+    tables = {"r": [10, 11, 12, 13], "other": [30, 31, 32, 33]}
+    for rid in ("r", "other"):
+        sched.on_new_request(_req(17, 4, rid))
+    n, _ = sched.get_num_new_matched_tokens(sched._requests["r"], 4)
+    sched.update_state_after_alloc(sched._requests["r"], (tables["r"],), n)
+    sched.plan_saves([("r", 12, 5), ("other", 0, 17)], lambda rid: (tables[rid],))
+    assert [b for s in sched.take_plan().saves for b in s.block_ids] == [30, 31, 32, 33]
+    sched.on_load_errors({11, 12})  # r's sync load failed
+
+    got = {}
+    if event == "preempt":
+        sched.plan_saves([], lambda rid: (tables[rid],), preempted=("other",))
+    elif event == "finish":
+        got["held"] = sched.request_finished("other")
+    else:
+        got["hit"] = sched.get_num_new_matched_tokens(_req(17, 4, "late"), 4)
+    plan = sched.take_plan()
+    if event != "new-hit":
+        got["finished"] = plan.finished
+    if event == "preempt":
+        got["flush"] = plan.flush
+    assert got == expected
+    assert plan.saves == []
 
 
 def test_shutdown_releases_unsent_plans():

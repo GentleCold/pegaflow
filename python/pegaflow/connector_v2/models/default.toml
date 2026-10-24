@@ -1,9 +1,6 @@
 # Policy knobs shared by every model; models/<profile>.toml overrides them.
 # Keys must be fields of pegaflow.connector_v2.policy.Policy.
 
-# Hits shorter than this many tokens are not loaded.
-min_hit_tokens = 0
-
 # How long a request may stay unscheduled while the server prefetches
 # (SSD / remote). 0 = never wait: a Loading answer counts as a miss.
 loading_wait_ms = 1000

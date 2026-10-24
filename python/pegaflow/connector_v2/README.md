@@ -56,7 +56,14 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
       policy vLLM evicts nothing: the failed blocks and every block computed
       on them stay in its prefix cache under their correct hashes, so any
       later request (a sharer's next turn, a hit on a preempted loader's
-      freed blocks) may extend bad KV.
+      freed blocks) may extend bad KV. From then on every load is also
+      asynchronous, so no further failed load enters vLLM's prefix cache.
+
+    Residual risk: this protects the store, not vLLM's own outputs. Until the
+    rewound holder recomputes, requests in this process that hit the failed
+    blocks in vLLM's prefix cache (a sharer vLLM did not rewind, a hit on a
+    preempted or aborted loader's freed blocks) can produce wrong tokens.
+    vLLM 0.32 has no connector hook to evict them.
 
     An async load needs neither: vLLM schedules the request only after it
     processed the failure and reset its computed tokens.
