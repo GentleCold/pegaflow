@@ -177,6 +177,9 @@ fn filter_new_hashes_per_group(
 /// and grow that block's region by the dead duplicate.
 fn retain_new_unique(ctx: &mut LayerContext, needed: &HashSet<(u32, Vec<u8>)>) {
     let group = ctx.group;
+    // Per layer: two layers whose `block_ids` orders differ may keep different
+    // GPU copies of one hash. The copies hold the same content, and each layer
+    // still adds exactly one slot per block.
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     ctx.blocks_to_save
         .retain(|(_, hash)| needed.contains(&(group, hash.clone())) && seen.insert(hash.clone()));
