@@ -752,6 +752,16 @@ the last accepted run record by hand until `--accepted` exists.
   stays byte-exact and hard: gsm8k digests every computation, so the
   reference is exhaustive (`digest_compare`) and a loaded block or state
   that equals no computed copy is `mismatched`.
+  Qwen3.5-4B runs with `--compilation-config {"mode":0}` (gate.json
+  `vllm_args`; no torch.compile, CUDA graphs kept). An inductor compile of
+  this model is not reproducible: two fresh compiles of one config give
+  different logits at concurrency 1. vLLM caches the first compile per
+  config hash, and that hash includes `kv_transfer_config`, so an arm with
+  a connector and one without ran different kernels, and plain vs baseline
+  `alone_ref` differed from the first sampled token (selftest run
+  `qwen3.5-4b-selftest-aa42a44`). With mode 0, plain, baseline and a
+  repeated plain give identical logprobs, so the exact controls above
+  compare connectors, not compile artifacts.
 - G3 (`oracle.py`): replays `requests.jsonl` with unlimited capacity. A block
   ending at token e is stored at the first step whose `progress` reaches e
   (checkpoint groups: only a step ending exactly on e) and is visible to
