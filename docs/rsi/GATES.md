@@ -440,6 +440,18 @@ the last accepted run record by hand until `--accepted` exists.
     (path glob + pattern + reason; adding an entry is a gate change, with
     review sign-off). Allowlisted hits are recorded with their reason in
     `summary.scan.allowlisted`, the others in `summary.scan.flagged`.
+    Residual: the scan matches literal text, so it is deterrence too. It
+    does not chase every route by pattern. These known gaps are covered by
+    review of the snapshot, not by the scan (S12):
+    - frame walking (`inspect.currentframe` / `inspect.stack`,
+      `sys._getframe`, `sys._current_frames`, a traceback's frames) up to
+      `MultiConnector._connectors` and the probe object;
+    - class discovery through `__subclasses__()` (of `KVConnectorBase_V1`,
+      `object`, ...), then `setattr` on the probe class;
+    - `importlib.import_module` / `__import__` with a computed name, and any
+      built string (`"r" "si"`), which the `rsi` pattern cannot see;
+    - `ctypes` (raw memory, or calls into the interpreter's C API), and
+      the native module, whose strings are scanned but whose code is not.
   - No plugins (d). Every vLLM process runs with `VLLM_PLUGINS=""`: no
     `vllm.general_plugins` entry point runs (the venv's `pegaflow` plugin
     would run a tree's code in every vLLM process, the API server included).
