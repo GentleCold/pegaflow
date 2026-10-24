@@ -342,6 +342,13 @@ def launched(
         with log.open("w") as fh:
             fh.write(" ".join(cmd) + "\n\n")
             fh.flush()
+            # S11: an isolated arm's helper waits after its unshare until the
+            # gate holds the new mount namespace (``_record_mnt_ns``).
+            gate_r = gate_w = None
+            if str(ISOLATE) in cmd:
+                gate_r, gate_w = os.pipe()
+                cut = cmd.index("--")
+                cmd = [*cmd[:cut], "--wait-fd", str(gate_r), *cmd[cut:]]
             _STOP["teardown"] += 1
             try:
                 proc = subprocess.Popen(
@@ -351,11 +358,25 @@ def launched(
                     stderr=subprocess.STDOUT,
                     cwd=REPO,
                     start_new_session=True,
+                    pass_fds=() if gate_r is None else (gate_r,),
                 )
                 _LIVE[proc.pid] = (proc, cmd[0])
+                if gate_w is not None:
+                    _MNT_NS[proc.pid] = None  # stop() also empties its mount ns
+            except BaseException:
+                if gate_w is not None:
+                    os.close(gate_w)
+                raise
             finally:
                 _STOP["teardown"] -= 1
+                if gate_r is not None:
+                    os.close(gate_r)
             try:
+                if gate_w is not None:
+                    try:
+                        _record_mnt_ns(proc.pid, NS_RECORD_TIMEOUT)
+                    finally:
+                        os.close(gate_w)  # EOF: the helper goes on
                 check_stop()
                 try:
                     wait_http(health, proc, timeout, log)
@@ -375,6 +396,71 @@ def launched(
 _STOP: dict[str, Any] = {"signal": None, "teardown": 0}
 # Every launched process group not yet stopped (pid -> (proc, name)).
 _LIVE: dict[int, tuple[subprocess.Popen, str]] = {}
+# S11: isolated leader pid -> an open fd of the private mount namespace
+# isolate.py unshared (None until read). A root arm can setsid() out of its
+# process group, but not out of this namespace (setns / unshare need
+# CAP_SYS_ADMIN, which isolate.py drops), so every process in it is the
+# arm's. The fd keeps the namespace (and so its inode number) from being
+# freed and reused until ``stop`` has emptied it.
+_MNT_NS: dict[int, int | None] = {}
+NS_RECORD_TIMEOUT = 30.0
+
+
+def _mnt_ns(pid: int | str) -> tuple[int, int] | None:
+    """The mount namespace of a live process (None: gone, or a zombie)."""
+    try:
+        st = os.stat(f"/proc/{pid}/ns/mnt")
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _record_mnt_ns(pid: int, timeout: float) -> None:
+    """Hold the leader's mount namespace once isolate.py has unshared it
+    (it differs from the gate's). The helper blocks on ``--wait-fd`` right
+    after the unshare, so this runs before any of the arm's code can. Left
+    None if the leader exits first or is still in the gate's namespace
+    after ``timeout``; ``stop`` tries once more."""
+    own = _mnt_ns("self")
+    t0 = time.monotonic()
+    while True:
+        try:
+            fd = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            return  # gone
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != own:
+            _MNT_NS[pid] = fd
+            return
+        os.close(fd)
+        if time.monotonic() - t0 >= timeout:
+            return
+        time.sleep(0.01)
+
+
+def _ns_signal(fd: int, sig: int) -> list[int]:
+    """Send ``sig`` to every live process in the mount namespace held by
+    ``fd``; return their pids. Each is signaled through a pidfd opened
+    before its namespace is checked, so a pid reused in between is never
+    signaled."""
+    st = os.fstat(fd)
+    ns = (st.st_dev, st.st_ino)
+    hit = []
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            pidfd = os.pidfd_open(int(p))
+        except OSError:
+            continue
+        try:
+            if _mnt_ns(p) == ns:
+                with suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(pidfd, sig)
+                hit.append(int(p))
+        finally:
+            os.close(pidfd)
+    return hit
 
 
 def check_stop() -> None:
@@ -395,24 +481,33 @@ def stop(proc: subprocess.Popen, name: str, fh) -> None:
     port, GPU memory or pinned host memory. Children (vLLM's EngineCore)
     outlive the API server while they free GPU / CPU-offload memory, and
     pegaflow-server can take minutes after SIGKILL to unpin a large pool, so
-    the wait is on the group, with a generous bound; the exit time is logged."""
+    the wait is on the group, with a generous bound; the exit time is logged.
+
+    S11: for an isolated arm the same signals and wait also cover every
+    process in its mount namespace (``_MNT_NS``), so one that setsid()'d out
+    of the group is stopped too."""
     t0 = time.monotonic()
     _STOP["teardown"] += 1  # a stop signal now waits for this group
     try:
-        with suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGTERM)
+        if proc.pid in _MNT_NS and _MNT_NS[proc.pid] is None:
+            _record_mnt_ns(proc.pid, 0)
+        ns = _MNT_NS.get(proc.pid)
+        _signal_all(proc, ns, signal.SIGTERM)
         how = "SIGTERM"
-        if not _group_gone(proc, TERM_GRACE):
-            with suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
+        if not _all_gone(proc, ns, TERM_GRACE):
+            _signal_all(proc, ns, signal.SIGKILL)
             how = "SIGKILL"
-            if not _group_gone(proc, KILL_GRACE):
+            if not _all_gone(proc, ns, KILL_GRACE):
+                left = f", mount ns members {_ns_signal(ns, 0)}" if ns is not None else ""
                 raise TeardownError(
                     f"process group {proc.pid} ({name}) still alive"
-                    f" {time.monotonic() - t0:.0f}s after SIGTERM + SIGKILL"
+                    f" {time.monotonic() - t0:.0f}s after SIGTERM + SIGKILL{left}"
                 )
     finally:
         _LIVE.pop(proc.pid, None)  # gone, or given up on (TeardownError)
+        fd = _MNT_NS.pop(proc.pid, None)
+        if fd is not None:
+            os.close(fd)
         _STOP["teardown"] -= 1
     msg = f"[gate] {name} group {proc.pid} gone after {how} in {time.monotonic() - t0:.1f}s"
     with suppress(ValueError, OSError, AttributeError):
@@ -431,16 +526,25 @@ def stop_live() -> None:
             stop(proc, name, None)
 
 
-def _group_gone(proc: subprocess.Popen, timeout: float) -> bool:
+def _signal_all(proc: subprocess.Popen, ns: int | None, sig: int) -> None:
+    with suppress(ProcessLookupError):
+        os.killpg(proc.pid, sig)
+    if ns is not None:
+        _ns_signal(ns, sig)
+
+
+def _all_gone(proc: subprocess.Popen, ns: int | None, timeout: float) -> bool:
     """Reap the leader (an unreaped zombie still counts as a group member)
-    and wait until no process of its group is left."""
+    and wait until no process of its group, nor of its mount namespace
+    ``ns``, is left. Signal 0 probes only: it delivers nothing."""
     t0 = time.monotonic()
     while True:
         proc.poll()
         try:
             os.killpg(proc.pid, 0)
         except ProcessLookupError:
-            return True
+            if ns is None or not _ns_signal(ns, 0):
+                return True
         if time.monotonic() - t0 >= timeout:
             return False
         time.sleep(1)

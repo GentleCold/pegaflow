@@ -245,7 +245,13 @@ run continues; a crash of baseline or the connector under test aborts it.
 Every stage's vLLM / pegaflow-server runs in its own process group; teardown
 SIGTERMs the group, waits up to 120 s, SIGKILLs it, waits up to 300 s, and a
 group that survives that aborts the run (`TeardownError`, also for reference
-arms: the next stage would start on a live GPU).
+arms: the next stage would start on a live GPU). For the arm under test the
+same signals and waits also cover every process in its private mount
+namespace (S11), so a process that `setsid()`s out of the group is stopped
+too. `isolate.py` blocks right after its `unshare` until the gate has opened
+`/proc/<pid>/ns/mnt` and is holding it, so the namespace is recorded before any arm
+code runs. Processes are matched by namespace inode only and signaled through
+pidfds; the arm cannot leave the namespace (no `CAP_SYS_ADMIN`).
 Stage ports (vLLM, pegaflow-server gRPC / HTTP) are leased from the
 host-reserved range 20000-29999 (`ip_local_reserved_ports`: never an
 ephemeral port) under per-port `flock` files in `~/kexi/rsi-ports`, each
@@ -399,7 +405,8 @@ the last accepted run record by hand until `--accepted` exists.
     `/proc/<gate pid>/root`. The baseline's outputs, digests and requests,
     and every other arm's, are not visible to it. The pid, IPC and network
     namespaces are the host's (CUDA IPC, loopback ports): the exec is in
-    place, so `stop` signals and waits for the same process group as before.
+    place, so `stop` signals and waits for the same process group as before,
+    plus everything in the arm's mount namespace (S11).
     The command prefix is in `summary.isolation`. A run whose arm under test
     could not be isolated (not Linux, not root) is not official.
     Residual: this is deterrence, not a boundary. What holds (tested in

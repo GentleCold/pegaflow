@@ -1,6 +1,6 @@
 """Run a command with a directory tree hidden (M7a, GATES.md "Boundary").
 
-    python -I -S -B isolate.py --hide ROOT [--rw DIR]... [--ro DIR]... -- CMD...
+    python -I -S -B isolate.py --hide ROOT [--rw DIR]... [--ro DIR]... [--wait-fd FD] -- CMD...
 
 In a private mount namespace (``os.unshare(CLONE_NEWNS)``, propagation
 private, so nothing is visible on the host), ``ROOT`` is covered by an empty
@@ -14,6 +14,9 @@ its last process. Binds go through ``/proc/self/fd/N`` of dirs opened (in the
 new namespace) before the tmpfs is mounted: the kernel follows the fd to the original dir, and no
 path is canonicalized after ROOT is covered. The dir fds are not inherited
 by ``CMD``. ``DROP_CAPS`` leave the bounding set before the exec.
+``--wait-fd`` (S11): right after the unshare, block until the read end
+``FD`` of a pipe reaches EOF, i.e. until the gate (holding the write end) has
+opened the new namespace, so it is recorded before ``CMD`` can run.
 
 Standalone: stdlib only, run with ``-I -S`` (no ``PYTHONPATH``, no site, so the
 arm's snapshot dir on it cannot shadow a module of this helper). Needs
@@ -107,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--hide", required=True)
     ap.add_argument("--rw", action="append", default=[])
     ap.add_argument("--ro", action="append", default=[])
+    ap.add_argument("--wait-fd", type=int)
     args = ap.parse_args(argv[:cut])
     cmd = argv[cut + 1 :]
     if not cmd:
@@ -119,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
         if not _inside(d, hide):
             raise SystemExit(f"isolate.py: {d} is not under {hide}")
     os.unshare(os.CLONE_NEWNS)
+    if args.wait_fd is not None:
+        os.read(args.wait_fd, 1)  # EOF once the gate holds this namespace
+        os.close(args.wait_fd)
     _mount("none", "/", None, MS_REC | MS_PRIVATE)
     # Opened in the new namespace (a bind source must be one of its mounts)
     # before ROOT is covered; O_CLOEXEC (Python's default): CMD never gets an

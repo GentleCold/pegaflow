@@ -1183,9 +1183,10 @@ port, runs = sys.argv[1], Path(sys.argv[2])
 arm = runs / "r" / "ut" / "gsm8k"
 arm.mkdir(parents=True, exist_ok=True)
 args = argparse.Namespace(runs_root=str(runs), under_test_path="", under_test_overlay="")
-# A child that forks a grandchild, as vLLM forks EngineCore / workers.
-inner = "import subprocess, sys, http.server; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)']); http.server.test(http.server.SimpleHTTPRequestHandler, port=int(sys.argv[1]), bind='127.0.0.1')"
-cmd = run_gate.isolated(args, "m:C", arm / "vllm.log", [sys.executable, "-c", inner, port])
+# A child that forks a grandchild, as vLLM forks EngineCore / workers, and
+# one that setsid()s out of the group (S11); its pid goes to the arm's dir.
+inner = "import subprocess, sys, http.server; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)']); s = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'], start_new_session=True); open(sys.argv[2], 'w').write(str(s.pid)); http.server.test(http.server.SimpleHTTPRequestHandler, port=int(sys.argv[1]), bind='127.0.0.1')"
+cmd = run_gate.isolated(args, "m:C", arm / "vllm.log", [sys.executable, "-c", inner, port, str(arm / "setsid.pid")])
 with run_gate.launched(cmd, {}, arm / "vllm.log", f"http://127.0.0.1:{port}/", 60) as p:
     (runs / "pid").write_text(str(p.pid))
     time.sleep(600)
@@ -1197,7 +1198,8 @@ def test_isolated_arm_is_torn_down_with_its_group(tmp_path):
     """M7(a): the isolated arm is exec'd in place, so it is the group
     leader ``launched`` started; its health endpoint is reachable on
     loopback, and SIGTERM to the gate stops every member of the group (the
-    grandchild included) before the gate exits."""
+    grandchild included) before the gate exits. S11: a child that setsid()'d
+    out of the group is stopped too (it is in the arm's mount namespace)."""
     import os
     import signal
     import subprocess
@@ -1217,10 +1219,23 @@ def test_isolated_arm_is_torn_down_with_its_group(tmp_path):
     assert os.readlink(f"/proc/{leader}/ns/pid") == os.readlink("/proc/self/ns/pid")
     members = [p for p in os.listdir("/proc") if p.isdigit() and _pgid(int(p)) == leader]
     assert len(members) >= 2, members  # leader + grandchild
+    escaped = int((tmp_path / "r" / "ut" / "gsm8k" / "setsid.pid").read_text())
+    assert _pgid(escaped) == escaped != leader  # out of the group
+    assert os.readlink(f"/proc/{escaped}/ns/mnt") == os.readlink(f"/proc/{leader}/ns/mnt")
     gate.send_signal(signal.SIGTERM)
     assert gate.wait(timeout=120) == 128 + signal.SIGTERM
     with pytest.raises(ProcessLookupError):
         os.killpg(leader, 0)
+    assert _dead(escaped), "setsid'd child survived teardown"
+
+
+def _dead(pid: int) -> bool:
+    """Gone, or a zombie its new parent (init) has not reaped yet."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] in ("Z", "X")
 
 
 def _pgid(pid: int) -> int | None:
