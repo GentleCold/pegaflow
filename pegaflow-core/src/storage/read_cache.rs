@@ -886,6 +886,10 @@ fn remove_retained_tail_first(
         return;
     }
     let before = removed.len();
+    // A pass looks at no more than TAIL_WINDOW_MAX_BLOCKS entries whatever
+    // the batch: reclaim batches are at most 512, and a larger caller gets a
+    // short round and calls again rather than a scan of the class.
+    let wanted = wanted.min(TAIL_WINDOW_MAX_BLOCKS);
     let share = (len as u128 * u128::from(window_percent) / 100) as usize;
     let window = share.min(TAIL_WINDOW_MAX_BLOCKS).max(wanted).min(len);
     // Clone only the keys the batch can use: a subtree yields at least one
@@ -913,10 +917,13 @@ fn remove_retained_tail_first(
     if removed.len() < batch_size {
         // Pins cover the candidates: take unpinned leaves in LRU order. Only
         // the victims are cloned, and the scan is capped like the window.
-        let wanted = batch_size - removed.len();
+        // Pinned window entries are not rotated here (only the LRU fallback
+        // below does that), so after a round that freed some but not all of
+        // the batch, the next round rescans them: at most 2 x 4096 entries.
+        let wanted = (batch_size - removed.len()).min(TAIL_WINDOW_MAX_BLOCKS);
         let leaves: Vec<BlockKey> = class_lru_ref(inner, class)
             .iter()
-            .take(TAIL_WINDOW_MAX_BLOCKS.max(wanted))
+            .take(TAIL_WINDOW_MAX_BLOCKS)
             .filter(|(key, _)| {
                 inner.cache.is_cache_owned_only(key) && deepest_retained_child(inner, key).is_none()
             })

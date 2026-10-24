@@ -77,9 +77,11 @@ pub(crate) struct CoreMetrics {
     /// position, linked by an earlier query. Dependents the server never
     /// linked (a new turn not yet requeried, decode tails, prefetch inserts,
     /// children of a re-saved head) are not counted. Nonzero under plain LRU
-    /// (window 0), under the reclaimable class's LRU, and when a tail-first
-    /// round falls back to LRU because pins cover the window. Full cleanup
-    /// (`remove_all`) never counts.
+    /// (window 0), under the reclaimable class's LRU, when a tail-first
+    /// round falls back to LRU because pins cover the window, and when
+    /// tail-first evicts a retained block whose resident children are all
+    /// reclaimable (a leaf for the retained walk; each child has a remote
+    /// copy). Full cleanup (`remove_all`) never counts.
     pub cache_evictions_with_resident_children: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
     pub cache_residence_duration: Histogram<f64>,
