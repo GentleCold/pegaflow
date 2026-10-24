@@ -1548,11 +1548,15 @@ def _digest_verdict(
     judged = d["external_matched"] + d["external_mismatched"]
     seen = d["external_compared"] + d["external_uncertain"] + d["external_unreferenced"]
     vacuous = vacuous_ok and seen == 0
+    # A state an episode started from (local or loaded) that the probe could
+    # not digest is a load nobody judged.
+    start_skipped = sum(n for k, n in d.get("state_skipped", {}).items() if k.startswith("start"))
     ok = (
         d["local_mismatched"] == 0
         and d["external_mismatched"] == 0
         and d["local_unreferenced"] == 0
         and d["external_unreferenced"] == 0
+        and start_skipped == 0
     )
     if min_judged is not None and not vacuous:
         ok = ok and judged > 0 and judged >= min_judged * seen
@@ -1578,6 +1582,7 @@ def _digest_verdict(
         **cov,
         **({"vacuous": "no external block in the digested sample"} if vacuous else {}),
         **({"preempted_uncertain": preempted} if preempted else {}),
+        **({"state_skipped": d["state_skipped"]} if d.get("state_skipped") else {}),
         **{k: d[k] for k in keys},
         "first_bad": next((g["first_bad"] for g in d["groups"].values() if g["first_bad"]), None),
     }

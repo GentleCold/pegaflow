@@ -527,8 +527,28 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             # caches after an async load landed (not a computation).
             if sched.get(rid, 0) > 0:
                 self._offered_states(rid, entries, states)
+        if self._state_groups:
+            before = {r.req_id: r.num_computed_tokens for r in scheduler_output.scheduled_new_reqs}
+            before |= dict(zip(cached.req_ids, cached.num_computed_tokens, strict=True))
+            self._unoffered(before, sched, offers)
         jobs, self._pending = self._pending, []
         return ProbeMetadata(jobs=jobs, states=states)
+
+    def _unoffered(self, before: dict[str, int], sched: dict[str, int], offers) -> None:
+        """A step ending exactly on a state boundary computes that state; one
+        vLLM did not offer is never digested (recorded ``not_offered``)."""
+        got = {(rid, gid, b) for rid, entries in offers.items() for gid, _, b in entries}
+        for rid, n in sched.items():
+            live = self._live.get(rid)
+            if n <= 0 or live is None or not live.episodes or rid not in before:
+                continue
+            if self._digest_mode(live) not in ("full", "ref"):
+                continue
+            after = before[rid] + n
+            for gid in sorted(self._state_groups):
+                bt = self._groups[gid].kv_cache_spec.block_size
+                if after % bt == 0 and (rid, gid, after) not in got:
+                    live.states.append([len(live.episodes) - 1, after, gid, "not_offered"])
 
     @staticmethod
     def _state_key(live: _Live, covered: int) -> str | None:
