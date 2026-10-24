@@ -84,6 +84,109 @@ def gsm8k_extract(text: str) -> str | None:
     return _norm(nums[-1]) if nums else None
 
 
+def _gsm8k_body(model: str, prompt: str | list[int], max_tokens: int) -> dict[str, Any]:
+    return {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stop": ["Question:", "\n\n\n"],
+    }
+
+
+async def tokenize(url: str, model: str, prompts: list[str]) -> list[list[int]]:
+    """Token ids of each prompt as the completions endpoint sees a string
+    prompt (``/tokenize``, special tokens added: both default to it)."""
+    out = []
+    async with session() as s:
+        for p in prompts:
+            async with s.post(f"{url}/tokenize", json={"model": model, "prompt": p}) as r:
+                r.raise_for_status()
+                out.append(list((await r.json())["tokens"]))
+    return out
+
+
+async def run_resume(
+    url: str,
+    model: str,
+    prompts: list[tuple[str, str]],
+    waves: list[list[tuple[int, int]]],
+    concurrency: int,
+    max_tokens: int = 384,
+    xargs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Replay of another arm's gsm8k pass at that arm's resume points.
+
+    ``waves``: (prompt index, resume tokens R) groups in the arm's schedule
+    order. Per request: a ``max_tokens=1`` request of the first R prompt
+    tokens (pass ``<pass>_prewarm``) puts ``[0, R)`` in vLLM's prefix cache,
+    then the whole prompt runs (streamed) and starts computing at R. A wave
+    starts once every request of the previous wave has its first token
+    (prefill done, so its blocks are in the prefix cache, as they were for
+    the arm's later requests); decoding overlaps later waves. Returns
+    ``outputs`` per prompt index (None if not in any wave)."""
+    import aiohttp
+
+    sem = asyncio.Semaphore(concurrency)
+    outputs: list[str | None] = [None] * len(prompts)
+    ids = await tokenize(url, model, [p for p, _ in prompts])
+    tail: list[asyncio.Task[None]] = []
+
+    async def one(s: aiohttp.ClientSession, i: int, r: int, prefilled: asyncio.Event) -> None:
+        tags = (xargs or {}) | {"rsi_conv": i}
+        try:
+            async with sem:
+                if r > 0:
+                    warm = _gsm8k_body(model, ids[i][:r], 1)
+                    warm["vllm_xargs"] = tags | {"rsi_pass": f"{tags.get('rsi_pass')}_prewarm"}
+                    async with s.post(f"{url}/v1/completions", json=warm) as resp:
+                        resp.raise_for_status()
+                        await resp.read()
+                body = _gsm8k_body(model, ids[i], max_tokens) | {"stream": True}
+                body["vllm_xargs"] = tags
+                text = []
+                async with s.post(f"{url}/v1/completions", json=body) as resp:
+                    resp.raise_for_status()
+                    async for raw in resp.content:
+                        line = raw.strip()
+                        if not line.startswith(b"data:") or line == b"data: [DONE]":
+                            continue
+                        prefilled.set()
+                        choices = json.loads(line[5:]).get("choices") or []
+                        if choices:
+                            text.append(choices[0].get("text") or "")
+                outputs[i] = "".join(text)
+        finally:
+            prefilled.set()  # a failed request must not stall later waves
+
+    t0 = time.monotonic()
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=600)
+    async with session(timeout) as s:
+        for wave in waves:
+            events = []
+            for i, r in wave:
+                ev = asyncio.Event()
+                events.append(ev)
+                tail.append(asyncio.create_task(one(s, i, r, ev)))
+            await asyncio.gather(*(ev.wait() for ev in events))
+            for t in tail:
+                if t.done() and t.exception():
+                    raise t.exception()  # type: ignore[misc]
+        await asyncio.gather(*tail)
+    n = sum(o is not None for o in outputs)
+    correct = sum(
+        o is not None and gsm8k_extract(o) == g for o, (_, g) in zip(outputs, prompts, strict=True)
+    )
+    return {
+        "n": n,
+        "waves": len(waves),
+        "correct": correct,
+        "accuracy": correct / n if n else 0.0,
+        "seconds": time.monotonic() - t0,
+        "outputs": outputs,
+    }
+
+
 async def run_gsm8k(
     url: str,
     model: str,
@@ -109,15 +212,11 @@ async def run_gsm8k(
     tokens: list[dict[str, Any] | None] = [None] * len(prompts)
 
     async def one(session: aiohttp.ClientSession, i: int) -> None:
-        body = {
-            "model": model,
-            "prompt": prompts[i][0],
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "stop": ["Question:", "\n\n\n"],
-        }
+        body = _gsm8k_body(model, prompts[i][0], max_tokens)
         if xargs:
-            body["vllm_xargs"] = xargs
+            # ``rsi_conv``: the prompt index (workload position), so a
+            # reference stage can replay a request of this pass by index.
+            body["vllm_xargs"] = xargs | {"rsi_conv": i}
         if logprobs:
             body["logprobs"] = 1
         async with sem:
@@ -126,7 +225,9 @@ async def run_gsm8k(
                 warm.pop("logprobs", None)
                 if xargs:
                     # Its own pass label: the oracle and verdicts never score it.
-                    warm["vllm_xargs"] = xargs | {"rsi_pass": f"{xargs.get('rsi_pass')}_prewarm"}
+                    warm["vllm_xargs"] = body["vllm_xargs"] | {
+                        "rsi_pass": f"{xargs.get('rsi_pass')}_prewarm"
+                    }
                 async with session.post(f"{url}/v1/completions", json=warm) as r:
                     r.raise_for_status()
                     await r.read()

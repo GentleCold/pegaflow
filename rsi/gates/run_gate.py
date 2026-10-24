@@ -128,6 +128,14 @@ SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 SPLIT_PASSES = ("split_ref", "split")
 MIN_PREWARMED = 0.9  # share of split requests whose hit reaches the last full block
 MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
+# Split-variant models, every arm with a gsm8k stage: a baseline stage
+# ``baseline/resume-<label>`` replays the arm's warm pass at the arm's own
+# resume points (``resume_plan``), so warm KV computed from wherever the arm
+# resumed (an LMCache 256-token chunk end, not the last full block) has a
+# same-split, same-context reference, and the arm's warm completions have a
+# same-split reference (``resume_differ``).
+RESUME_PASS = "resume"
+RESUME_PREFIX = "resume-"
 
 
 def free_port() -> int:
@@ -1037,6 +1045,62 @@ def match_locals(reqs: list[dict[str, Any]], ref: dict[str, int] | None) -> list
     return out
 
 
+def resume_plan(reqs: list[dict[str, Any]], n: int) -> dict[str, Any]:
+    """An arm's gsm8k warm pass as the baseline's ``resume`` stage replays it.
+
+    Per warm request (prompt index ``conv``), from its last schedule episode
+    ``[step, local, start]``: the arm resumed computing at ``start`` with
+    ``[0, local)`` from vLLM's prefix cache (filled by its earlier warm
+    requests) and ``[local, start)`` loaded by the connector. The replay
+    pre-warms ``[0, start)`` (only when ``start > local``: the local part
+    comes from the replay's own earlier requests, as in the arm), in waves of
+    the arm's schedule order (same ``step`` = same wave). ``problems``: warm
+    requests without a usable prompt index (the plan then fails closed)."""
+    rows, problems, seen = [], [], set()
+    for r in reqs:
+        if r.get("pass") != "warm" or not r.get("episodes"):
+            continue
+        i = r.get("conv")
+        if not isinstance(i, int) or not 0 <= i < n or i in seen:
+            problems.append(f"warm request {r.get('req_id')}: prompt index {i!r}")
+            continue
+        seen.add(i)
+        step, local, start = r["episodes"][-1]
+        rows.append((step, i, start, local or 0, r.get("prompt_len")))
+    waves: list[list[list[int]]] = []
+    last = None
+    for step, i, start, local, plen in sorted(rows):
+        if step != last:
+            waves.append([])
+            last = step
+        waves[-1].append([i, start if start > local else 0, start, plen])
+    if len(seen) != n:
+        problems.append(f"{len(seen)} of {n} prompts have a warm request")
+    return {"waves": waves, "problems": problems}
+
+
+def resume_check(plan: dict[str, Any], reqs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Did the replay resume where the arm did? Per planned prompt: the
+    replayed ``resume`` request's prompt length and last-episode start vs the
+    arm's (a differing start leaves that request's computed blocks without a
+    same-split reference: unjudged, never matched)."""
+    got = {
+        r["conv"]: r for r in reqs if r.get("pass") == RESUME_PASS and r.get("episodes")
+    }  # fmt: skip
+    planned = [x for w in plan["waves"] for x in w]
+    missing = [i for i, *_ in planned if i not in got]
+    plen = [i for i, _, _, p in planned if i in got and got[i].get("prompt_len") != p]
+    start = [i for i, _, s, _ in planned if i in got and got[i]["episodes"][-1][2] != s]
+    return {
+        "planned": len(planned),
+        "waves": len(plan["waves"]),
+        "missing": missing,
+        "prompt_len_differs": plen,
+        "start_differs": start,
+        "plan_problems": plan["problems"],
+    }
+
+
 def run_arm_workload(
     args,
     gate,
@@ -1045,10 +1109,15 @@ def run_arm_workload(
     out: Path,
     capacity: int = 0,
     ref_local: dict[str, int] | None = None,
+    resume_from: Path | None = None,
+    resume_limit: int | None = None,
 ) -> dict[str, Any]:
     """``capacity`` (``cap*`` workloads): store bytes, for PegaFlow's pool or
     the native arm's CPU cache. Other workloads use ``--pool-size``.
-    ``ref_local``: baseline cap local hits (``reference_locals``)."""
+    ``ref_local``: baseline cap local hits (``reference_locals``).
+    ``resume_from`` (baseline, workload ``resume-<label>``): the arm's gsm8k
+    probe dir, whose warm pass this stage replays (``resume_plan``) over the
+    arm's ``resume_limit`` gsm8k prompts."""
     out.mkdir(parents=True, exist_ok=True)
     probe = out / "probe"
     if probe.exists():
@@ -1060,11 +1129,15 @@ def run_arm_workload(
         d.mkdir(parents=True)
     kind = arm_kind(arm)
     gsm = workload == "gsm8k"
+    resume = workload.startswith(RESUME_PREFIX)
+    if resume and (kind != "baseline" or resume_from is None):
+        raise ValueError("a resume stage is a baseline stage replaying an arm's gsm8k probe")
     cap = workload.startswith("cap")
     if cap and capacity <= 0 and kind != "baseline":
         raise ValueError("cap workload needs a capacity")
     store_bytes = capacity if cap else parse_size(args.pool_size)
-    invariant = gsm and bool(gate.get("batch_invariant"))
+    # The resume replay is judged like the gsm8k stage it references.
+    invariant = (gsm or resume) and bool(gate.get("batch_invariant"))
     split_inv = bool(gate.get("split_invariant", True))
     result: dict[str, Any] = {
         "arm": arm,
@@ -1110,6 +1183,12 @@ def run_arm_workload(
                 names += list(SPLIT_PASSES)  # the split control
             elif kind == "baseline" and not split_inv:
                 names.append("split")  # same-split references for warm computed KV
+        elif resume:
+            assert resume_from is not None
+            prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, resume_limit)
+            plan = resume_plan(oracle.load_requests(resume_from / "requests.jsonl"), len(prompts))
+            result["resume_plan"] = plan
+            names = [RESUME_PASS]
         else:
             convs = workloads.build_turns(
                 Path(args.replay_file),
@@ -1158,6 +1237,18 @@ def run_arm_workload(
                 (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
                 if "tokens" in res:
                     (gdir / f"{name}-tokens.json").write_text(json.dumps(res.pop("tokens")))
+            elif resume:
+                res = asyncio.run(
+                    workloads.run_resume(
+                        url,
+                        "m",
+                        prompts,
+                        [[(i, r) for i, r, *_ in w] for w in plan["waves"]],
+                        args.concurrency,
+                        xargs={"rsi_pass": name, "rsi_digest": "full"},
+                    )
+                )
+                (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
             else:
                 # Replay: digest a conversation sample in the untimed passes;
                 # all turns of a sampled conversation, so its references are
@@ -1231,6 +1322,8 @@ def run_arm_workload(
     result["load_errors"] = (
         [json.loads(x) for x in errs.read_text().splitlines()] if errs.exists() else []
     )
+    if resume:
+        result["resume_check"] = resume_check(result["resume_plan"], reqs)
     result["digest_self"] = digest_compare.compare(probe, probe, invariant, split_inv)
     (gdir / "result.json").write_text(json.dumps(result, indent=1))
     return result
@@ -1377,8 +1470,8 @@ def g0_provenance(
 # ------------------------------------------------------------- verdicts
 
 
-def _outputs(run_dir: Path, label: str, name: str) -> list[str] | None:
-    f = run_dir / GATE_DIR / label / "gsm8k" / f"{name}-outputs.json"
+def _outputs(run_dir: Path, label: str, name: str, wl: str = "gsm8k") -> list[Any] | None:
+    f = run_dir / GATE_DIR / label / wl / f"{name}-outputs.json"
     return json.loads(f.read_text()) if f.exists() else None
 
 
@@ -1491,6 +1584,52 @@ def split_differ(
     pairs = zip(ctrl["split_outputs"], got, ctrl["aligned"], strict=False)
     diff = [(a != b, al) for a, b, al in pairs]
     return sum(d for d, al in diff if not al), sum(d for d, al in diff if al)
+
+
+def resume_differ(
+    check: dict[str, Any],
+    plan: dict[str, Any],
+    ref: list[Any] | None,
+    got: list[str] | None,
+    align: int,
+) -> tuple[int | None, int | None]:
+    """Warm completions vs the baseline's replay at the arm's resume points
+    (``split_differ``'s shape: (differing among checked prompts, differing
+    among exempt ones)). Exempt: an aligned prompt (``prompt_len % align ==
+    0``) whose replay could not resume where the arm did (a connector's hit
+    may end inside the last block, vLLM's prefix cache cannot). Every other
+    prompt is checked; one without a replayed completion (missing, or not
+    resumed at the arm's point) counts as differing (fail closed, S7)."""
+    if got is None or ref is None or plan["problems"]:
+        return None, None
+    plen = {i: p for w in plan["waves"] for i, _, _, p in w}
+    unreplayed = set(check["missing"]) | set(check["start_differs"]) | set(check["prompt_len_differs"])  # fmt: skip
+    checked = exempt = 0
+    for i, out in enumerate(got):
+        p = plen.get(i)
+        aligned = bool(p) and p % align == 0
+        if i in unreplayed and aligned:
+            exempt += i < len(ref) and ref[i] != out
+            continue
+        checked += i in unreplayed or i >= len(ref) or ref[i] != out
+    return checked, exempt
+
+
+def _resume_verdict(r: dict[str, Any] | None) -> dict[str, Any]:
+    """``G2.resume_reference``: the baseline replay of the arm's warm pass ran
+    and is self-consistent (its local hits equal its computed copies). How
+    many requests resumed elsewhere than the arm is reported; their computed
+    blocks have no same-split copy and count as unjudged in the coverage."""
+    if r is None:
+        return {"pass": False, "reason": "no baseline replay of this arm's resume points"}
+    d = _digest_verdict(r.get("digest_self"), None)
+    c = r.get("resume_check", {})
+    return {
+        "pass": d["pass"] and not c.get("plan_problems"),
+        "digest_self": d["pass"],
+        **{k: c.get(k) for k in ("planned", "waves", "plan_problems")},
+        **{k: len(c.get(k) or []) for k in ("missing", "start_differs", "prompt_len_differs")},
+    }
 
 
 def _outputs_verdict(
@@ -1905,7 +2044,12 @@ def verdicts(
         if "cap" in base
         else {"pass": True, "na": "no cap workload"},
     }
-    base_errors = {wl: r["error"] for wl, r in base.items() if "error" in r}
+    # A failed resume stage belongs to the arm it serves (``G2.resume_reference``).
+    base_errors = {
+        wl: r["error"]
+        for wl, r in base.items()
+        if "error" in r and not wl.startswith(RESUME_PREFIX)
+    }
     if base_errors:
         v["baseline"]["errors"] = base_errors
 
@@ -1923,9 +2067,22 @@ def verdicts(
             g["G0.provenance"] = g0_provenance(run_dir, label, pegaflow_dirs.get(label), mod, root)
         g["G2.digest_self.gsm8k"] = _digest_verdict(gsm and gsm["digest_self"], MIN_JUDGED_GSM8K)
         g["G2.digest_groups"] = digest_groups(run_dir / label / "gsm8k" / "probe")
+        # Split-variant: the baseline's replay of this arm's warm resume
+        # points (``resume_plan``), when the run has one.
+        rl = f"{RESUME_PREFIX}{label}"
+        res_r = base.get(rl)
+        res_probe = run_dir / "baseline" / rl / "probe"
+        resumed = (
+            not split_inv
+            and res_r is not None
+            and "error" not in res_r
+            and (res_probe / "requests.jsonl").exists()
+        )
+        if not split_inv:
+            g["G2.resume_reference"] = _resume_verdict(res_r if resumed else None)
         vs_base = (
             digest_compare.compare(
-                base_probe,
+                [base_probe, res_probe] if resumed else base_probe,
                 run_dir / label / "gsm8k" / "probe",
                 invariant,
                 split_inv,
@@ -1936,11 +2093,24 @@ def verdicts(
         )
         g["G2.digest_vs_baseline.gsm8k"] = _digest_verdict(vs_base, MIN_JUDGED_GSM8K)
         # Split-variant: cold computed KV is judged against baseline cold,
-        # warm against the baseline's split pass (same split).
+        # warm against the baseline's replay at the arm's resume points (else
+        # its split pass: the last full block).
         _coverage_verdict(g["G2.digest_vs_baseline.gsm8k"], vs_base, ("cold", "warm"))
         diffs = {p: _differ(ref_cold, _outputs(run_dir, label, p)) for p in ("cold", "warm")}
-        split_diffs = split_differ(ctrl, _outputs(run_dir, label, "warm"))
+        if resumed:
+            assert res_r is not None
+            split_diffs = resume_differ(
+                res_r["resume_check"],
+                res_r["resume_plan"],
+                _outputs(run_dir, "baseline", RESUME_PASS, rl),
+                _outputs(run_dir, label, "warm"),
+                _hit_alignment(run_dir),
+            )
+        else:
+            split_diffs = split_differ(ctrl, _outputs(run_dir, label, "warm"))
         g["G2.gsm8k_outputs"] = _outputs_verdict(diffs, invariant, split_inv, split_diffs)
+        if resumed:
+            g["G2.gsm8k_outputs"]["warm_reference"] = rl
         if kind == "selftest":
             # Negative arms must be caught by both digest checks (a single
             # flipped byte need not change a greedy output, so outputs are
@@ -2555,10 +2725,16 @@ def _teardown_failed(e: BaseException) -> bool:
     return False
 
 
-def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
+def run_stage(
+    args, gate, arm: str, wl: str, out: Path, record_only: bool | None = None, **kw
+) -> dict[str, Any]:
     """Run one stage; a reference arm's crash is recorded, not fatal, unless
     its teardown failed (the next stage would share a live GPU) or a stop
-    signal was received (whatever the exception became on the way)."""
+    signal was received (whatever the exception became on the way).
+    ``record_only``: override (a baseline ``resume`` stage serving a
+    reference arm is recorded like that arm)."""
+    if record_only is None:
+        record_only = arm_kind(arm) in _RECORD_ONLY
     check_stop()
     since = len(_LEASES)
     try:
@@ -2574,7 +2750,7 @@ def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
             err["port_leases"] = release_leases(since)
             (gdir / "stage-error.json").write_text(json.dumps(err, indent=1))
         check_stop()
-        if arm_kind(arm) not in _RECORD_ONLY or _teardown_failed(e):
+        if not record_only or _teardown_failed(e):
             raise
         print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)
         return {"arm": arm, "workload": wl, "error": f"{type(e).__name__}: {e}"[:2000]}
@@ -2723,6 +2899,9 @@ def main(argv: list[str] | None = None) -> int:
         return run_stage(args, gate, arm, wl, out, **kw)
 
     measured_u: dict[str, dict[str, Any]] = {}
+    # Split-variant: every arm's gsm8k warm pass gets a baseline replay at its
+    # resume points (needs the baseline arm, which always runs first).
+    needs_resume = not gate.get("split_invariant", True) and "baseline" in arms
 
     for arm in arms:
         kind = arm_kind(arm)
@@ -2745,6 +2924,25 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         pool_checks.append(measured_u[wl])
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
+                if wl == "gsm8k" and kind not in ("plain", "baseline") and needs_resume:
+                    # Same-split references at this arm's own warm resume points.
+                    rl = f"{RESUME_PREFIX}{label}"
+                    probe = run_dir / label / wl / "probe"
+                    if "error" in results[label][wl] or not (probe / "requests.jsonl").exists():
+                        results["baseline"][rl] = {
+                            "arm": "baseline",
+                            "workload": rl,
+                            "error": f"no {label} gsm8k probe to replay",
+                        }
+                    else:
+                        results["baseline"][rl] = stage(
+                            "baseline",
+                            rl,
+                            run_dir / "baseline" / rl,
+                            record_only=kind in _RECORD_ONLY,
+                            resume_from=probe,
+                            resume_limit=SELFTEST_LIMIT if kind == "selftest" else args.gsm8k_limit,
+                        )
                 continue
             if kind == "baseline":
                 spec_file = next(

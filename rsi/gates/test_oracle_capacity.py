@@ -1930,6 +1930,137 @@ def test_split_variant_still_fails_wrong_loaded_bytes(tmp_path):
     assert not run_gate._digest_verdict(d, 0.0)["pass"]
 
 
+def _ctx_probe(tmp_path, name: str, rows: list[tuple[str, str, str]], seeds: tuple = ()):
+    """Requests resuming at 2 blocks: each loads context block ``p:1``
+    (bytes ``ctx``) and computes ``p:2`` (bytes ``out``). ``seeds``: bytes of
+    cold requests computing ``p:1`` from scratch (its reference copies)."""
+    reqs, digests = [], []
+    for j, ctx in enumerate(seeds):
+        rid = f"{name}s{j}"
+        reqs.append(_req("p", 2, 100 + 10 * j, "cold", 50 + j) | {"req_id": rid, "digest": "full", "episodes": [[100 + 10 * j, 0, 0]]})  # fmt: skip
+        blk = {"key": "p:1", "covered": 2 * BT, "exact": [ctx], "l1": [1.0]}
+        digests.append({"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": [blk]})  # fmt: skip
+    for i, (label, ctx, out) in enumerate(rows):
+        rid = f"{name}{i}"
+        r = _req("p", 3, 10 * i + 1, label, i) | {"req_id": rid, "digest": "full"}
+        r["episodes"] = [[10 * i + 1, 0, 2 * BT]]
+        r["progress"] = [[10 * i + 1, 3 * BT + 1]]
+        reqs.append(r)
+        blocks = [
+            {"key": "p:1", "covered": 2 * BT, "exact": [ctx], "l1": [1.0]},
+            {"key": "p:2", "covered": 3 * BT, "exact": [out], "l1": [1.0]},
+        ]
+        digests.append({"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": blocks})  # fmt: skip
+    d = tmp_path / name
+    d.mkdir()
+    return _probe(d, reqs, digests)
+
+
+@pytest.mark.parametrize(
+    "ref_rows,cand_rows,compared,exact,unmatched",
+    [
+        # Same split and context bytes: judged, equal.
+        ([("cold", "X", "A")], [("warm", "X", "A")], 1, 1, 0),
+        # Same split and context, other bytes: judged, inexact (a fault).
+        ([("cold", "X", "A")], [("warm", "X", "flip")], 1, 0, 0),
+        # Same split, context computed elsewhere (other bytes): no
+        # same-context copy, unjudged (the honest DSV2 lmcache case).
+        ([("cold", "X", "A")], [("warm", "Y", "B")], 0, 0, 1),
+    ],
+    ids=["same-context", "same-context-wrong", "other-context"],
+)
+def test_split_key_includes_context_bytes(tmp_path, ref_rows, cand_rows, compared, exact, unmatched):  # fmt: skip
+    """Split-variant: a computed block is judged only against copies computed
+    from the same context bytes; the context itself is judged as loaded
+    blocks (here ``p:1`` external: ``Y`` has no reference copy)."""
+    from rsi.gates import digest_compare
+
+    ref = _ctx_probe(tmp_path, "ref", ref_rows, seeds=(ref_rows[0][1],))
+    cand = _ctx_probe(tmp_path, "cand", cand_rows)
+    d = digest_compare.compare(ref, cand, invariant=True, split_invariant=False)
+    got = (d["computed_compared"], d["computed_exact"], d["computed_unmatched_split"])
+    assert got == (compared, exact, unmatched), d
+    assert d["external_mismatched"] == (cand_rows[0][1] != ref_rows[0][1])
+    if compared and not exact:
+        assert not run_gate._digest_verdict(d, None)["pass"]
+
+
+def test_reference_pools_several_probe_dirs(tmp_path):
+    """The resume replay adds same-split copies to the baseline's: a block
+    unjudged against the baseline alone is judged against both, and a wrong
+    one is still inexact."""
+    from rsi.gates import digest_compare
+
+    base = _ctx_probe(tmp_path, "base", [("cold", "X", "A")], seeds=("X",))
+    # The replay computed the context at the arm's split too (bytes Y).
+    res = _ctx_probe(tmp_path, "res", [("resume", "Y", "B")], seeds=("Y",))
+    for out, ok in (("B", True), ("flip", False)):
+        cand = _ctx_probe(tmp_path, f"cand{out}", [("warm", "Y", out)])
+        alone = digest_compare.compare(base, cand, True, False)
+        assert alone["computed_unmatched_split"] == 1
+        both = digest_compare.compare([base, res], cand, True, False)
+        assert (both["computed_compared"], both["computed_exact"]) == (1, int(ok))
+        assert both["external_mismatched"] == 0  # ``Y`` was computed by the replay
+        assert run_gate._digest_verdict(both, None)["pass"] is ok
+
+
+def _warm(conv, step: int, local: int, start: int, plen: int = 30) -> dict:
+    return {
+        "req_id": f"w{conv}",
+        "pass": "warm",
+        "conv": conv,
+        "prompt_len": plen,
+        "episodes": [[step, local, start]],
+    }
+
+
+def test_resume_plan_replays_the_arm_schedule():
+    """Waves follow the arm's first-episode steps; the replay pre-warms the
+    arm's resume point only where the connector loaded (start > local);
+    other passes are ignored; a missing or bad prompt index fails closed."""
+    reqs = [
+        _warm(1, 5, 0, 16),  # first request: loaded [0, 16)
+        _warm(0, 7, 16, 16),  # local only: no pre-warm
+        _warm(2, 7, 16, 24, 32),  # local + loaded, resumes at 24
+        {"pass": "cold", "conv": 0, "episodes": [[1, 0, 0]]},
+    ]
+    plan = run_gate.resume_plan(reqs, 3)
+    assert plan == {
+        "waves": [[[1, 16, 16, 30]], [[0, 0, 16, 30], [2, 24, 24, 32]]],
+        "problems": [],
+    }
+    assert run_gate.resume_plan(reqs, 4)["problems"] == ["3 of 4 prompts have a warm request"]
+    bad = run_gate.resume_plan([*reqs, _warm(None, 9, 0, 0)], 3)
+    assert bad["problems"] == ["warm request wNone: prompt index None"]
+    dup = run_gate.resume_plan([*reqs, _warm(2, 9, 0, 0)], 3)
+    assert dup["problems"] == ["warm request w2: prompt index 2"]
+
+
+def test_resume_check_and_differ_fail_closed():
+    """Only a prompt whose replay resumed where the arm did is compared; an
+    unreplayed one counts as differing unless its prompt is block-aligned."""
+    plan = {"waves": [[[0, 16, 16, 30], [1, 16, 16, 32], [2, 24, 24, 30]]], "problems": []}
+    reqs = [
+        {"pass": "resume", "conv": 0, "prompt_len": 30, "episodes": [[1, 0, 16]]},
+        {"pass": "resume", "conv": 1, "prompt_len": 32, "episodes": [[1, 0, 32]]},  # moved
+        {"pass": "resume_prewarm", "conv": 2, "prompt_len": 24, "episodes": [[1, 0, 0]]},
+    ]
+    check = run_gate.resume_check(plan, reqs)
+    assert (check["missing"], check["start_differs"], check["prompt_len_differs"]) == ([2], [1], [])  # fmt: skip
+    ref = ["a", "b", None]
+    # Prompt 1 (32 tokens, aligned) is exempt; prompt 2 (missing) differs.
+    assert run_gate.resume_differ(check, plan, ref, ["a", "x", "c"], 16) == (1, 1)
+    assert run_gate.resume_differ(check, plan, ref, ["x", "b", "c"], 16) == (2, 0)
+    full = run_gate.resume_check(plan, reqs[:1] + [
+        {"pass": "resume", "conv": 1, "prompt_len": 32, "episodes": [[1, 0, 16]]},
+        {"pass": "resume", "conv": 2, "prompt_len": 30, "episodes": [[1, 16, 24]]},
+    ])  # fmt: skip
+    assert run_gate.resume_differ(full, plan, ["a", "b", "c"], ["a", "b", "c"], 16) == (0, 0)
+    assert run_gate.resume_differ(full, plan | {"problems": ["x"]}, ["a"], ["a"], 16) == (None, None)  # fmt: skip
+    v = run_gate._resume_verdict(None)
+    assert not v["pass"]
+
+
 def test_workload_sessions_never_reuse_connections():
     """vLLM's uvicorn closes idle keep-alive connections after 5 s; a pooled
     client reuses a closing socket and the pass dies with "Server
