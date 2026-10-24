@@ -69,6 +69,7 @@ OFFICIAL = {
     "gsm8k_limit": 0,  # full test split
     "shots": 8,
     "replay_convs": 32,
+    "replay_skip": 0,  # > 0: a held-out slice of the trace, never official
     "replay_turns": 12,
     "replay_out_tokens": 64,
     "replay_repeats": 3,
@@ -897,6 +898,7 @@ def run_arm_workload(
                 args.cap_plan["cap_convs"] if cap else args.replay_convs,
                 args.max_model_len - args.replay_out_tokens - 8,
                 args.cap_turns if cap else args.replay_turns,
+                skip=args.replay_skip,
             )
             names = ["cold", "warm"] + [f"warm{k}" for k in range(2, args.replay_repeats + 1)]
             if cap:
@@ -1841,7 +1843,7 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     budget = args.max_model_len - args.replay_out_tokens - 8
-    lines = Path(args.replay_file).read_text().splitlines()
+    lines = Path(args.replay_file).read_text().splitlines()[args.replay_skip :]
     need = CAP_FLOOR_MARGIN * MIN_CAPACITY_GPU_KV * gpu_kv_bytes(spec) / CAPACITY_FRACTION
     est = UniqueEstimate(spec, args.replay_out_tokens)
     used = 0
@@ -1880,6 +1882,7 @@ def estimate_unique(args, spec: dict[str, Any], wl: str) -> dict[str, Any]:
             args.replay_convs,
             args.max_model_len - args.replay_out_tokens - 8,
             args.replay_turns,
+            skip=args.replay_skip,
         ):
             est.add(turns)
         how = "estimate"
@@ -1971,7 +1974,13 @@ def official_problems(
                 return False
         return got == v
 
-    out = [f"{k}={getattr(args, k)} (official {v})" for k, v in OFFICIAL.items() if not same(k, v)]
+    out = [
+        f"{k}={getattr(args, k)} (held-out slice; official {v})"
+        if k == "replay_skip"
+        else f"{k}={getattr(args, k)} (official {v})"
+        for k, v in OFFICIAL.items()
+        if not same(k, v)
+    ]
     kinds = {arm_kind(a) for a in arms}
     for need in ("plain", "baseline", "under_test"):
         if need not in kinds:
@@ -2260,6 +2269,13 @@ def main(argv: list[str] | None = None) -> int:
         "--replay-file", default=str(Path.home() / "kexi" / "datasets" / "r2egym-256.jsonl")
     )
     ap.add_argument("--replay-convs", type=int, default=OFFICIAL["replay_convs"])
+    ap.add_argument(
+        "--replay-skip",
+        type=int,
+        default=OFFICIAL["replay_skip"],
+        help="skip the first N conversations of --replay-file (replay and cap): "
+        "a held-out slice, never official",
+    )
     ap.add_argument("--replay-turns", type=int, default=OFFICIAL["replay_turns"])
     ap.add_argument("--replay-out-tokens", type=int, default=OFFICIAL["replay_out_tokens"])
     ap.add_argument("--replay-repeats", type=int, default=OFFICIAL["replay_repeats"])
@@ -2442,6 +2458,8 @@ def main(argv: list[str] | None = None) -> int:
         "args": vars(args),
         "gate": gate,
         "official": not problems,
+        "held_out": args.replay_skip > 0,
+        "replay_skip": args.replay_skip,
         "not_official_because": problems,
         "capacity_floor": floor,
         "cap_plan": getattr(args, "cap_plan", None),

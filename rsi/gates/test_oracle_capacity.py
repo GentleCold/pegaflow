@@ -475,13 +475,30 @@ def test_unique_estimate_counts_shared_prefix_once():
     assert est.bytes == (3 + 2) * PAGE * LAYERS
 
 
-@pytest.mark.parametrize("given,ok", [("0.75,0.5,0.25", True), ("0.5,0.25,0.75,0.5", True), ("0.25,0.5", False)])  # fmt: skip
-def test_official_cap_fractions_compare_as_sets(tmp_path, given, ok):
+@pytest.mark.parametrize(
+    "over,key,ok",
+    [
+        pytest.param(
+            {"cap_fractions": "0.75,0.5,0.25"}, "cap_fractions", True, id="fractions-reordered"
+        ),  # fmt: skip
+        pytest.param(
+            {"cap_fractions": "0.5,0.25,0.75,0.5"}, "cap_fractions", True, id="fractions-dup"
+        ),  # fmt: skip
+        pytest.param(
+            {"cap_fractions": "0.25,0.5"}, "cap_fractions", False, id="fractions-missing"
+        ),  # fmt: skip
+        pytest.param({"replay_skip": 0}, "replay_skip", True, id="replay-skip-0"),
+        pytest.param({"replay_skip": 32}, "replay_skip=32 (held-out", False, id="held-out"),
+    ],
+)
+def test_official_args(tmp_path, over, key, ok):
+    """cap_fractions compare as sets; ``--replay-skip`` > 0 is a held-out
+    slice of the trace, never official."""
     import argparse
 
-    args = argparse.Namespace(**(run_gate.OFFICIAL | {"cap_fractions": given, "num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python"}))  # fmt: skip
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python"} | over))  # fmt: skip
     probs = run_gate.official_problems(args, ["plain", "baseline", "m:C"], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
-    assert any(p.startswith("cap_fractions") for p in probs) is not ok
+    assert any(p.startswith(key) for p in probs) is not ok, probs
 
 
 def test_stop_waits_for_the_whole_process_group(tmp_path, monkeypatch):

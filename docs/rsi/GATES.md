@@ -613,6 +613,9 @@ the last accepted run record by hand until `--accepted` exists.
     3,096,465,408).
   - Trace: `--cap-convs` x `--cap-turns` (official `auto` x 12) conversations
     of `--replay-file`, `--replay-out-tokens` outputs, `--concurrency` workers.
+    `--replay-skip N` (replay and cap) starts at conversation N of the file.
+    The official value is 0. Any N > 0 is a held-out slice
+    (`summary.held_out`, `summary.replay_skip`), never official.
     `auto`: before the baseline cap stage, from the baseline's spec dump,
     conversations are added from the file start (at least 64) until the
     estimated `U` (distinct prompt-prefix blocks per group plus each
