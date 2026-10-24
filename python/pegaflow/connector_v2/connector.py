@@ -235,7 +235,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             scheduled,
             block_state.get_block_ids if block_state is not None else lambda _: None,
             scheduler_output.preempted_req_ids or (),
-            kv_usage=kv_cache_manager.usage if kv_cache_manager is not None else 0.0,
+            # None (not bound): the scheduler treats it as pressure, i.e. no batching.
+            kv_usage=kv_cache_manager.usage if kv_cache_manager is not None else None,
         )
         return PegaConnectorMetadata(self._scheduler.take_plan())
 

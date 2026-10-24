@@ -74,6 +74,7 @@ class StepPlan:
     finished: list[str] = field(default_factory=list)
     flush: bool = False
     send_saves: bool = False
+    kv_usage_unknown: bool = False  # vLLM's KV usage was unavailable (send_saves set)
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,7 @@ class Scheduler:
         # bad KV. No save is planned once vLLM reported one (``on_load_errors``),
         # and later loads are async so no further bad block enters that cache.
         self._saves_disabled = False
+        self._kv_usage_warned = False
         self._plan = StepPlan()
 
     # ------------------------------------------------------------------ hits
@@ -409,7 +411,7 @@ class Scheduler:
         scheduled: list[tuple[str, int, int]],
         block_ids_of: Callable[[str], tuple[list[int], ...] | None],
         preempted: Iterable[str] = (),
-        kv_usage: float = 0.0,
+        kv_usage: float | None = 0.0,
     ) -> None:
         """``scheduled``: (req_id, num_computed_before_step, num_scheduled_tokens).
 
@@ -419,7 +421,9 @@ class Scheduler:
 
         ``kv_usage``: vLLM's GPU KV cache usage (0..1) after this step's
         allocations. At or above the policy's ``save_batch_max_kv_usage`` the
-        workers send held saves this step (``StepPlan.send_saves``).
+        workers send held saves this step (``StepPlan.send_saves``). None
+        (unknown) counts as pressure, so batching is off: a silent 0.0 would
+        hold blocks that waiting requests need.
 
         A request whose blocks include an unconfirmed sync-load block saves
         nothing yet (its range is offered again once the outcome is visible).
@@ -437,7 +441,16 @@ class Scheduler:
             self._plan.flush = True
             self._saving.discard(req_id)  # the flush covers its old blocks
         self._plan.flush |= self._flush_always
-        if kv_usage >= self._policy.save_batch_max_kv_usage:
+        if kv_usage is None:
+            if not self._kv_usage_warned:
+                self._kv_usage_warned = True
+                logger.warning(
+                    "[PegaKVConnectorV2] vLLM's KV cache usage is unavailable (cache "
+                    "manager not bound): saves are sent every step, batching is off"
+                )
+            self._plan.kv_usage_unknown = True
+            self._plan.send_saves = True
+        elif kv_usage >= self._policy.save_batch_max_kv_usage:
             self._plan.send_saves = True
         if self._saves_disabled:
             return
