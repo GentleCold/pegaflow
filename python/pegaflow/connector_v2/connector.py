@@ -171,10 +171,10 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             sync_saves = may_zero_or_copy_blocks(kv_cache_config)
             policy = load_policy(profile)
             logger.info(
-                "[PegaKVConnectorV2] saves=%s batch_steps=%d batch_ms=%s",
+                "[PegaKVConnectorV2] saves=%s batch_steps=%d max_kv_usage=%s",
                 "sync" if sync_saves else "async",
                 policy.save_batch_steps,
-                policy.save_batch_ms,
+                policy.save_batch_max_kv_usage,
             )
             self._worker = Worker(
                 self._layout,
@@ -187,7 +187,6 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 _mark_compute,
                 sync_saves=sync_saves,
                 batch_steps=policy.save_batch_steps,
-                batch_ms=policy.save_batch_ms,
             )
 
     @property

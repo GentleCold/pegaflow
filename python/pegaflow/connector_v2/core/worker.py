@@ -84,6 +84,11 @@ class Worker:
     STALL_LOG_S = 10.0
     # Sync-load poll interval: doubles from the first value up to the cap.
     SYNC_POLL_S = (20e-6, 200e-6)
+    # Staleness cap for batched saves, not a tuned policy: held saves are sent
+    # once the oldest has waited this long, so other requests see a step's
+    # blocks in the store within about this bound when steps are slow. It is
+    # checked once per step, so a hold can exceed it by about one step.
+    SAVE_HOLD_MAX_S = 1.0
 
     def __init__(
         self,
@@ -98,17 +103,15 @@ class Worker:
         clock: Callable[[], float] = time.perf_counter,
         sync_saves: bool = False,
         batch_steps: int = 1,
-        batch_ms: float = 0.0,
     ):
         """``sync_saves``: ``save`` returns only after the step's saves are done
         (vLLM may zero or copy blocks before ``handle_preemptions`` runs).
 
-        ``batch_steps`` / ``batch_ms`` (policy ``save_batch_*``): a step's save
-        job is held and merged with later steps' jobs into one save RPC until
-        the oldest held job has seen ``batch_steps`` steps or waited
-        ``batch_ms``, whichever comes first (a value <= 0 disables that
-        bound; both disabled, or ``batch_steps`` 1, sends every step).
-        ``flush`` sends held jobs at once.
+        ``batch_steps`` (policy ``save_batch_steps``): a step's save job is
+        held and merged with later steps' jobs into one save RPC until the
+        oldest held job has seen ``batch_steps`` steps or waited
+        ``SAVE_HOLD_MAX_S``, whichever comes first (<= 1 sends every step).
+        ``flush`` and ``StepPlan.send_saves`` send held jobs at once.
         """
         self._layout = layout
         self._rpc = rpc
@@ -142,7 +145,6 @@ class Worker:
         # Save batching (step thread only). Held jobs already own their
         # sequence numbers, so finish fences and flush cover them.
         self._batch_steps = batch_steps
-        self._batch_s = batch_ms / 1e3
         self._held: list[_SaveJob] = []
         self._held_steps = 0  # steps seen by the oldest held job
         self._held_since = 0.0
@@ -383,14 +385,13 @@ class Worker:
             self.report_save_stats()
 
     def _release_due(self, now: float) -> bool:
-        steps, wait_s = self._batch_steps, self._batch_s
-        if self._sync_saves or (steps <= 1 and wait_s <= 0):
+        if self._sync_saves or self._batch_steps <= 1:
             # No batching. Sync saves wait for every step's copy before the
             # next step (vLLM may zero or copy the blocks), so nothing could
             # be merged anyway.
             return True
-        return (steps > 0 and self._held_steps >= steps) or (
-            wait_s > 0 and now - self._held_since >= wait_s
+        return (
+            self._held_steps >= self._batch_steps or now - self._held_since >= self.SAVE_HOLD_MAX_S
         )
 
     def _release_held(self) -> None:

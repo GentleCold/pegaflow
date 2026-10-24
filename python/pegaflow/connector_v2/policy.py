@@ -49,11 +49,10 @@ class Policy:
     # layout allows it), longer ones asynchronously between steps.
     sync_load_tokens: int = 256
     # Merge consecutive steps' saves into one save RPC: send when the oldest
-    # held step has seen save_batch_steps steps or waited save_batch_ms,
-    # whichever comes first (<= 0 disables that bound), or when the GPU KV
-    # cache is under pressure. Preemption flushes and shutdown send at once.
+    # held step has seen save_batch_steps steps (<= 1 sends every step), when
+    # the GPU KV cache is under pressure, or after the worker's staleness cap
+    # (Worker.SAVE_HOLD_MAX_S). Preemption flushes and shutdown send at once.
     save_batch_steps: int = 32
-    save_batch_ms: float = 1000.0
     # Send held saves at once while vLLM's GPU KV cache usage (0..1, after
     # the step's allocations) is at or above this: finished requests held
     # for a batch keep blocks that waiting requests need. > 1 disables it.

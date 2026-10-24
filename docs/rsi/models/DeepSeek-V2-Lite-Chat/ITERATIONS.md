@@ -995,25 +995,34 @@ worker checked `send_saves` before the batch bound, so a step where both
 fired counted as a pressure RPC. Now the bound is checked first;
 `pressure_rpcs` counts only early sends. Behaviour is unchanged.
 
-## Policy budget (HEAD 3e6f7a3)
+## Policy budget (after review fix MF3, on top of fc06c9b)
 
-- Knobs: 6 in total, all in `models/default.toml`, with no model profile
-  (no `models/<arch>.toml`): `min_hit_tokens`, `loading_wait_ms`,
-  `sync_load_tokens` (pre-P4), and the three P4 batching knobs
-  `save_batch_steps`, `save_batch_ms`, `save_batch_max_kv_usage`.
-- `policy.py`: 121 lines, none of them specific to a Kind. `accept` and
+The review (`docs/rsi/reviews/P4-dsv2-lite.md` M3) found that
+`save_batch_ms` breaks the knob rule. It never moved a verdict, and it
+never capped the hold either: the max cold hold is 1030 to 1121 ms with
+no time bound and 1066 to 1106 ms with 1000 ms, because the bound is
+checked once per step. It is now `Worker.SAVE_HOLD_MAX_S = 1.0`, a
+staleness cap with no behaviour change (the shipped value was 1000 ms).
+The unit cases cover it by patching the constant. No gate rerun.
+
+- Knobs: 4 in total, all in `models/default.toml`, with no model profile
+  (no `models/<arch>.toml`): `loading_wait_ms`, `sync_load_tokens`
+  (pre-P4; `min_hit_tokens` was deleted upstream in fc06c9b), and the two
+  P4 batching knobs `save_batch_steps` and `save_batch_max_kv_usage`.
+- `policy.py`: no line is specific to a Kind. `accept` and
   `choose_saves` are the identity for every Kind, and the knobs are
   Kind-agnostic. `SaveItem.kind` is carried but no policy code reads it.
   P4 added 0 lines of per-Kind policy (MLA maps to `Full`).
 
 Gate evidence per batching knob (DSV2 TP2, G4 replay cold p50 / cold
-req/s verdicts, P = pass, F = fail):
+req/s verdicts, P = pass, F = fail). All are replay-only, non-official
+runs. gsm8k G4 has not been evaluated with batching on.
 
 | knob | evidence | changed alone? |
 |---|---|---|
-| `save_batch_steps` 1 -> 32 | `knob-01`: v2 (1) F/F, KB32 (32) P/P; `rep-01`: v2 F/F, KB32 x3 P/P, P/P, F/P; `sweep-01`: KOff F/P, KB32 P/P; `it5-rep-01`: KOff F/F, default x3 P/P (with the other two knobs at their defaults) | yes, in knob-01 / rep-01 / sweep-01 (time bound off): cold moves from +5 to +20% to -4.6 to +2.4% |
-| `save_batch_ms` 0 -> 1000 (at 32 steps) | `sweep-01`: KB32 P/P, KB32T1000 P/P (51 vs 50 RPCs, cold -4.6% vs +1.0%) | yes, and no verdict moved. It is a safety cap on the hold when steps are slow, never the trigger in any run. The only run where a time bound moved a verdict is `def-01` (250 ms: 3 of 3 cold p50 F, against KB32's 2 of 3 P), which is why it is 1000 and not 250. No measured gain backs it, only the hold bound. |
+| `save_batch_steps` 1 -> 32 | `knob-01`: v2 (1) F/F, KB32 (32) P/P; `rep-01`: v2 F/F, KB32 x3 P/P, P/P, F/P; `sweep-01`: KOff F/P, KB32 P/P; `it5-rep-01`: KOff F/F, default x3 P/P (with the other knobs at their defaults) | yes, in knob-01 / rep-01 / sweep-01: cold moves from +5 to +20% to -4.6 to +2.4% |
 | `save_batch_max_kv_usage` > 1 -> 0.9 | `press-01` (none): KD cold p50 F (+8.2% vs baseline, +53% vs KOff); `press-02` (0.9): KD, KDb P/P (cold p50 -23.7 / -30.8%) | yes (the same tree otherwise, the same `--num-gpu-blocks 1200`) |
+| `Worker.SAVE_HOLD_MAX_S = 1.0` (constant, not a knob) | `sweep-01`: KB32 P/P, KB32T1000 P/P (50 vs 51 RPCs). The 250 ms variant (`def-01`) moved cold p50 to F 3 of 3. | kept only as a staleness cap: other requests see a step's blocks in the store within about 1 s plus one step when steps are slow |
 
 ## Open items
 
