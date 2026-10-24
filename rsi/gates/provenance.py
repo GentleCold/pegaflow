@@ -19,6 +19,8 @@
   imports. ``dest`` is the only dir put on that arm's ``PYTHONPATH``: the
   tree cannot shadow the probe, its worker extension, vLLM, torch or
   ``sitecustomize``.
+- ``scan``: static scan of the snapshot for instrument / run-artifact
+  access (M7b); a hit makes the run non-official until a reviewer clears it.
 - ``module_problems``: the module files a probe recorded in its spec dumps
   (``rsi_probe.module_files``) must resolve under the gate tree (probe,
   worker extension), the shared venv (vLLM, torch, interpreter prefix) and
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -310,3 +313,60 @@ def stage(under_test: Path, dest: Path, trees: Trees) -> dict[str, Any]:
     else:
         rec["verified"] = True
     return rec
+
+
+# M7(b): instrument / run-artifact access a connector has no reason for
+# (GATES.md, "Boundary"). A hit is not a verdict: the run is non-official
+# until a reviewer clears the hit's id (``--scan-cleared``).
+SCAN_PATTERNS = {
+    "rsi": r"\brsi\b",
+    "rsi_probe": r"rsi_probe",
+    "RsiProbe": r"RsiProbe",
+    "RsiWorkerExt": r"RsiWorkerExt",
+    "rsi_poison": r"rsi_poison",
+    "rsi-runs": r"rsi-runs",
+    "probe_dir": r"probe_dir",
+    "digest-": r"digest-",
+    "-outputs.json": r"-outputs\.json",
+    "-tokens.json": r"-tokens\.json",
+    "requests.jsonl": r"requests\.jsonl",
+    "sys.modules write": r"sys\.modules\s*\[[^\]]*\]\s*=|sys\.modules\.(setdefault|update|pop|popitem|clear|__setitem__)\b|\bdel\s+sys\.modules",
+    "gc introspection": r"\bgc\.get_(objects|referrers|referents)\b",
+    "trace / audit hook": r"\bsys\.(settrace|setprofile|addaudithook|_getframe)\b|\bthreading\.(settrace|setprofile)\b",
+    "import hook": r"\bsys\.(meta_path|path_hooks)\b|\bimportlib\.reload\b|\bbuiltins\.__import__\b",
+}  # fmt: skip
+_SCAN = {k: re.compile(v) for k, v in SCAN_PATTERNS.items()}
+
+
+def _strings(data: bytes, n: int = 4) -> list[str]:
+    return [m.decode() for m in re.findall(rb"[\x20-\x7e]{%d,}" % n, data)]
+
+
+def scan(pkg_dir: Path) -> list[dict[str, Any]]:
+    """``SCAN_PATTERNS`` hits in a snapshot: every line of every text file,
+    and the printable strings of binary files (the native module). Hit id:
+    ``<file>:<line>:<pattern>``, ``<file>:strings:<pattern>`` for binaries."""
+    hits = []
+    for f in sorted(p for p in pkg_dir.rglob("*") if p.is_file()):
+        rel = str(f.relative_to(pkg_dir.parent))
+        data = f.read_bytes()
+        binary = f.suffix in (".so", ".pyd", ".dylib") or b"\0" in data
+        if not binary:
+            try:
+                lines = list(enumerate(data.decode().splitlines(), 1))
+            except UnicodeDecodeError:
+                binary = True
+        if binary:
+            lines = [(0, s) for s in _strings(data)]
+        counts: dict[str, int] = {}
+        for i, line in lines:
+            for name, rx in _SCAN.items():
+                if not rx.search(line):
+                    continue
+                if binary:
+                    counts[name] = counts.get(name, 0) + 1
+                    if counts[name] == 1:
+                        hits.append({"id": f"{rel}:strings:{name}", "text": line[:200]})
+                else:
+                    hits.append({"id": f"{rel}:{i}:{name}", "text": line.strip()[:200]})
+    return hits

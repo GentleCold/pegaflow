@@ -231,7 +231,45 @@ def fresh_pycache(run_dir: Path, labels: list[str]) -> None:
         d.mkdir(parents=True)
 
 
-def pegaflow_server(args, log: Path, pool_size: str):
+ISOLATE = Path(__file__).resolve().parent / "isolate.py"
+
+
+def isolation_available() -> bool:
+    return sys.platform.startswith("linux") and os.geteuid() == 0
+
+
+def isolation(args, arm_dir: Path) -> dict[str, Any]:
+    """M7(a): what the arm under test sees of the runs root: only its own
+    dir (rw) and its snapshot (ro); every other arm's outputs, digests and
+    requests (the baseline's included) are under a tmpfs in its private
+    mount namespace (``isolate.py``)."""
+    return {
+        "helper": str(ISOLATE),
+        "hide": str(Path(args.runs_root).resolve()),
+        "rw": [str(arm_dir.resolve())],
+        "ro": [str(Path(args.under_test_overlay).resolve())] if args.under_test_path else [],
+    }
+
+
+def isolated(args, arm: str, log: Path, cmd: list[str]) -> list[str]:
+    """``cmd`` for a stage process: the arm under test's go through
+    ``isolate.py`` (exec in place: same pid and process group, so ``stop``
+    is unchanged; pid / IPC / network namespaces stay the host's, so CUDA
+    IPC between its vLLM and pegaflow-server and the loopback ports the gate
+    reads work as before)."""
+    if arm_kind(arm) != "under_test" or not isolation_available():
+        return cmd
+    return [*isolation_prefix(isolation(args, log.parent.parent)), *cmd]
+
+
+def isolation_prefix(iso: dict[str, Any]) -> list[str]:
+    pre = [sys.executable, "-I", "-S", "-B", iso["helper"], "--hide", iso["hide"]]
+    pre += [x for d in iso["rw"] for x in ("--rw", d)]
+    pre += [x for d in iso["ro"] for x in ("--ro", d)]
+    return [*pre, "--"]
+
+
+def pegaflow_server(args, log: Path, pool_size: str, arm: str = "old"):
     grpc, http = free_port(), free_port()
     env = os.environ.copy()
     pycache_env(env, log)
@@ -256,6 +294,7 @@ def pegaflow_server(args, log: Path, pool_size: str):
         # sees pool_size / numa_nodes, and the oracle assumes no eviction.
         "--disable-numa-affinity",
     ]
+    cmd = isolated(args, arm, log, cmd)
     return grpc, http, launched(cmd, env, log, f"http://127.0.0.1:{http}/health", 300)
 
 
@@ -376,6 +415,11 @@ def vllm_server(
     pycache_env(env, log)
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
     env["VLLM_SERVER_DEV_MODE"] = "1"  # /reset_prefix_cache, /collective_rpc
+    # No ``vllm.general_plugins`` (M7d): the pegaflow plugin would run a
+    # tree's code in every vLLM process, the API server included. Every arm
+    # names its connector by module path; the only other plugins in the venv
+    # are vLLM's LoRA resolvers (unused). Same for every arm.
+    env["VLLM_PLUGINS"] = ""
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONPATH"] = ":".join(x for x in (str(REPO), env.get("PYTHONPATH")) if x)
     env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
@@ -443,6 +487,7 @@ def vllm_server(
         cmd += ["--kv-transfer-config", json.dumps(cfg)]
     if args.num_gpu_blocks:
         cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks)]
+    cmd = isolated(args, arm, log, cmd)
     url = f"http://127.0.0.1:{port}"
     return url, launched(cmd, env, log, f"{url}/health", 900)
 
@@ -567,7 +612,7 @@ def run_arm_workload(
         pf_port = pf_http = None
         if kind in ("old", "under_test"):
             pf_port, pf_http, cm = pegaflow_server(
-                args, out / "pegaflow.log", str(capacity) if cap else args.pool_size
+                args, out / "pegaflow.log", str(capacity) if cap else args.pool_size, arm
             )
             stack.enter_context(cm)
         url, cm = vllm_server(
@@ -1702,6 +1747,21 @@ _PROVENANCE_ROLES = {
 }
 
 
+def scan_record(args) -> dict[str, Any]:
+    """M7(b): static scan of the snapshot the arm under test imports."""
+    if not getattr(args, "under_test_path", ""):
+        return {"scanned": None, "hits": [], "uncleared": []}
+    hits = provenance.scan(Path(args.under_test_overlay) / "pegaflow")
+    cleared = set(args.scan_cleared)
+    return {
+        "scanned": str(Path(args.under_test_overlay) / "pegaflow"),
+        "patterns": provenance.SCAN_PATTERNS,
+        "hits": hits,
+        "cleared": sorted(cleared),
+        "uncleared": [h for h in hits if h["id"] not in cleared],
+    }
+
+
 def provenance_problems(prov: dict[str, Any]) -> list[str]:
     """Official only if every tree the run imports is verified: the gate
     tree, the venv's ``pegaflow`` and, with ``--under-test-path``, the
@@ -1791,6 +1851,12 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="python dir put first on PYTHONPATH of the connector-under-test arm only "
         "(e.g. another tree's python/); its rev (.rsi-rev / git) is recorded",
+    )
+    ap.add_argument(
+        "--scan-cleared",
+        action="append",
+        default=[],
+        help="static-scan hit id (summary.scan) a reviewer cleared (M7b); repeatable",
     )
     ap.add_argument("--concurrency", type=int, default=OFFICIAL["concurrency"])
     ap.add_argument("--settle", type=float, default=5.0)
@@ -1939,6 +2005,15 @@ def main(argv: list[str] | None = None) -> int:
         for c in contaminated
     ]
     problems += provenance_problems(prov)
+    scan = scan_record(args)
+    problems += [f"static scan hit not cleared by a reviewer: {h['id']}" for h in scan["uncleared"]]
+    iso_rec = None
+    if any(arm_kind(a) == "under_test" for a in arms):
+        label = next(arm_label(a) for a in arms if arm_kind(a) == "under_test")
+        iso_rec = isolation(args, run_dir / label)
+        iso_rec |= {"available": isolation_available(), "command_prefix": isolation_prefix(iso_rec)}
+        if not iso_rec["available"]:
+            problems.append("arm under test not isolated (isolate.py needs Linux and root)")
     dirs = {arm_label(a): expected_pegaflow(args, arm_kind(a)) for a in arms}
     v = verdicts(results, run_dir, committed, gate, dirs)
     floor = None
@@ -1954,6 +2029,8 @@ def main(argv: list[str] | None = None) -> int:
         "provenance": prov,
         "pool_checks": pool_checks,
         "contamination": contaminated,
+        "isolation": iso_rec,
+        "scan": scan,
         "args": vars(args),
         "gate": gate,
         "official": not problems,

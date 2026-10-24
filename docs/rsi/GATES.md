@@ -320,6 +320,49 @@ the last accepted run record by hand until `--accepted` exists.
   `PEGAFLOW_PORT`, and gets an empty `kv_connector_extra_config`. The probe
   keeps `prefer_cross_layer_blocks=False`, so cross-layer KV layouts are out of
   scope for now.
+- Boundary (M7). The connector under test runs in the same processes as
+  `RsiProbe` / `RsiWorkerExt`, and `MultiConnector` imports its module in
+  vLLM's API server too (`requires_piecewise_for_cudagraph`). So it *can*
+  patch the instrument at runtime, and nothing in-process can detect that:
+  a probe self-check would run in the patched process. The gate bounds this;
+  it does not prevent it:
+  - Isolation (a). The arm under test's vLLM and pegaflow-server are exec'd
+    through `rsi/gates/isolate.py`, which uses a private mount namespace. The
+    runs root is under an empty tmpfs; only `<run>/<arm>` (rw) and its
+    snapshot (ro) are bound back. Block devices and `/dev/{mem,kmem,port}`
+    are masked. `CAP_SYS_ADMIN` / `CAP_SYS_PTRACE` / ... leave the bounding
+    set, so the arm cannot unmount the cover or reach the host tree through
+    `/proc/<gate pid>/root`. The baseline's outputs, digests and requests,
+    and every other arm's, are not visible to it. The pid, IPC and network
+    namespaces are the host's (CUDA IPC, loopback ports): the exec is in
+    place, so `stop` signals and waits for the same process group as before.
+    The command prefix is in `summary.isolation`. A run whose arm under test
+    could not be isolated (not Linux, not root) is not official.
+  - Static scan (b). `provenance.scan` scans the snapshot, every text line
+    and the strings of the native module, for `provenance.SCAN_PATTERNS`:
+    names of the instrument (`rsi`, `rsi_probe`, `RsiProbe`, `RsiWorkerExt`,
+    `rsi_poison`) and of run artifacts (`rsi-runs`, `probe_dir`, `digest-`,
+    `-outputs.json`, `-tokens.json`, `requests.jsonl`), plus runtime
+    patching (`sys.modules` writes, `gc.get_objects`/referrers, trace /
+    audit hooks, `sys.meta_path` / `path_hooks`, `importlib.reload`). A hit
+    makes the run non-official until a reviewer reads it and clears its id
+    (`--scan-cleared <id>`, recorded in `summary.scan`). Clearing is a review
+    decision, logged in the model's ITERATIONS.md.
+  - No plugins (d). Every vLLM process runs with `VLLM_PLUGINS=""`: no
+    `vllm.general_plugins` entry point runs (the venv's `pegaflow` plugin
+    would run a tree's code in every vLLM process, the API server included).
+    Arms name their connector by module path. The connector module is still
+    imported in the API server, by `MultiConnector`'s class lookup.
+  - Independent signal. Completions are read by the gate *client-side*, from
+    the `/v1/completions` HTTP response (`workloads.run_gsm8k`), and judged
+    in the gate process. A connector that fakes digests while loading
+    garbage still changes completions (exact vs baseline cold, or vs `split`
+    on non-aligned prompts on split-variant models). A connector patching
+    the API server could in principle forge completions too. That is what
+    the scan and the review checklist below are for.
+  - Review checklist (skill step 6): the connector does not touch the probe,
+    the worker extension, `sys.modules`, the poison RPC or any run artifact.
+    No instrument or run-artifact access, by code or by string.
 - Per-model settings: `docs/rsi/models/<model>/gate.json` (gate-owned):
   `batch_invariant`, `split_invariant` (default true, established by
   `G2.split_control`, see below), `invariant_attention_backend`,

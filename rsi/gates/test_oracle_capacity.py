@@ -765,6 +765,152 @@ def test_every_imported_tree_must_be_verified(bad):
     ]
 
 
+_needs_isolation = pytest.mark.skipif(
+    not run_gate.isolation_available(), reason="isolate.py needs Linux and root"
+)
+
+_PROBE_ESCAPE = """
+import os, sys
+base, arm, gate_pid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+seen = {}
+seen["baseline_dir"] = os.path.exists(f"{base}/baseline/gsm8k/warm-outputs.json")
+seen["own_dir"] = os.path.exists(f"{arm}/mine.txt")
+open(f"{arm}/written.txt", "w").write("ok")
+for how in ("root", "cwd"):
+    try:
+        seen[how] = os.path.exists(f"/proc/{gate_pid}/{how}{base}/baseline/gsm8k/warm-outputs.json")
+    except OSError:
+        seen[how] = False
+try:
+    import ctypes
+    seen["umount"] = ctypes.CDLL(None, use_errno=True).umount2(base.encode(), 2) == 0
+except Exception:
+    seen["umount"] = False
+print(repr(seen))
+"""
+
+
+@_needs_isolation
+def test_isolated_arm_cannot_read_other_arms(tmp_path):
+    """M7(a): the arm under test sees its own dir (rw) and not the
+    baseline's outputs, neither by path nor through ``/proc/<gate>/root``
+    or ``cwd``, and cannot unmount the cover."""
+    import argparse
+    import os
+    import subprocess
+
+    runs = tmp_path / "runs"
+    base = runs / "2026-10-24-t"
+    (base / "baseline" / "gsm8k").mkdir(parents=True)
+    (base / "baseline" / "gsm8k" / "warm-outputs.json").write_text("[]")
+    arm = base / "ut"
+    (arm / "gsm8k").mkdir(parents=True)
+    (arm / "mine.txt").write_text("")
+    args = argparse.Namespace(runs_root=str(runs), under_test_path="", under_test_overlay="")
+    cmd = run_gate.isolated(args, "m:C", arm / "gsm8k" / "vllm.log", [sys.executable, "-c", _PROBE_ESCAPE, str(base), str(arm), str(os.getpid())])  # fmt: skip
+    assert cmd[0] == sys.executable and "--hide" in cmd
+    out = subprocess.check_output(cmd, text=True, timeout=60)
+    seen = eval(out)  # noqa: S307 - our own child's repr
+    assert seen == {"baseline_dir": False, "own_dir": True, "root": False, "cwd": False, "umount": False}, seen  # fmt: skip
+    assert (arm / "written.txt").read_text() == "ok"  # rw bind reaches the host dir
+    assert os.path.exists(base / "baseline" / "gsm8k" / "warm-outputs.json")  # host unchanged
+
+
+_ISOLATED_GATE = """
+import sys, time, argparse
+from pathlib import Path
+from rsi.gates import run_gate
+run_gate.install_stop_handlers()
+port, runs = sys.argv[1], Path(sys.argv[2])
+arm = runs / "r" / "ut" / "gsm8k"
+arm.mkdir(parents=True, exist_ok=True)
+args = argparse.Namespace(runs_root=str(runs), under_test_path="", under_test_overlay="")
+# A child that forks a grandchild, as vLLM forks EngineCore / workers.
+inner = "import subprocess, sys, http.server; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)']); http.server.test(http.server.SimpleHTTPRequestHandler, port=int(sys.argv[1]), bind='127.0.0.1')"
+cmd = run_gate.isolated(args, "m:C", arm / "vllm.log", [sys.executable, "-c", inner, port])
+with run_gate.launched(cmd, {}, arm / "vllm.log", f"http://127.0.0.1:{port}/", 60) as p:
+    (runs / "pid").write_text(str(p.pid))
+    time.sleep(600)
+"""
+
+
+@_needs_isolation
+def test_isolated_arm_is_torn_down_with_its_group(tmp_path):
+    """M7(a): the isolated arm is exec'd in place, so it is the group
+    leader ``launched`` started; its health endpoint is reachable on
+    loopback, and SIGTERM to the gate stops every member of the group (the
+    grandchild included) before the gate exits."""
+    import os
+    import signal
+    import subprocess
+    import time
+
+    root = Path(run_gate.__file__).resolve().parents[2]
+    env = os.environ | {"PYTHONPATH": str(root)}
+    port = str(run_gate.free_port())
+    gate = subprocess.Popen([sys.executable, "-c", _ISOLATED_GATE, port, str(tmp_path)], env=env)
+    pid_file = tmp_path / "pid"
+    t0 = time.monotonic()
+    while not pid_file.exists():
+        assert gate.poll() is None and time.monotonic() - t0 < 60
+        time.sleep(0.2)
+    leader = int(pid_file.read_text())
+    assert os.readlink(f"/proc/{leader}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
+    assert os.readlink(f"/proc/{leader}/ns/pid") == os.readlink("/proc/self/ns/pid")
+    members = [p for p in os.listdir("/proc") if p.isdigit() and _pgid(int(p)) == leader]
+    assert len(members) >= 2, members  # leader + grandchild
+    gate.send_signal(signal.SIGTERM)
+    assert gate.wait(timeout=120) == 128 + signal.SIGTERM
+    with pytest.raises(ProcessLookupError):
+        os.killpg(leader, 0)
+
+
+def _pgid(pid: int) -> int | None:
+    import os
+
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+@pytest.mark.parametrize(
+    "body,hit",
+    [
+        ("x = 1\n", None),
+        ("from rsi.gates import rsi_probe\n", "rsi"),
+        ("import sys\nsys.modules['rsi.gates.rsi_probe'] = None\n", "sys.modules write"),
+        ("import gc\nobjs = gc.get_objects()\n", "gc introspection"),
+        ("p = run_dir / 'baseline' / 'gsm8k' / 'warm-outputs.json'\n", "-outputs.json"),
+        ("glob('digest-*.jsonl')\n", "digest-"),
+        ("sys.meta_path.insert(0, Finder())\n", "import hook"),
+    ],
+    ids=["clean", "rsi-import", "sys-modules", "gc", "outputs", "digests", "meta-path"],
+)
+def test_static_scan_flags_instrument_access(tmp_path, body, hit):
+    """M7(b): a snapshot that names the instrument or run artifacts, or
+    patches modules at runtime, is flagged (run non-official until a
+    reviewer clears the id); strings of a native module are scanned too."""
+    import argparse
+
+    from rsi.gates import provenance
+
+    pkg = tmp_path / "ov" / "pegaflow"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "conn.py").write_text(body)
+    hits = provenance.scan(pkg)
+    names = {h["id"].rsplit(":", 1)[1] for h in hits}
+    assert (hit in names) if hit else not names, hits
+    args = argparse.Namespace(under_test_path="x", under_test_overlay=str(tmp_path / "ov"), scan_cleared=[])  # fmt: skip
+    assert bool(run_gate.scan_record(args)["uncleared"]) is bool(hit)
+    args.scan_cleared = [h["id"] for h in hits]
+    assert run_gate.scan_record(args)["uncleared"] == []
+    (pkg / "conn.py").write_text("x = 1\n")
+    (pkg / "pegaflow.so").write_bytes(b"\x7fELF\x00\x01rsi_poison\x00")
+    assert [h["id"] for h in provenance.scan(pkg)] == ["pegaflow/pegaflow.so:strings:rsi_poison"]
+
+
 def test_module_files_must_resolve_under_gate_and_venv(tmp_path):
     import sys
 

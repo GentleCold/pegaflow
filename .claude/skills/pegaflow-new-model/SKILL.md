@@ -83,7 +83,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
    gate integrity (nothing relaxed), copying from the old connector, regressions
-   on earlier models. Fix or justify every finding in ITERATIONS.md.
+   on earlier models, and that the connector does not touch the probe (no
+   instrument or run-artifact access: `RsiProbe`, `RsiWorkerExt`,
+   `rsi_poison`, `sys.modules`, digests, outputs; GATES.md "Boundary"). It
+   reads every `summary.scan` hit before any `--scan-cleared`. Fix or justify
+   every finding in ITERATIONS.md.
 7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers.
 
 ## 3. Lessons (append)
