@@ -1,4 +1,9 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use hashlink::LruCache;
 use parking_lot::Mutex;
@@ -44,6 +49,9 @@ pub(crate) struct ReadCache {
     capacity_bytes: u64,
     /// Reclaimable share of capacity that decode backups keep ready.
     backup_reclaimable_percent: u64,
+    /// Share of a class, oldest first, that tail-first eviction picks from.
+    /// `0` is plain LRU.
+    tail_window_percent: u64,
 }
 
 /// Backup reporting starts once resident blocks fill this share of capacity.
@@ -52,6 +60,13 @@ const BACKUP_REPORT_USAGE_PERCENT: u64 = 90;
 pub(crate) const DEFAULT_BACKUP_RECLAIMABLE_PERCENT: u64 = 10;
 /// Retained entries a candidate scan may look at per candidate wanted.
 const BACKUP_SCAN_FACTOR: usize = 4;
+/// Default tail-first window: the oldest quarter of a class.
+pub(crate) const DEFAULT_TAIL_WINDOW_PERCENT: u64 = 25;
+/// Tail-first candidates cloned per block a batch still wants.
+const TAIL_CANDIDATE_FACTOR: usize = 4;
+/// Sort rank of a block whose chain depth was never observed (decode tails,
+/// blocks of other cache groups): evicted before any block of known depth.
+const UNKNOWN_DEPTH: u32 = u32::MAX;
 
 struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
@@ -63,6 +78,80 @@ struct ReadCacheInner {
     /// fragmentation starts eviction well below full occupancy, so this, not
     /// resident bytes alone, marks a cache that is effectively full.
     pressured: bool,
+    links: ChainLinks,
+}
+
+/// Dependencies between resident blocks, learned from queries: a block's
+/// parent is the block it extends (the previous block of a prefix query) or,
+/// for another cache group, the attention block at the same position. A
+/// resume point needs a block and every ancestor, so tail-first eviction only
+/// evicts blocks without resident children.
+///
+/// Links exist only while both ends are resident; evicting either end drops
+/// them.
+#[derive(Default)]
+struct ChainLinks {
+    parent: HashMap<BlockKey, BlockKey>,
+    children: HashMap<BlockKey, Vec<BlockKey>>,
+    /// Blocks linked to a position block as other-group data of the same
+    /// resume point rather than as the next chain block.
+    members: HashSet<BlockKey>,
+}
+
+impl ChainLinks {
+    fn link(&mut self, parent: &BlockKey, child: &BlockKey) {
+        if parent == child || self.parent.get(child) == Some(parent) {
+            return;
+        }
+        if let Some(old) = self.parent.insert(child.clone(), parent.clone()) {
+            self.drop_child(&old, child);
+        }
+        self.children
+            .entry(parent.clone())
+            .or_default()
+            .push(child.clone());
+    }
+
+    fn drop_child(&mut self, parent: &BlockKey, child: &BlockKey) {
+        if let Some(children) = self.children.get_mut(parent) {
+            children.retain(|c| c != child);
+            if children.is_empty() {
+                self.children.remove(parent);
+            }
+        }
+    }
+
+    /// Forget every link of a block leaving the cache. Returns whether it
+    /// still had resident children.
+    fn unlink(&mut self, key: &BlockKey) -> bool {
+        self.members.remove(key);
+        if let Some(parent) = self.parent.remove(key) {
+            self.drop_child(&parent, key);
+        }
+        let Some(children) = self.children.remove(key) else {
+            return false;
+        };
+        for child in &children {
+            self.parent.remove(child);
+            self.members.remove(child);
+        }
+        !children.is_empty()
+    }
+
+    /// The block whose subtree eviction of `key` starts from: a group
+    /// member goes with its position block. The server does not know a
+    /// group's kind, so it keeps every group's data of a position as long as
+    /// the position: right for full-attention groups, which every later
+    /// resume point needs, and only conservative for window or checkpoint
+    /// groups.
+    fn eviction_root(&self, key: &BlockKey) -> BlockKey {
+        if self.members.contains(key)
+            && let Some(position) = self.parent.get(key)
+        {
+            return position.clone();
+        }
+        key.clone()
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -71,6 +160,10 @@ struct ResidentMetadata {
     generation: u64,
     /// Footprint at insertion, used for per-class byte accounting.
     bytes: u64,
+    /// Index in the latest prefix query whose hit prefix covered the block.
+    /// Relative to that query's first block, so it orders blocks within a
+    /// chain; [`UNKNOWN_DEPTH`] until a query covers it.
+    depth: u32,
 }
 
 struct RemovedResident {
@@ -102,14 +195,21 @@ impl ReadCache {
                 next_generation: 0,
                 class_bytes: ClassBytes::default(),
                 pressured: false,
+                links: ChainLinks::default(),
             }),
             capacity_bytes: capacity_bytes as u64,
             backup_reclaimable_percent: DEFAULT_BACKUP_RECLAIMABLE_PERCENT,
+            tail_window_percent: DEFAULT_TAIL_WINDOW_PERCENT,
         }
     }
 
     pub(crate) fn with_backup_reclaimable_percent(mut self, percent: u64) -> Self {
         self.backup_reclaimable_percent = percent.min(100);
+        self
+    }
+
+    pub(crate) fn with_tail_window_percent(mut self, percent: u64) -> Self {
+        self.tail_window_percent = percent.min(100);
         self
     }
 
@@ -131,14 +231,28 @@ impl ReadCache {
     }
 
     /// Scan cache for a prefix of `keys`, stopping at the first miss.
-    pub(super) fn get_prefix_blocks(&self, keys: &[BlockKey]) -> (usize, Vec<Arc<SealedBlock>>) {
+    ///
+    /// `chain` marks `keys` as one prefix chain in order (an attention prefix
+    /// query): the hit prefix then records each block's depth and its parent
+    /// link for tail-first eviction. Set lists (membership fetches) pass false.
+    pub(super) fn get_prefix_blocks(
+        &self,
+        keys: &[BlockKey],
+        chain: bool,
+    ) -> (usize, Vec<Arc<SealedBlock>>) {
         let mut hit = 0usize;
         let mut blocks = Vec::with_capacity(keys.len());
         {
             let mut inner = self.inner.lock();
-            for key in keys {
+            for (i, key) in keys.iter().enumerate() {
                 if let Some(block) = inner.cache.get(key) {
                     refresh_recency(&mut inner, key);
+                    if chain {
+                        set_depth(&mut inner, key, i);
+                        if i > 0 {
+                            inner.links.link(&keys[i - 1], key);
+                        }
+                    }
                     hit += 1;
                     blocks.push(block);
                 } else {
@@ -147,6 +261,25 @@ impl ReadCache {
             }
         }
         (hit, blocks)
+    }
+
+    /// Record each resident `(position, member)` pair as one resume point:
+    /// `member` is another cache group's block at the chain position of
+    /// `position`. The member takes the position's depth and is evicted no
+    /// later than it. Pairs with a non-resident end are ignored.
+    pub(super) fn link_group_members(&self, pairs: &[(BlockKey, BlockKey)]) {
+        let mut inner = self.inner.lock();
+        for (position, member) in pairs {
+            if !inner.cache.contains_key(position) || !inner.cache.contains_key(member) {
+                continue;
+            }
+            inner.links.link(position, member);
+            inner.links.members.insert(member.clone());
+            let depth = depth_of(&inner, position);
+            if let Some(metadata) = resident_metadata_mut(&mut inner, member) {
+                metadata.depth = depth;
+            }
+        }
     }
 
     pub(super) fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
@@ -240,23 +373,31 @@ impl ReadCache {
             .collect()
     }
 
+    /// Evict up to `batch_size` cache-owned blocks, reclaimable class first.
+    ///
+    /// With a tail window, each class evicts tail-first: among its oldest
+    /// `tail_window_percent` blocks, the deepest chain position goes first,
+    /// and a block goes only after its resident descendants. Otherwise plain
+    /// LRU.
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let removed = {
             let mut inner = self.inner.lock();
             let mut removed = Vec::with_capacity(batch_size);
-            remove_lru_batch_from_class(
-                &mut inner,
-                ResidentClass::Reclaimable,
-                batch_size,
-                &mut removed,
-            );
-            if removed.len() < batch_size {
-                remove_lru_batch_from_class(
-                    &mut inner,
-                    ResidentClass::Retained,
-                    batch_size,
-                    &mut removed,
-                );
+            for class in [ResidentClass::Reclaimable, ResidentClass::Retained] {
+                if removed.len() == batch_size {
+                    break;
+                }
+                if self.tail_window_percent == 0 {
+                    remove_lru_batch_from_class(&mut inner, class, batch_size, &mut removed);
+                } else {
+                    remove_tail_first_from_class(
+                        &mut inner,
+                        class,
+                        batch_size,
+                        self.tail_window_percent,
+                        &mut removed,
+                    );
+                }
             }
             inner.pressured |= !removed.is_empty();
             removed
@@ -274,6 +415,7 @@ impl ReadCache {
             );
             metadata.extend(inner.reclaimable.drain());
             metadata.extend(inner.retained.drain());
+            inner.links = ChainLinks::default();
             let removed = inner
                 .cache
                 .remove_all()
@@ -482,6 +624,7 @@ fn insert_block(
                     inserted_at: Instant::now(),
                     generation,
                     bytes: footprint_bytes,
+                    depth: UNKNOWN_DEPTH,
                 },
             );
             *class_bytes(inner, class) += footprint_bytes;
@@ -510,6 +653,16 @@ fn class_lru(
     }
 }
 
+fn class_lru_ref(
+    inner: &ReadCacheInner,
+    class: ResidentClass,
+) -> &LruCache<BlockKey, ResidentMetadata> {
+    match class {
+        ResidentClass::Reclaimable => &inner.reclaimable,
+        ResidentClass::Retained => &inner.retained,
+    }
+}
+
 fn backup_report_budget(
     capacity_bytes: u64,
     reclaimable_percent: u64,
@@ -529,6 +682,33 @@ fn class_bytes(inner: &mut ReadCacheInner, class: ResidentClass) -> &mut u64 {
     match class {
         ResidentClass::Reclaimable => &mut inner.class_bytes.reclaimable,
         ResidentClass::Retained => &mut inner.class_bytes.retained,
+    }
+}
+
+fn resident_metadata_mut<'a>(
+    inner: &'a mut ReadCacheInner,
+    key: &BlockKey,
+) -> Option<&'a mut ResidentMetadata> {
+    if inner.reclaimable.contains_key(key) {
+        inner.reclaimable.peek_mut(key)
+    } else {
+        inner.retained.peek_mut(key)
+    }
+}
+
+fn depth_of(inner: &ReadCacheInner, key: &BlockKey) -> u32 {
+    inner
+        .reclaimable
+        .peek(key)
+        .or_else(|| inner.retained.peek(key))
+        .map_or(UNKNOWN_DEPTH, |metadata| metadata.depth)
+}
+
+fn set_depth(inner: &mut ReadCacheInner, key: &BlockKey, index: usize) {
+    // UNKNOWN_DEPTH is reserved; a prefix of 4 billion blocks does not occur.
+    let depth = u32::try_from(index).unwrap_or(UNKNOWN_DEPTH - 1);
+    if let Some(metadata) = resident_metadata_mut(inner, key) {
+        metadata.depth = depth.min(UNKNOWN_DEPTH - 1);
     }
 }
 
@@ -605,30 +785,178 @@ fn mark_reclaimable_with_generation(
 
 fn remove_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> Option<RemovedResident> {
     while let Some((key, metadata)) = class_lru(inner, class).remove_lru() {
-        let block = inner.cache.remove(&key);
-        debug_assert!(
-            block.is_some(),
-            "replacement class contains a non-resident block"
-        );
-        let Some(block) = block else {
-            continue;
-        };
-        *class_bytes(inner, class) -= metadata.bytes;
-        let metrics = core_metrics();
-        metrics.cache_resident_blocks.add(-1, class.attributes());
-        metrics
-            .cache_resident_bytes_by_class
-            .add(-(metadata.bytes as i64), class.attributes());
-        metrics
-            .cache_block_evictions_by_class
-            .add(1, class.attributes());
-        return Some(RemovedResident {
-            key,
-            block,
-            inserted_at: metadata.inserted_at,
-        });
+        if let Some(removed) = finish_eviction(inner, class, key, metadata) {
+            return Some(removed);
+        }
     }
     None
+}
+
+/// Evict one resident block from whichever class holds it.
+fn evict_resident(inner: &mut ReadCacheInner, key: &BlockKey) -> Option<RemovedResident> {
+    let (class, metadata) = if let Some(metadata) = inner.reclaimable.remove(key) {
+        (ResidentClass::Reclaimable, metadata)
+    } else {
+        (ResidentClass::Retained, inner.retained.remove(key)?)
+    };
+    finish_eviction(inner, class, key.clone(), metadata)
+}
+
+/// Drop a block whose class entry was just removed: the resident block, its
+/// chain links, and the class accounting.
+fn finish_eviction(
+    inner: &mut ReadCacheInner,
+    class: ResidentClass,
+    key: BlockKey,
+    metadata: ResidentMetadata,
+) -> Option<RemovedResident> {
+    let block = inner.cache.remove(&key);
+    debug_assert!(
+        block.is_some(),
+        "replacement class contains a non-resident block"
+    );
+    let block = block?;
+    let had_children = inner.links.unlink(&key);
+    *class_bytes(inner, class) -= metadata.bytes;
+    let metrics = core_metrics();
+    metrics.cache_resident_blocks.add(-1, class.attributes());
+    metrics
+        .cache_resident_bytes_by_class
+        .add(-(metadata.bytes as i64), class.attributes());
+    metrics
+        .cache_block_evictions_by_class
+        .add(1, class.attributes());
+    if had_children {
+        metrics.cache_evictions_with_resident_children.add(1, &[]);
+    }
+    Some(RemovedResident {
+        key,
+        block,
+        inserted_at: metadata.inserted_at,
+    })
+}
+
+/// The resident child of `key` to evict before it: the deepest, unknown depth
+/// first.
+fn deepest_child(inner: &ReadCacheInner, key: &BlockKey) -> Option<BlockKey> {
+    inner
+        .links
+        .children
+        .get(key)?
+        .iter()
+        .max_by_key(|child| depth_of(inner, child))
+        .cloned()
+}
+
+/// Tail-first eviction within one class.
+///
+/// Candidates are the oldest `window_percent` of the class (at least the
+/// blocks still wanted), deepest chain position first, oldest first among
+/// equals. Taking a candidate evicts its resident subtree leaves first, so no
+/// block is evicted while a block that depends on it stays resident; such
+/// descendants may sit in the other class. A subtree whose next leaf is
+/// pinned by a load or transfer is skipped. If pins exhaust the candidates,
+/// the rest of the class is tried in LRU order under the same rule.
+fn remove_tail_first_from_class(
+    inner: &mut ReadCacheInner,
+    class: ResidentClass,
+    batch_size: usize,
+    window_percent: u64,
+    removed: &mut Vec<RemovedResident>,
+) {
+    let len = class_lru_ref(inner, class).len();
+    let wanted = batch_size.saturating_sub(removed.len());
+    if len == 0 || wanted == 0 {
+        return;
+    }
+    let share = (len as u128 * u128::from(window_percent) / 100) as usize;
+    let window = share.max(wanted).min(len);
+    // Clone only the keys the batch can use: a subtree yields at least one
+    // victim unless pinned, so a few per wanted block is plenty.
+    let take = wanted.saturating_mul(TAIL_CANDIDATE_FACTOR);
+    let candidates: Vec<BlockKey> = {
+        // Deepest first; the LRU index breaks ties oldest first.
+        let mut window_keys: Vec<(Reverse<u32>, usize, &BlockKey)> = class_lru_ref(inner, class)
+            .iter()
+            .take(window)
+            .enumerate()
+            .map(|(index, (key, metadata))| (Reverse(metadata.depth), index, key))
+            .collect();
+        if take < window_keys.len() {
+            window_keys.select_nth_unstable_by_key(take, |(depth, index, _)| (*depth, *index));
+            window_keys.truncate(take);
+        }
+        window_keys.sort_unstable_by_key(|(depth, index, _)| (*depth, *index));
+        window_keys
+            .into_iter()
+            .map(|(_, _, key)| key.clone())
+            .collect()
+    };
+    evict_candidates(inner, candidates, batch_size, removed);
+    if removed.len() < batch_size {
+        // Pins cover the window: fall back to the class's leaves in LRU
+        // order. Leaves need no walk, so a fully pinned class costs one scan.
+        let leaves: Vec<BlockKey> = class_lru_ref(inner, class)
+            .iter()
+            .filter(|(key, _)| !inner.links.children.contains_key(*key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        evict_candidates(inner, leaves, batch_size, removed);
+    }
+}
+
+fn evict_candidates(
+    inner: &mut ReadCacheInner,
+    candidates: Vec<BlockKey>,
+    batch_size: usize,
+    removed: &mut Vec<RemovedResident>,
+) {
+    for candidate in candidates {
+        if removed.len() == batch_size {
+            return;
+        }
+        if !inner.cache.contains_key(&candidate) {
+            continue;
+        }
+        let root = inner.links.eviction_root(&candidate);
+        evict_subtree(inner, &root, batch_size, removed);
+    }
+}
+
+/// Evict `root`'s resident descendants, leaves first, then `root`, until the
+/// batch is full.
+fn evict_subtree(
+    inner: &mut ReadCacheInner,
+    root: &BlockKey,
+    batch_size: usize,
+    removed: &mut Vec<RemovedResident>,
+) {
+    let mut current = root.clone();
+    while removed.len() < batch_size && inner.cache.contains_key(root) {
+        // Links come from client queries; a malformed client could link a
+        // cycle. Bound the walk and evict where it stops, which drops the
+        // block's links and so breaks the cycle.
+        let mut steps = inner.links.parent.len();
+        while steps > 0
+            && let Some(child) = deepest_child(inner, &current)
+        {
+            steps -= 1;
+            current = child;
+        }
+        if !inner.cache.is_cache_owned_only(&current) {
+            return;
+        }
+        let parent = inner.links.parent.get(&current).cloned();
+        let reached_root = current == *root;
+        let Some(evicted) = evict_resident(inner, &current) else {
+            return;
+        };
+        removed.push(evicted);
+        if reached_root {
+            return;
+        }
+        current = parent.unwrap_or_else(|| root.clone());
+    }
 }
 
 fn remove_lru_batch_from_class(
@@ -949,7 +1277,7 @@ mod tests {
             (oldest.clone(), make_block()),
         ]);
         let inserted_at = backdate_resident(&cache, &hit, Duration::from_secs(60));
-        let (count, _) = cache.get_prefix_blocks(std::slice::from_ref(&hit));
+        let (count, _) = cache.get_prefix_blocks(std::slice::from_ref(&hit), true);
 
         assert_eq!(count, 1);
         assert_eq!(
@@ -958,6 +1286,115 @@ mod tests {
         );
         assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
         assert_class(&cache, &hit, ResidentClass::Reclaimable);
+    }
+
+    fn keys(prefix: u8, n: u8) -> Vec<BlockKey> {
+        (0..n)
+            .map(|i| BlockKey::new("ns".into(), vec![prefix, i]))
+            .collect()
+    }
+
+    fn insert_all(cache: &ReadCache, keys: &[BlockKey]) {
+        cache.batch_insert(keys.iter().map(|k| (k.clone(), make_block())).collect());
+    }
+
+    fn evict_order(cache: &ReadCache, n: usize) -> Vec<BlockKey> {
+        (0..n)
+            .flat_map(|_| cache.remove_lru_batch(1))
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    #[test]
+    fn tail_first_evicts_deepest_block_of_oldest_window_first() {
+        // (window percent, expected order). Chain a (4 blocks, oldest) then
+        // chain b (2 blocks); both learned from prefix queries.
+        let a = keys(1, 4);
+        let b = keys(2, 2);
+        let cases: [(&str, u64, Vec<&BlockKey>); 3] = [
+            // Only a0 is in the window; its subtree goes leaf first.
+            ("narrow", 10, vec![&a[3], &a[2], &a[1], &a[0], &b[1], &b[0]]),
+            // Deepest across both chains, oldest first among equal depths.
+            ("whole", 100, vec![&a[3], &a[2], &a[1], &b[1], &a[0], &b[0]]),
+            ("lru", 0, vec![&a[0], &a[1], &a[2], &a[3], &b[0], &b[1]]),
+        ];
+        for (id, percent, expected) in cases {
+            let cache = make_cache().with_tail_window_percent(percent);
+            insert_all(&cache, &a);
+            insert_all(&cache, &b);
+            assert_eq!(cache.get_prefix_blocks(&a, true).0, 4, "{id}");
+            assert_eq!(cache.get_prefix_blocks(&b, true).0, 2, "{id}");
+            let expected: Vec<BlockKey> = expected.into_iter().cloned().collect();
+            assert_eq!(evict_order(&cache, 6), expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn queried_never_loaded_head_outlives_its_resident_descendants() {
+        // The old connector queries from vLLM's local hit, so the chain head
+        // is queried once, never loaded, and never refreshed again: it is the
+        // LRU front while its descendants stay hot.
+        let cache = make_cache();
+        let chain = keys(1, 4);
+        let newer = keys(2, 4);
+        insert_all(&cache, &chain);
+        assert_eq!(cache.get_prefix_blocks(&chain, true).0, 4);
+        insert_all(&cache, &newer);
+        assert_eq!(cache.get_prefix_blocks(&newer, true).0, 4);
+        // Later turns hit chain[1..] only.
+        assert_eq!(cache.get_prefix_blocks(&chain[1..], true).0, 3);
+
+        let mut victims = Vec::new();
+        for _ in 0..3 {
+            victims.extend(evict_order(&cache, 1));
+            assert!(
+                cache.inner.lock().cache.contains_key(&chain[0]),
+                "head evicted while {:?} is resident",
+                chain[1..]
+                    .iter()
+                    .filter(|k| !victims.contains(k))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            victims,
+            vec![chain[3].clone(), chain[2].clone(), chain[1].clone()]
+        );
+        assert_eq!(evict_order(&cache, 1), vec![chain[0].clone()]);
+    }
+
+    #[test]
+    fn tail_first_keeps_resume_point_groups_together_and_skips_pinned_leaves() {
+        let cache = make_cache().with_tail_window_percent(100);
+        let positions = keys(1, 2);
+        let members: Vec<BlockKey> = positions
+            .iter()
+            .map(|k| BlockKey::new("ns".into(), [k.hash.as_slice(), &[0, 0, 0, 1]].concat()))
+            .collect();
+        insert_all(&cache, &members);
+        insert_all(&cache, &positions);
+        assert_eq!(cache.get_prefix_blocks(&positions, true).0, 2);
+        cache.link_group_members(
+            &positions
+                .iter()
+                .cloned()
+                .zip(members.iter().cloned())
+                .collect::<Vec<_>>(),
+        );
+        // The deepest resume point leaves as a unit, other group first.
+        assert_eq!(
+            evict_order(&cache, 2),
+            vec![members[1].clone(), positions[1].clone()]
+        );
+
+        // A held member keeps its position (and so the chain) resident.
+        let held = cache.peek_blocks(std::slice::from_ref(&members[0]));
+        assert!(cache.remove_lru_batch(1).is_empty());
+        drop(held);
+        assert_eq!(
+            evict_order(&cache, 2),
+            vec![members[0].clone(), positions[0].clone()]
+        );
     }
 
     #[test]
@@ -1182,7 +1619,7 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         // get_prefix_blocks: stops at key 1 (first miss), returns only key 0
-        let (prefix_hit, _) = cache.get_prefix_blocks(&keys);
+        let (prefix_hit, _) = cache.get_prefix_blocks(&keys, true);
         assert_eq!(prefix_hit, 1);
     }
 

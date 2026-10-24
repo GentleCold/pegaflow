@@ -72,6 +72,10 @@ pub(crate) struct CoreMetrics {
     pub cache_resident_blocks: UpDownCounter<i64>,
     pub cache_block_evictions_by_class: Counter<u64>,
     pub cache_block_evictions_still_referenced: Counter<u64>,
+    /// Evictions of a block that still had a resident dependent (a deeper
+    /// chain block or another group's block of the same resume point). Stays
+    /// 0 under tail-first eviction except for plain LRU and full cleanup.
+    pub cache_evictions_with_resident_children: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
     pub cache_residence_duration: Histogram<f64>,
     pub cache_resident_bytes_by_class: UpDownCounter<i64>,
@@ -344,6 +348,10 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             cache_block_evictions_still_referenced: meter
                 .u64_counter("pegaflow_cache_block_evictions_still_referenced")
                 .with_description("Evicted cache blocks that still had external references (eviction did not immediately reclaim memory)")
+                .build(),
+            cache_evictions_with_resident_children: meter
+                .u64_counter("pegaflow_cache_evictions_with_resident_children")
+                .with_description("Pressure evictions of a block whose resident dependents became unreachable")
                 .build(),
             cache_eviction_reclaimed_bytes: meter
                 .u64_counter("pegaflow_cache_eviction_reclaimed_bytes")
