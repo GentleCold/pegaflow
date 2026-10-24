@@ -739,7 +739,16 @@ the last accepted run record by hand until `--accepted` exists.
   load timing, so no reference shares its batch composition, and
   `G2.warm_equals_cold` / `G2.gsm8k_outputs` report the differ counts
   (`gated: false`; vs baseline cold, and `warm_differ_vs_split`) without
-  gating. G2.gsm8k (accuracy within 0.01) gates, and every digest check
+  gating. The output controls compare one batch composition instead: the
+  plain and baseline arms also run `alone_ref` (the same 64 prompts, one at
+  a time, no pre-warm). `G2.plain_equals_baseline` requires plain and
+  baseline `alone_ref` equal in every completion and sampled-token logprob
+  (batched `cold_differ` reported), and `G2.split_control` compares plain
+  `alone_ref` with plain `alone` (basis: baseline `alone_ref`).
+  `same_start` reports pairs whose two passes started at the same point
+  (no split compared there); on Qwen3.5-4B gsm8k every prompt's last full
+  block is the shared prefix (1056), so the split claim rests on the P5
+  control and is not exercised by this workload. G2.gsm8k (accuracy within 0.01) gates, and every digest check
   stays byte-exact and hard: gsm8k digests every computation, so the
   reference is exhaustive (`digest_compare`) and a loaded block or state
   that equals no computed copy is `mismatched`.

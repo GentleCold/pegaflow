@@ -2230,3 +2230,51 @@ def _pre(preempted: int, resumed_loads: int, mismatched: int = 0) -> dict:
 )
 def test_preempt_verdict_needs_judged_loads_after_preemption(r, ok):
     assert run_gate._preempt_verdict(r, None)["pass"] is ok
+
+
+def _alone_dirs(tmp_path, plain_ref, base_ref, alone, cached=(48, 48)):
+    """``alone_ref`` (plain, baseline) and ``alone`` (plain, pre-warmed) passes."""
+    import json
+
+    for label, passes in (
+        ("plain", {"alone_ref": plain_ref, "alone": alone, "cold": ["c0", "c1"], "split": alone}),
+        ("baseline", {"alone_ref": base_ref, "cold": ["c0", "cX"]}),
+    ):
+        d = tmp_path / run_gate.GATE_DIR / label / "gsm8k"
+        d.mkdir(parents=True, exist_ok=True)
+        for name, outs in passes.items():
+            (d / f"{name}-outputs.json").write_text(json.dumps(outs))
+            c = cached if name in ("alone", "split") else (32, 32)
+            toks = [
+                {"logprobs": [len(o)], "cached": n, "prompt_tokens": 50}
+                for o, n in zip(outs, c, strict=True)
+            ]
+            (d / f"{name}-tokens.json").write_text(json.dumps(toks))
+
+
+@pytest.mark.parametrize(
+    "plain_ref,base_ref,alone,plain_ok,split_measured",
+    [
+        (["a", "b"], ["a", "b"], ["a", "b"], True, True),
+        (["a", "b"], ["a", "x"], ["a", "b"], False, True),  # the probe changed an output
+        (["a", "b"], ["a", "b"], ["a", "bb"], True, False),  # the split changed one
+    ],
+    ids=["equal", "probe-changes", "split-changes"],
+)
+def test_non_invariant_controls_compare_one_composition(
+    tmp_path, plain_ref, base_ref, alone, plain_ok, split_measured
+):
+    """batch_invariant=false: batched cold passes differ by composition, so
+    plain vs baseline and the split control compare one-at-a-time passes."""
+    _alone_dirs(tmp_path, plain_ref, base_ref, alone)
+    ref_cold = ["c0", "cX"]  # batched: differs from plain cold, reported only
+    v = run_gate._plain_equals_baseline(tmp_path, ref_cold, batch_invariant=False)
+    assert (v["pass"], v["cold_differ"]) == (plain_ok, 1)
+    ctrl = run_gate.split_control(tmp_path, batch_invariant=False)
+    assert ctrl["pair"] == ["alone_ref", "alone"] and ctrl["prewarmed"] == 2
+    assert ctrl["ref_equals_cold"] is plain_ok
+    sv = run_gate._split_control_verdict(ctrl, True)
+    assert sv["measured_invariant"] is split_measured
+    assert (
+        run_gate._plain_equals_baseline(tmp_path, ref_cold, batch_invariant=True)["pass"] is False
+    )

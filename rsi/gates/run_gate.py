@@ -133,6 +133,13 @@ MIN_PREWARMED = 0.9  # share of split requests whose hit reaches the last full b
 # ones establish gate.json ``batch_invariant``; any divergence refutes it.
 BATCH_PASS = "alone"
 BATCH_CONTROL_N = 64
+# Without batch invariance a batched pass's outputs depend on its batches
+# (load timing), so the output controls compare passes of one composition:
+# ``alone_ref`` (the same BATCH_CONTROL_N prompts, one at a time, no
+# pre-warm) on the plain and the baseline arm. ``G2.plain_equals_baseline``
+# compares the two; ``G2.split_control`` compares plain ``alone`` with it.
+ALONE_REF = "alone_ref"
+_ALONE = (BATCH_PASS, ALONE_REF)
 # Preempt workload (optional, ``--workloads ...,preempt``): the first
 # PREEMPT_N gsm8k prompts, each decoding exactly PREEMPT_OUT tokens, cold then
 # warm (reset + poison), on a GPU KV pool of ``preempt_gpu_blocks`` blocks
@@ -1125,10 +1132,13 @@ def run_arm_workload(
             limit = SELFTEST_LIMIT if kind == "selftest" else args.gsm8k_limit
             prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, limit)
             names = ["cold", "warm"]
+            batch_inv = bool(gate.get("batch_invariant"))
             if kind == "plain":
                 names += [*SPLIT_PASSES, BATCH_PASS]  # the split and batch controls
-            elif kind == "baseline" and not split_inv:
-                names.append("split")  # same-split references for warm computed KV
+                names += [] if batch_inv else [ALONE_REF]
+            elif kind == "baseline":
+                names += [] if split_inv else ["split"]  # same-split references
+                names += [] if batch_inv else [ALONE_REF]
         elif pre:
             prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, PREEMPT_N)
             names = ["cold", "warm"]
@@ -1167,7 +1177,7 @@ def run_arm_workload(
                 # Digest every request: under batch invariance every copy is a
                 # reference, so nothing a connector loads goes unjudged.
                 xargs = {"rsi_pass": name, "rsi_digest": "full"}
-                alone = name == BATCH_PASS
+                alone = name in _ALONE
                 res = asyncio.run(
                     workloads.run_gsm8k(
                         url,
@@ -1175,8 +1185,8 @@ def run_arm_workload(
                         prompts[:BATCH_CONTROL_N] if alone else prompts,
                         1 if alone else args.concurrency,
                         xargs=xargs,
-                        logprobs=kind == "plain" and (alone or name in SPLIT_PASSES),
-                        prewarm=alone or name == "split",
+                        logprobs=alone or (kind == "plain" and name in SPLIT_PASSES),
+                        prewarm=name in (BATCH_PASS, "split"),
                         **({"max_tokens": PREEMPT_OUT, "free_run": True} if pre else {}),
                     )
                 )
@@ -1462,15 +1472,19 @@ def _hit_alignment(run_dir: Path) -> int:
     return 16
 
 
-def split_control(run_dir: Path) -> dict[str, Any] | None:
+def split_control(run_dir: Path, batch_invariant: bool = True) -> dict[str, Any] | None:
     """The plain arm's split control: ``split`` (each prompt pre-warmed into
     vLLM's prefix cache, so the request starts at its last full prompt block)
     vs ``split_ref`` (same prompts, hits end at the shared few-shot prefix).
+    Without batch invariance the batched pair differs by batch composition
+    alone, so the pair is ``alone`` vs ``alone_ref`` (one request at a time)
+    and its basis is the baseline's ``alone_ref`` instead of plain cold.
     Per request: completion differs, sampled-token logprobs differ, and the
     pre-warm took (``split`` cached the whole prompt up to its last full
     block: ``cached >= (prompt_tokens - 1) // align * align``)."""
-    ref, got = _outputs(run_dir, "plain", "split_ref"), _outputs(run_dir, "plain", "split")
-    rt, gt = _tokens(run_dir, "plain", "split_ref"), _tokens(run_dir, "plain", "split")
+    rn, gn = ("split_ref", "split") if batch_invariant else (ALONE_REF, BATCH_PASS)
+    ref, got = _outputs(run_dir, "plain", rn), _outputs(run_dir, "plain", gn)
+    rt, gt = _tokens(run_dir, "plain", rn), _tokens(run_dir, "plain", gn)
     if not ref or not got or rt is None or gt is None or len(ref) != len(got):
         return None
     differ = [a != b for a, b in zip(ref, got, strict=True)]
@@ -1490,16 +1504,52 @@ def split_control(run_dir: Path) -> dict[str, Any] | None:
     # split differs from a connector's warm request on exactly these prompts.
     # A missing token record is not aligned: it is never exempted (S7).
     aligned = [b is not None and bool(b.get("prompt_tokens")) and b["prompt_tokens"] % al == 0 for b in gt]  # fmt: skip
-    cold = _outputs(run_dir, "plain", "cold")
+    basis = _outputs(run_dir, *(("plain", "cold") if batch_invariant else ("baseline", ALONE_REF)))
+    # Requests whose two passes started at the same point: the pair compares
+    # no split there (reported; e.g. a last full block at the shared prefix).
+    same = sum(
+        a is not None and b is not None and a.get("cached") == b.get("cached")
+        for a, b in zip(rt, gt, strict=True)
+    )
     return {
         "n": len(ref),
+        "pair": [rn, gn],
         "differ": differ,
         "logprob_differ": lp,
         "prewarmed": sum(warmed),
-        "ref_equals_cold": cold is not None and cold == ref,
-        "split_outputs": got,
-        "aligned": aligned,
+        "same_start": same,
+        "ref_equals_cold": basis is not None and basis == ref,
+        "split_outputs": _outputs(run_dir, "plain", "split") if not batch_invariant else got,
+        "aligned": aligned
+        if batch_invariant
+        else [
+            b is not None and bool(b.get("prompt_tokens")) and b["prompt_tokens"] % al == 0
+            for b in (_tokens(run_dir, "plain", "split") or [])
+        ],
     }
+
+
+def _plain_equals_baseline(
+    run_dir: Path, ref_cold: list[str] | None, batch_invariant: bool
+) -> dict[str, Any]:
+    """The probe changes nothing: plain cold == baseline cold under batch
+    invariance; otherwise the one-at-a-time ``alone_ref`` passes (same batch
+    composition) must agree in every completion and sampled-token logprob,
+    and the batched cold differ count is reported."""
+    cold_differ = _differ(ref_cold, _outputs(run_dir, "plain", "cold"))
+    if batch_invariant:
+        return {"pass": cold_differ == 0, "differ": cold_differ}
+    a, b = _outputs(run_dir, "baseline", ALONE_REF), _outputs(run_dir, "plain", ALONE_REF)
+    at, bt = _tokens(run_dir, "baseline", ALONE_REF), _tokens(run_dir, "plain", ALONE_REF)
+    out: dict[str, Any] = {"pair": ALONE_REF, "cold_differ": cold_differ}
+    if not a or a is None or b is None or at is None or bt is None or len(a) != len(b):
+        return {"pass": False, "reason": f"{ALONE_REF} passes missing"} | out
+    out["differ"] = _differ(a, b)
+    out["logprob_differ"] = sum(
+        x is None or y is None or x.get("logprobs") != y.get("logprobs")
+        for x, y in zip(at, bt, strict=True)
+    )
+    return {"pass": out["differ"] == 0 and out["logprob_differ"] == 0, "n": len(a)} | out
 
 
 def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str, Any]:
@@ -1526,6 +1576,7 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
         "logprob_differ": lp,
         "prewarmed": ctrl["prewarmed"],
         "ref_equals_cold": ctrl["ref_equals_cold"],
+        **{k: ctrl[k] for k in ("pair", "same_start") if k in ctrl},
     }
     if measured != claim:
         out["reason"] = (
@@ -1533,7 +1584,7 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
             f"{'no' if measured else 'a'} divergence"
         )
     elif not ctrl["ref_equals_cold"]:
-        out["reason"] = "split_ref differs from plain cold: the control has no stable basis"
+        out["reason"] = "the reference pass differs from its basis: the control has no stable basis"
     elif not ok:
         out["reason"] = "pre-warm did not take: the control is vacuous"
     return out
@@ -2014,7 +2065,8 @@ def verdicts(
     v: dict[str, Any] = {}
     connectors = connectors or {}
     split_inv = bool((gate or {}).get("split_invariant", True))
-    ctrl = split_control(run_dir)
+    batch_inv = bool((gate or {}).get("batch_invariant"))
+    ctrl = split_control(run_dir, batch_inv)
     base = results.get("baseline", {})
     ref_cold = _outputs(run_dir, "baseline", "cold")
     ref_acc = base.get("gsm8k", {}).get("passes", {}).get("cold", {}).get("accuracy")
@@ -2025,10 +2077,7 @@ def verdicts(
     # the local reset change nothing (baseline warm == cold), local hits are
     # byte-identical to their computed copies.
     v["baseline"] = {
-        "G2.plain_equals_baseline": {
-            "pass": _differ(ref_cold, _outputs(run_dir, "plain", "cold")) == 0,
-            "differ": _differ(ref_cold, _outputs(run_dir, "plain", "cold")),
-        },
+        "G2.plain_equals_baseline": _plain_equals_baseline(run_dir, ref_cold, batch_inv),
         # Output equality needs batch invariance; gate.json declares when a
         # model cannot have it, and then only accuracy and digests count.
         "G2.warm_equals_cold": {
