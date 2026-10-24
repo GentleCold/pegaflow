@@ -1559,8 +1559,9 @@ def _qwen35_cfg():
 def test_qwen35_layout(sem, mamba, full_attention):
     """Full group first (prefix query), then the 3 GDN checkpoint groups; step 528.
 
-    The Mamba state layout enters the namespace: a different state dtype is a
-    different namespace for the same page size.
+    The Mamba state layout enters the namespace: a different state dtype, or
+    vLLM's ``VLLM_SSM_CONV_STATE_LAYOUT=DS`` conv orientation (same page size,
+    other byte order), is a different namespace.
     """
     layout = build_layout(_qwen35_cfg(), Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
     assert [(g.gid, g.sem.kind) for g in layout.groups] == [
@@ -1570,11 +1571,15 @@ def test_qwen35_layout(sem, mamba, full_attention):
         (2, "checkpoint"),
     ]
     assert layout.step == 528
-    cfg = _qwen35_cfg()
-    for g in cfg.kv_cache_groups[:3]:
-        g.kv_cache_spec = dataclasses.replace(g.kv_cache_spec, dtypes=("bfloat16", "bfloat16"))
-    other = build_layout(cfg, Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
-    assert other.namespace != layout.namespace
+    for change in (
+        {"dtypes": ("bfloat16", "bfloat16")},
+        {"shapes": ((8192, 3), (32, 128, 128))},  # conv layout DS
+    ):
+        cfg = _qwen35_cfg()
+        for g in cfg.kv_cache_groups[:3]:
+            g.kv_cache_spec = dataclasses.replace(g.kv_cache_spec, **change)
+        other = build_layout(cfg, Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
+        assert other.namespace != layout.namespace, change
 
 
 # Qwen3-4B test layout namespaces computed by the 6545352 core (before

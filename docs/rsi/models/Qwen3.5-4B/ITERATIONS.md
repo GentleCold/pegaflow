@@ -140,7 +140,7 @@ mapping below.
 
 | group | spec | Kind | unit (bt) | stored bytes per (block, layer) | `needed(p)` | `saveable(before, after)` |
 |---|---|---|---|---|---|---|
-| 0, 1, 2 | MambaSpec (GDN), align | `Checkpoint` | 528 | 2146304 (conv + ssm, unpadded), one segment | `[p/528 - 1]` | `[after/528 - 1]` only when `after % 528 == 0` |
+| 0, 1, 2 | MambaSpec (GDN), align | `Checkpoint` | 528 | 2162688, the padded page (states 2146304 + 16384 padding; see "Adapter draft"), one segment | `[p/528 - 1]` | `[after/528 - 1]` only when `after % 528 == 0` |
 | 3 | FullAttentionSpec | `Full` | 528 | 2162688, one segment | `[0, p/528)` | `[before/528, after/528)` |
 
 No new Kind is needed. `Kind::Checkpoint` already states "the state at `p` is

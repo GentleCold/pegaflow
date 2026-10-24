@@ -20,9 +20,13 @@ and dtypes go into ``LayerDecl.layout`` (namespace). That covers
 ``mamba_cache_dtype`` / ``mamba_ssm_cache_dtype`` changing the page while the
 model path stays the same.
 
-Draft (P5 it0): the core still rejects checkpoint groups until it saves from
-vLLM's ``boundary_state_offloads`` (see ``core/layout.py``). This adapter only
-declares facts; it is reached by ``build_layout`` before that check.
+The core saves checkpoint groups from vLLM's ``boundary_state_offloads``
+(``core/scheduler.py`` ``plan_saves``); this adapter only declares facts.
+
+Not visible in ``MambaSpec``, so not rejected here: ``cache_config.use_replayssm``
+(Mamba2 decode writes the state back only on flush, so a block-end page may be
+stale when offered). GDN (Qwen3.5) does not use it; a Mamba2 model must check
+it before it relies on this adapter.
 """
 
 from __future__ import annotations
