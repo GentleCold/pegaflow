@@ -1238,7 +1238,12 @@ def run_arm_workload(
                         prompts[:BATCH_CONTROL_N] if alone else prompts,
                         1 if alone else args.concurrency,
                         xargs=xargs,
-                        logprobs=alone or (kind == "plain" and name in SPLIT_PASSES),
+                        # Logprobs only where they are compared (plain and
+                        # baseline controls): a negative self-test arm's
+                        # corrupted state gives non-finite logprobs, which
+                        # vLLM cannot serialize (HTTP 400).
+                        logprobs=(alone and kind in ("plain", "baseline"))
+                        or (kind == "plain" and name in SPLIT_PASSES),
                         prewarm=name in (BATCH_PASS, "split"),
                         **({"max_tokens": PREEMPT_OUT, "free_run": True} if pre else {}),
                     )
