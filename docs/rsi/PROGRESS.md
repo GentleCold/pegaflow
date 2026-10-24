@@ -101,7 +101,7 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
 - 2026-10-24: the `old` reference arm runs with `VLLM_PLUGINS=pegaflow` (vLLM
   0.32 looks MultiConnector children up by registered name to rebuild stats;
   P4 MF1 got HTTP 500 on every old-arm request). Every other arm keeps `""`.
-  Branch `fix/rsi-gate-old-plugin` 81e8f87.
+  Branch `fix/rsi-gate-old-plugin` 3fe119c.
 
 ## Isolation (no reference to existing implementation)
 
