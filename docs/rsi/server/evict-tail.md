@@ -141,7 +141,7 @@ The rule is: a group block never outlives its position.
   position keys for hits only.
 - A position no prefix query has covered has unknown depth, so its linked
   members also take unknown depth and rank first. With a hybrid model,
-  members of positions that were saved but not yet requeried are therefore
+  members of positions that were saved but not yet re-queried are therefore
   early victims.
 - So when a position is chosen, its group blocks go before it. A position is
   never evicted while its group data stays as weight no resume point can
@@ -380,7 +380,7 @@ the logged hit. Shares are of ext\*_C:
 - The LRU sim reproduces H4 well (match 0.86-0.96). The H5 sim reproduces
   H5 at 0.5 and 0.75 (0.65-0.82) but not at 0.25 (0.20-0.38). The sim's
   depth model is the hit prefix of the latest query, and the server's
-  depths drift from it once a chain is partly evicted and requeried. So
+  depths drift from it once a chain is partly evicted and re-queried. So
   attribution of the H5 runs is approximate, and at 0.25 not reliable.
 - At 0.5, H5 cuts the "evicted" class from 0.28 to 0.23: it evicts less of
   what is needed next. That is where the gain comes from.
@@ -593,7 +593,7 @@ help text (it now points at this doc).
 - Group > 0 linking is unit-tested only. No hybrid model has run on H5, and
   the client contract in §Group coherence is unchecked.
 - Depth is the hit-prefix index of the latest query, so it shifts when a
-  chain is requeried from another offset (old: 6-21% of queries start past
+  chain is re-queried from another offset (old: 6-21% of queries start past
   its local hit, 6-10% before it; `sim/offsets.py`). Order within a chain stays right, but depths of two
   chains are not comparable. The gate result is the evidence this is good
   enough.

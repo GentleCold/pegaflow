@@ -75,7 +75,7 @@ pub(crate) struct CoreMetrics {
     /// Pressure evictions of a block that still had a known resident
     /// dependent: a deeper chain block or another group's block of the same
     /// position, linked by an earlier query. Dependents the server never
-    /// linked (a new turn not yet requeried, decode tails, prefetch inserts,
+    /// linked (a new turn not yet re-queried, decode tails, prefetch inserts,
     /// children of a re-saved head) are not counted. Nonzero under plain LRU
     /// (window 0), under the reclaimable class's LRU, when a tail-first
     /// round falls back to LRU because pins cover the window, and when
