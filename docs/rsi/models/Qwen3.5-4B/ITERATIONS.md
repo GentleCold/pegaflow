@@ -394,6 +394,24 @@ Expectations:
   boundaries and junctions are saved. That `E_ext` is recorded as the
   cost of not retaining, not judged.
 
+Sync checkpoint saves (review should-fix 4). Layouts with a checkpoint
+group save synchronously in `wait_for_save`. With retention 528, every
+prefill chunk that ends on a boundary copies 24 GDN pages (about 52 MB)
+plus the attention block before the next step. order3's `save stats`:
+`flush_ms` 42.9 over 5 save steps and 57.8 over 3 (8.6 to 19 ms per save
+step, up to 41 ms of it `wait_ms` on compute). That can fail the ≤ 2% cold
+replay G4 checks without any noise. In each slice:
+- record per-step save time from the v2 arm's `save stats` lines for the
+  cold replay pass (`flush_ms / save_steps`, `wait_ms`, `rpc_ms`), next
+  to the step time (pass seconds / steps);
+- attribute the cold-replay G4 TTFT and req/s delta against it before
+  calling anything noise: Σ `flush_ms` over the pass vs the delta in pass
+  seconds;
+- if cold G4 fails and the flush time covers the delta, the next
+  hypothesis is one change: fence the offered block id (keep vLLM from
+  reusing it until the copy is done, as vLLM's OffloadingConnector does,
+  see "Save offers") and save asynchronously.
+
 ### 2. Per-group miss attribution in the gate slices
 
 `hit stats` is logged today only after a miss is counted. In a gate slice,
