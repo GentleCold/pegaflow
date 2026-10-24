@@ -35,6 +35,13 @@ const MIN_BATCH_DRIVER: i32 = 13000;
 #[cfg(not(feature = "cuda-13"))]
 const MIN_BATCH_DRIVER: i32 = 12080;
 
+/// The batch entry point this build calls. cudarc resolves it lazily and
+/// panics if libcuda does not export it, so it is probed before first use.
+#[cfg(feature = "cuda-13")]
+const BATCH_SYMBOL: &str = "cuMemcpyBatchAsync_v2";
+#[cfg(not(feature = "cuda-13"))]
+const BATCH_SYMBOL: &str = "cuMemcpyBatchAsync";
+
 const DISABLE_BATCH_ENV: &str = "PEGAFLOW_DISABLE_BATCH_MEMCPY";
 
 /// A run of input copies that are contiguous on both the device and the host
@@ -118,6 +125,8 @@ enum Choice {
     DisabledByEnv,
     /// The driver version is unknown or older than the batch API.
     OldDriver,
+    /// The driver is new enough but libcuda does not export [`BATCH_SYMBOL`].
+    MissingSymbol,
 }
 
 impl Choice {
@@ -126,7 +135,21 @@ impl Choice {
             Self::Batch => "batch",
             Self::DisabledByEnv => "per-range (disabled by env)",
             Self::OldDriver => "per-range (driver older than the batch API)",
+            Self::MissingSymbol => "per-range (libcuda does not export the batch symbol)",
         }
+    }
+}
+
+/// Whether the loaded libcuda exports [`BATCH_SYMBOL`]. Looks it up in the
+/// same library cudarc's lazy loader uses.
+fn batch_symbol_present() -> bool {
+    // SAFETY: `culib` returns the process-wide libcuda handle cudarc already
+    // opened for `cuDriverGetVersion`; `get` only resolves the address and the
+    // pointer is never called here.
+    unsafe {
+        sys::culib()
+            .get::<*const std::ffi::c_void>(BATCH_SYMBOL.as_bytes())
+            .is_ok()
     }
 }
 
@@ -137,12 +160,24 @@ fn disables(value: &std::ffi::OsStr) -> bool {
     !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
 }
 
-fn choose(env: Option<&std::ffi::OsStr>, driver_version: Option<i32>) -> Choice {
+/// `symbol_present` is only asked once the env and the driver version allow
+/// batching.
+fn choose(
+    env: Option<&std::ffi::OsStr>,
+    driver_version: Option<i32>,
+    symbol_present: impl FnOnce() -> bool,
+) -> Choice {
     if env.is_some_and(disables) {
         return Choice::DisabledByEnv;
     }
     match driver_version {
-        Some(v) if v >= MIN_BATCH_DRIVER => Choice::Batch,
+        Some(v) if v >= MIN_BATCH_DRIVER => {
+            if symbol_present() {
+                Choice::Batch
+            } else {
+                Choice::MissingSymbol
+            }
+        }
         _ => Choice::OldDriver,
     }
 }
@@ -156,7 +191,7 @@ impl MemcpyBackend {
         // SAFETY: writes one c_int; a CUDA context is not required.
         let result = unsafe { sys::cuDriverGetVersion(&mut version) };
         let driver = (result == sys::cudaError_enum::CUDA_SUCCESS).then_some(version);
-        let choice = choose(env.as_deref(), driver);
+        let choice = choose(env.as_deref(), driver, batch_symbol_present);
         info!(
             "memcpy transfer submission: {} (driver={version}, min_batch_driver={MIN_BATCH_DRIVER}, {DISABLE_BATCH_ENV}={env:?})",
             choice.describe()
@@ -496,8 +531,28 @@ mod tests {
             ("unknown driver", None, None, Choice::OldDriver),
         ];
         for (id, env, driver, want) in cases {
-            assert_eq!(choose(env.map(OsStr::new), driver), want, "case {id}");
+            assert_eq!(
+                choose(env.map(OsStr::new), driver, || true),
+                want,
+                "case {id}"
+            );
         }
+        // A new enough driver without the symbol falls back; the probe is not
+        // consulted once the env or the version already decided.
+        assert_eq!(choose(None, new_driver, || false), Choice::MissingSymbol);
+        let probe = || -> bool { panic!("probe must not run") };
+        assert_eq!(
+            choose(Some(OsStr::new("1")), new_driver, probe),
+            Choice::DisabledByEnv
+        );
+        assert_eq!(choose(None, None, probe), Choice::OldDriver);
+    }
+
+    /// The driver on a GPU host exports the symbol this build calls.
+    #[test]
+    #[ignore = "requires a CUDA driver"]
+    fn installed_driver_exports_the_batch_symbol() {
+        assert!(batch_symbol_present(), "{BATCH_SYMBOL} not exported");
     }
 
     /// A batch call that fails is retried per range: every range lands exactly
