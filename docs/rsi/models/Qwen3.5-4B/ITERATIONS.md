@@ -356,3 +356,120 @@ invalid. The launch lacked `PYTHONPATH=<tree>/python`, so vLLM imported the
 shared tree's connector, which has no MLA adapter, and the v2 arm failed at
 init. The first Qwen3-4B slice (`2026-10-23-qwen3-4b-p5-it1-nonreg`) had
 the same fault and is discarded.
+
+## it2 plan (not run; starts when `feat/rsi-gate-hybrid` lands)
+
+Preconditions:
+- The hybrid gate digests the Mamba groups, so `G2.digest_groups` can pass.
+- The gate.json has `--prefix-cache-retention-interval 528` on every arm.
+- GPUs are assigned by the coordinator.
+
+Every launch sets `PYTHONPATH=<tree>/python`, or `--under-test-path` once
+feat/rsi-g5 is merged. I check the `from=` line before reading any verdict.
+
+### 1. Slices
+
+The Qwen3.5-4B hybrid-gate slice uses the same shape as the it1 slices:
+- full gsm8k and replay 8 x 6;
+- arms plain, baseline and v2;
+- then G5 `cap` at the gate's capacity fraction.
+
+The report has these hit-rate tables:
+- per pass: local / external / total / `H*` / `E_ext`, v2 vs baseline;
+- per group: hit tokens, fallback count and tokens lost (the gate's
+  per-group report).
+
+Expectations:
+- With retention 528, every boundary is offered, so replay warm should
+  reach `E_ext` 1.0 with no eviction.
+- If the gate.json is not ready, I run once without it. Then only replay
+  boundaries and junctions are saved. That `E_ext` is recorded as the
+  cost of not retaining, not judged.
+
+### 2. Per-group miss attribution in the gate slices
+
+`hit stats` is logged today only after a miss is counted. In a gate slice,
+silence cannot be told apart from a missing log line. it2 changes this:
+- At shutdown, log `hit stats` unconditionally, with lookups and zero
+  counts. This is a small connector change, tested in
+  `test_miss_attribution_names_the_missing_group`.
+- Keep the every-500-lookups line, with its timestamp.
+
+The gate runs one vLLM process per arm and workload, so the counters cover
+all passes of that workload. Cold passes count nothing, because the server
+starts empty and the full group backs no resume point. For a per-pass
+split, I align the timestamped lines with the gate's pass boundaries. If
+the run record has no pass timestamps, I ask the gate owner instead of
+guessing.
+
+Cross-check per slice:
+- Connector `missing=<sids>` counts and `lost_tokens` against the gate's
+  per-group "tokens lost to fallback".
+- Unlimited pool (gsm8k, replay): both must be 0.
+- G5 cap: misses are expected. A `missing=1,2,3` without `missing=0`
+  means the server evicted the checkpoint groups but kept the full group,
+  and that goes to the server agent as group-coherent eviction evidence.
+  Any disagreement between the connector's count and the gate's count is
+  a bug in one of them and blocks the slice.
+
+### 3. Settling the order3 p4 divergence
+
+In order3, p4's completion in C (external hit at 1584) diverges from A
+(cold) at output token 152. The checkpoint loads were byte-equal. My
+tool did not compare the full-attention blocks loaded at the same resume.
+Candidate causes:
+- (a) batch non-invariance: after preemption, the batches differ;
+- (b) split non-invariance: GDN prefill resumed at 1584 is chunked
+  differently from a run through, like MLA on DSV2;
+- (c) a wrong full-attention load.
+
+Leg 1 runs first: a no-connector control in the in-process driver, GPU
+only, no pegaflow-server. Plain vLLM, same prompts, retention 528:
+- split control: p4 alone, cold vs warm with vLLM's own local hit at 1584
+  (prime p4's prefix, then rerun with enough GPU blocks to keep the
+  state);
+- batch control: p4 alone vs all six batched under the order3 tight
+  config, cold, so preemption happens.
+
+The connector changes the schedule, so I cannot replay order3's exact
+preemption schedule without it. The two controls separate the causes
+instead.
+
+Leg 2 runs only if leg 1 shows no divergence of the same kind: a digest of
+the loaded state at resume. In C, I capture p4's full-attention blocks
+`[0, 1584)` right after the load and compare them with A's saved pages,
+as the checkpoint loads already are. I also compare the first sampled
+token's logits at 1584 between A and C.
+
+| Leg 1 result | Leg 2 result | Conclusion | Next step |
+|---|---|---|---|
+| warm or batched p4 diverges | not run | vLLM non-invariance, not the connector | Gate owner decides `split_invariant` / `batch_invariant` for this model, as P4 did for DSV2 |
+| no divergence | full-attention bytes differ | a connector load bug | Blocks it2 |
+| no divergence | bytes equal, logits differ | an open question | Back to the coordinator before any gate run |
+
+Once the hybrid gate exists, `G2.digest_self` on the full and Mamba
+groups gives the same evidence on every slice. Leg 2 is for the
+reproducer only.
+
+### 4. Should `~/kexi/rsi-tools/p5` move into the repo?
+
+No. The tools stay outside the repo, as P4's did.
+- The tools subclass `PegaKVConnectorV2` and read its plan internals. The
+  gate is connector-agnostic, and `rsi/gates/**` belongs to the gate
+  owner, so they cannot go there as written.
+- Once the hybrid gate digests Mamba state, its `G2.digest_*` covers the
+  load side: external loads matched against computed state. Its
+  negative self-tests cover what poisoning showed.
+- Two parts are worth giving to the gate owner as technique, not code:
+  - When to digest a Mamba state: the state block is valid in the step
+    vLLM offers it in `boundary_state_offloads`, after that step's
+    forward, and is freed or reused soon after. The probe should digest
+    it then, not at finish.
+  - The saved-vs-unprimed-recompute comparison with a rounding bound
+    (conv ≤ 0.0625, ssm ≤ 0.024 against controls of 28.6 / 4.28). Under
+    `batch_invariant` it can become exact equality.
+
+  I send both to the gate owner (a81695e98582ef447) with a pointer to
+  `p5_check.py`. Whether they belong in the gate is the gate owner's call.
+- The tools stay until Qwen3.5-4B passes G2 on the hybrid gate, and are
+  then deleted.
