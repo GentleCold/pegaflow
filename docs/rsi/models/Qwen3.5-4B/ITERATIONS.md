@@ -337,8 +337,8 @@ R's (p4 alone, unprimed, no loads). A (cold but batched) is the odd one
 out. p3 also differs between the batched phases (A == C) and R. With
 every loaded byte equal to its save and a one-ulp flip, cause (c) is
 excluded for this run, and batch composition (a) is the remaining
-explanation. The no-connector batch control (it2 item 3, leg 1) has not
-run yet.
+explanation. The no-connector controls (it2 item 3, leg 1) confirmed it
+and closed the divergence (below).
 
 Analyzer fix: a preempted request reloads into reused GPU block ids, so
 pairing loads by `(req, sid, block_id)` mixed up two loads of the same
@@ -491,9 +491,51 @@ captured. Candidate causes:
   differently from a run through, like MLA on DSV2;
 - (c) a wrong full-attention block in `[0, 1584)`.
 
-Status: leg 2 ran as order4 at 863cc99 (see the it1 ordering check).
-Every full and checkpoint load is byte-equal, and the margin at the
-divergence is one bf16 step. Leg 1 remains.
+Status: closed as batch non-invariance in vLLM 0.32 GDN decode, not the
+connector. Leg 2 ran as order4 at 863cc99 (see the it1 ordering check):
+every full and checkpoint load is byte-equal, and the margin at the
+divergence is one bf16 step. Leg 1 ran without the connector (results
+below).
+
+#### Leg 1 result (`~/kexi/rsi-runs/2026-10-24-qwen3.5-4b-p5-it2-ctrl`)
+
+Plain vLLM 0.32.0 (no `kv_transfer_config`, PYTHONPATH unset). Same
+in-process driver knobs and prompts as order4 (retention 528,
+`max_num_batched_tokens 1056`, `max_num_seqs 4`, 300 output tokens,
+top-2 logprobs). Tree rev 863cc99 (the connector is not loaded). GPU4
+only, pgid 2328944, 02:55:32Z-02:59:27Z host UTC. Script md5s are in the
+run's `config`.
+
+| Run | p4 token 152 (top-2 logprobs) | p4 vs alone |
+|---|---|---|
+| plain, batched, 16 GPU blocks (order3/order4 tight config) | 16809 (-0.8326) over 6704 (-0.9576), margin 0.125 | diverges at 152 |
+| plain, batched, 200 GPU blocks | 16809 (-0.6735) over 6704 (-1.1735), margin 0.5 | diverges at 152 |
+| plain, alone, cold (prefix cache reset before each prompt) | 6704 (-0.7964) over 16809 (-0.9214) | reference |
+| plain, alone after vLLM's own local hit (split control) | identical to alone | equal, 300/300 |
+| order4 A (connector, batched cold) | 16809 (-0.8195) over 6704 (-0.9445), margin 0.125 | diverges at 152 |
+| order4 C (connector, external hit at 1584) | identical to alone, same logprobs to all digits | equal, 300/300 |
+| order4 R (connector, alone, loads disabled) | identical to alone | equal, 300/300 |
+
+- Plain vLLM with the same tight config gives the same one-bf16-step flip
+  at p4 token 152 when batched, so the connector does not cause it. p3
+  (first diff at 148) and p2 (at 170) also differ between batched and
+  alone runs in plain vLLM. Which ones differ depends on the batch.
+- Split: vLLM's own local hit came at 1056, not 1584. The 1056 boundary
+  was the longest one in vLLM's prefix cache when p4 reran. Resuming at
+  1056 does not change p4's output, and order4 C resumes at 1584 (from
+  the connector, byte-checked loads) and also equals the alone run. So
+  in this setup GDN has no split non-invariance at 1056 or 1584.
+  Batch composition is the only cause seen.
+- Preemption counts for these control runs were not collected:
+  `LLM.get_metrics()` asserted in-process. The batched 200-block run does
+  not need preemption to flip.
+- For the hybrid gate, this model is batch-sensitive in decode. A cold
+  vs warm `G2.*_outputs` comparison is meaningful only under
+  `batch_invariant` (if vLLM supports it for GDN), or with comparisons
+  limited to same-batch runs. That decision is the gate owner's.
+
+Tools: `p5_ctrl.py`, `p5_ctrl.sh`, `p5_ctrl_cmp.py` in
+`~/kexi/rsi-tools/p5` (out of the repo, like the rest).
 
 Both legs always run.
 - Leg 1, no connector (in-process driver, GPU only, plain vLLM, same

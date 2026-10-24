@@ -98,7 +98,7 @@ names, magic constants that only exist in the old code).
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 pending (G5 r3 official) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
-| P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed with one open output divergence (order3 p4), Qwen3-4B + DSV2 non-regression; review of it0+it1 pending; gate runs wait for `feat/rsi-gate-hybrid` and the retention-528 gate.json |
+| P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed (the order3 p4 output divergence is closed as vLLM batch non-invariance), Qwen3-4B + DSV2 non-regression; review of it0+it1 pending; gate runs wait for `feat/rsi-gate-hybrid` and the retention-528 gate.json |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ## Log
@@ -647,8 +647,14 @@ names, magic constants that only exist in the old code).
     with 6 preemptions: 5/6; p4 diverges at token 152 before its own
     preemption). Rerun at 863cc99 as order4 (review should-fix 2): 27/27
     checkpoint and 29/29 full loads byte-equal, p4 flips at token 152 by
-    one bf16 step and matches the unprimed alone run. The no-connector
-    batch control is still open (ITERATIONS it2 plan item 3).
+    one bf16 step and matches the unprimed alone run.
+  - it2 leg 1 (`2026-10-24-qwen3.5-4b-p5-it2-ctrl`, plain vLLM, no
+    connector, GPU4, pgid 2328944, 02:55:32Z-02:59:27Z): batched p4 flips
+    at token 152 to the same token with the same 0.125 margin under the
+    tight config (0.5 with 200 blocks), and p4 alone equals order4 C. A
+    local-hit resume equals alone. Closed as GDN decode batch
+    non-invariance in vLLM 0.32, not the connector. Gate implication
+    (`batch_invariant` for this model) goes to the gate owner.
   - Non-regression on c4c1615: the Qwen3-4B slice
     (`2026-10-24-qwen3-4b-p5-it1-nonreg-b`, GPU4) passes every verdict, with
     the same deltas as P3 it2e. The DSV2 TP2 slice
