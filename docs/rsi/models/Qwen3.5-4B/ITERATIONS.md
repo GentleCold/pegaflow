@@ -288,10 +288,18 @@ extension of another prompt. Phases:
 - No save used a block that was not offered at that step, and no saved
   state was overwritten before the copy (the bytes match R up to bf16/fp32
   rounding).
-- order3 p4: its loads were byte-equal, so this is not a transfer error.
-  The batch composition differs between A and C after preemption (no
-  batch-invariant mode for GDN), which is the likely cause. A-vs-R is not
-  comparable past token 64 there (R ran 64 output tokens).
+- order3 p4 (corrected after review, `docs/rsi/reviews/P5-qwen35-it0-it1.md`
+  should-fix 1): the divergence at output token 152 (position 2052) comes
+  before p4's preemption in C (C step 3572, after at least 212 output
+  tokens), and p4 (A req 4) was never preempted in A. Up to the divergent
+  token, the connector supplied the three GDN states at 1584 (byte-equal to
+  A's saves) and full blocks 0-2. Blocks 0 and 1 have the same layer-0 sha in
+  all their loads. Block `a2bb744a` loads the same in both C loads, but the
+  tool did not capture A's save of it (full saves were not captured). So
+  open: batch non-invariance in decode (p4 decoded beside reqs 10 and 12 in
+  C, beside 3 and 5 in A; GDN has no batch-invariant mode), or a wrong
+  full-attention block. A-vs-R is not comparable past token 64 (R ran 64
+  output tokens). it2 plan item 3 settles it.
 - Unused offers are boundaries already inside a local or external hit, or
   offers on steps whose computed boundary is a different one.
 - hit stats (order3): `{"lookups": 1445}`, no group-incoherent miss.
@@ -415,41 +423,45 @@ Cross-check per slice:
 ### 3. Settling the order3 p4 divergence
 
 In order3, p4's completion in C (external hit at 1584) diverges from A
-(cold) at output token 152. The checkpoint loads were byte-equal. My
-tool did not compare the full-attention blocks loaded at the same resume.
-Candidate causes:
-- (a) batch non-invariance: after preemption, the batches differ;
+(cold) at output token 152, before any preemption of p4 (see the it1
+ordering check). The checkpoint loads were byte-equal; the full-attention
+blocks 0-2 were loaded identically in C but A's save of block 2 was not
+captured. Candidate causes:
+- (a) batch non-invariance in decode: p4 decoded beside different
+  requests in A and C (no preemption needed);
 - (b) split non-invariance: GDN prefill resumed at 1584 is chunked
   differently from a run through, like MLA on DSV2;
-- (c) a wrong full-attention load.
+- (c) a wrong full-attention block in `[0, 1584)`.
 
-Leg 1 runs first: a no-connector control in the in-process driver, GPU
-only, no pegaflow-server. Plain vLLM, same prompts, retention 528:
-- split control: p4 alone, cold vs warm with vLLM's own local hit at 1584
-  (prime p4's prefix, then rerun with enough GPU blocks to keep the
-  state);
-- batch control: p4 alone vs all six batched under the order3 tight
-  config, cold, so preemption happens.
+Both legs always run.
+- Leg 1, no connector (in-process driver, GPU only, plain vLLM, same
+  prompts, retention 528, enough GPU blocks that nothing is preempted):
+  - batch control: p4 alone vs p4 decoded beside the other prompts, cold
+    both times, compared token by token;
+  - split control: p4 alone cold vs p4 alone after vLLM's own local hit at
+    1584.
+- Leg 2, the connector run (order3 config): capture the saved bytes of
+  full blocks too (`P5_SAVE_FULL=1`) and compare every full-attention
+  block p4 loads in C, `[0, 1584)`, with A's save of the same hash; the
+  checkpoint comparison stays.
+- Both legs log the top-2 logprobs per output token. At the first
+  divergent token the margin (top-1 minus top-2, A and C) is recorded: a
+  near-tie (< ~1e-2) supports rounding, a large margin points at (c).
 
-The connector changes the schedule, so I cannot replay order3's exact
-preemption schedule without it. The two controls separate the causes
-instead.
+| Leg 2 (bytes) | Leg 1 | Margin at divergence | Conclusion | Next step |
+|---|---|---|---|---|
+| any full or checkpoint load differs | any | any | connector load or save bug (c) | Blocks it2 |
+| all equal | batched or split p4 diverges | near-tie | vLLM non-invariance (a) or (b) | Gate owner decides `batch_invariant` / `split_invariant` for this model, as P4 did for DSV2 |
+| all equal | no divergence | any | open | Back to the coordinator before any gate run |
 
-Leg 2 runs only if leg 1 shows no divergence of the same kind: a digest of
-the loaded state at resume. In C, I capture p4's full-attention blocks
-`[0, 1584)` right after the load and compare them with A's saved pages,
-as the checkpoint loads already are. I also compare the first sampled
-token's logits at 1584 between A and C.
-
-| Leg 1 result | Leg 2 result | Conclusion | Next step |
-|---|---|---|---|
-| warm or batched p4 diverges | not run | vLLM non-invariance, not the connector | Gate owner decides `split_invariant` / `batch_invariant` for this model, as P4 did for DSV2 |
-| no divergence | full-attention bytes differ | a connector load bug | Blocks it2 |
-| no divergence | bytes equal, logits differ | an open question | Back to the coordinator before any gate run |
-
-Once the hybrid gate exists, `G2.digest_self` on the full and Mamba
-groups gives the same evidence on every slice. Leg 2 is for the
-reproducer only.
+The hybrid gate's digests catch wrong loaded bytes only for requests that
+take an external hit after vLLM dropped their state, and its Mamba
+digests only if taken in the offer step. With an unlimited pool and 481
+GPU blocks, gsm8k and replay may never preempt or evict locally, so this
+evidence needs a preemption-forcing slice or the G5 `cap` pass. The
+coordinator passes that to the hybrid-gate brief. Output-level
+non-invariance shows only in `G2.*_outputs`, which depends on this
+model's invariance flags in gate.json.
 
 ### 4. Should `~/kexi/rsi-tools/p5` move into the repo?
 

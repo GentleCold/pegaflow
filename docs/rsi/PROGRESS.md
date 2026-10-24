@@ -98,7 +98,7 @@ names, magic constants that only exist in the old code).
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 pending (G5 r3 official) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
-| P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed, Qwen3-4B + DSV2 non-regression; review of it0+it1 pending; gate runs wait for `feat/rsi-gate-hybrid` and the retention-528 gate.json |
+| P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed with one open output divergence (order3 p4), Qwen3-4B + DSV2 non-regression; review of it0+it1 pending; gate runs wait for `feat/rsi-gate-hybrid` and the retention-528 gate.json |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ## Log
@@ -644,7 +644,8 @@ names, magic constants that only exist in the old code).
     repo): all checkpoint saves from offered blocks, saved bytes equal an
     unprimed recompute up to rounding, every load byte-equal to the saved
     page after poisoning the GPU cache, outputs equal (order2: 6/6; order3
-    with 6 preemptions: 5/6, divergence at token 152 with byte-equal loads).
+    with 6 preemptions: 5/6; p4 diverges at token 152 before its own
+    preemption, open, see ITERATIONS it2 plan item 3).
   - Non-regression on c4c1615: the Qwen3-4B slice
     (`2026-10-24-qwen3-4b-p5-it1-nonreg-b`, GPU4) passes every verdict, with
     the same deltas as P3 it2e. The DSV2 TP2 slice
