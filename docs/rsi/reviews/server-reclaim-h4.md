@@ -356,3 +356,192 @@ This is not a bug, and H3 did not introduce it.
 
 Correct `reclaim-eviction.md:343-345`. Prefer `pegaflow_end` over prefix sums
 in the analysis scripts.
+
+## Re-review (4a51e22..c4ad329)
+
+Reviewer: independent review agent, fresh context. Scope: the commits after
+67922b5: 4a51e22, 46e7bb9, 29158e4, 3f42b7a, 6a99d43 and c4ad329. The code
+diff `67922b5..6a99d43` touches only `transfer/memcpy.rs`, `metrics.rs`,
+`kernel.rs` (test only) and a 3-line comment in `offload.rs`. `c4ad329` is
+docs only.
+
+Read only on 10.1.0.44 under `~/kexi/`. I did not build or run anything. The
+isolation list was respected.
+
+### Previous items
+
+| item | status | evidence |
+|---|---|---|
+| MF1 recorded runs tested master | closed | see "MF1 evidence" below |
+| SF1 one failed batch latches the process, silently | closed | `memcpy.rs:122,274,310-339`: the latch is per backend and set only on `retry_ok`; `metrics.rs:93-95,419-425` add the counter |
+| SF2 no fallback test; batch test blind to a fallback | closed | `kernel.rs:216-221,269-270` assert `"batch"` before and after; `memcpy.rs:675-764` covers injected failure, the real legacy-stream failure, and bad ranges with no latch |
+| SF3 missing symbol panics | closed | `memcpy.rs:156-165,191-208`; probe ordering is pinned by the `choose` table (`probe must not run`) |
+| SF4 cuda-12 batch path never ran | closed | `memcpy.rs:53,215`: cuda-12 needs `PEGAFLOW_ENABLE_BATCH_MEMCPY`; `failIdx` starts at `usize::MAX` and is in the error (`memcpy.rs:438-441,488-504`); the GPU tests also pass on a cuda-12 build (driver 13.2) |
+| SF5 `resident_bytes` "2x" | closed | `reclaim-eviction.md:378-384` |
+| SF6 doc facts | closed | 64 GB at `:162-164,336-338`; 0.468 at `:322`; sims stored and reproduce (below) |
+| SF7 GPU confound in r3 reruns | closed (stated) | `reclaim-eviction.md:349-353` |
+| nit 1 model name in `memcpy.rs` | closed | no model name left in `memcpy.rs` / `offload.rs` |
+| nit 2 env parsing | closed | `disables` / `enables` plus `env_switches_err_towards_off` |
+| nit 3 legacy-stream failure hidden | closed | pinned as a real trigger in the retry test (`memcpy.rs:727-734`) |
+| nit 4 per-layer `seen` comment | closed | `offload.rs:180-182` |
+
+### MF1 evidence, checked independently
+
+(a) Source identity:
+- `~/kexi/pegaflow-rsi-server-reclaim-src-6a99d43/.rsi-rev` is
+  `6a99d43fe0179ab2eb20f87cb108720fd8a22812`.
+- I ran `sha256sum` remotely on all 71 files that `git diff --name-only
+  master...6a99d43` lists. All 71 match `git show 6a99d43:<path> | shasum -a
+  256` locally, not just the 4 in `env.txt`. `memcpy.rs` is 41cea3e3...
+
+(b) The logs come from that tree and this branch:
+- `cargo-test.log` compiles `pegaflow-core v0.25.1
+  (/root/kexi/pegaflow-rsi-server-reclaim-src-6a99d43/...)`. It runs
+  `target/debug/deps/pegaflow_core-29fa06abc22bbc66`, built 01:59 UTC in that
+  tree.
+- That binary contains "the per-range retry worked" and "injected batch
+  error" (new in 4a51e22 / 46e7bb9). It does not contain "Failed to record
+  event", which c04b6c7 removed. Master's binary would show the opposite.
+- The test list names all five earlier branch tests and the two new unit
+  tests. Lib: 177 passed, 4 ignored. The four ignored tests are the GPU tests.
+- `ssd_cache` fails 11/11 with "pinned pool exhausted while allocating block
+  buffer" (`harness.rs:379`). The baseline log
+  `rsi-server-reclaim-base-ssd.log` fails the same 11 with the same message
+  on a v0.24.6 core (75dfa4c's version). Its source dir is gone, so I could
+  not confirm its commit. Every other target's count matches the doc.
+- `clippy-cuda13.log` rc 0. `check-rest.log` rc 0: ruff check, default-feature
+  (cuda-12) clippy `-D warnings`, and cargo check.
+- `check.log` rc 1 only on ruff format. All 11 listed files are byte-identical
+  between 75dfa4c and 6a99d43, so the failure is not from this branch.
+
+(c) The GPU tests ran:
+- `cargo-test-ignored.log` (cuda-13, `--test-threads=1`, rc 0): 4 passed,
+  0 failed, 0 ignored. The tests are
+  `failed_submit_drains_copies_already_enqueued`,
+  `kernel_matches_direct_both_directions`,
+  `failed_batch_retries_per_range_and_lands_every_range` and
+  `installed_driver_exports_the_batch_symbol`. The binary
+  (`pegaflow_core-59a628b55322c793`, 02:00:30, in the export) has the new
+  strings.
+- `cargo-test-ignored-cuda12.log` (rc 0): 3 passed. Its binary
+  `pegaflow_core-72b14dec9650320f` has no `cuMemcpyBatchAsync_v2` string,
+  which matches the cuda-12 entry point.
+
+(d) The sims reproduce the doc:
+- `out/env.txt` sha256s match the current `sim/*.py`. Every entry in
+  `out/rc.txt` is 0. The run used the gate tree `.gate-bf9ef3c` (rev
+  bf9ef3c...) and the r3 run dir.
+- Measured E_C 0.684 / 0.681 (v2 / old) is `efficiency_c` at `cap` in the r3
+  `summary.json`. The r3 row of the cap3 table (0.069 / 0.681 / 0.682 old,
+  0.084 / 0.684 / 0.669 v2, plus the hit rates) also matches.
+- `r3sim` H1 rounds gives sim E_C 0.698 / 0.685 and match 0.901 / 0.841.
+  Attribution is evicted 0.278 / 0.270, stranded 0.017 / 0.025, query past
+  local 0 / 0.011, scan end 0.008 / 0.008. All as in `:399-410`.
+- The `gap3` walk is 0.859 → 0.859 / 0.858 → 0.828 / 0.831 → 0.584 / 0.682
+  → 0.698 / 0.685, and baseline-local v2 is 0.853.
+- The policy rows come from `r3sim` and `gap3b`:
+  - reverse refresh 0.704 / 0.688;
+  - SLRU 0.717 / 0.691 and 0.615 / 0.550 vs 0.616 / 0.548;
+  - tail-first 1024: 0.734 / 0.720;
+  - tail-first 2048: 0.742 / 0.728;
+  - tail-first 4096: 0.742 (gap3) and 0.747 (r3sim) / 0.728;
+  - tail-first 8192: 0.596 / 0.589.
+
+  All match `:420-443`. The H5 "+0.04" holds (+0.044-0.049 / +0.043).
+- `cap3.txt` reproduces the cap3 table and the dead-block ranges (1232-2636
+  at 0.5, 2630-4458 at 0.75, H4 0).
+
+### SF1-SF4 code review
+
+- **Latch and races.**
+  - `build_backend` (`gpu_worker.rs:264-276`) boxes one `MemcpyBackend` per
+    worker thread. That covers the load and save workers on each device.
+  - `TransferBackend` is `Send` and not `Sync`, so no two threads ever call
+    one backend at once.
+  - When several workers hit a failing batch at the same time, each does its
+    own retry and latches on its own: one `warn!` and one `retry_ok` per
+    worker. That is correct, and at most one extra failed batch call per
+    worker.
+  - Even if a backend were shared, the outcome is safe. `swap` gives one
+    warn, concurrent retries are independent stream-ordered enqueues, and
+    `Relaxed` publishes no data.
+  - Latch only on a good retry: a bad-range error leaves batching on, and
+    the test proves it (`bad_ranges`).
+  - A transient batch-only error, such as an internal allocation failure,
+    latches that one worker for its lifetime. The degradation is bounded
+    and now visible through the metric.
+- **Metric.** `pegaflow_memcpy_batch_fallbacks{outcome=retry_ok|retry_failed}`
+  follows the crate's convention: a `u64_counter`, no `_total` in code, and
+  the Prometheus exporter appends it. `retry_ok` saturates at one per worker
+  by design. See nit 2 for the scraped name.
+- **The fallback test forces the per-range path.**
+  - The injected case returns `Err` from `batch_call` before any enqueue, so
+    every byte that lands came through `submit_per_range`. The test then
+    checks every range against the zeroed device.
+  - The legacy-stream case is a real driver rejection, with
+    `submission() == "per-range"` asserted afterwards.
+  - One weakness: all ranges carry identical bytes (nit 1).
+- **Symbol probe.**
+  - `sys::culib().get` resolves the same name in the same `libloading`
+    handle that cudarc's `load()` uses, so a probe hit means the lazy load
+    cannot panic.
+  - cudarc's default `fallback-dynamic-loading` sets `dynamic-loading`
+    (`cudarc build.rs:95-103`), so `culib` exists in every build this repo
+    makes. Under `dynamic-linking` the build would fail to compile, not
+    silently.
+  - `culib()` panics only if libcuda is absent, and `cuDriverGetVersion`
+    already needs it.
+- **cuda-12 default off.**
+  - `BATCH_NEEDS_OPT_IN = !cfg!(feature = "cuda-13")`, and the disable switch
+    wins over the enable switch.
+  - The default-feature release wheel (`release.yml:22`) and default
+    `pegaflow-server` / `python` builds are cuda-12, so they now submit per
+    range. That is master's behavior since b96e80c, so it is no regression.
+  - `new_without_opt_in` is `cfg(test)` only.
+
+### Gate rerun: not needed
+
+The H4 gate runs used `pegaflow-server-h4`, a cuda-13 build. Every one logged
+`submission: batch (driver=13020 ...)`, and none logged a fallback. On that
+build and driver, the post-H4 code takes the same steady-state path:
+- `choose` returns `Batch`: env unset, 13020 >= 13000, and
+  `installed_driver_exports_the_batch_symbol` passed on this driver.
+- `uses_batch()` is one `Relaxed` load, as before. It now reads a
+  per-backend field instead of a static.
+- `batch_call`'s injection branch is `cfg(test)`.
+- `batch_memcpy` returns `(result, None)` around the same `_v2` call.
+- The changed code (retry, latch, metric, `failIdx` string) runs only after
+  a batch error, and no H4 run had one.
+
+The rest of the post-H4 diff is a comment in `offload.rs` and tests. The log
+line format changed, but nothing in `rsi/` parses it. The unchanged-path
+argument holds.
+
+### New findings
+
+No must-fix. No should-fix.
+
+Nits:
+1. `memcpy.rs:688-700`: the pattern `(i * 131 + 17) as u8` has period 256,
+   and `SEG` (64 KiB) is a multiple of 256. Every range therefore holds
+   identical bytes.
+   - Scenario: a regression that swaps two destinations, or writes range k
+     to slot j while also covering j, passes. The test only catches a range
+     that leaves its slot zeroed, despite the comment "a lost or misplaced
+     one shows".
+   - Fix: mix the range index in, e.g. `((i * 131 + 17) ^ (i / SEG * 37)) as
+     u8`.
+   - `kernel.rs:227` has the same property, but that is pre-existing.
+   - The doc's "every range lands once" (`reclaim-eviction.md:310`) is also
+     not testable, because a repeated copy is idempotent. Say "every range
+     lands".
+2. `reclaim-eviction.md:297` names the counter as declared. Scrapes and
+   alerts see `pegaflow_memcpy_batch_fallbacks_total`, so name that one in
+   the deploy notes.
+3. `reclaim-eviction.md:323`: `swB` old H4 warm3 is 0.486 in `summary.json`
+   (0.48650), not 0.487.
+4. `out/r3sim-PegaKVConnectorV2.txt`: "lru, touch loaded only E_C=0.000" is
+   almost certainly a sim bug, because old gives 0.664 for the same row. The
+   doc does not cite it. Fix or drop the row before H5 uses the script.
+
+Verdict: accept
