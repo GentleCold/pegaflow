@@ -357,6 +357,10 @@ def test_lmcache_cpu_size_is_exact_bytes(cpu_bytes):
     exactly the PegaFlow pool / C bytes, local CPU only."""
     env = run_gate.lmcache_env(cpu_bytes)
     assert int(float(env["LMCACHE_MAX_LOCAL_CPU_SIZE"]) * 1024**3) == cpu_bytes
+    assert (
+        env["LMCACHE_CHUNK_SIZE"] == "256"
+        and run_gate.lmcache_env(1, 16)["LMCACHE_CHUNK_SIZE"] == "16"
+    )
     assert env["LMCACHE_LOCAL_CPU"] == "True" and env["LMCACHE_MAX_LOCAL_DISK_SIZE"] == "0"
     assert not any(k in env for k in ("LMCACHE_LOCAL_DISK", "LMCACHE_REMOTE_URL"))
 
@@ -567,17 +571,26 @@ def test_unique_estimate_counts_shared_prefix_once():
             False,
             id="rsi-module-under-test",
         ),  # fmt: skip
+        pytest.param(
+            {"lmcache_chunk_size": 256}, "lmcache_chunk_size", True, id="lmcache-chunk-default"
+        ),  # fmt: skip
+        pytest.param(
+            {"lmcache_chunk_size": 16}, "lmcache_chunk_size=16", False, id="lmcache-chunk-16"
+        ),  # fmt: skip
     ],
 )
 def test_official_args(tmp_path, over, key, ok):
     """cap_fractions compare as sets; ``--replay-skip`` > 0 is a held-out
     slice of the trace, never official; the arm under test's module must be
-    in the ``pegaflow`` package (M8: the only one the snapshot holds)."""
+    in the ``pegaflow`` package (M8: the only one the snapshot holds); the
+    lmcache arm is official only with LMCache's default chunk size."""
     import argparse
 
     arm = over.pop("arm", "pegaflow.m:C")
-    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python"} | over))  # fmt: skip
-    probs = run_gate.official_problems(args, ["plain", "baseline", arm], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
+    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python", "lmcache_chunk_size": run_gate.LMCACHE_CHUNK}  # fmt: skip
+    args = argparse.Namespace(**(run_gate.OFFICIAL | fixed | over))
+    arms = ["plain", "baseline", "lmcache", arm]
+    probs = run_gate.official_problems(args, arms, list(run_gate.WORKLOADS), tmp_path, tmp_path)
     assert any(p.startswith(key) for p in probs) is not ok, probs
 
 
@@ -1455,6 +1468,7 @@ def test_only_the_old_arm_loads_the_pegaflow_plugin(tmp_path, monkeypatch, arm, 
         gpu="0", model="m", tp=1, max_model_len=8, max_num_batched_tokens=8, max_num_seqs=1,
         gpu_mem=0.5, vllm_arg=[], num_gpu_blocks=0, under_test_path="",
         lmcache_overlay=str(tmp_path),
+        lmcache_chunk_size=run_gate.LMCACHE_CHUNK,
     )  # fmt: skip
     run_gate.vllm_server(args, {}, arm, tmp_path / "probe", False, None, tmp_path / "log", 1 << 30)
     assert seen["plugins"] == plugins == run_gate.vllm_plugins(arm)

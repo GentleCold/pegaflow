@@ -713,16 +713,21 @@ LMCACHE_CONNECTOR = "LMCacheConnectorV1Dynamic"
 LMCACHE_CONNECTOR_MODULE = "lmcache.integration.vllm.lmcache_connector_v1"
 # ``LMCacheEngine.__init__`` logs its whole config on this line (0.5.6 and dev).
 LMCACHE_CONFIG_MARK = "Creating LMCacheEngine with config:"
+# LMCache's default chunk (tokens): the primary reference config. Any other
+# value (e.g. the vLLM block size, to isolate chunk granularity) is a
+# secondary config and makes the run non-official.
+LMCACHE_CHUNK = 256
 
 
-def lmcache_env(cpu_bytes: int) -> dict[str, str]:
+def lmcache_env(cpu_bytes: int, chunk: int = LMCACHE_CHUNK) -> dict[str, str]:
     """LMCache config (env, read by ``LMCacheEngineConfig.from_env``): local
     CPU backend only, sized to exactly ``cpu_bytes``. ``max_local_cpu_size``
     is GiB and LMCache allocates ``int(GiB * 1024**3)`` bytes; ``bytes / 2**30``
-    is exact in a float and ``repr`` round-trips it. Chunk size stays at
-    LMCache's default (256 tokens); telemetry is off. Disk and remote stay at
-    their defaults (None); the caller drops any inherited ``LMCACHE_*``."""
+    is exact in a float and ``repr`` round-trips it. Chunk size ``chunk``
+    tokens (default LMCache's own 256); telemetry is off. Disk and remote stay
+    at their defaults (None); the caller drops any inherited ``LMCACHE_*``."""
     return {
+        "LMCACHE_CHUNK_SIZE": str(chunk),
         "LMCACHE_LOCAL_CPU": "True",
         "LMCACHE_MAX_LOCAL_CPU_SIZE": repr(cpu_bytes / (1 << 30)),
         "LMCACHE_MAX_LOCAL_DISK_SIZE": "0",
@@ -731,7 +736,9 @@ def lmcache_env(cpu_bytes: int) -> dict[str, str]:
     }
 
 
-def lmcache_config(log: Path, cpu_bytes: int, overlay: Path) -> dict[str, Any]:
+def lmcache_config(
+    log: Path, cpu_bytes: int, overlay: Path, chunk: int = LMCACHE_CHUNK
+) -> dict[str, Any]:
     """What the lmcache arm ran with: the overlay and its lmcache dist (the
     version names the source commit for a source build), the connector, the
     env we set and LMCache's own config log line (``LMCACHE_CONFIG_MARK``:
@@ -742,7 +749,7 @@ def lmcache_config(log: Path, cpu_bytes: int, overlay: Path) -> dict[str, Any]:
         "dist": sorted(p.name for p in overlay.glob("lmcache-*.dist-info")),
         "connector": f"{LMCACHE_CONNECTOR_MODULE}:{LMCACHE_CONNECTOR}",
         "cpu_bytes": cpu_bytes,
-        "env": lmcache_env(cpu_bytes),
+        "env": lmcache_env(cpu_bytes, chunk),
         "logged": line.split(LMCACHE_CONFIG_MARK, 1)[1].strip()[:4000] if line else None,
     }
 
@@ -902,7 +909,7 @@ def vllm_server(
         # LMCache lives in an overlay (its pins would downgrade the shared
         # venv); only this arm's vLLM sees it.
         env["PYTHONPATH"] = f"{env['PYTHONPATH']}:{args.lmcache_overlay}"
-        env |= lmcache_env(cpu_bytes)
+        env |= lmcache_env(cpu_bytes, args.lmcache_chunk_size)
     cmd = [
         "vllm",
         "serve",
@@ -1087,7 +1094,7 @@ def run_arm_workload(
         stack.enter_context(cm)
         if kind == "lmcache":
             result["lmcache"] = lmcache_config(
-                out / "vllm.log", store_bytes, Path(args.lmcache_overlay)
+                out / "vllm.log", store_bytes, Path(args.lmcache_overlay), args.lmcache_chunk_size
             )
         if cap and pf_http:
             # What the server actually allocated: must not exceed C.
@@ -2284,6 +2291,8 @@ def official_problems(
         out.append(f"workloads {wls} != {','.join(WORKLOADS)}")
     if args.num_gpu_blocks or args.vllm_arg:
         out.append("--num-gpu-blocks / --vllm-arg override")
+    if "lmcache" in kinds and args.lmcache_chunk_size != LMCACHE_CHUNK:
+        out.append(f"lmcache_chunk_size={args.lmcache_chunk_size} (official {LMCACHE_CHUNK})")
     for a in arms:
         mod = a.split(":")[0]
         if arm_kind(a) == "under_test" and not (mod == "pegaflow" or mod.startswith("pegaflow.")):
@@ -2611,6 +2620,12 @@ def main(argv: list[str] | None = None) -> int:
         "--lmcache-overlay",
         default=str(LMCACHE_OVERLAY),
         help="dir with lmcache + its missing pure deps, on PYTHONPATH of the lmcache arm only",
+    )
+    ap.add_argument(
+        "--lmcache-chunk-size",
+        type=int,
+        default=LMCACHE_CHUNK,
+        help=f"lmcache arm chunk tokens (official {LMCACHE_CHUNK}, LMCache's default)",
     )
     ap.add_argument(
         "--under-test-path",
