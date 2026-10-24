@@ -463,8 +463,10 @@ names, magic constants that only exist in the old code).
   - Fixes from the review:
     - c04b6c7: drain the stream on a failed transfer.
     - ef53344: save each block once per call.
-  - `cargo test` and `check.sh` results are recorded in the doc. The
-    failures there (`ssd_cache`, ruff format) also occur on master.
+  - `cargo test` and `check.sh` on .44 for each commit are in the doc,
+    with log paths. The first recorded run tested master by mistake and is
+    withdrawn. The failures that remain (`ssd_cache`, ruff format) also
+    occur on master.
   - Official r3 cap plan (gate bf9ef3c, v2 8a05b7c), cap-only, 2 runs each.
     E_C at 0.5, old / v2:
     - base: 0.664-0.666 / 0.676-0.683.

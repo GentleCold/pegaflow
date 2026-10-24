@@ -408,33 +408,51 @@ measured.
   modest gain, which the plain-LRU preference has to weigh. It needs a gate
   run before it can be claimed.
 
-## Tests and checks (10.1.0.44, RTX 4090, CUDA 13.2, branch head ef53344)
+## Tests and checks (10.1.0.44, RTX 4090, driver 595.91.07, CUDA 13.2)
 
-- `cargo test --no-default-features --features cuda-13,rdma --no-fail-fast`
-  (workspace):
-  - Everything passes except `pegaflow-core --test ssd_cache`, where 0 of 11
-    pass with "pinned pool exhausted while allocating ... buffer".
-  - Master 75dfa4c fails the same 11 on this host, so this is environmental
-    (same as on .117).
-  - pegaflow-core lib: 170 passed, 1 ignored.
+An earlier version of this section reported a run that tested master. The
+sync had copied the main checkout instead of this worktree, so `memcpy.rs`,
+`gpu_worker.rs`, `storage/mod.rs` and `offload.rs` on the remote matched
+75dfa4c. That run is withdrawn.
+
+Runs are now made from a `git archive` of the commit, unpacked into
+`~/kexi/pegaflow-rsi-server-reclaim-src`, with the commit in `.rsi-rev`.
+The script is `~/kexi/rsi-tools/server-reclaim/verify.sh <src> 6`, and it
+writes its logs to `~/kexi/logs/rsi-server-reclaim-verify-<rev7>/`. Each
+`env.txt` records the sha256 of those four files, and they match
+`git show <rev>:<file>`.
+
+Run at 67922b5 (code = ef53344; GPU6):
+- `cargo-test.log`: `cargo test --no-default-features --features
+  cuda-13,rdma --no-fail-fast`, workspace.
+  - pegaflow-core lib: 175 passed, 2 ignored. The branch's tests ran and
+    passed: `each_saved_block_owns_one_region_across_layers`,
+    `reclaim_frees_what_the_allocation_needs_not_a_fixed_batch`,
+    `duplicate_and_resident_hashes_are_not_saved`, and
+    `failed_allocation_returns_every_region`.
   - pegaflow-core integration: engine_basic 10, eviction 3, hybrid_groups 3,
     prefetch_lease 2, prefix_semantics 5, save_validation 2.
+  - `ssd_cache` fails all 11 with "pinned pool exhausted while allocating
+    ... buffer". Master 75dfa4c fails the same 11 on this host, so the
+    failure is environmental (as on .117).
   - pegaflow-server: lib 24, mock_vllm_rpc_e2e 8, http_cleanup_hang_repro 1.
     Its binaries need the uv CPython 3.12 lib dir on `LD_LIBRARY_PATH`.
-  - pegaflow-common 48, pegaflow-metaserver 52, pegaflow-transfer 17,
-    pegaflow-pd-wire 7.
-- `cargo test -p pegaflow-core --lib -- --ignored` (GPU):
-  `kernel_matches_direct_both_directions` (kernel, per-range, and batch
-  backends) and `failed_submit_drains_copies_already_enqueued` pass.
-- `./scripts/check.sh` with ruff 0.14.14 (the prek pin):
+  - pegaflow-common 48, pegaflow-metaserver 52, pegaflow-semantics 13 + 3,
+    pegaflow-transfer 17, pegaflow-pd-wire 7.
+- `cargo-test-ignored.log`: `cargo test -p pegaflow-core --lib -- --ignored`
+  on GPU6. Both pass: `failed_submit_drains_copies_already_enqueued`, and
+  `kernel_matches_direct_both_directions` (kernel, per-range, and batch).
+- `clippy-cuda13.log`: clippy `-D warnings` with `cuda-13,rdma`. Clean.
+- `check.log`: `./scripts/check.sh` with ruff 0.14.14 (the prek pin).
   - cargo fmt passes.
-  - typos is not installed on the host, and the script skips it.
+  - typos is not installed, and the script skips it.
   - `ruff format --check python/` fails on 11 files this branch does not
-    touch. Master 75dfa4c fails on the same 11 files with the same ruff.
-  - The script stops at the first failure, so its remaining steps were run
-    by hand: `ruff check python/`, clippy `-D warnings` (default features
-    and `cuda-13,rdma`), and `cargo check -p pegaflow-core` /
-    `-p pegaflow-server`. All pass.
+    touch. Master 75dfa4c fails on the same 11.
+- `check-rest.log`: the check.sh steps after the failure, run on their own:
+  `ruff check python/`, clippy `-D warnings` (default features), and
+  `cargo check` for pegaflow-core and pegaflow-server. All pass.
+
+The should-fix commits below are verified the same way; see the last run.
 
 ## Server bug candidates (low priority, not on this branch)
 
