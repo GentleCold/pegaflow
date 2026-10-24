@@ -1038,24 +1038,27 @@ class StepClock:
 
 # Steps: block id saved that step (None = a step without saves), then the
 # step's clock advance in ms. Expected: block ids per save RPC, in order.
+# The staleness cap (Worker.SAVE_HOLD_MAX_S) is 10 ms here.
 @pytest.mark.parametrize(
-    "batch_steps,batch_ms,steps,expected",
+    "batch_steps,steps,expected",
     [
-        pytest.param(1, 0, [(1, 0), (2, 0), (3, 0)], [[1], [2], [3]], id="off"),
-        pytest.param(3, 0, [(1, 0), (2, 0), (3, 0), (4, 0)], [[1, 2, 3]], id="steps"),
+        pytest.param(1, [(1, 0), (2, 0), (3, 0)], [[1], [2], [3]], id="off"),
+        pytest.param(3, [(1, 0), (2, 0), (3, 0), (4, 0)], [[1, 2, 3]], id="steps"),
         # Steps without saves still age the held jobs (vLLM calls
         # wait_for_save every engine step).
-        pytest.param(3, 0, [(1, 0), (None, 0), (None, 0)], [[1]], id="idle-steps-count"),
-        # The step that finds the batch due joins it (sent at 12 ms).
-        pytest.param(0, 10, [(1, 4), (2, 4), (3, 4), (4, 0), (5, 0)], [[1, 2, 3, 4]], id="time"),
+        pytest.param(3, [(1, 0), (None, 0), (None, 0)], [[1]], id="idle-steps-count"),
+        # The cap: the step that finds the batch due joins it (sent at 12 ms).
+        pytest.param(100, [(1, 4), (2, 4), (3, 4), (4, 0), (5, 0)], [[1, 2, 3, 4]], id="cap"),
         # Whichever bound comes first.
-        pytest.param(8, 10, [(1, 6), (2, 6), (3, 0)], [[1, 2, 3]], id="time-before-steps"),
-        pytest.param(2, 100, [(1, 0), (2, 0), (3, 0)], [[1, 2]], id="steps-before-time"),
+        pytest.param(8, [(1, 6), (2, 6), (3, 0)], [[1, 2, 3]], id="cap-before-steps"),
+        pytest.param(2, [(1, 0), (2, 0), (3, 0)], [[1, 2]], id="steps-before-cap"),
     ],
 )
-def test_save_batching(batch_steps, batch_ms, steps, expected):
-    """Policy save_batch_*: consecutive steps' saves go out as one save RPC
-    per layer list, released by a step or time bound; nothing is lost."""
+def test_save_batching(batch_steps, steps, expected, monkeypatch):
+    """Policy save_batch_steps: consecutive steps' saves go out as one save RPC
+    per layer list, released by the step bound or the staleness cap; nothing
+    is lost."""
+    monkeypatch.setattr(Worker, "SAVE_HOLD_MAX_S", 10e-3)
     calls = []
     rpc = FakeRpc()
     rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
@@ -1071,7 +1074,6 @@ def test_save_batching(batch_steps, batch_ms, steps, expected):
         FakeMark,
         clock=clock,
         batch_steps=batch_steps,
-        batch_ms=batch_ms,
     )
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     for block, advance_ms in steps:
@@ -1109,7 +1111,7 @@ def test_kv_pressure_sends_held_saves(kv_usage, threshold, send):
     rpc = FakeRpc()
     rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
     worker = _worker(StubSemantics, rpc, [], layout=layout)
-    worker._batch_steps, worker._batch_s = 32, 1.0
+    worker._batch_steps = 32
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
     pressured.saves = [GroupSave(0, [12], [b"h2"])]
@@ -1174,7 +1176,7 @@ def test_layouts_that_zero_or_copy_save_synchronously(fields, sync):
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=SlowMark, sync_saves=sync)
     # Save batching on (the shipped default): sync saves must ignore it.
-    worker._batch_steps, worker._batch_s = 32, 1.0
+    worker._batch_steps = 32
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
     # Sync: done before the next step can zero or copy a block, in its own
