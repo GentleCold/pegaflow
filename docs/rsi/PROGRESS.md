@@ -487,6 +487,29 @@ names, magic constants that only exist in the old code).
     Tail-first eviction is the only policy that beats LRU, and only by
     about +0.04 (H5 candidate).
 
+- Server tail-first eviction H5 (branch `feat/rsi-server-evict-tail`,
+  stacked on `feat/rsi-server-reclaim`; see `docs/rsi/server/evict-tail.md`).
+  - 7791c30 + 81fdb6d: pressure eviction takes the deepest prefix-chain
+    block among the oldest 25% of a class (`--tail-window-percent`, 0 =
+    LRU). It evicts leaves first, so no block goes while a dependent stays
+    resident. Depth and links come from query hit prefixes; group > 0
+    blocks are tied to their group 0 position. Model-agnostic.
+  - Recency is refreshed only by queries, serving and re-saves, never by
+    load. So old's head blocks age out under LRU; H5 keeps them while
+    their descendants stay.
+  - Official r3 cap plan, 2 pairs with a GPU swap, E_C old / v2:
+    - 0.5: H4 0.699-0.719, H5 0.763-0.769; hit 0.861 -> 0.889, against
+      H_lru 0.857 and H\*_C 0.929.
+    - 0.75: H4 0.748-0.757, H5 0.760-0.792.
+    - 0.25: regresses, H4 0.170-0.194, H5 0.129-0.163, with hit unchanged.
+      Window 0 recovers it and 10% does not. Likely cause: unknown-depth
+      blocks go first. Recorded as a tradeoff.
+  - No-cap replay and gsm8k: no warm-TTFT regression, accuracy 0.8594 on
+    every arm. cargo test, clippy and check.sh were run from a git archive
+    of 81fdb6d; only the known ssd_cache and ruff-format failures remain.
+  - G5 has no hard threshold any more. At 0.5 and 0.75 the hit is within
+    0.04 of H\*_C and above LRU, which is judged close enough.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

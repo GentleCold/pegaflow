@@ -191,7 +191,7 @@ pub struct Cli {
     /// (oldest first). Pressure eviction takes the deepest prefix-chain blocks
     /// in this window first and never evicts a block before its resident
     /// descendants. 0 is plain LRU. Larger windows reach into recently used
-    /// chains and lose hits; see docs/rsi/server/reclaim-eviction.md.
+    /// chains and lose hits; see docs/rsi/server/evict-tail.md.
     #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u64).range(0..=100))]
     pub tail_window_percent: u64,
 
