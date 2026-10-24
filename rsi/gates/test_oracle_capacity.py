@@ -2275,6 +2275,7 @@ def test_non_invariant_controls_compare_one_composition(
     assert ctrl["ref_equals_cold"] is plain_ok
     sv = run_gate._split_control_verdict(ctrl, True)
     assert sv["measured_invariant"] is split_measured
+    assert "batched" in sv  # the batched pair stays reported (None: passes missing)
     assert (
         run_gate._plain_equals_baseline(tmp_path, ref_cold, batch_invariant=True)["pass"] is False
     )

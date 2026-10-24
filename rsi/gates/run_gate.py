@@ -1511,9 +1511,25 @@ def split_control(run_dir: Path, batch_invariant: bool = True) -> dict[str, Any]
         a is not None and b is not None and a.get("cached") == b.get("cached")
         for a, b in zip(rt, gt, strict=True)
     )
+    batched = None
+    if not batch_invariant:
+        # The batched pair, reported only: its differences mix split and
+        # batch composition.
+        br, bg = _outputs(run_dir, "plain", "split_ref"), _outputs(run_dir, "plain", "split")
+        bt_r, bt_g = _tokens(run_dir, "plain", "split_ref"), _tokens(run_dir, "plain", "split")
+        if br and bg and bt_r is not None and bt_g is not None and len(br) == len(bg):
+            batched = {
+                "n": len(br),
+                "differ": sum(a != b for a, b in zip(br, bg, strict=True)),
+                "logprob_differ": sum(
+                    a is None or b is None or a.get("logprobs") != b.get("logprobs")
+                    for a, b in zip(bt_r, bt_g, strict=True)
+                ),
+            }
     return {
         "n": len(ref),
         "pair": [rn, gn],
+        **({"batched": batched} if not batch_invariant else {}),
         "differ": differ,
         "logprob_differ": lp,
         "prewarmed": sum(warmed),
@@ -1576,7 +1592,7 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
         "logprob_differ": lp,
         "prewarmed": ctrl["prewarmed"],
         "ref_equals_cold": ctrl["ref_equals_cold"],
-        **{k: ctrl[k] for k in ("pair", "same_start") if k in ctrl},
+        **{k: ctrl[k] for k in ("pair", "same_start", "batched") if k in ctrl},
     }
     if measured != claim:
         out["reason"] = (
