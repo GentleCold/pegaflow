@@ -447,13 +447,24 @@ def _group_gone(proc: subprocess.Popen, timeout: float) -> bool:
 
 
 def pycache_env(env: dict[str, str], log: Path) -> None:
-    """Every stage process caches bytecode under its arm's dir (made fresh
-    per run, ``fresh_pycache``), never in a source tree: an in-tree
-    ``__pycache__`` (planted, or from another interpreter) is never read."""
-    env["PYTHONPYCACHEPREFIX"] = str(log.parent.parent / PYCACHE_DIR)
+    """Every stage process caches bytecode in its stage's own cache dir
+    (``stage_pycache``), never in a source tree: an in-tree ``__pycache__``
+    (planted, or from another interpreter) is never read."""
+    env["PYTHONPYCACHEPREFIX"] = str(stage_pycache(log.parent))
 
 
 PYCACHE_DIR = ".pycache"
+# M10: one bytecode cache per stage, made fresh before the stage and outside
+# every arm dir (<run>/.pycache-stages/<label>/<wl>): a stage cannot plant a
+# ``.pyc`` that a later stage runs.
+STAGE_PYCACHE_DIR = ".pycache-stages"
+
+
+def stage_pycache(stage: Path) -> Path:
+    """``<run>/<label>/<wl>`` -> ``<run>/.pycache-stages/<label>/<wl>``."""
+    return stage.parents[1] / STAGE_PYCACHE_DIR / stage.parent.name / stage.name
+
+
 # M9: everything the gate judges from that the gate itself writes (pass
 # outputs and tokens, result.json, stage-error.json) lives here, never in a
 # dir an arm gets: <run>/.gate/<label>/<workload>. The runs root is under the
@@ -481,14 +492,6 @@ def untrusted_problems(stage: Path) -> list[str]:
     return out
 
 
-def fresh_pycache(run_dir: Path, labels: list[str]) -> None:
-    for label in labels:
-        d = run_dir / label / PYCACHE_DIR
-        if d.exists():
-            shutil.rmtree(d)
-        d.mkdir(parents=True)
-
-
 ISOLATE = Path(__file__).resolve().parent / "isolate.py"
 # What hiding does not stop (GATES.md "Boundary"): it is deterrence.
 ISOLATION_RESIDUAL = (
@@ -501,8 +504,13 @@ ISOLATION_RESIDUAL = (
     "cannot be unmounted. Not covered: the arm stays uid 0 with CAP_DAC_OVERRIDE "
     "in the host pid / IPC / network namespaces, so it can write any host file "
     "outside the runs root, including code that later stages or other root "
-    "processes run with full capabilities (gate tree, venv, system files). The "
-    "controls for that are the static scan, provenance and the review."
+    "processes run with full capabilities (gate tree, venv, system files). "
+    "Controls: the gate tree, the venv pegaflow tree, the snapshot and the "
+    "pegaflow-server binary are re-fingerprinted before every stage and after "
+    "the last one (a change makes the run non-official, naming the path); each "
+    "stage gets a fresh bytecode cache no later stage reads; the static scan and "
+    "the review. Not covered: other venv / system files, and a change made and "
+    "undone within one stage."
 )
 
 
@@ -511,16 +519,17 @@ def isolation_available() -> bool:
 
 
 def isolation(args, stage: Path) -> dict[str, Any]:
-    """M7(a), M9: what the arm under test sees of the runs root: only the
-    current stage's dir and the arm's bytecode cache (rw) and its snapshot
-    (ro). Every other arm's outputs, digests and requests (the baseline's
-    included), its own earlier stages, and the gate dir (``GATE_DIR``) are
-    under a tmpfs in its private mount namespace (``isolate.py``)."""
+    """M7(a), M9, M10: what the arm under test sees of the runs root: only
+    the current stage's dir and that stage's bytecode cache (rw) and its
+    snapshot (ro). Every other arm's outputs, digests and requests (the
+    baseline's included), its own earlier stages and their caches, and the
+    gate dir (``GATE_DIR``) are under a tmpfs in its private mount namespace
+    (``isolate.py``)."""
     stage = stage.resolve()
     return {
         "helper": str(ISOLATE),
         "hide": str(Path(args.runs_root).resolve()),
-        "rw": [str(stage), str(stage.parent / PYCACHE_DIR)],
+        "rw": [str(stage), str(stage_pycache(stage))],
         "ro": [str(Path(args.under_test_overlay).resolve())] if args.under_test_path else [],
     }
 
@@ -881,9 +890,10 @@ def run_arm_workload(
     if probe.exists():
         shutil.rmtree(probe)
     gdir = gate_dir(out)
-    if gdir.exists():
-        shutil.rmtree(gdir)
-    gdir.mkdir(parents=True)
+    for d in (gdir, stage_pycache(out)):  # fresh per stage (M9, M10)
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
     kind = arm_kind(arm)
     gsm = workload == "gsm8k"
     cap = workload.startswith("cap")
@@ -2194,6 +2204,62 @@ def record_provenance(args, run_dir: Path) -> dict[str, Any]:
         trees.cleanup()
 
 
+class ProvenanceWatch:
+    """M10: what ``record_provenance`` verified must stay as it was. The gate
+    tree (``rsi/``, ``python/pegaflow``, the model's committed
+    ``docs/rsi/models/<model>``), the venv ``pegaflow`` tree, the snapshot
+    the arm under test imports and the pegaflow-server binary are
+    fingerprinted (blob ids) right after verification and compared before
+    every stage and after the last one. Any change makes the run
+    non-official, naming the path; the run goes on."""
+
+    def __init__(self, args, model_dir: Path):
+        pyc_ok = bool(sys.pycache_prefix)
+        gate_subs = ("rsi", "python/pegaflow")
+        if model_dir.is_dir():
+            gate_subs += (str(model_dir.resolve().relative_to(REPO.resolve())),)
+        self.roots: dict[str, tuple[Path, tuple[str, ...], bool]] = {
+            "gate": (REPO.resolve(), gate_subs, pyc_ok)
+        }
+        venv = provenance.gate_pegaflow_dir()
+        if venv:
+            self.roots["venv_pegaflow"] = (provenance.tree_root(venv), ("python/pegaflow",), pyc_ok)  # fmt: skip
+        if getattr(args, "under_test_path", ""):
+            self.roots["under_test"] = (Path(args.under_test_overlay).resolve(), ("pegaflow",), False)  # fmt: skip
+        server = Path(args.pegaflow_server).resolve()
+        self.roots["pegaflow_server"] = (server.parent, (server.name,), False)
+        self.base = {r: provenance.fingerprint(*v) for r, v in self.roots.items()}
+        self.checks: list[dict[str, Any]] = []
+
+    def check(self, when: str) -> dict[str, list[str]]:
+        changes = {}
+        for role, v in self.roots.items():
+            d = provenance.fingerprint_diff(self.base[role], provenance.fingerprint(*v))
+            if d:
+                changes[role] = d[:20]
+        self.checks.append({"before": when, "at": time.time(), "changes": changes})
+        if changes:
+            print(f"[gate] provenance changed before {when}: {changes}", flush=True)
+        return changes
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "roots": {
+                r: {"root": str(v[0]), "subpaths": list(v[1]), "files": len(self.base[r])}
+                for r, v in self.roots.items()
+            },  # fmt: skip
+            "checks": self.checks,
+        }
+
+    def problems(self) -> list[str]:
+        return [
+            f"provenance: {_PROVENANCE_ROLES.get(role, role)} changed before {c['before']}: "
+            + ", ".join(d[:5])
+            for c in self.checks
+            for role, d in c["changes"].items()
+        ]
+
+
 _PROVENANCE_ROLES = {
     "gate": "gate tree (rsi/, the judge)",
     "venv_pegaflow": "venv pegaflow (oracle semantics, reference arms)",
@@ -2392,10 +2458,10 @@ def main(argv: list[str] | None = None) -> int:
     results: dict[str, dict[str, Any]] = {}
     if args.under_test_path:
         args.under_test_overlay = str((run_dir / "under-test-overlay").resolve())
-    fresh_pycache(run_dir, [arm_label(a) for a in arms])
     # Before any stage: what the run is about to measure.
     prov = record_provenance(args, run_dir)
     print(f"[gate] provenance {json.dumps(prov, default=str)}", flush=True)
+    watch = ProvenanceWatch(args, model_dir)
     cuda = cuda_env()
     cuda_bad = cuda_problems(cuda)
     print(f"[gate] cuda env {json.dumps(cuda)} problems {cuda_bad}", flush=True)
@@ -2410,6 +2476,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[pool] no committed {committed}: estimate skipped", flush=True)
 
     def stage(arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
+        watch.check(f"{arm_label(arm)}/{out.name}")  # M10: before every stage
         return run_stage(args, gate, arm, wl, out, **kw)
 
     measured_u: dict[str, dict[str, Any]] = {}
@@ -2470,6 +2537,8 @@ def main(argv: list[str] | None = None) -> int:
                     (gate_dir(out) / "result.json").write_text(json.dumps(r, indent=1))
                 results.setdefault(label, {})[name] = r
 
+    watch.check("verdicts")  # ... and after the last one (M10)
+
     def strip(r: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
@@ -2485,6 +2554,7 @@ def main(argv: list[str] | None = None) -> int:
         for c in contaminated
     ]
     problems += provenance_problems(prov)
+    problems += watch.problems()
     problems += cuda_bad
     scan = scan_record(args)
     problems += [f"static scan hit not on the allowlist: {h['id']}" for h in scan["flagged"]]
@@ -2517,6 +2587,7 @@ def main(argv: list[str] | None = None) -> int:
         "rev": git_rev(),
         "under_test_rev": prov.get("under_test", {}).get("rev"),
         "provenance": prov,
+        "provenance_watch": watch.record(),
         "pool_checks": pool_checks,
         "contamination": contaminated,
         "isolation": iso_rec,

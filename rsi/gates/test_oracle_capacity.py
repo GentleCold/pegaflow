@@ -999,6 +999,73 @@ def test_stage_copies_only_the_verified_rev(tmp_path):
     assert (snap / "a.py").read_text() == "x = 1\n"
 
 
+@pytest.mark.parametrize(
+    "role,edit",
+    [
+        pytest.param(None, None, id="unchanged"),
+        pytest.param("gate", "rsi/gates/rsi_probe.py", id="gate-probe-edited"),
+        pytest.param("gate", "rsi/gates/new.py", id="gate-file-added"),
+        pytest.param("under_test", "pegaflow/a.py", id="snapshot-edited"),
+        pytest.param("pegaflow_server", "pegaflow-server", id="server-binary-replaced"),
+    ],
+)
+def test_a_tree_changed_between_stages_is_named(tmp_path, monkeypatch, role, edit):
+    """M10: what was verified before stage 1 is fingerprinted and checked
+    again before every stage (and after the last one); a change makes the
+    run non-official with the role and the path named. In-tree pyc of the
+    gate tree is not part of it (never read)."""
+    import argparse
+    import sys
+
+    gate = tmp_path / "gate"
+    (gate / "rsi/gates").mkdir(parents=True)
+    (gate / "rsi/gates/rsi_probe.py").write_text("x = 1\n")
+    (gate / "python/pegaflow").mkdir(parents=True)
+    (gate / "python/pegaflow/__init__.py").write_text("")
+    ov = tmp_path / "ov"
+    (ov / "pegaflow").mkdir(parents=True)
+    (ov / "pegaflow/a.py").write_text("y = 1\n")
+    srv = tmp_path / "bin"
+    srv.mkdir()
+    (srv / "pegaflow-server").write_bytes(b"elf")
+    monkeypatch.setattr(run_gate, "REPO", gate)
+    monkeypatch.setattr(run_gate.provenance, "gate_pegaflow_dir", lambda: None)
+    monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "pyc"))
+    args = argparse.Namespace(under_test_path="/t", under_test_overlay=str(ov), pegaflow_server=str(srv / "pegaflow-server"))  # fmt: skip
+    watch = run_gate.ProvenanceWatch(args, gate / "docs/rsi/models/M")
+    (gate / "rsi/gates/__pycache__").mkdir()
+    (gate / "rsi/gates/__pycache__/rsi_probe.cpython-312.pyc").write_bytes(b"pyc")
+    assert watch.check("baseline/gsm8k") == {}
+    if edit:
+        base = {"gate": gate, "under_test": ov, "pegaflow_server": srv}[role]
+        (base / edit).write_text("tampered\n")
+    changes = watch.check("ut/replay")
+    probs = watch.problems()
+    if role is None:
+        assert changes == {} and probs == []
+    else:
+        assert list(changes) == [role], changes
+        assert len(probs) == 1 and "before ut/replay" in probs[0] and Path(edit).name in probs[0], probs  # fmt: skip
+    assert [c["before"] for c in watch.record()["checks"]] == ["baseline/gsm8k", "ut/replay"]
+
+
+def test_each_stage_gets_a_fresh_bytecode_cache_outside_the_arm(tmp_path):
+    """M10: a stage's PYTHONPYCACHEPREFIX is its own dir, outside every arm
+    dir; the isolated arm gets only its current stage's cache bound rw."""
+    import argparse
+
+    run = tmp_path / "runs" / "r"
+    env: dict[str, str] = {}
+    run_gate.pycache_env(env, run / "ut" / "replay" / "vllm.log")
+    assert env["PYTHONPYCACHEPREFIX"] == str(run / ".pycache-stages" / "ut" / "replay")
+    assert not Path(env["PYTHONPYCACHEPREFIX"]).is_relative_to(run / "ut")
+    args = argparse.Namespace(
+        runs_root=str(tmp_path / "runs"), under_test_path="", under_test_overlay=""
+    )
+    iso = run_gate.isolation(args, run / "ut" / "replay")
+    assert iso["rw"] == [str((run / "ut" / "replay").resolve()), str((run / ".pycache-stages" / "ut" / "replay").resolve())]  # fmt: skip
+
+
 @pytest.mark.parametrize("bad", [None, "gate", "venv_pegaflow", "under_test"])
 def test_every_imported_tree_must_be_verified(bad):
     """M6: an unverified gate tree (the judge) or venv ``pegaflow`` (the

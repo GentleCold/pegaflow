@@ -323,8 +323,11 @@ the last accepted run record by hand until `--accepted` exists.
   ignored file, another `.so`, or any `.pyc` makes it unverified. Editing the
   tree mid-run changes nothing the arm imports, and the tree cannot replace
   the probe, its worker extension, vLLM or `sitecustomize`. Every vLLM and
-  pegaflow-server process runs with `PYTHONPYCACHEPREFIX=<run>/<arm>/.pycache`
-  (fresh per run); the gate re-execs itself with
+  pegaflow-server process runs with
+  `PYTHONPYCACHEPREFIX=<run>/.pycache-stages/<arm>/<workload>`. That cache is
+  made fresh before the stage, is outside every arm dir, and no later stage
+  reads it (M10), so a stage cannot plant bytecode for a later one. The
+  gate re-execs itself with
   `PYTHONPYCACHEPREFIX=<run>/.pycache`. So no process reads an in-tree
   `__pycache__`, and the gate and venv trees may carry `__pycache__/*.pyc`
   (any other untracked file still unverifies them). Gate code (`rsi/`)
@@ -342,7 +345,21 @@ the last accepted run record by hand until `--accepted` exists.
   binary is not tied to a rev). A run with `--under-test-path` is official
   only if the under-test snapshot is verified, and any run only if the gate
   tree and the venv `pegaflow` tree are verified too (an unverified judge or
-  oracle is not official; `run_gate.provenance_problems`). G0.provenance (every arm, and
+  oracle is not official; `run_gate.provenance_problems`).
+  Re-verification (M10): right after that, the gate fingerprints by blob
+  id:
+  - the gate tree (`rsi/`, `python/pegaflow`, the model's
+    `docs/rsi/models/<model>`);
+  - the venv `pegaflow` tree;
+  - the snapshot the arm under test imports;
+  - the pegaflow-server binary.
+  It compares them again before every stage and after the last one. Any
+  change (a file edited, added, removed or turned into a symlink) makes the
+  run non-official, with the role, the path and the stage it was found
+  before named in `not_official_because`. Every check is in
+  `summary.provenance_watch`. The run goes on. Not covered: other venv or
+  system files, and a change made and undone within one stage.
+  G0.provenance (every arm, and
   baseline): every spec dump (scheduler and each worker) records the module
   files of `rsi.gates.rsi_probe`, the worker extension, vLLM, torch,
   `pegaflow` (+ its loaded native module, `site/usercustomize` if loaded)
@@ -394,9 +411,15 @@ the last accepted run record by hand until `--accepted` exists.
     What does not hold: the arm stays uid 0 with `CAP_DAC_OVERRIDE` in the
     host pid / IPC / network namespaces, so it can write any host file outside
     the runs root. That includes code that later stages or other root
-    processes run with full capabilities (gate tree, venv, system files). The
-    controls for that are the static scan, provenance and the review
-    (`summary.isolation.residual` says the same).
+    processes run with full capabilities (gate tree, venv, system files).
+    The controls for that:
+    - re-verification before every stage and after the last one (M10). It
+      covers the gate tree, the venv `pegaflow` tree, the snapshot and the
+      server binary;
+    - a fresh per-stage bytecode cache that no later stage reads;
+    - the static scan and the review.
+    Not covered: other venv or system files, and a change made and undone
+    within one stage (`summary.isolation.residual` says the same).
   - Static scan (b). `provenance.scan` scans the snapshot, every text line
     and the strings of the native module, for `provenance.SCAN_PATTERNS`:
     names of the instrument (`rsi`, `rsi_probe`, `RsiProbe`, `RsiWorkerExt`,

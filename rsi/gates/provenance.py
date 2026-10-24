@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -259,6 +260,35 @@ class Trees:
             shutil.rmtree(self.work / "git")
         if self.work.is_dir() and not any(self.work.iterdir()):
             self.work.rmdir()
+
+
+def fingerprint(root: Path, subpaths: tuple[str, ...], pycache_ok: bool = False) -> dict[str, str]:
+    """M10: ``path -> blob id`` of every file under ``root/subpaths`` (a
+    symlink as ``symlink -> <target>``; a subpath may be one file). With
+    ``pycache_ok``, in-tree ``__pycache__/*.pyc`` are skipped: no process
+    reads them (every one runs with PYTHONPYCACHEPREFIX)."""
+    out: dict[str, str] = {}
+    for sub in subpaths:
+        files, links = _walk(root, sub)
+        for f in files:
+            p = Path(f)
+            if pycache_ok and p.suffix == ".pyc" and p.parent.name == "__pycache__":
+                continue
+            with suppress(OSError):
+                out[f] = _blob_id(root / f)
+        for link in links:
+            with suppress(OSError):
+                out[link] = f"symlink -> {os.readlink(root / link)}"
+    return out
+
+
+def fingerprint_diff(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    """What changed between two ``fingerprint``s, by path."""
+    return (
+        [f"changed {p}" for p in sorted(set(before) & set(after)) if before[p] != after[p]]
+        + [f"added {p}" for p in sorted(set(after) - set(before))]
+        + [f"removed {p}" for p in sorted(set(before) - set(after))]
+    )
 
 
 def tree_root(pegaflow_dir: Path) -> Path:
