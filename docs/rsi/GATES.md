@@ -460,7 +460,13 @@ the last accepted run record by hand until `--accepted` exists.
   digest_vs_baseline.gsm8k also needs, in each of `cold` and `warm`, judged
   computed blocks > 0 and `compared / (compared + unmatched_split +
   unreferenced) >= 0.9` (`MIN_COMPUTED_COVERAGE`; warm is judged against the
-  baseline's `split` pass). G2.digest_self.replay: same, with no
+  baseline's `split` pass), and in `warm` zero unjudged computed blocks on
+  prompts whose length is not a multiple of the hit alignment (a prompt
+  without a recorded length counts as non-aligned; only aligned prompts,
+  where the plain split stops one block short of a connector's hit, may
+  leave warm blocks unjudged). The split control's `aligned` exemption
+  likewise never applies to a request without a token record.
+  G2.digest_self.replay: same, with no
   judged-fraction floor (untagged conversations share prefixes).
 - G2.digest_groups (baseline and every arm, gsm8k probe): every group the
   oracle scores (not skipped, not scratch) has digest records and is not in

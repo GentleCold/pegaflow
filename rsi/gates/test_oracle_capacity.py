@@ -1230,6 +1230,14 @@ def test_computed_other_split_only_is_reported_not_judged(tmp_path):
     assert v["pass"] and v["computed_coverage"] == pytest.approx(2 / 3)
     strict = digest_compare.compare(probe, probe, invariant=True, split_invariant=True)
     assert not run_gate._digest_verdict(strict, None)["pass"]
+    # S7: the unmatched block counts as non-aligned unless its prompt length
+    # is a multiple of the alignment (no recorded length: non-aligned).
+    by = digest_compare.compare(probe, probe, True, False, align=16)["computed_by_pass"]
+    assert by["cold"]["unjudged_nonaligned"] == 1
+    f = probe / "requests.jsonl"
+    f.write_text("".join(json.dumps(json.loads(x) | {"prompt_len": 64}) + "\n" for x in f.read_text().splitlines()))  # fmt: skip
+    by = digest_compare.compare(probe, probe, True, False, align=16)["computed_by_pass"]
+    assert by["cold"]["unjudged_nonaligned"] == 0  # reported, not absent
 
 
 def _ctrl(differ: int, lp: int, n: int = 10, prewarmed: int = 10) -> dict:
@@ -1298,6 +1306,22 @@ def test_split_differ_separates_aligned_prompts():
     assert run_gate.split_differ(None, ["a"]) == (None, None)
 
 
+def test_missing_token_record_is_not_aligned(tmp_path):
+    """S7: a request without a token record is never exempted from the
+    exact warm-vs-split comparison."""
+    import json
+
+    d = tmp_path / "plain" / "gsm8k"
+    d.mkdir(parents=True)
+    for name in ("cold", "split_ref", "split"):
+        (d / f"{name}-outputs.json").write_text(json.dumps(["a", "b"]))
+    (d / "split_ref-tokens.json").write_text(json.dumps([None, None]))
+    (d / "split-tokens.json").write_text(json.dumps([None, {"prompt_tokens": 64, "cached": 48}]))
+    ctrl = run_gate.split_control(tmp_path)
+    assert ctrl["aligned"] == [False, True]
+    assert run_gate.split_differ(ctrl, ["x", "b"]) == (1, 0)
+
+
 def test_split_control_prewarm_must_reach_last_full_block(tmp_path):
     """S6: the pre-warm counts only if ``split`` cached the prompt up to its
     last full block (one block more than split_ref is not enough)."""
@@ -1326,12 +1350,21 @@ def _cov(by_pass: dict) -> dict:
 @pytest.mark.parametrize(
     "warm,ok",
     [
-        ({"compared": 95, "unmatched_split": 5}, True),
-        ({"compared": 0, "unmatched_split": 2136}, False),  # the reviewer's vacuous honest arm
-        ({"compared": 80, "unmatched_split": 10, "unreferenced": 10}, False),
+        ({"compared": 95, "unmatched_split": 5, "unjudged_nonaligned": 0}, True),
+        (
+            {"compared": 0, "unmatched_split": 2136, "unjudged_nonaligned": 0},
+            False,
+        ),  # the reviewer's vacuous honest arm
+        (
+            {"compared": 80, "unmatched_split": 10, "unreferenced": 10, "unjudged_nonaligned": 0},
+            False,
+        ),
         ({}, False),  # no warm computed block judged at all
+        # S7: 95% coverage, but one unjudged block on a non-aligned prompt.
+        ({"compared": 95, "unmatched_split": 5, "unjudged_nonaligned": 1}, False),
+        ({"compared": 95, "unmatched_split": 5}, False),  # count not reported
     ],
-    ids=["covered", "vacuous", "low", "missing"],
+    ids=["covered", "vacuous", "low", "missing", "nonaligned-unjudged", "nonaligned-unknown"],
 )
 def test_split_variant_needs_computed_coverage_per_pass(warm, ok):
     v = _cov({"cold": {"compared": 10}, "warm": warm})

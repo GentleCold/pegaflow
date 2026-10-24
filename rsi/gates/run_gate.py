@@ -963,7 +963,8 @@ def split_control(run_dir: Path) -> dict[str, Any] | None:
     # prompt_len % align == 0: vLLM's own hit stops one block short of the
     # prompt (it must compute the last token), a connector's need not, so the
     # split differs from a connector's warm request on exactly these prompts.
-    aligned = [b is None or not b.get("prompt_tokens") or b["prompt_tokens"] % al == 0 for b in gt]
+    # A missing token record is not aligned: it is never exempted (S7).
+    aligned = [b is not None and bool(b.get("prompt_tokens")) and b["prompt_tokens"] % al == 0 for b in gt]  # fmt: skip
     cold = _outputs(run_dir, "plain", "cold")
     return {
         "n": len(ref),
@@ -1050,11 +1051,19 @@ def _outputs_verdict(
     return {"pass": diffs["cold"] == 0 and split_diffs[0] == 0} | out
 
 
-def _coverage_verdict(v: dict[str, Any], d: dict[str, Any] | None, passes: tuple[str, ...]) -> None:
+def _coverage_verdict(
+    v: dict[str, Any],
+    d: dict[str, Any] | None,
+    passes: tuple[str, ...],
+    exact: tuple[str, ...] = ("warm",),
+) -> None:
     """Split-variant: in each of ``passes`` the candidate's computed blocks
     must be judged against same-split references: judged > 0 and at least
     ``MIN_COMPUTED_COVERAGE`` of them (unjudged = only other-split copies in
-    REF, or REF never computed the key)."""
+    REF, or REF never computed the key). In ``exact`` passes every unjudged
+    block must sit in an aligned prompt (``prompt_len % align == 0``, where
+    the plain split stops one block short of a connector's hit): zero
+    unjudged computed blocks on non-aligned prompts (S7)."""
     if d is None or d.get("split_invariant") is not False:
         return
     cov, ok = {}, True
@@ -1064,12 +1073,19 @@ def _coverage_verdict(v: dict[str, Any], d: dict[str, Any] | None, passes: tuple
         judged = c.get("compared", 0)
         seen = judged + c.get("unmatched_split", 0) + c.get("unreferenced", 0)
         frac = judged / seen if seen else None
-        cov[p] = {"judged": judged, "seen": seen, "coverage": frac}
+        nonaligned = c.get("unjudged_nonaligned")
+        cov[p] = {"judged": judged, "seen": seen, "coverage": frac, "unjudged_nonaligned": nonaligned}  # fmt: skip
         ok = ok and judged > 0 and frac is not None and frac >= MIN_COMPUTED_COVERAGE
+        if p in exact:
+            ok = ok and nonaligned == 0
     v["computed_coverage_by_pass"] = cov
     if not ok:
         v["pass"] = False
-        v.setdefault("reason", f"computed coverage below {MIN_COMPUTED_COVERAGE} or nothing judged")
+        v.setdefault(
+            "reason",
+            f"computed coverage below {MIN_COMPUTED_COVERAGE}, nothing judged,"
+            " or unjudged warm blocks on non-aligned prompts",
+        )
 
 
 def _digest_verdict(
@@ -1392,7 +1408,11 @@ def verdicts(
         g["G2.digest_groups"] = digest_groups(run_dir / label / "gsm8k" / "probe")
         vs_base = (
             digest_compare.compare(
-                base_probe, run_dir / label / "gsm8k" / "probe", invariant, split_inv
+                base_probe,
+                run_dir / label / "gsm8k" / "probe",
+                invariant,
+                split_inv,
+                _hit_alignment(run_dir),
             )
             if gsm and base_probe.exists()
             else None

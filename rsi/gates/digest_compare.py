@@ -186,12 +186,23 @@ def _uncertain(g: dict[str, Any], tag: str, ref: Reference, key: Key) -> None:
 
 
 def compare(
-    ref_dir: Path, cand_dir: Path, invariant: bool, split_invariant: bool = True
+    ref_dir: Path,
+    cand_dir: Path,
+    invariant: bool,
+    split_invariant: bool = True,
+    align: int | None = None,
 ) -> dict[str, Any]:
+    """``align``: vLLM's hit alignment; with it, ``computed_by_pass`` also
+    counts unjudged computed blocks of requests whose prompt length is not a
+    multiple of it (``unjudged_nonaligned``; a missing length counts)."""
     ref = Reference(ref_dir)
     own = 1 if ref_dir.resolve() == cand_dir.resolve() else 0
     groups: dict[int, dict[str, Any]] = defaultdict(_group)
-    pass_of = {r["req_id"]: r.get("pass") for r in _requests(cand_dir)}
+    reqs = list(_requests(cand_dir))
+    pass_of = {r["req_id"]: r.get("pass") for r in reqs}
+    nonaligned = {
+        r["req_id"] for r in reqs if align and (not r.get("prompt_len") or r["prompt_len"] % align)
+    }
     by_pass: dict[str, Counter[str]] = defaultdict(Counter)
     for key, tag, exact, l1, rid, split in records(cand_dir):
         g = groups[key[1]]
@@ -202,6 +213,7 @@ def compare(
                 if not own:
                     g["computed_unreferenced"] += 1
                     bp["unreferenced"] += 1
+                    bp["unjudged_nonaligned"] += rid in nonaligned
                 continue
             pool = copies
             if not split_invariant:
@@ -210,6 +222,7 @@ def compare(
                 if sum(c[0] for c in pool.values()) - own <= 0:
                     g["computed_unmatched_split"] += 1
                     bp["unmatched_split"] += 1
+                    bp["unjudged_nonaligned"] += rid in nonaligned
                     continue
             g["computed_compared"] += 1
             bp["compared"] += 1
@@ -248,7 +261,9 @@ def compare(
     total["max_rel_l1"] = max((g["max_rel_l1"] for g in groups.values()), default=0.0)
     total["invariant"] = invariant
     total["split_invariant"] = split_invariant
-    total["computed_by_pass"] = {p: dict(c) for p, c in sorted(by_pass.items())}
+    # With ``align`` every pass reports ``unjudged_nonaligned`` (0 included).
+    extra = {"unjudged_nonaligned": 0} if align else {}
+    total["computed_by_pass"] = {p: extra | dict(c) for p, c in sorted(by_pass.items())}
     total["groups"] = {str(k): v for k, v in sorted(groups.items())}
     return total
 
