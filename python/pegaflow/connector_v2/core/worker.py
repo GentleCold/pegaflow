@@ -52,6 +52,17 @@ class _SaveJob:
     saves: list[tuple[str, list[int], list[bytes]]]
 
 
+def _wire_bytes(saves: list[tuple[str, list[int], list[bytes]]]) -> int:
+    """Upper bound on the protobuf size of these SaveLayer entries.
+
+    Per entry: name plus framing; per block: a uint32 id (<= 5 B varint) and a
+    length-prefixed hash (+ 2 B tag/length, +1 B packed-field slack).
+    """
+    return sum(
+        len(name) + 16 + sum(len(h) for h in hashes) + 8 * len(ids) for name, ids, hashes in saves
+    )
+
+
 @dataclass
 class SaveStats:
     """Save cost since the last report (grep "save stats" in vllm.log)."""
@@ -90,6 +101,11 @@ class Worker:
     # blocks in the store within about this bound when steps are slow. It is
     # checked once per step, so a hold can exceed it by about one step.
     SAVE_HOLD_MAX_S = 1.0
+    # Wire-size budget of one merged save RPC: a quarter of the 64 MiB gRPC
+    # message limit (python/src/lib.rs). A step whose job would push the held
+    # batch past it sends the batch first, so a merged RPC is at most this big
+    # (or one step's size, the unbatched behaviour, if a single step is bigger).
+    SAVE_RPC_MAX_BYTES = 16 << 20
 
     def __init__(
         self,
@@ -149,6 +165,7 @@ class Worker:
         self._held: list[_SaveJob] = []
         self._held_steps = 0  # steps seen by the oldest held job
         self._held_since = 0.0
+        self._held_bytes = 0  # estimated wire size of the held jobs' save entries
         # The saver thread exited: it reads no block any more, so every hold
         # is released and later saves are dropped (future misses).
         self._saver_dead = False
@@ -357,9 +374,14 @@ class Worker:
             # saver only reads the blocks after the KV writes completed.
             ready = self._mark_compute()
             self._submitted += 1
+            size = _wire_bytes(saves)
+            if self._held and self._held_bytes + size > self.SAVE_RPC_MAX_BYTES:
+                # One merged RPC must stay well under the gRPC message limit.
+                self._release_held()
             if not self._held:
                 self._held_steps, self._held_since = 0, t0
             self._held.append(_SaveJob(self._submitted, ready, saves))
+            self._held_bytes += size
         if self._held:
             self._held_steps += 1
             if self._release_due(t0):
@@ -406,6 +428,7 @@ class Worker:
         if not self._held:
             return
         jobs, self._held = self._held, []
+        self._held_bytes = 0
         job = jobs[-1]
         if len(jobs) > 1:
             merged: dict[str, tuple[list[int], list[bytes]]] = {}
