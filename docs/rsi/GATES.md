@@ -171,7 +171,38 @@ so such stranded bytes are possible today.
   |---|---|---|---|
   | Qwen3-4B (FLASH_ATTN, `LBNHC`) | 0.5.6 (PyPI) | not comparable: wrong KV | below |
   | Qwen3-4B | source build of LMCache PR #4467 head `e05c2ea` | comparable | below |
-  | DeepSeek-V2-Lite-Chat (TP2, MLA) | PR #4467 `e05c2ea` | TODO | TODO |
+  | DeepSeek-V2-Lite-Chat (TP2, MLA) | PR #4467 `e05c2ea` | not comparable: crashes | below |
+  | DeepSeek-V2-Lite-Chat | 0.5.6 | not comparable: G2 fails (split, not bytes) | below |
+
+- DeepSeek-V2-Lite-Chat, 2026-10-24, gsm8k 64 questions, TP2,
+  TRITON_MLA, batch invariant, not split-invariant. vLLM 0.32 hands MLA
+  layers to connectors as rank-4 `[NB, BS, 1, 576]`, which LMCache's vLLM
+  detector reads as fused K/V (`NL_X_NB_BS_NH_CS`, NH 1, CS 576), not as
+  MLA (its rank-4 branch only special-cases the DSA indexer plane).
+  - PR #4467 build (`2026-10-24-dsv2-lite-lmcache-pr4467-slice`): the first
+    store raises in `multi_layer_kv_transfer` (the PR's new layout check
+    wants a split `[2, L, T, NH*HS]` object for a fused format; the MLA
+    object is `[1, L, T, 576]`): every request HTTP 500, stage error
+    recorded. Upstream bug in the PR for MLA on vLLM >= 0.29, not patched
+    here.
+  - 0.5.6 (`2026-10-24-dsv2-lite-lmcache-056-slice`): for MLA the packed
+    addressing is the object's own layout, so bytes round-trip: external
+    128/128 matched vs baseline and vs self, local 0 mismatched vs self,
+    cold outputs = baseline. It still fails `G2.digest_vs_baseline.gsm8k`
+    (504 local mismatched, warm computed 0/1010 exact, warm computed
+    coverage 0.77 < 0.9), `G2.digest_self.gsm8k` (computed 0/2020 exact)
+    and `G2.gsm8k` (warm 0.672 vs 0.688, one question). Cause: the first
+    warm request after poison loads 4 x 256-token chunks (1024 tokens) and
+    computes blocks 64-67 from token 1024, a split the cold pass never had;
+    every one of the 504 mismatched local blocks equals that request's own
+    warm-computed copy (split `(1024, ())`, layers 1-26 differ). Later
+    requests reuse those blocks locally, so their computed KV differs from
+    the cold copies with the same split key from layer 2 on. This looks like
+    MLA split-variance carried through the context (the split key does not
+    capture it), not a wrong load. The gate cannot verify that, though, so
+    under the comparability rule the arm is not comparable on this model.
+    `native` passes the same checks in the official run
+    (`2026-10-24-dsv2-lite-p4-mf1`).
 
 - lmcache 0.5.6 is wrong on vLLM 0.32's fused K/V page, 2026-10-23,
   re-confirmed 2026-10-24 (`2026-10-24-qwen3-4b-lmcache-repro056`, vLLM's
