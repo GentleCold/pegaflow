@@ -226,3 +226,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   Never give a sync load a deadline: the server's copy may still land.
 - A 64-question gsm8k slice cannot resolve a 2% bound (~10 s of wall time);
   use the full 1319 questions in slices when a G4 gsm8k check is the target.
+- PR CI must pass (user, 2026-10-24). Before reporting a branch done, run
+  `./scripts/check.sh` (fmt, typos, clippy, cargo check) on the remote and
+  the default Python unit gate. CI runs `cz check` on every commit of the PR,
+  merge commits included: name a merge `Merge branch '<src>' into <dst>`
+  (git's default) or use a commitizen type (`chore(rsi): merge ...`), never
+  `merge(...)`. Locally: `typos` and `cz` install from PyPI into a temp venv.
