@@ -213,9 +213,28 @@ def _group_gone(proc: subprocess.Popen, timeout: float) -> bool:
         time.sleep(1)
 
 
+def pycache_env(env: dict[str, str], log: Path) -> None:
+    """Every stage process caches bytecode under its arm's dir (made fresh
+    per run, ``fresh_pycache``), never in a source tree: an in-tree
+    ``__pycache__`` (planted, or from another interpreter) is never read."""
+    env["PYTHONPYCACHEPREFIX"] = str(log.parent.parent / PYCACHE_DIR)
+
+
+PYCACHE_DIR = ".pycache"
+
+
+def fresh_pycache(run_dir: Path, labels: list[str]) -> None:
+    for label in labels:
+        d = run_dir / label / PYCACHE_DIR
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+
+
 def pegaflow_server(args, log: Path, pool_size: str):
     grpc, http = free_port(), free_port()
     env = os.environ.copy()
+    pycache_env(env, log)
     env.pop("CUDA_VISIBLE_DEVICES", None)
     env["PYO3_PYTHON"] = sys.executable
     env["PYTHONHOME"] = sys.base_prefix
@@ -354,6 +373,7 @@ def vllm_server(
 ):
     port = free_port()
     env = os.environ.copy()
+    pycache_env(env, log)
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
     env["VLLM_SERVER_DEV_MODE"] = "1"  # /reset_prefix_cache, /collective_rpc
     env["PYTHONHASHSEED"] = "0"
@@ -376,9 +396,9 @@ def vllm_server(
         del env[k]
     if arm_kind(arm) == "under_test" and args.under_test_path:
         # The connector under test (and its native extension) from another
-        # tree, through an overlay holding only its ``pegaflow``: the tree
-        # cannot shadow the probe, vLLM or sitecustomize. Reference arms keep
-        # the venv's pegaflow.
+        # tree, through a verified snapshot holding only its ``pegaflow``
+        # (``provenance.stage``): the tree cannot shadow the probe, vLLM or
+        # sitecustomize. Reference arms keep the venv's pegaflow.
         env["PYTHONPATH"] = f"{args.under_test_overlay}:{env['PYTHONPATH']}"
     if arm_kind(arm) == "lmcache":
         # LMCache lives in an overlay (its pins would downgrade the shared
@@ -775,7 +795,7 @@ def g0(run_dir: Path, label: str, committed: Path) -> dict[str, Any]:
 def expected_pegaflow(args, kind: str) -> Path | None:
     """The ``pegaflow`` dir an arm's processes must import."""
     if kind == "under_test" and getattr(args, "under_test_path", ""):
-        return (Path(args.under_test_path) / "pegaflow").resolve()
+        return (Path(args.under_test_overlay) / "pegaflow").resolve()
     return provenance.gate_pegaflow_dir()
 
 
@@ -1640,20 +1660,27 @@ def record_provenance(args, run_dir: Path) -> dict[str, Any]:
     oracle's ``pegaflow.semantics``), the ``--under-test-path`` tree and the
     pegaflow-server binary (sha256; its tree's ``.rsi-rev`` is a claim)."""
     trees = provenance.Trees(run_dir / ".provenance")
+    # In-tree ``__pycache__`` of the gate / venv trees is never read when the
+    # gate itself runs with PYTHONPYCACHEPREFIX (stage processes always do).
+    pyc_ok = bool(sys.pycache_prefix)
+    native = provenance.native_module()
     try:
-        out: dict[str, Any] = {"gate": trees.tree(REPO, ("rsi", "python/pegaflow"))}
+        out: dict[str, Any] = {
+            "gate": trees.tree(REPO, ("rsi", "python/pegaflow"), native, pyc_ok)
+            | {"pycache_prefix": sys.pycache_prefix}
+        }
         venv = provenance.gate_pegaflow_dir()
         out["venv_pegaflow"] = (
-            trees.tree(provenance.tree_root(venv), ("python/pegaflow",))
+            trees.tree(provenance.tree_root(venv), ("python/pegaflow",), native, pyc_ok)
             | {"pegaflow_dir": str(venv)}
             if venv
             else {"verified": False, "reason": "pegaflow not importable"}
         )
         if args.under_test_path:
-            ut = expected_pegaflow(args, "under_test")
-            out["under_test"] = trees.tree(provenance.tree_root(ut), ("python/pegaflow",)) | {
-                "pegaflow_dir": str(ut)
-            }
+            # The arm imports this snapshot, not the tree (M5).
+            out["under_test"] = provenance.stage(
+                Path(args.under_test_path), Path(args.under_test_overlay), trees
+            )
         server = Path(args.pegaflow_server).resolve()
         rev_file = server.parents[2] / ".rsi-rev"
         out["pegaflow_server"] = {
@@ -1783,6 +1810,16 @@ def main(argv: list[str] | None = None) -> int:
     gate = json.loads(gate_file.read_text()) if gate_file.exists() else {}
     run_dir = Path(args.runs_root) / f"{date.today().isoformat()}-{args.tag}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    gate_pyc = (run_dir / PYCACHE_DIR).resolve()
+    if argv is None and sys.pycache_prefix != str(gate_pyc):
+        # Re-exec (same pid) with a fresh bytecode cache: the gate and the
+        # oracle never read an in-tree ``__pycache__`` of the gate or venv
+        # ``pegaflow`` trees (M5). Nothing ran yet but argument parsing.
+        if gate_pyc.exists():
+            shutil.rmtree(gate_pyc)
+        gate_pyc.mkdir(parents=True)
+        env = os.environ | {"PYTHONPYCACHEPREFIX": str(gate_pyc)}
+        os.execve(sys.executable, [sys.executable, "-m", "rsi.gates.run_gate", *sys.argv[1:]], env)  # fmt: skip
     arms = [a for a in args.arms.split(",") if a]
     wls = [w for w in args.workloads.split(",") if w]
     if "baseline" in arms:  # every comparison references the baseline
@@ -1791,9 +1828,8 @@ def main(argv: list[str] | None = None) -> int:
         wls = [w for w in wls if w != "cap"] + ["cap"]
     results: dict[str, dict[str, Any]] = {}
     if args.under_test_path:
-        args.under_test_overlay = str(
-            provenance.overlay(Path(args.under_test_path), run_dir / "under-test-overlay")
-        )
+        args.under_test_overlay = str((run_dir / "under-test-overlay").resolve())
+    fresh_pycache(run_dir, [arm_label(a) for a in arms])
     # Before any stage: what the run is about to measure.
     prov = record_provenance(args, run_dir)
     print(f"[gate] provenance {json.dumps(prov, default=str)}", flush=True)

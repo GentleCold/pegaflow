@@ -278,10 +278,21 @@ the last accepted run record by hand until `--accepted` exists.
   granularity loss and are not a pure eviction-policy comparison),
   `selftest:<mode>` (gsm8k only), `<module>:<Class>`. `old`, `native`,
   `lmcache` and the connector under test run as `MultiConnector[arm, RsiProbe]`.
-  `--under-test-path DIR` (another tree's `python/`) puts an overlay dir
-  holding only a `pegaflow -> DIR/pegaflow` symlink first on the `PYTHONPATH`
-  of the connector-under-test arm only, so that tree cannot replace the
-  probe, its worker extension, vLLM or `sitecustomize`. Gate code (`rsi/`)
+  `--under-test-path DIR` (another tree's `python/`) stages a snapshot,
+  `<run>/under-test-overlay/pegaflow`, and puts only that dir first on the
+  `PYTHONPATH` of the connector-under-test arm (`provenance.stage`). The
+  snapshot holds the verified rev's tracked blobs of `python/pegaflow` plus
+  the one expected native module `pegaflow<EXT_SUFFIX>`; it is verified again
+  after the copy (blob ids, sha256 equal to the source's). The source tree
+  must hold nothing else under `python/pegaflow`: a symlink, an untracked or
+  ignored file, another `.so`, or any `.pyc` makes it unverified. Editing the
+  tree mid-run changes nothing the arm imports, and the tree cannot replace
+  the probe, its worker extension, vLLM or `sitecustomize`. Every vLLM and
+  pegaflow-server process runs with `PYTHONPYCACHEPREFIX=<run>/<arm>/.pycache`
+  (fresh per run); the gate re-execs itself with
+  `PYTHONPYCACHEPREFIX=<run>/.pycache`. So no process reads an in-tree
+  `__pycache__`, and the gate and venv trees may carry `__pycache__/*.pyc`
+  (any other untracked file still unverifies them). Gate code (`rsi/`)
   always comes from the gate tree. `pegaflow` does not: for the gate process
   (the oracle's `pegaflow.semantics`), the reference arms (`old`) and
   pegaflow-server's embedded Python it resolves through the shared venv's
@@ -300,7 +311,7 @@ the last accepted run record by hand until `--accepted` exists.
   `pegaflow` (+ its loaded native module, `site/usercustomize` if loaded)
   and the interpreter prefix; probe and extension must resolve under the gate
   tree, vLLM / torch / prefix to the shared venv, and `pegaflow` to the arm's
-  expected dir (the overlay target for the arm under test, the venv's
+  expected dir (the snapshot for the arm under test, the venv's
   otherwise).
   The connector under test runs as `MultiConnector[under_test, RsiProbe]` with
   `kv_load_failure_policy=recompute`, reads its server port from

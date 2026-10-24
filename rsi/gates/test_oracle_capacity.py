@@ -6,6 +6,9 @@ Run from the repo root: ``python -m pytest rsi/gates/test_oracle_capacity.py``.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 
 from rsi.gates import oracle, run_gate
@@ -578,7 +581,7 @@ def test_sigterm_tears_down_launched_groups(tmp_path):
 
 
 def _git_tree(tmp_path):
-    """A repo with python/pegaflow/{__init__,a}.py committed; returns (repo, rev)."""
+    """A repo with python/pegaflow/{__init__,a,conn}.py committed; returns (repo, rev)."""
     import subprocess
 
     repo = tmp_path / "src"
@@ -586,6 +589,7 @@ def _git_tree(tmp_path):
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text("")
     (pkg / "a.py").write_text("x = 1\n")
+    (pkg / "conn.py").write_text("print('original')\n")
     git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     subprocess.run([*git, "config", "uploadpack.allowFilter", "true"], check=True)
@@ -608,6 +612,12 @@ def _copy(repo, tmp_path, rev, edit=None, extra=None):
     return dst
 
 
+def _native(pkg):
+    from rsi.gates import provenance
+
+    return pkg / Path(provenance.native_module()).name
+
+
 @pytest.mark.parametrize(
     "case,verified",
     [("git-clean", True), ("git-dirty", False), ("rsi-rev", True), ("rsi-rev-edited", False),
@@ -616,7 +626,7 @@ def _copy(repo, tmp_path, rev, edit=None, extra=None):
 def test_tree_rev_is_verified_blob_for_blob(tmp_path, case, verified):
     """M3: a run is official with a tree under test only if its rev is
     verified: a clean git toplevel, or ``.rsi-rev`` whose tracked files match
-    on disk (a native extension is allowed and hashed)."""
+    on disk (the expected native module is allowed and hashed)."""
     from rsi.gates import provenance
 
     repo, rev = _git_tree(tmp_path)
@@ -634,29 +644,106 @@ def test_tree_rev_is_verified_blob_for_blob(tmp_path, case, verified):
             tmp_path,
             "0" * 40 if case == "unknown-rev" else rev,
             edit="x = 2\n" if case == "rsi-rev-edited" else None,
-            extra={"b.py": b""} if case == "rsi-rev-extra-py" else {"m.so": b"elf"} if case == "rsi-rev-native" else None,
-        )  # fmt: skip
-    rec = trees.tree(root, ("python/pegaflow",))
+            extra={"b.py": b""} if case == "rsi-rev-extra-py" else None,
+        )
+        if case == "rsi-rev-native":
+            _native(root / "python" / "pegaflow").write_bytes(b"elf")
+    rec = trees.tree(root, ("python/pegaflow",), provenance.native_module())
     assert rec["verified"] is verified, rec
     if case == "rsi-rev-native":
-        assert list(rec["native_sha256"]) == ["python/pegaflow/m.so"]
+        assert list(rec["native_sha256"]) == [provenance.native_module()]
     if verified:
         assert rec["rev"] == rev
 
 
-def test_under_test_overlay_exposes_only_pegaflow(tmp_path):
-    """M2: the overlay holds a single ``pegaflow`` symlink, so a tree under
-    test cannot shadow ``rsi``, ``vllm`` or ``sitecustomize``."""
+def _plant(case, pkg, tmp_path):
+    """M5 bypasses: each makes ``import pegaflow.conn`` run injected code
+    from a tree whose tracked blobs are all intact."""
+    import importlib.util
+    import marshal
+
+    evil = tmp_path / "elsewhere"
+    if case == "dir-symlink":
+        (evil / "conn").mkdir(parents=True)
+        (evil / "conn" / "__init__.py").write_text("print('INJECTED')\n")
+        (pkg / "conn").symlink_to(evil / "conn", target_is_directory=True)
+    elif case in ("unchecked-pyc", "git-ignored-pyc"):
+        code = compile("print('INJECTED')\n", str(pkg / "conn.py"), "exec")
+        # PEP 552 unchecked-hash pyc: the importer never compares it with conn.py.
+        head = importlib.util.MAGIC_NUMBER + (1).to_bytes(4, "little") + b"\0" * 8
+        cache = pkg / "__pycache__"
+        cache.mkdir(exist_ok=True)
+        (cache / f"conn.{sys.implementation.cache_tag}.pyc").write_bytes(head + marshal.dumps(code))
+    elif case == "extra-so":
+        ext = Path(_native(pkg)).name.removeprefix("pegaflow")
+        (pkg / f"conn{ext}").write_bytes(b"elf")  # beats conn.py in the loader order
+    elif case == "file-symlink":
+        evil.mkdir(parents=True)
+        (evil / "conn.py").write_text("print('INJECTED')\n")
+        (pkg / "conn.py").unlink()
+        (pkg / "conn.py").symlink_to(evil / "conn.py")
+
+
+@pytest.mark.parametrize("case", ["dir-symlink", "unchecked-pyc", "git-ignored-pyc", "extra-so", "file-symlink"])  # fmt: skip
+def test_tree_bypasses_are_rejected(tmp_path, case):
+    """M5: every file Python could import from a tree is accounted for. A
+    symlink, an untracked or ignored ``.pyc`` (even in ``__pycache__``, even
+    in a clean git toplevel whose ``status`` hides it) and any native module
+    but the expected one reject the tree."""
+    import subprocess
+
     from rsi.gates import provenance
 
-    tree = tmp_path / "ut"
-    for d in ("pegaflow", "rsi/gates", "vllm"):
-        (tree / d).mkdir(parents=True)
-    (tree / "pegaflow" / "__init__.py").write_text("")
-    (tree / "sitecustomize.py").write_text("")
-    ov = provenance.overlay(tree, tmp_path / "ov")
-    assert [p.name for p in ov.iterdir()] == ["pegaflow"]
-    assert (ov / "pegaflow").resolve() == (tree / "pegaflow").resolve()
+    repo, rev = _git_tree(tmp_path)
+    if case == "git-ignored-pyc":
+        (repo / ".gitignore").write_text("__pycache__/\n*.so\n")
+        subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "ignore"], check=True)  # fmt: skip
+        root = repo
+        _plant(case, repo / "python/pegaflow", tmp_path)
+        status = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--porcelain"], text=True
+        )
+        assert status == ""  # what the old check looked at
+    else:
+        root = _copy(repo, tmp_path, rev)
+        _plant(case, root / "python/pegaflow", tmp_path)
+    trees = provenance.Trees(tmp_path / "work", remote=f"file://{repo}")
+    rec = trees.tree(root, ("python/pegaflow",), provenance.native_module())
+    assert rec["verified"] is False, rec
+    staged = provenance.stage(root / "python", tmp_path / "ov", trees)
+    assert staged["verified"] is False, staged
+    # The snapshot never carries the planted file: importing it runs the
+    # tracked code only, with no cache dir in the snapshot.
+    snap = Path(staged["pegaflow_dir"])
+    assert not any(p.suffix in (".pyc", ".so") or p.is_symlink() for p in snap.rglob("*"))
+    if (snap / "conn.py").exists():
+        env = {"PYTHONPATH": str(tmp_path / "ov"), "PYTHONPYCACHEPREFIX": str(tmp_path / "pyc")}
+        out = subprocess.check_output([sys.executable, "-c", "import pegaflow.conn"], env=env, text=True)  # fmt: skip
+        assert out == "original\n"
+
+
+def test_stage_copies_only_the_verified_rev(tmp_path):
+    """M5: the arm imports a snapshot (tracked blobs + the expected native
+    module, sha256 equal to the source's), so editing the tree mid-run
+    changes nothing it imports, and the snapshot holds only ``pegaflow``."""
+    from rsi.gates import provenance
+
+    repo, rev = _git_tree(tmp_path)
+    root = _copy(repo, tmp_path, rev)
+    for d in ("python/rsi/gates", "python/vllm"):
+        (root / d).mkdir(parents=True)
+    (root / "python/sitecustomize.py").write_text("")
+    _native(root / "python/pegaflow").write_bytes(b"elf")
+    trees = provenance.Trees(tmp_path / "work", remote=f"file://{repo}")
+    rec = provenance.stage(root / "python", tmp_path / "ov", trees)
+    assert rec["verified"], rec
+    assert [p.name for p in (tmp_path / "ov").iterdir()] == ["pegaflow"]
+    snap = Path(rec["pegaflow_dir"])
+    assert sorted(p.name for p in snap.iterdir()) == sorted(["__init__.py", "a.py", "conn.py", _native(snap).name])  # fmt: skip
+    assert rec["native_sha256"] == provenance.sha256(_native(root / "python/pegaflow"))
+    (root / "python/pegaflow/a.py").write_text("x = 'edited mid-run'\n")
+    assert (snap / "a.py").read_text() == "x = 1\n"
 
 
 def test_module_files_must_resolve_under_gate_and_venv(tmp_path):
