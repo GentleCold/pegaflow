@@ -141,7 +141,7 @@ names, magic constants that only exist in the old code).
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
-| P4 | onboard DeepSeek-V2-Lite-Chat | final review requested (`feat/rsi-deepseek-v2-lite`, TP2): official MF1 (DSV2, 07f5d96) and MF2 (Qwen3-4B nonreg, d56fcb2) pass G0-G4; it6 (43a3759) fixes the batching G5 regression; G5 at C/U 0.5 v2 0.844 vs old 0.845 / native 0.851 (DSV2), 0.843 vs old 0.840 (Qwen3-4B) |
+| P4 | onboard DeepSeek-V2-Lite-Chat | final review pending (`feat/rsi-deepseek-v2-lite` a1e7fd2+, TP2). Official on the it6 tree: MF4 DSV2 `2026-10-24-dsv2-lite-p4-it6-off-a1e7fd2` passes every verdict; MF5 Qwen3-4B `2026-10-24-qwen3-4b-p4-it6-off-a1e7fd2` passes all but `G2.digest_self.cap` (1.008% preempted-uncertain vs 1% limit, 0 mismatched). G5 hit at C/U 0.25 / 0.5 / 0.75, v2 / old / native / lmcache (H_lru, H*_C): DSV2 0.436 / 0.512 / 0.578 / pending, 0.844 / 0.845 / 0.850 / pending (0.847, 0.925), 0.863 / 0.889 / 0.933 / pending; Qwen3-4B 0.392 / 0.398 / 0.542 / pending, 0.838 / 0.820 / 0.861 / pending (0.857, 0.929), 0.883 / 0.873 / 0.927 / pending. lmcache: pending (arm not comparable yet) |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
 
@@ -701,11 +701,27 @@ names, magic constants that only exist in the old code).
     block is evicted (see "Server limitations").
   - it6 (43a3759) keeps one entry per held step. Same RPC count, DSV2
     8 x 6 cold p50 -0.5% vs baseline.
-  - G5 at C/U 0.5 after it6:
-    - Qwen3-4B 0.843 (old 0.840, H_lru 0.857).
-    - DSV2 0.844 (old 0.845, native 0.851, H_lru 0.848).
-  - DSV2 still trails old by 0.09 at 0.25 and 0.025 at 0.75. This is
-    open and listed in the review request.
+  - Official runs on the it6 tree a1e7fd2 (arms plain, baseline, old,
+    native, v2; lmcache pending, arm not comparable yet):
+    - MF4 DSV2 `2026-10-24-dsv2-lite-p4-it6-off-a1e7fd2` (pgid
+      3030292): v2 passes every verdict.
+    - MF5 Qwen3-4B `2026-10-24-qwen3-4b-p4-it6-off-a1e7fd2` (pgid
+      3092773): v2 passes G0, G3, G4 and every other G2. It fails
+      `G2.digest_self.cap`: 1.008% preempted-uncertain vs the 1% limit,
+      0 mismatched. Open for the coordinator and the gate owner.
+
+    | model | C/U | v2 | old | native | lmcache | H_lru | H*_C |
+    |---|---|---|---|---|---|---|---|
+    | DSV2 | 0.25 | 0.436 | 0.512 | 0.578 | pending | 0.673 | 0.851 |
+    | DSV2 | 0.5 | 0.844 | 0.845 | 0.850 | pending | 0.847 | 0.925 |
+    | DSV2 | 0.75 | 0.863 | 0.889 | 0.933 | pending | 0.919 | 0.968 |
+    | Qwen3-4B | 0.25 | 0.392 | 0.398 | 0.542 | pending | 0.581 | 0.862 |
+    | Qwen3-4B | 0.5 | 0.838 | 0.820 | 0.861 | pending | 0.857 | 0.929 |
+    | Qwen3-4B | 0.75 | 0.883 | 0.873 | 0.927 | pending | 0.915 | 0.970 |
+
+  - DSV2 still trails old by 0.076 at 0.25 and 0.026 at 0.75. The
+    per-request entry split is untested and deliberately not done.
+    Listed for the reviewer.
 - P3 it2e non-regression (fc06c9b):
   - Slice `2026-10-23-qwen3-4b-p3-it2e-slice`: all correctness and replay
     verdicts pass. gsm8k cold failed at +9.9%. A 10 s zero-throughput stall
