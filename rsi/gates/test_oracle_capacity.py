@@ -85,8 +85,16 @@ CKPT8 = _group(1, "MambaSpec", ["MambaSpec", "KVCacheSpec"], bt=2 * BT, page=3 *
 MIXED = (_spec(FULL, CKPT8), _trace(["p0", "p1"], 4, ["a", "b"]))
 
 
+# Qwen3.5 shape: groups 0-2 MambaSpec (GDN), group 3 full attention, one block size.
+_MAMBA = ["MambaSpec", "KVCacheSpec"]
+QWEN35_SPEC = _spec(*(_group(g, "MambaSpec", _MAMBA) for g in range(3)), dict(FULL, id=3))
+QWEN35 = (QWEN35_SPEC, _trace(["p0", "p1"], 2, ["a", "b"]))
+
+
 @pytest.mark.parametrize(
-    "case", [CYCLIC, HYBRID, MIXED], ids=["cyclic-full", "full+checkpoint", "mixed-block-sizes"]
+    "case",
+    [CYCLIC, HYBRID, MIXED, QWEN35],
+    ids=["cyclic-full", "full+checkpoint", "mixed-block-sizes", "qwen3.5-3ckpt+full"],
 )
 @pytest.mark.parametrize("policy", ["belady", "lru"])
 def test_capacity_at_least_u_equals_unlimited_oracle(case, policy):
@@ -171,6 +179,59 @@ def test_local_hit_blocks_count_as_present_and_are_not_external():
     assert ext == [(0, "p0:1"), (1, "p0:1")]
     resident = dict.fromkeys(ext, 0)
     assert oracle._resolve(kinds, r, resident, BT) == 2 * BT
+
+
+def test_checkpoint_needs_and_saves_only_block_ends():
+    """GDN = Checkpoint(bt): resuming at p needs exactly block p/bt - 1; a
+    state is saveable only when a step ends on a block boundary."""
+    g = oracle.group_kinds(QWEN35_SPEC)[0][1]
+    assert (g.kind, g.block_tokens) == ("checkpoint", BT)
+    assert [oracle.sem.needed(g, p) for p in (BT, 3 * BT)] == [(0, 1), (2, 3)]
+    assert oracle.sem.saveable(g, 0, 3 * BT) == (2, 3)  # only the state at the chunk end
+    assert oracle.sem.saveable(g, 0, 3 * BT - 1) == (0, 0)  # mid-block: nothing
+
+
+@pytest.mark.parametrize(
+    "ends,hit",
+    [
+        ([BT, 2 * BT, 3 * BT, 3 * BT + 1], 3 * BT),  # every boundary materialized
+        ([2 * BT, 3 * BT + 1], 2 * BT),  # last state on a boundary: block 1
+        ([BT + 2, 3 * BT + 1], 0),  # no chunk ends on a boundary: no state
+        ([BT, 3 * BT - 1, 3 * BT + 1], BT),  # full blocks 1-2 stored, state only at 1 block
+    ],
+    ids=["aligned", "last-state-mid", "no-aligned-end", "full-ahead-of-state"],
+)
+def test_qwen35_replay_counts_only_chunk_end_states(ends, hit):
+    """A second request on the same prompt hits only up to the last block end
+    some step of the first one stopped at (vLLM writes state at chunk ends)."""
+    plen = 3 * BT + 1
+    first = _req("p0", 3, 1, "a") | {"progress": [[1 + k, e] for k, e in enumerate(ends)]}
+    again = _req("p0", 3, len(ends) + 2, "b")
+    assert oracle.replay(QWEN35_SPEC, [first, again]) == [0, hit]
+    assert hit < plen
+
+
+@pytest.mark.parametrize(
+    "ckpt,full,hit",
+    [
+        ([{1, 2}] * 3, {0, 1, 2}, 3 * BT),
+        ([{1, 2}, {1, 2}, {1}], {0, 1, 2}, 2 * BT),  # group 2 lacks block 2's state
+        ([{2}, {2}, {1}], {0, 1, 2}, 0),  # no length where all three states exist
+        ([{0, 1, 2}] * 3, {0, 2}, BT),  # full-attention gap at block 1
+        ([{0, 1, 2}] * 3, set(), 0),  # states alone resume nothing
+    ],
+    ids=["all", "one-group-short", "groups-disagree", "full-gap", "no-full"],
+)
+def test_qwen35_hit_needs_every_group(ckpt, full, hit):
+    """H* (and H*_C, same ``_resolve``) counts a length only where all three
+    GDN groups hold that length's state and full attention holds the prefix."""
+    kinds = oracle._active(QWEN35_SPEC)
+    r = _req("p0", 3, 1, "a")
+    resident = {(gi, f"p0:{b}"): 0 for gi, bs in enumerate([*ckpt, full]) for b in bs}
+    assert oracle._resolve(kinds, r, resident) == hit
+    # Resuming at ``hit`` loads one state per GDN group plus the full prefix.
+    want = [(gi, f"p0:{hit // BT - 1}") for gi in range(3)] + [(3, f"p0:{b}") for b in range(hit // BT)]  # fmt: skip
+    assert oracle._needed_keys(kinds, r, hit) == (want if hit else [])
 
 
 def test_reference_local_hit_fixes_the_bar():
