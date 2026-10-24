@@ -1041,6 +1041,9 @@ the last accepted run record by hand until `--accepted` exists.
   every load is async except `sync`'s: vLLM's align-mode precopy runs before
   a synchronous `start_load_kv`, so `sync` (honest bytes, synchronous
   loads) computes from a stale state and corrupts the state groups only.
+  `sync` runs gsm8k only: in the preempt pool vLLM 0.32's scheduler dies on
+  its synchronous Mamba loads (`allocate_slots`: "Cannot get 1 free blocks
+  from the pool", run `qwen3.5-4b-selftest-687c5b2`).
   The connector reports what it corrupted per group
   (`<stage>/selftest/sabotage-*.jsonl`, `result.sabotage`). A negative arm
   passes (is caught) only if G0 passes and `G2.caught_per_group` passes:
