@@ -1336,6 +1336,15 @@ def _perf_verdicts(
             True,
             MAX_OVERHEAD,
         )
+    # S9: the untimed warmup moves one-time costs (first save, gRPC setup)
+    # out of the cold passes; reported per workload, never gated.
+    g["G4.warmup_seconds"] = {
+        wl: {
+            "value": (passes(r, (workloads.WARMUP_PASS,), "seconds") or [None])[0],
+            "baseline": (passes(b, (workloads.WARMUP_PASS,), "seconds") or [None])[0],
+        }
+        for wl, r, b in (("replay", rep, base_rep), ("gsm8k", gsm, base_gsm))
+    }
     return g
 
 

@@ -1040,6 +1040,22 @@ def test_contamination_marks_not_drops():
     assert ("baseline", "warm3") not in got
 
 
+def test_warmup_seconds_reported_not_gated():
+    """S9: ``passes._warmup.seconds`` per arm vs baseline, in the G4 verdicts
+    without a ``pass`` key (reported, not gated)."""
+
+    def rep(w, c):
+        return {"passes": {"_warmup": {"seconds": w}, "cold": {"ttft_p50": c, "req_per_s": 1.0}}}
+
+    base_gsm = {"passes": {"_warmup": {"seconds": 0.5}}}
+    g = run_gate._perf_verdicts(rep(3.0, 1.0), rep(1.0, 1.0), None, base_gsm, True)
+    assert g["G4.warmup_seconds"] == {
+        "replay": {"value": 3.0, "baseline": 1.0},
+        "gsm8k": {"value": None, "baseline": 0.5},
+    }
+    assert "pass" not in g["G4.warmup_seconds"]
+
+
 def test_warmup_shares_no_prefix_with_workload():
     from rsi.gates import workloads
 
