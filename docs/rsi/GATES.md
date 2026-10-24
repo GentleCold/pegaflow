@@ -162,21 +162,46 @@ so such stranded bytes are possible today.
   `C` CPU bytes) and `lmcache` (LMCache local CPU backend of exactly `C`
   bytes, 256-token chunks) record their G5 numbers and are never required;
   phase 2 will gate warm replay and `E_C` against `native`.
-- lmcache: not comparable on vLLM 0.32 (wrong KV), 2026-10-23. lmcache 0.5.6
-  (wheel built against torch 2.13.0; ops load under the shared venv's
-  2.13.0+cu130), vLLM 0.32.0, Qwen3-4B, FLASH_ATTN, layout `LBNHC`, LMCache
-  detects `NL_X_NB_BS_NH_CS`. Default adapter (LMCache's "latest dev"):
-  gsm8k cold accuracy 0.859 (= baseline), warm 0 (outputs empty / one
-  token); under batch invariance external digests 64/64 mismatched vs
-  baseline (gsm8k) and 468/468 (replay, self), every one of 36 layers.
-  The wrong blocks are not the poison pattern (per-layer L1 is never the
-  all-0x3F value 24448) and equal no computed copy of any key (so no
-  block / chunk mix-up and not a load after poison); per-layer L1 differs
-  from the right block by 6-46%: wrong bytes, not a reordering of the right
-  ones. vLLM's in-tree adapter (`use_native: true`) does not start with
-  0.5.6 (`ImportError: CudaIPCWrapper` from
-  `lmcache.v1.multiprocess.custom_types`). The arm stays wired
-  (`--arms ...,lmcache`) for a later lmcache; it is not in official runs.
+- lmcache status per model (vLLM 0.32.0, shared venv torch 2.13.0+cu130).
+  The arm is comparable on a model only when its loads are digest-verified
+  there (`G2.digest_self.*` and `G2.digest_vs_baseline.gsm8k` pass with 0
+  mismatches, warm accuracy within `ACC_TOL` of baseline):
+
+  | model | lmcache | status | evidence |
+  |---|---|---|---|
+  | Qwen3-4B (FLASH_ATTN, `LBNHC`) | 0.5.6 (PyPI) | not comparable: wrong KV | below |
+  | Qwen3-4B | source build of LMCache PR #4467 head `e05c2ea` | comparable | below |
+  | DeepSeek-V2-Lite-Chat (TP2, MLA) | PR #4467 `e05c2ea` | TODO | TODO |
+
+- lmcache 0.5.6 is wrong on vLLM 0.32's fused K/V page, 2026-10-23,
+  re-confirmed 2026-10-24 (`2026-10-24-qwen3-4b-lmcache-repro056`, vLLM's
+  builtin `LMCacheConnectorV1`; `2026-10-24-qwen3-4b-lmcache-056-dynamic`,
+  LMCache's dynamic connector: same result). vLLM's page is
+  `[NB, BS, NH, 2*HS]` (K | V per head); LMCache detects it as
+  `NL_X_NB_BS_NH_CS`. gsm8k (64 questions, batch invariant) cold accuracy
+  0.859 (= baseline), warm 0; external digests 64/64 mismatched vs baseline
+  and vs self, every one of 36 layers. Earlier evidence (2026-10-23): the
+  wrong blocks are not the poison pattern and equal no computed copy of
+  any key; per-layer L1 differs from the right block by 6-46%. Cause
+  (LMCache issue #4463, fix PR #4467, open): the in-process
+  `VLLMPagedMemGPUConnectorV2` keeps split `KV_2LTD` objects
+  (`[2, L, T, NH*HS]`) while the transfer kernel addresses the fused
+  buffer as packed (`[1, L, T, NH*CS]`): the slot stride is half the row,
+  slots alias and the V half never round-trips. `use_gpu_connector_v3`
+  crashes on the first store (shape mismatch, same issue). vLLM's in-tree
+  adapter (`use_native: true`) does not start with 0.5.6 (`ImportError:
+  CudaIPCWrapper`), and is missing `get_kv_events` (vLLM issue #62216).
+- lmcache build used by the arm: `~/kexi/overlays/lmcache-pr4467`, a source
+  build of https://github.com/LMCache/LMCache/pull/4467 head
+  `e05c2ea9781b4021081f34dfb982189ec0fabc15` (base: dev `18651e8f`, 2026-10-21),
+  unmodified, wheel version `0.5.7.dev0+pr4467.e05c2ea`, CUDA 13.0 nvcc,
+  `TORCH_CUDA_ARCH_LIST=8.9`, `--no-build-isolation` against the shared
+  venv's torch (build tools in `~/kexi/tmp/lmcache-buildtools`, never in the
+  venv), plus the pure deps the venv lacks (aiofile, aiofiles, caio, redis,
+  sortedcontainers, as in the 0.5.6 overlay). No local patch: PR #4467 is
+  upstream's fix for #4463 and is used as published (validated upstream on
+  vLLM 0.32.0, A100, by the issue reporter). Rebuild recipe: below
+  ("lmcache overlay").
 - Known server limit (slice 2026-10-23, `old` and connector_v2 on the same
   build): reclaim evicts `RECLAIM_BATCH_SIZE = 512` blocks per round
   (`pegaflow-core/src/storage/mod.rs`), so on a small pool each eviction
@@ -259,9 +284,32 @@ CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python/.venv/bin:~/kexi/cuda13/bin:
 LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 ~/kexi/pegaflow/python/.venv/bin/python -m rsi.gates.run_gate \
   --model ~/kexi/models/<model> --tag <model>-it<N> \
-  --arms plain,baseline,old,native,lmcache,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0
+  --arms plain,baseline,old,native,lmcache,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0 \
+  --lmcache-overlay ~/kexi/overlays/lmcache-pr4467
 # G5 smoke on a slice (below the capacity floor: not official, no E_C conclusion):
 #   ... --gsm8k-limit 64 --replay-convs 8 --replay-turns 6 --cap-convs 8 --cap-turns 6
+```
+
+Official runs include `native` and `lmcache` on every model where the arm
+is comparable (G5 "lmcache status per model"); where it is not, drop
+`lmcache` and cite that table. A reference-arm rerun that is not part of an
+official run (e.g. `--arms plain,baseline,native,lmcache`) lines up with
+an official run only with the same model, flags and cap plan (`cap_convs`
+`auto` resolves to the same count from the same baseline trace; check
+`summary.args.cap_plan`) and the same baseline `U`.
+
+lmcache overlay (a source build of one pinned LMCache commit; on .44):
+
+```bash
+git -C ~/kexi/tmp/lmcache-src fetch origin pull/4467/head && git -C ~/kexi/tmp/lmcache-src checkout e05c2ea9781b
+# build tools (pip, grpcio-tools 1.78, setuptools_scm, wheel) in a --target dir, never the venv;
+# the venv's python only provides torch / ninja (pip wheel installs nothing)
+cd ~/kexi/tmp/lmcache-src && CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python/.venv/bin:~/kexi/cuda13/bin:$PATH \
+  LD_LIBRARY_PATH=~/kexi/cuda13-lib PYTHONPATH=~/kexi/tmp/lmcache-buildtools TORCH_CUDA_ARCH_LIST=8.9 \
+  LMCACHE_CUDA_MAJOR=13 SETUPTOOLS_SCM_PRETEND_VERSION=0.5.7.dev0+pr4467.e05c2ea \
+  ~/kexi/pegaflow/python/.venv/bin/python -m pip wheel . --no-build-isolation --no-deps -w dist
+<any pip> install --no-deps --target ~/kexi/overlays/lmcache-pr4467 dist/lmcache-*.whl
+# + aiofile aiofiles caio redis sortedcontainers (copied from the 0.5.6 overlay)
 ```
 
 Self-test at onboarding (gsm8k only, 128 questions per self-test arm, no PegaFlow):
@@ -351,10 +399,15 @@ the last accepted run record by hand until `--accepted` exists.
   switches `kv_cache_layout` to `LBHNC`, so its `G0.spec` and
   `G2.digest_vs_baseline.gsm8k` fail by construction: layout, not data;
   `G2.digest_self.*` and `G2.gsm8k_outputs` are its correctness evidence),
-  `lmcache` (reference arm, record only: LMCache's vLLM connector
-  `LMCacheConnectorV1`, lmcache 0.5.6 from the overlay `--lmcache-overlay`
-  (default `~/kexi/overlays/lmcache`, on `PYTHONPATH` of that arm's vLLM
-  only: its pins would downgrade numpy / protobuf / otel in the shared venv),
+  `lmcache` (reference arm, record only: LMCache's in-process vLLM
+  connector, loaded by module path as LMCache documents it
+  (`lmcache.integration.vllm.lmcache_connector_v1:LMCacheConnectorV1Dynamic`;
+  vLLM's builtin `LMCacheConnectorV1` imports a module LMCache dev moved),
+  from the overlay `--lmcache-overlay` (on `PYTHONPATH` of that arm's vLLM
+  only: its pins would downgrade numpy / protobuf / otel in the shared venv;
+  official runs pass `~/kexi/overlays/lmcache-pr4467`, see G5 "lmcache
+  build"; the default `~/kexi/overlays/lmcache` is 0.5.6, wrong KV;
+  `result.lmcache.dist` records the overlay's lmcache version),
   no PegaFlow server, configured by env only (inherited `LMCACHE_*` dropped):
   `LMCACHE_LOCAL_CPU=True`, `LMCACHE_MAX_LOCAL_CPU_SIZE` = `B / 2^30` GiB
   (exact: LMCache allocates `int(GiB x 2^30)` bytes = `B`, same `B` as
@@ -517,7 +570,7 @@ the last accepted run record by hand until `--accepted` exists.
     only registers connector names (lazy imports). The other arms' children
     report no stats (probe, selftest, `connector_v2` today), or are vLLM
     builtins registered under their class names (native
-    `OffloadingConnector`, lmcache `LMCacheConnectorV1`). If the connector
+    `OffloadingConnector`), or report none (lmcache's dynamic connector). If the connector
     under test starts reporting stats, it hits the same lookup and fails
     loudly (HTTP 500 on every request), never silently. The fix is in that
     connector: its own module registers its class under its class name when
