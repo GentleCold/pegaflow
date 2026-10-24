@@ -233,8 +233,9 @@ capacity floor (`C(0.5) >= 2 x` GPU KV bytes), no
 `--num-gpu-blocks`/`--vllm-arg` override, and committed
 `docs/rsi/models/<model>/{gate.json,spec.json}`. A run is also not official
 when it is contaminated: any arm's G4-timed replay pass (`cold`, `warm2..`)
-has p99 TTFT `> 10x` the in-run baseline's p99 for the same pass
-(`summary.contamination`; the pass is kept and still judged, never
+has p99 TTFT `> 10x` the in-run baseline's p99 for the same pass, or the
+baseline's p99 is `> 10x` the median of the arms' p99 for that pass (a
+baseline stall inflates every arm's margin) (`summary.contamination`; the pass is kept and still judged, never
 dropped). `summary.json` lists `not_official_because`. A required verdict that cannot be evaluated is a fail.
 Required verdicts: `baseline` and the connector under test, including
 `G2.digest_self.cap` and `G5.replay_warm`. Not required (`required: false`,
