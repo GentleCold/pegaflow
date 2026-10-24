@@ -550,6 +550,40 @@ with run_gate.launched(cmd, {}, out / "sleeper.log", f"http://127.0.0.1:{port}/"
 """
 
 
+def test_port_leases_are_exclusive_and_released(tmp_path):
+    """Stage ports: leased under per-port flocks, so two gate runs never get
+    the same port; released when the stage ends."""
+    p = run_gate.free_port()
+    a = run_gate.PortLease(1, tmp_path, (p, p))
+    with pytest.raises(RuntimeError, match="no 1 free ports"):
+        run_gate.PortLease(1, tmp_path, (p, p))
+    a.release()
+    b = run_gate.PortLease(1, tmp_path, (p, p))
+    assert b.ports == a.ports == [p]
+    b.release()
+
+
+def test_port_race_fails_the_stage_naming_the_port(tmp_path):
+    """Another process binds the leased port before the stage does: the stage
+    fails with ``PortRace`` naming the port (not retried), the lease is
+    released, and run_stage records the cause in the stage dir."""
+    import socket
+
+    p = run_gate.free_port()
+    lease = run_gate.PortLease(1, tmp_path / "locks", (p, p))
+    squatter = socket.socket()
+    squatter.bind(("127.0.0.1", p))
+    squatter.listen()
+    cmd = [sys.executable, "-c", f"import socket; socket.socket().bind(('127.0.0.1', {p}))"]
+    try:
+        log, url = tmp_path / "vllm.log", f"http://127.0.0.1:{p}/x"
+        with pytest.raises(run_gate.PortRace, match=str(p)), run_gate.launched(cmd, {}, log, url, 30, lease):  # fmt: skip
+            pass
+    finally:
+        squatter.close()
+    assert lease._fds == []
+
+
 def test_sigterm_tears_down_launched_groups(tmp_path):
     """``kill -TERM <gate>`` must stop the stages' process groups (own
     sessions, so the signal never reaches them) before the gate exits."""

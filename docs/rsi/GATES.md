@@ -246,6 +246,13 @@ Every stage's vLLM / pegaflow-server runs in its own process group; teardown
 SIGTERMs the group, waits up to 120 s, SIGKILLs it, waits up to 300 s, and a
 group that survives that aborts the run (`TeardownError`, also for reference
 arms: the next stage would start on a live GPU).
+Stage ports (vLLM, pegaflow-server gRPC / HTTP) are leased from the
+host-reserved range 20000-29999 (`ip_local_reserved_ports`: never an
+ephemeral port) under per-port `flock` files in `~/kexi/rsi-ports`, each
+bind-checked at lease time and released after teardown. A stage process
+that dies with EADDRINUSE before it is healthy fails the stage with
+`PortRace` naming the port; it is never retried. Every failed stage writes
+`stage-error.json` (arm, workload, exception type, error) in its dir.
 
 Stopping a run: `kill -TERM -<run_gate pgid>` (or `-INT`, `-HUP`; launched
 with `setsid`, the gate's pgid is its pid). Each aborts the whole run: the

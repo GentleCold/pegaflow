@@ -118,9 +118,87 @@ MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
 
 
 def free_port() -> int:
+    """An OS-assigned ephemeral port (tests only: a stage port must be a
+    ``PortLease``; the ephemeral range is shared with every client socket)."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+# Stage ports come from a host-reserved range (net.ipv4.ip_local_reserved_ports
+# on the 4090 host: 20000-29999), which the kernel never hands out as an
+# ephemeral port, so no outgoing connection can take one. Concurrent gate runs
+# (several agents share the host) coordinate through per-port lock files: a
+# port is leased while a live process holds ``flock`` on its file.
+PORT_RANGE = (20000, 29999)
+PORT_LOCK_DIR = Path.home() / "kexi" / "rsi-ports"
+
+
+class PortRace(RuntimeError):
+    """A leased port was taken by another process before the stage bound it.
+    Fail-closed: the stage fails with this reason and is never retried."""
+
+
+def port_free(port: int) -> bool:
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+class PortLease:
+    """``n`` ports of ``rng``, held until ``release`` (or the gate's exit:
+    the kernel drops the flocks); each was free at lease time."""
+
+    def __init__(self, n: int, lock_dir: Path | None = None, rng: tuple[int, int] = PORT_RANGE):
+        import fcntl
+        import random
+
+        lock_dir = lock_dir or PORT_LOCK_DIR
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        self.ports: list[int] = []
+        self._fds: list[int] = []
+        order = list(range(rng[0], rng[1] + 1))
+        random.shuffle(order)
+        for port in order:
+            if len(self.ports) == n:
+                break
+            fd = os.open(lock_dir / str(port), os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            if not port_free(port):
+                os.close(fd)  # in use by a process outside the lock protocol
+                continue
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+            self.ports.append(port)
+            self._fds.append(fd)
+        if len(self.ports) < n:
+            self.release()
+            raise RuntimeError(f"no {n} free ports in {rng} (lock dir {lock_dir})")
+
+    def release(self) -> None:
+        for fd in self._fds:
+            with suppress(OSError):
+                os.close(fd)
+        self._fds = []
+
+
+def check_port_race(log: Path, ports: list[int], proc: subprocess.Popen) -> None:
+    """A stage process died before it was healthy: if its log shows a bind
+    failure, raise ``PortRace`` naming its leased ports."""
+    text = log.read_text(errors="replace")[-20000:] if log.exists() else ""
+    if "Address already in use" in text or "EADDRINUSE" in text:
+        raise PortRace(
+            f"port race: {log.name} (pid {proc.pid}) could not bind its leased port(s) "
+            f"{ports}: EADDRINUSE, taken by another process after the lease (not retried)"
+        )
 
 
 def wait_http(url: str, proc: subprocess.Popen, timeout: float, log: Path) -> None:
@@ -137,18 +215,35 @@ def wait_http(url: str, proc: subprocess.Popen, timeout: float, log: Path) -> No
 
 
 @contextmanager
-def launched(cmd: list[str], env: dict[str, str], log: Path, health: str, timeout: float):
-    with log.open("w") as fh:
-        fh.write(" ".join(cmd) + "\n\n")
-        fh.flush()
-        proc = subprocess.Popen(
-            cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True
-        )
-        try:
-            wait_http(health, proc, timeout, log)
-            yield proc
-        finally:
-            stop(proc, cmd[0], fh)
+def launched(
+    cmd: list[str],
+    env: dict[str, str],
+    log: Path,
+    health: str,
+    timeout: float,
+    lease: PortLease | None = None,
+):
+    """``lease``: the stage's ports, released once its group is gone."""
+    try:
+        with log.open("w") as fh:
+            fh.write(" ".join(cmd) + "\n\n")
+            fh.flush()
+            proc = subprocess.Popen(
+                cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True
+            )
+            try:
+                try:
+                    wait_http(health, proc, timeout, log)
+                except RuntimeError:
+                    if lease is not None and proc.poll() is not None:
+                        check_port_race(log, lease.ports, proc)
+                    raise
+                yield proc
+            finally:
+                stop(proc, cmd[0], fh)
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 _STOP: dict[str, Any] = {"signal": None, "teardown": 0}
@@ -284,7 +379,8 @@ def isolation_prefix(iso: dict[str, Any]) -> list[str]:
 
 
 def pegaflow_server(args, log: Path, pool_size: str, arm: str = "old"):
-    grpc, http = free_port(), free_port()
+    lease = PortLease(2)
+    grpc, http = lease.ports
     env = os.environ.copy()
     pycache_env(env, log)
     env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -309,7 +405,7 @@ def pegaflow_server(args, log: Path, pool_size: str, arm: str = "old"):
         "--disable-numa-affinity",
     ]
     cmd = isolated(args, arm, log, cmd)
-    return grpc, http, launched(cmd, env, log, f"http://127.0.0.1:{http}/health", 300)
+    return grpc, http, launched(cmd, env, log, f"http://127.0.0.1:{http}/health", 300, lease)
 
 
 _REFERENCE = ("plain", "baseline", "old", "native", "lmcache")
@@ -426,7 +522,8 @@ def vllm_server(
     log,
     cpu_bytes: int = 0,
 ):
-    port = free_port()
+    lease = PortLease(1)
+    (port,) = lease.ports
     env = os.environ.copy()
     pycache_env(env, log)
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -505,7 +602,7 @@ def vllm_server(
         cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks)]
     cmd = isolated(args, arm, log, cmd)
     url = f"http://127.0.0.1:{port}"
-    return url, launched(cmd, env, log, f"{url}/health", 900)
+    return url, launched(cmd, env, log, f"{url}/health", 900, lease)
 
 
 def reset_prefix_cache(url: str) -> None:
@@ -1893,6 +1990,12 @@ def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
         return run_arm_workload(args, gate, arm, wl, out, **kw)
     except Exception as e:
         check_stop()
+        # Every failed stage leaves its cause in the run record (a port race
+        # names the port); a required arm's failure still aborts the run.
+        with suppress(OSError):
+            out.mkdir(parents=True, exist_ok=True)
+            err = {"arm": arm, "workload": wl, "type": type(e).__name__, "error": str(e)[:4000]}
+            (out / "stage-error.json").write_text(json.dumps(err, indent=1))
         if arm_kind(arm) not in _RECORD_ONLY or _teardown_failed(e):
             raise
         print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)
