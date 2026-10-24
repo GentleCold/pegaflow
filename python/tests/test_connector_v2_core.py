@@ -1093,19 +1093,27 @@ def test_save_batching(batch_steps, steps, expected, monkeypatch):
         pytest.param(0.3, 0.9, False, id="low"),
         pytest.param(0.9, 0.9, True, id="at-threshold"),
         pytest.param(1.0, 1.01, False, id="disabled"),
+        # vLLM did not bind its cache manager: fail loud and stop batching.
+        pytest.param(None, 0.9, True, id="unknown"),
     ],
 )
-def test_kv_pressure_sends_held_saves(kv_usage, threshold, send):
+def test_kv_pressure_sends_held_saves(kv_usage, threshold, send, caplog):
     """Under GPU KV pressure, held saves go out in the step's RPC instead of
     waiting for the batch bound: finished requests held for the batch keep
-    blocks that waiting requests need. The step does not wait for them."""
+    blocks that waiting requests need. The step does not wait for them.
+    Unknown usage counts as pressure, warned once and counted in save stats."""
     layout = _layout(StubSemantics, StubFullSpec())
     sched, _ = _sched(
         StubSemantics, {}, policy=Policy(save_batch_max_kv_usage=threshold), layout=layout
     )
-    sched.plan_saves([], lambda rid: None, kv_usage=kv_usage)
-    pressured = sched.take_plan()
+    with caplog.at_level("WARNING", logger="pegaflow.connector_v2.core.scheduler"):
+        sched.plan_saves([], lambda rid: None, kv_usage=kv_usage)
+        pressured = sched.take_plan()
+        sched.plan_saves([], lambda rid: None, kv_usage=kv_usage)
+    warned = [r for r in caplog.records if "usage is unavailable" in r.getMessage()]
+    assert len(warned) == (1 if kv_usage is None else 0)
     assert pressured.send_saves is send and pressured.flush is False
+    assert pressured.kv_usage_unknown is (kv_usage is None)
 
     calls = []
     rpc = FakeRpc()
@@ -1118,6 +1126,7 @@ def test_kv_pressure_sends_held_saves(kv_usage, threshold, send):
     worker.save(pressured)
     assert len(worker._held) == (0 if send else 2)
     assert worker.save_stats.pressure_rpcs == (1 if send else 0)
+    assert worker.save_stats.kv_usage_unknown_steps == (1 if kv_usage is None else 0)
     assert worker.flush(5)
     assert [[ids for _, ids, _ in c] for c in calls] == [[[11, 12]]]
     worker.shutdown()

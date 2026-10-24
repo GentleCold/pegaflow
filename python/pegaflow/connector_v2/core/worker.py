@@ -70,6 +70,7 @@ class SaveStats:
     failed: int = 0  # jobs that did not store their blocks
     rpcs: int = 0  # save RPCs issued (one per released batch)
     pressure_rpcs: int = 0  # of those, sent early on KV pressure (StepPlan.send_saves)
+    kv_usage_unknown_steps: int = 0  # steps without vLLM's KV usage (batching off)
     sent: int = 0  # finished requests reported in finished_sending
     sent_wait_s: float = 0.0  # their total time held between finish and report
     max_sent_wait_s: float = 0.0
@@ -373,6 +374,7 @@ class Worker:
             stats = self.save_stats
             stats.steps += 1
             stats.submit_s += t1 - t0
+            stats.kv_usage_unknown_steps += plan.kv_usage_unknown
             if saves:
                 stats.save_steps += 1
                 stats.blocks += sum(len(ids) for _, ids, _ in saves)
@@ -506,7 +508,7 @@ class Worker:
             "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
             "blocks=%d bytes=%d submit_ms=%.1f flushes=%d flush_ms=%.1f wait_ms=%.1f "
             "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d rpcs=%d pressure_rpcs=%d "
-            "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f",
+            "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f kv_usage_unknown_steps=%d",
             self._par.tp_rank,
             now - s._since,
             s.steps,
@@ -526,6 +528,7 @@ class Worker:
             s.sent,
             s.sent_wait_s * 1e3,
             s.max_sent_wait_s * 1e3,
+            s.kv_usage_unknown_steps,
         )
 
     def shutdown(self) -> None:
