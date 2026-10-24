@@ -1257,15 +1257,17 @@ connector:
    Explaining it needs the server's save accounting, which is
    pegaflow-core (server-owned, not read here).
 
-The connector cannot recover this within its scope. Save batching only
-changes when a save is sent, not what is kept. The pressure send already
-fires on nearly every RPC here.
-
-Judgment: G3 is close enough. G5 is not close at 0.25 and is a moderate
-gap at 0.5 and 0.75, but it is not attributable to the DSV2 mapping or to
-connector_v2. I don't block onboarding on it. It is reported to the
-server agent as a retention issue (resident bytes vs pool size), with
-these numbers.
+Judgment, after the coordinator's review of this section:
+- G3 (unlimited) is close enough: v2 is at H*.
+- G5 on this server is not close enough. v2 is below H_lru and below
+  native at every capacity (0.5: 0.765 vs 0.847 / 0.852; 0.25: 0.428 vs
+  0.673 / 0.570). That is "差太多", too far off.
+- Cache-resident 0.6 to 0.77 C while the pool is 0.92 to 1.0 used is the
+  pool fragmentation the server's H3/H4 work fixed for Qwen3-4B. MF1 ran
+  the base server (sha256 d1970ead...), so the attribution is still open.
+- A cap-only run on the H4 server is pending. That run decides it: if v2
+  is still below native there, I look for a connector-side cause (the TP2
+  single-writer save, or the batch hold delaying saves past eviction).
 
 ## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
 
