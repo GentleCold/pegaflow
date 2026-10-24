@@ -785,9 +785,13 @@ the last accepted run record by hand until `--accepted` exists.
   gsm8k stage. Qwen3-4B and DeepSeek-V2-Lite set no `gsm8k_vllm_args`:
   their plain and connector compiles currently in the cache made the same
   choices (the artifacts differ only in hash-bearing files and an
-  autotune timing field), which is why their controls pass. A recompile
-  can choose differently. That fails loud (plain vs baseline differ),
-  never passes a wrong load: connector arms share one compile.
+  autotune timing field), which is why their controls pass. Their
+  gate.json stays as is: their accepted runs were timed under the current
+  config. A recompile can choose differently. That fails loud on
+  `G2.plain_equals_baseline` and cannot pass a wrong load (connector arms
+  share one compile), so it costs a rerun, not correctness. The fix when
+  it happens is the same one line: gate.json `gsm8k_vllm_args` with
+  deterministic inductor.
 - G3 (`oracle.py`): replays `requests.jsonl` with unlimited capacity. A block
   ending at token e is stored at the first step whose `progress` reaches e
   (checkpoint groups: only a step ending exactly on e) and is visible to
