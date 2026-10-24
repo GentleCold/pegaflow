@@ -25,7 +25,8 @@ Config via ``kv_connector_extra_config``: ``probe_dir`` (required),
 ``digest``: ``"off"`` | ``"all"`` | ``"tagged"`` (only requests sent with
 ``vllm_xargs={"rsi_digest": "full" | "ref" | "hit"}``: every complete block,
 computed blocks only, loaded blocks only). Requests may also carry
-``rsi_pass`` (a label copied into the record). Digests run in ``start_load_kv`` and add GPU
+``rsi_pass`` (a label copied into the record) and ``rsi_conv`` / ``rsi_turn``
+(workload position, copied as ``conv`` / ``turn``). Digests run in ``start_load_kv`` and add GPU
 work and syncs: only tag requests whose timing is not measured.
 
 ``RsiWorkerExt`` (``--worker-extension-cls``) adds ``rsi_poison`` for the
@@ -57,6 +58,40 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 
 _CHUNK_BYTES = 64 << 20  # bound on the uint8 chunk; int64 temporaries are 8x this
 _MASK = 2**64 - 1
+
+
+def module_files(connector_modules: list[str] = ()) -> dict[str, Any]:
+    """Files this process resolved its instrument and runtime from (G0
+    provenance): the probe, the worker extension, vLLM, torch, ``pegaflow``
+    (imported, or where it would resolve) and its native extension if
+    loaded, ``site/usercustomize`` if loaded, the interpreter prefix, and
+    ``connector:<module>`` for each module the gate names in
+    ``connector_modules`` (the arm's connector, stacked before the probe in
+    ``MultiConnector``, so already imported)."""
+    import importlib.util
+    import sys
+
+    def file_of(name: str) -> str | None:
+        m = sys.modules.get(name)
+        return getattr(m, "__file__", None) if m is not None else None
+
+    out: dict[str, Any] = {
+        "rsi.gates.rsi_probe": __file__,
+        "worker_extension": file_of(RsiWorkerExt.__module__),
+        "prefix": sys.prefix,
+    }
+    for name in ("vllm", "torch", "pegaflow"):
+        f = file_of(name)
+        if f is None:
+            spec = importlib.util.find_spec(name)
+            f = spec.origin if spec else None
+        out[name] = f
+    for name in ("pegaflow.pegaflow", "sitecustomize", "usercustomize"):
+        if file_of(name):
+            out[name] = file_of(name)
+    for name in connector_modules:
+        out[f"connector:{name}"] = file_of(name)
+    return out
 
 
 def _jsonable(value: Any) -> Any:
@@ -203,6 +238,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             raise ValueError(f"RsiProbe digest must be off|all|tagged, got {self._digest!r}")
         self._groups = kv_cache_config.kv_cache_groups
         self._skip_groups = self._undigestable_groups(vllm_config)
+        self._connector_modules = [str(m) for m in extra.get("connector_modules", [])]
 
         if role == KVConnectorRole.SCHEDULER:
             self._live: dict[str, _Live] = {}
@@ -229,10 +265,14 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         mode = getattr(vllm_config.cache_config, "mamba_cache_mode", None)
         out = {}
         for gid, g in enumerate(self._groups):
-            if isinstance(g.kv_cache_spec, MambaSpec) and str(_jsonable(mode)) != "align":
+            if isinstance(g.kv_cache_spec, MambaSpec):
                 # Outside align mode a state block is the running state of the
-                # request, not the state at the block end.
-                out[gid] = f"MambaSpec with mamba_cache_mode={_jsonable(mode)}"
+                # request, not the state at the block end. In align mode the
+                # block-end states are freed (nulled in the request's block
+                # table) as compute moves on, so none is left at finish, where
+                # the probe digests: not digested either way (the gate fails
+                # an arm whose transferable group is undigested).
+                out[gid] = f"MambaSpec with mamba_cache_mode={_jsonable(mode)}: not digested"
         return out
 
     # ------------------------------------------------------------------ G0
@@ -294,6 +334,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 "tensors": tensors,
             },
             "probe": {"digest_skipped_groups": {str(k): v for k, v in self._skip_groups.items()}},
+            "modules": module_files(self._connector_modules),
         }
         (self._dir / "spec.json").write_text(json.dumps(dump, indent=1, sort_keys=True))
 
@@ -337,6 +378,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             "device": str(first.device) if first is not None else None,
             "raw_bytes": self._raw.numel() if self._raw is not None else 0,
             "layers": layers,
+            "modules": module_files(self._connector_modules),
         }
         (self._dir / f"spec-{self._rank}.json").write_text(
             json.dumps(out, indent=1, sort_keys=True)
@@ -456,6 +498,10 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 {
                     "req_id": rid,
                     "pass": live.tags.get("rsi_pass"),
+                    # Workload position (replay: conversation, turn) for
+                    # cross-arm matching; None when the workload sets none.
+                    "conv": live.tags.get("rsi_conv"),
+                    "turn": live.tags.get("rsi_turn"),
                     "prompt_len": request.num_prompt_tokens,
                     "num_tokens": len(tokens),
                     "computed": computed,

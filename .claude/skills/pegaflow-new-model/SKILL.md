@@ -98,9 +98,12 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
    gate integrity (nothing relaxed), copying from the old connector, regressions
-   on earlier models, and the policy complexity rules above (grep `policy.py`
-   for model / spec class names, count knobs and lines, unused knobs). Fix or
-   justify every finding in ITERATIONS.md.
+   on earlier models, the policy complexity rules above (grep `policy.py`
+   for model / spec class names, count knobs and lines, unused knobs), and
+   that the connector does not touch the probe (no instrument or run-artifact
+   access: `RsiProbe`, `RsiWorkerExt`, `rsi_poison`, `sys.modules`, digests,
+   outputs; GATES.md "Boundary"). It reads every `summary.scan` hit (flagged
+   and allowlisted). Fix or justify every finding in ITERATIONS.md.
 7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers:
    the hit-rate table (local / external / total hit, oracle H*, E_ext; at
    capacity H*_C, H_lru, E_C) next to the G4 perf table, for the arm under
@@ -109,6 +112,10 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 
 ## 3. Lessons (append)
 
+- A tree for `--under-test-path` must hold no `.pyc` (the snapshot check
+  rejects it, fail-closed): extract with `git archive <rev> | tar -x` or sync
+  with `tar --exclude=__pycache__ --exclude='*.pyc'`, never import from it
+  before the run.
 - vLLM 0.32 + flashinfer-python 0.7.0.post1: remove stale `flashinfer-cubin`
   (version check aborts startup; no 0.7 cubin on PyPI).
 - A cuda-13 server build aborts in preflight when the unversioned
