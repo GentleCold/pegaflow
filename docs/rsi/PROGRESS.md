@@ -516,8 +516,8 @@ names, magic constants that only exist in the old code).
       Window 0 recovers it and 10% does not. The cause is unknown: the
       loss is in previously hit (known-depth) blocks, and H5 serves more
       never-hit blocks than H4. The earlier "unknown depth first"
-      explanation is withdrawn. Old's hit drops up to 0.02 in one of two
-      runs.
+      explanation is withdrawn. Old's hit drops by 0.021 in two of three
+      pairs.
   - No-cap replay and gsm8k: no warm-TTFT regression, accuracy 0.8594 on
     every arm. cargo test, clippy and check.sh were run from a git archive
     of 81fdb6d; only the known ssd_cache and ruff-format failures remain.

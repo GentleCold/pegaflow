@@ -45,18 +45,26 @@ Pressure eviction, reclaimable class first, then retained:
      Those evictions can strand descendants and show in the counter below.
 
 Lock hold per pressure round, from the ignored bench
-`tail_first_round_lock_hold_at_2_6m_blocks` (2.6M resident blocks in
-64-block chains, batch 512, 20 rounds, release build, 10.1.0.44; the
-time is `remove_lru_batch` including its metrics, so it is an upper
-bound):
+`tail_first_round_lock_hold_at_2_6m_blocks`:
+- Setup: 2.6M resident blocks in 64-block chains, batch 512, 20 rounds.
+- The timer covers `remove_lru_batch` including its metrics, so it is an
+  upper bound on the locked section.
+- Run: `~/kexi/rsi-tools/server-evict-tail/bench.sh` on a `git archive`
+  of 073e496. Release build with `--ignored --nocapture`, 10.1.0.44 (AMD
+  EPYC 7542), GPU6, pgid 2756241, 2026-10-24 10:39:30 - 10:41:27 UTC.
+- Log: `~/kexi/logs/rsi-server-evict-tail-bench-073e496/bench.log`
+  (sha256 74fd1eb3…). Its `env.txt` hash of `read_cache.rs` equals
+  `git show 073e496:pegaflow-core/src/storage/read_cache.rs`.
 
-| case | plain LRU | tail-first 25%, capped | tail-first 25%, uncapped (pre-M2) |
-|---|---|---|---|
-| nothing pinned, mean / max | 0.81 / 0.89 ms | 1.45 / 1.81 ms | 19.6 / 24.8 ms |
-| oldest 8192 pinned, mean / max | 0.95 / 3.5 ms | 1.97 / 12.2 ms | 19.8 / 24.8 ms |
+| case | plain LRU, mean / p50 / max | tail-first 25%, mean / p50 / max |
+|---|---|---|
+| nothing pinned | 0.76 / 0.76 / 0.79 ms | 1.48 / 1.44 / 1.83 ms |
+| oldest 8192 pinned | 0.93 / 0.77 / 3.80 ms | 1.94 / 1.39 / 12.15 ms |
 
-The uncapped column is the same bench with the cap set to `usize::MAX`, a
-one-off patch in the remote wip tree that was reverted and not committed.
+Before M2 the window and the fallback leaf scan grew with the class. That
+build was timed once with a reverted local patch, and the output was not
+kept, so no uncapped figure is given here.
+
 With the oldest 8192 pinned, the whole 4096-block window is pinned. By the
 code path (the bench does not time rounds separately), the first round
 finds no candidate and no unpinned leaf, and falls back to plain LRU. That
@@ -220,8 +228,8 @@ Rejected:
 At the gated C/U 0.5, H5 raises E_C from 0.699-0.719 (H4) to 0.763-0.769
 on both arms, and hit from 0.861 to 0.889. That is above LRU (H_lru 0.857)
 and 0.04 below the offline bound (H\*_C 0.929). At 0.75 it gains
-+0.01-0.03 E_C. At 0.25 it loses 0.01-0.05 E_C, and old's hit drops by up
-to 0.02 in one of two runs. The cause is not known (§The 0.25 regression),
++0.01-0.04 E_C. At 0.25 it loses 0.01-0.08 E_C, and old's hit drops by
+0.021 in two of three pairs. The cause is not known (§The 0.25 regression),
 and it is one reason the window is opt-in. No-cap warm TTFT and gsm8k do
 not regress. One cap pair rerun on the review-fixed build (10e7afa,
 window passed explicitly) is in §Rerun after the review fixes.
@@ -283,10 +291,11 @@ GPU:
 - At 0.75, H5 adds +0.01-0.03 E_C, and hit rises from 0.915-0.917 to
   0.930-0.935.
 - At 0.25, E_C drops: old 0.174-0.179 to 0.129-0.147, v2 0.170-0.194 to
-  0.159-0.163. Old's hit drops up to 0.02 in one of two runs: H5 0.430 /
-  0.457 against 0.451-0.459 for every LRU run (H4 0.451 / 0.458, w0
-  0.459). v2's hit does not drop (H4 0.459 / 0.442, H5 0.464 / 0.458).
-  See §The 0.25 regression.
+  0.159-0.163. Old's hit drops by 0.021 in two of the three pairs (with the
+  rerun below): 0.451 to 0.430 (`cap3`) and 0.474 to 0.453 (`cap4`). In
+  the third pair it is unchanged, 0.458 to 0.457 (`cap3-b`). v2's hit does
+  not drop (H4 0.459 / 0.442 / 0.455, H5 0.464 / 0.458 / 0.462). See
+  §The 0.25 regression.
 - Both servers have 0 dead blocks at every pass end.
   `pegaflow_cache_evictions_with_resident_children` is not exported by any
   H5 25% run. An OTel counter that is never added is not exported, and the
@@ -336,8 +345,9 @@ Both runs exit rc 1, non-official, as above. Timed warm passes, old / v2:
   three pairs, since this H4 run is the highest H4 so far. v2 loses
   0.027.
 - Pressure evictions at 0.5: 63.7k / 63.2k against H4's 75.4k / 75.2k,
-  the same ratio as the first build. `with_children` is 0 on both
-  servers, and dead blocks are 0 at every pass end.
+  the same ratio as the first build. H5 does not export
+  `with_children`, so it is 0. H4 (d45a366) predates the metric, so its
+  0 means nothing. Dead blocks are 0 at every pass end on both servers.
 - Warm TTFT p50 at 0.5, warm2 / warm3: H5 2.19 / 2.13 s (old) and
   2.11 / 2.08 s (v2), against H4's 2.29 / 2.33 and 2.24 / 2.31 s.
 
@@ -390,9 +400,9 @@ The cause is not known. What the runs show:
   half of the 0.5 gain.
 - It shows mostly in E_C. Server-served tokens past the baseline's local
   hit (the part E_C credits) drop from 360-376 to 264-307 per request
-  (old), and from 366-420 to 337-352 (v2) (`sim/split.py`). Old's hit
-  drops up to 0.02 in one of the two runs (above). v2's hit does not
-  drop.
+  (old), and from 366-420 to 337-352 (v2) (`sim/split.py`, first two
+  pairs). Old's hit drops by 0.021 in two of three pairs (above). v2's hit
+  does not drop.
 - The loss is in blocks of known depth. `sim/unknown.py` splits each run's
   credited blocks (timed passes, past the baseline's local hit, capped by
   the unlimited oracle) into those that no earlier query had hit (still at
@@ -445,8 +455,8 @@ capacity, 0.640 / 0.702 at 0.5 against 0.753 / 0.767, so that is not the
 fix either.
 
 Tradeoff, not fixed: at 0.25 the store serves little under any policy (E_C
-0.13-0.19, hit 0.43-0.46 against H_lru 0.57-0.60). H5 loses 0.01-0.05 E_C
-there, and old's hit drops up to 0.02 in one of two runs. At 0.5 it gains
+0.13-0.21, hit 0.43-0.47 against H_lru 0.57-0.60). H5 loses 0.01-0.08 E_C
+there, and old's hit drops by 0.021 in two of three pairs. At 0.5 it gains
 +0.06 E_C and +0.03 hit, and at 0.75 +0.01-0.03 E_C and +0.015 hit. The
 server default is 0 (opt-in, §What changes); 25 is the evaluated setting.
 
@@ -473,8 +483,8 @@ attribution) and scan end (0.01).
 
 Judgment: at 0.5 and 0.75 the hit rate is close enough. It beats LRU and is
 within 0.04 of the offline bound. At 0.25 neither policy is close (hit
-0.43-0.46 against 0.86). That point is capacity-bound, and H5 lowers old's
-hit there by up to 0.02 in one of two runs.
+0.43-0.47 against 0.86). That point is capacity-bound, and H5 lowers old's
+hit there by 0.021 in two of three pairs.
 
 ## Warm TTFT and correctness (no-cap)
 
@@ -518,7 +528,11 @@ rerun's source), GPU6, started 10:04:02 UTC, logs in
   `ssd_cache` fails all 11 with "pinned pool exhausted", as on master
   (below).
 - `cargo-test-ignored.log`: 5 passed, including
-  `tail_first_round_lock_hold_at_2_6m_blocks`. `cargo-test-ignored-cuda12`:
+  `tail_first_round_lock_hold_at_2_6m_blocks` (debug, no output captured;
+  the timed release run is cited in §What changes). After 10e7afa,
+  073e496 only changes comments and caps `wanted` at 4096 (re-review N6
+  and N7). Its pegaflow-core lib tests pass, 180 passed, and clippy is
+  clean, both run from the remote wip tree. `cargo-test-ignored-cuda12`:
   3 passed. `clippy-cuda13`: clean. `check-rest` (rc 0): ruff check,
   default-feature clippy and cargo check pass. `check.log` (rc 1): typos is
   not installed, and `ruff format --check` fails on the same 11 untouched
@@ -566,8 +580,13 @@ help text (it now points at this doc).
 - A pressure round scans the window under the cache lock: it collects up to
   4096 entries (25% of the class is about 2.9k at 11.5k blocks), selects
   the deepest 4 x batch, and sorts only those. At 2.6M resident blocks that
-  is about 1.4 ms per round against 0.8 ms for LRU (§What changes). The
+  is 1.48 ms per round against 0.76 ms for LRU (§What changes). The
   reclaim loop still has no round cap, as on H4.
+- After a round that frees some but not all of its batch, pinned window
+  entries are not rotated, and the next round rescans them: at most
+  2 x 4096 entries, tens of µs, with the lock released between rounds
+  (re-review N8). If that ever shows in a profile, rotate pinned
+  candidates as the LRU loop does.
 - Decode backup with the window on is untested end to end. M1 is a unit
   test only; no gate run has a MetaServer, and reclaimable evictions are 0
   in every gate run.
