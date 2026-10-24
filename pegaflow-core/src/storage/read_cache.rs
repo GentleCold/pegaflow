@@ -354,24 +354,32 @@ impl ReadCache {
 
     /// Evict up to `batch_size` cache-owned blocks, reclaimable class first.
     ///
-    /// With a tail window, each class evicts tail-first: among its oldest
-    /// `tail_window_percent` blocks, the deepest chain position goes first,
-    /// and a block goes only after its resident descendants. Otherwise plain
-    /// LRU.
+    /// The reclaimable class is always plain LRU: another node holds a copy
+    /// of each of its blocks, so evicting a chain head there strands nothing
+    /// a prefetch cannot refill. With a tail window the retained class evicts
+    /// tail-first: among its oldest blocks the deepest chain position goes
+    /// first, and a block goes only after its retained descendants.
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let removed = {
             let mut inner = self.inner.lock();
             let mut removed = Vec::with_capacity(batch_size);
-            for class in [ResidentClass::Reclaimable, ResidentClass::Retained] {
-                if removed.len() == batch_size {
-                    break;
-                }
+            remove_lru_batch_from_class(
+                &mut inner,
+                ResidentClass::Reclaimable,
+                batch_size,
+                &mut removed,
+            );
+            if removed.len() < batch_size {
                 if self.tail_window_percent == 0 {
-                    remove_lru_batch_from_class(&mut inner, class, batch_size, &mut removed);
-                } else {
-                    remove_tail_first_from_class(
+                    remove_lru_batch_from_class(
                         &mut inner,
-                        class,
+                        ResidentClass::Retained,
+                        batch_size,
+                        &mut removed,
+                    );
+                } else {
+                    remove_retained_tail_first(
+                        &mut inner,
                         batch_size,
                         self.tail_window_percent,
                         &mut removed,
@@ -771,16 +779,6 @@ fn remove_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> Option<Remove
     None
 }
 
-/// Evict one resident block from whichever class holds it.
-fn evict_resident(inner: &mut ReadCacheInner, key: &BlockKey) -> Option<RemovedResident> {
-    let (class, metadata) = if let Some(metadata) = inner.reclaimable.remove(key) {
-        (ResidentClass::Reclaimable, metadata)
-    } else {
-        (ResidentClass::Retained, inner.retained.remove(key)?)
-    };
-    finish_eviction(inner, class, key.clone(), metadata)
-}
-
 /// Drop a block whose class entry was just removed: the resident block, its
 /// chain links, and the class accounting.
 fn finish_eviction(
@@ -815,34 +813,37 @@ fn finish_eviction(
     })
 }
 
-/// The resident child of `key` to evict before it: the deepest, unknown depth
-/// first.
-fn deepest_child(inner: &ReadCacheInner, key: &BlockKey) -> Option<BlockKey> {
+/// The retained child of `key` to evict before it: the deepest, unknown depth
+/// first. Reclaimable children are not followed: the walk never leaves the
+/// retained class, so it never evicts a block that exists only here to keep
+/// one that has a copy elsewhere.
+fn deepest_retained_child(inner: &ReadCacheInner, key: &BlockKey) -> Option<BlockKey> {
     inner
         .links
         .children
         .get(key)?
         .iter()
-        .max_by_key(|child| depth_of(inner, child))
-        .cloned()
+        .filter_map(|child| Some((inner.retained.peek(child)?.depth, child)))
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, child)| child.clone())
 }
 
-/// Tail-first eviction within one class.
+/// Tail-first eviction within the retained class.
 ///
 /// Candidates are the oldest `window_percent` of the class (at least the
 /// blocks still wanted), deepest chain position first, oldest first among
-/// equals. Taking a candidate evicts its resident subtree leaves first, so no
-/// block is evicted while a block that depends on it stays resident; such
-/// descendants may sit in the other class. A subtree whose next leaf is
-/// pinned by a load or transfer is skipped. If pins exhaust the candidates,
-/// the rest of the class is tried in LRU order under the same rule.
-fn remove_tail_first_from_class(
+/// equals. Taking a candidate evicts its retained subtree leaves first, so no
+/// block is evicted while a retained block that depends on it stays
+/// resident. A subtree whose next leaf is pinned by a load or transfer is
+/// skipped. If pins exhaust the candidates, the rest of the class is tried in
+/// LRU order under the same rule.
+fn remove_retained_tail_first(
     inner: &mut ReadCacheInner,
-    class: ResidentClass,
     batch_size: usize,
     window_percent: u64,
     removed: &mut Vec<RemovedResident>,
 ) {
+    let class = ResidentClass::Retained;
     let len = class_lru_ref(inner, class).len();
     let wanted = batch_size.saturating_sub(removed.len());
     if len == 0 || wanted == 0 {
@@ -877,7 +878,7 @@ fn remove_tail_first_from_class(
         // order. Leaves need no walk, so a fully pinned class costs one scan.
         let leaves: Vec<BlockKey> = class_lru_ref(inner, class)
             .iter()
-            .filter(|(key, _)| !inner.links.children.contains_key(*key))
+            .filter(|(key, _)| deepest_retained_child(inner, key).is_none())
             .map(|(key, _)| key.clone())
             .collect();
         evict_candidates(inner, leaves, batch_size, removed);
@@ -894,15 +895,17 @@ fn evict_candidates(
         if removed.len() == batch_size {
             return;
         }
-        if !inner.cache.contains_key(&candidate) {
+        if !inner.retained.contains_key(&candidate) {
             continue;
         }
         evict_subtree(inner, &candidate, batch_size, removed);
     }
 }
 
-/// Evict `root`'s resident descendants, leaves first, then `root`, until the
-/// batch is full.
+/// Evict the retained block `root`'s retained descendants, leaves first, then
+/// `root`, until the batch is full. Every block the walk visits is retained:
+/// it only descends into retained children, and climbs back along the path
+/// it came down.
 fn evict_subtree(
     inner: &mut ReadCacheInner,
     root: &BlockKey,
@@ -910,13 +913,13 @@ fn evict_subtree(
     removed: &mut Vec<RemovedResident>,
 ) {
     let mut current = root.clone();
-    while removed.len() < batch_size && inner.cache.contains_key(root) {
+    while removed.len() < batch_size && inner.retained.contains_key(root) {
         // Links come from client queries; a malformed client could link a
         // cycle. Bound the walk and evict where it stops, which drops the
         // block's links and so breaks the cycle.
         let mut steps = inner.links.parent.len();
         while steps > 0
-            && let Some(child) = deepest_child(inner, &current)
+            && let Some(child) = deepest_retained_child(inner, &current)
         {
             steps -= 1;
             current = child;
@@ -926,7 +929,12 @@ fn evict_subtree(
         }
         let parent = inner.links.parent.get(&current).cloned();
         let reached_root = current == *root;
-        let Some(evicted) = evict_resident(inner, &current) else {
+        let Some(metadata) = inner.retained.remove(&current) else {
+            return;
+        };
+        let Some(evicted) =
+            finish_eviction(inner, ResidentClass::Retained, current.clone(), metadata)
+        else {
             return;
         };
         removed.push(evicted);
@@ -1285,25 +1293,87 @@ mod tests {
 
     #[test]
     fn tail_first_evicts_deepest_block_of_oldest_window_first() {
-        // (window percent, expected order). Chain a (4 blocks, oldest) then
-        // chain b (2 blocks); both learned from prefix queries.
+        // Chain a (4 blocks, oldest) then chain b (2 blocks); both learned
+        // from prefix queries, all retained.
         let a = keys(1, 4);
         let b = keys(2, 2);
-        let cases: [(&str, u64, Vec<&BlockKey>); 3] = [
-            // Only a0 is in the window; its subtree goes leaf first.
-            ("narrow", 10, vec![&a[3], &a[2], &a[1], &a[0], &b[1], &b[0]]),
-            // Deepest across both chains, oldest first among equal depths.
-            ("whole", 100, vec![&a[3], &a[2], &a[1], &b[1], &a[0], &b[0]]),
-            ("lru", 0, vec![&a[0], &a[1], &a[2], &a[3], &b[0], &b[1]]),
+        struct Case<'a> {
+            id: &'a str,
+            window_percent: u64,
+            /// Demoted to reclaimable, e.g. after a decode backup copied them.
+            reclaimable: Vec<&'a BlockKey>,
+            /// Held by a load or transfer while the order is taken.
+            pinned: Vec<&'a BlockKey>,
+            expected: Vec<&'a BlockKey>,
+        }
+        let cases = [
+            Case {
+                // Only a0 is in the window; its subtree goes leaf first.
+                id: "narrow",
+                window_percent: 10,
+                reclaimable: vec![],
+                pinned: vec![],
+                expected: vec![&a[3], &a[2], &a[1], &a[0], &b[1], &b[0]],
+            },
+            Case {
+                // Deepest across both chains, oldest first among equal depths.
+                id: "whole",
+                window_percent: 100,
+                reclaimable: vec![],
+                pinned: vec![],
+                expected: vec![&a[3], &a[2], &a[1], &b[1], &a[0], &b[0]],
+            },
+            Case {
+                id: "lru",
+                window_percent: 0,
+                reclaimable: vec![],
+                pinned: vec![],
+                expected: vec![&a[0], &a[1], &a[2], &a[3], &b[0], &b[1]],
+            },
+            Case {
+                // A backed-up head goes first in plain LRU order; its retained
+                // descendants exist only here and are not walked into.
+                id: "reclaimable_head_keeps_retained_tail",
+                window_percent: 25,
+                reclaimable: vec![&a[0], &a[1]],
+                pinned: vec![],
+                expected: vec![&a[0], &a[1], &a[3], &a[2], &b[1], &b[0]],
+            },
+            Case {
+                // A pinned reclaimable child does not hold its retained parent:
+                // the retained walk treats the parent as a leaf.
+                id: "retained_walk_stops_at_reclaimable_child",
+                window_percent: 100,
+                reclaimable: vec![&a[2], &a[3]],
+                pinned: vec![&a[2], &a[3]],
+                expected: vec![&a[1], &b[1], &a[0], &b[0]],
+            },
         ];
-        for (id, percent, expected) in cases {
-            let cache = make_cache().with_tail_window_percent(percent);
+        for case in cases {
+            let id = case.id;
+            let cache = make_cache().with_tail_window_percent(case.window_percent);
             insert_all(&cache, &a);
             insert_all(&cache, &b);
             assert_eq!(cache.get_prefix_blocks(&a, true).0, 4, "{id}");
             assert_eq!(cache.get_prefix_blocks(&b, true).0, 2, "{id}");
-            let expected: Vec<BlockKey> = expected.into_iter().cloned().collect();
+            let demote: Vec<BlockKey> = case.reclaimable.into_iter().cloned().collect();
+            cache.mark_reclaimable_keys(&demote, DemotionReason::BackupHint);
+            let pinned: Vec<BlockKey> = case.pinned.into_iter().cloned().collect();
+            let held = cache.peek_blocks(&pinned);
+            let expected: Vec<BlockKey> = case.expected.into_iter().cloned().collect();
             assert_eq!(evict_order(&cache, 6), expected, "{id}");
+
+            // Whatever the order, nothing of the link maps outlives the
+            // blocks.
+            drop(held);
+            evict_order(&cache, 6);
+            let inner = cache.inner.lock();
+            assert!(
+                inner.reclaimable.is_empty() && inner.retained.is_empty(),
+                "{id}"
+            );
+            assert!(inner.links.parent.is_empty(), "{id}: parent links leak");
+            assert!(inner.links.children.is_empty(), "{id}: child links leak");
         }
     }
 
