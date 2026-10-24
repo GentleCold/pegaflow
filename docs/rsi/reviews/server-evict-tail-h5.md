@@ -358,3 +358,167 @@ real and repeated across two GPU-swapped pairs.
 ## Verdict
 
 accept after must-fix (M1, M2)
+
+## Re-review (93759f6..ed5a477, code final at 10e7afa)
+
+Same reviewer. Line numbers below are at 10e7afa. Remote evidence was read
+on 10.1.0.44 under `~/kexi/` only; I ran nothing there.
+
+### Previous findings
+
+| item | status | evidence |
+|---|---|---|
+| M1 cross-class descent | closed | see (1) below |
+| M2 uncapped scans | closed | see (2) below |
+| S1 default 0 | closed | `read_cache.rs:61` `DEFAULT_TAIL_WINDOW_PERCENT = 0`, used by `ReadCache::new` and `StorageConfig::default` (`storage/mod.rs:114`); CLI `default_value_t = 0` (`pegaflow-server/src/lib.rs:197`). The PyO3 crate has no `tail_window` reference, so it inherits the `StorageConfig` default. |
+| S2 absolute window cap | closed | `read_cache.rs:66` `TAIL_WINDOW_MAX_BLOCKS = 4096`, applied at `:890` |
+| S3 0.25 cause | closed | `evict-tail.md` §The 0.25 regression now says "cause is not known", withdraws the unknown-depth explanation, and carries the full per-run table (both arms, both pairs, w0, w10). The numbers equal my rerun. |
+| S4 client contract | closed (doc) | `evict-tail.md:151-162` states the refresh contract and the Full-member stranding case. The hybrid run is still owed, but it is now the bar for turning the default on, not for merging. |
+| S5 tests | closed | the eviction-order table has the M1 case (`reclaimable_head_keeps_retained_tail`), a reclaimable-child case, and asserts both link maps are empty after every drain |
+| N1 known dependents | closed | `metrics.rs:75-82` and `evict-tail.md` (invariant bullet) say "known (query-linked) dependent" and list the unlinked cases; the "full cleanup" wording is fixed |
+| N2 env hashes | closed | `verify-10e7afa/src-sha256.txt` covers 143 files. On the host, `read_cache.rs` is 471495e1… and `pegaflow-server/src/lib.rs` is b080858a…, which equal `git show 10e7afa:<file>` locally. |
+| N3 0.25 hit spread | closed, then stale | fixed for two pairs, but cap4 makes it stale (new S6) |
+| N4 single-lock membership | closed | `get_group_members` (`read_cache.rs:275-295`) refreshes and links under one lock, and builds the position key only for a hit whose key differs from its position. `lib.rs:627` calls it. The fetch path still links in a second lock (`lib.rs:584`), which is fine: it is async and rare. |
+| N5 unknown-depth members | closed | `evict-tail.md:134-137` |
+
+### (1) M1: is the class boundary airtight?
+
+Yes. I traced every path that can evict a retained block:
+- The reclaimable pass is H4's `remove_lru_batch_from_class(Reclaimable)`
+  (`read_cache.rs:383-388`). `remove_lru` only pops the reclaimable LRU, so
+  this pass cannot touch a retained block.
+- The retained pass runs only when that pass leaves the batch short
+  (`:389`), exactly as in H4. Retained blocks are therefore evicted under
+  pressure only once the reclaimable class is empty or fully pinned.
+- Inside the retained pass, every candidate must be in `retained` (`:943`).
+  The descent only follows children found in `retained` (`:851-861`). The
+  eviction is `inner.retained.remove(&current)` and returns if the block is
+  not there (`:977`). The climb goes back along `links.parent` of a node
+  reached through retained children, and nothing can demote it in between
+  because the whole walk runs under one lock. So the walk never evicts a
+  reclaimable block, and the reclaimable pass never evicts a retained one.
+
+The one cross-class effect is by design. A retained block whose children are
+all reclaimable counts as a leaf, so it can go while those reclaimable
+children stay. That strands the children locally, but each has a remote copy
+and RDMA prefetch can refill the head. `finish_eviction` counts this case in
+`evictions_with_resident_children`, but the metric doc does not list it
+(new N6).
+
+### (2) M2: can `wanted` reopen the unbounded scan?
+
+No, not in production.
+- `window = share.min(4096).max(wanted).min(len)` (`:890`). `wanted` is at
+  most `batch_size`, and the only production caller passes
+  `reclaim_batch_size`, clamped to 512 (`storage/mod.rs:796`). So the window
+  is at most 4096 entries.
+- The leaf scan is `take(4096.max(wanted))` (`:919`) and clones only the
+  victims (`take(wanted)`).
+- `remove_lru_batch` is `pub(super)`, so a future caller with a huge batch
+  could widen the window. A `debug_assert!(batch_size <= RECLAIM_BATCH_SIZE)`
+  would pin that down (N7, optional).
+
+The plain-LRU fallback (`:928-930`) is correct. It runs only when the round
+made no progress, it is H4's own loop, and it rotates pinned blocks to the
+MRU end, so a pinned window does not stay pinned across rounds. Its worst
+case is O(len) when every retained block is pinned, the same as H4. The
+cost is one pointer step per pinned entry, with no clone except the key.
+
+There is a residual slow case, which I rate Nit. If a round frees some
+blocks but fewer than the batch, the LRU fallback does not run, and the
+pinned window is not rotated. Each later round rescans up to 2 × 4096
+entries for a few victims. That costs about tens of µs per round, with the
+lock released between rounds. It is not a stall.
+
+On the bench: it times `cache.remove_lru_batch(BATCH)`, i.e. lock
+acquisition (uncontended), the locked section, and
+`record_residence_durations` after the unlock. The returned blocks drop
+after the timer stops. So it is an upper bound on the locked section, as
+the doc says. The figures (LRU 0.81 ms, capped 1.45 ms, uncapped 19.6 ms)
+agree in order of magnitude with my estimate (3-10 ms uncapped).
+
+However, no bench output exists on the host. `verify-10e7afa` ran the
+ignored tests in the debug profile without `--nocapture`, so the log only
+says `ok`. I searched `~/kexi/logs` and `~/kexi/rsi-tools` for "per round
+mean" and found nothing, and the uncapped column came from a reverted,
+uncommitted patch. The table is plausible but unverifiable (new S7).
+
+### (3) Default
+
+0 in the CLI, in `StorageConfig::default` and in `ReadCache::new` (see S1
+above). Gate runs pass 25 through the `-w25` wrapper.
+
+### (4) N4
+
+Closed (table above).
+
+### (5) Evidence
+
+`cap4-h5fix` / `cap4-h4` `summary.json`:
+- Provenance:
+  - gate bf9ef3c, under-test 8a05b7c, cap fractions 0.25 / 0.5 / 0.75;
+  - H5 on GPU7 and H4 on GPU6;
+  - the H5 server is the wrapper `pegaflow-server-h5-10e7afa-w25` (sha256
+    eb4b824c…), which execs `pegaflow-server-h5-10e7afa` (sha256
+    ebce745b…) with `--tail-window-percent 25`;
+  - `build-10e7afa.log` shows ebce745b… built from rev 10e7afab….
+- Every cell of the doc's rerun table matches warm_timed:
+
+| C/U | old E_C H4 / H5 | v2 E_C H4 / H5 | old hit H4 / H5 | v2 hit H4 / H5 |
+|---|---|---|---|---|
+| 0.25 | 0.208 / 0.126 | 0.195 / 0.168 | 0.474 / 0.453 | 0.455 / 0.462 |
+| 0.5 | 0.712 / 0.759 | 0.712 / 0.769 | 0.860 / 0.887 | 0.860 / 0.890 |
+| 0.75 | 0.749 / 0.778 | 0.750 / 0.791 | 0.916 / 0.930 | 0.917 / 0.933 |
+
+The 0.5 gain reproduces on the fixed build: +0.047 / +0.057 E_C and +0.03
+hit. The 0.25 old regression also reproduces, and is the widest yet.
+
+Two small inaccuracies:
+- "`with_children` is 0 on both servers" is vacuous for H4: d45a366
+  predates the metric. For H5 it is 0 by absence, as before.
+- The hit-rate judgment still says old's hit "drops up to 0.02 in one of
+  two runs" (`evict-tail.md:224`, `286`, `449`, `477`). With cap4 it is
+  two of three pairs, 0.451 → 0.430 and 0.474 → 0.453, plus 0.458 → 0.457
+  (new S6).
+
+Tests:
+- `verify-10e7afa` came from 10e7afa's export (rev line, source hashes).
+- The 5-case table, `queried_never_loaded…`, `group_blocks_leave…` and the
+  ignored bench all report `ok`. pegaflow-core lib: 180 passed, 5 ignored.
+- The only failures are the 11 `ssd_cache` cases. The master 75dfa4c log
+  (`rsi-server-evict-tail-master-75dfa4c-ssd_cache/`) shows the same 11
+  failing with the same "pinned pool exhausted", so that is now verified.
+
+### New findings
+
+Must-fix: none.
+
+Should-fix:
+- S6 `evict-tail.md:224`, `286`, `449`, `477`: update "old's hit drops up to
+  0.02 in one of two runs" to "in two of three pairs (0.021 each)". This is
+  doc only, but it is the hit-rate judgment.
+- S7 `evict-tail.md:47-56`: keep the bench output. Rerun
+  `tail_first_round_lock_hold_at_2_6m_blocks` with `--release --nocapture`
+  for the capped and LRU cases, store the log under `~/kexi/logs/`, and cite
+  it. The uncapped column can stay as "one-off, not kept".
+
+Nit:
+- N6 `metrics.rs:75-82`: under tail-first, the counter also increments
+  when a retained block whose children are all reclaimable is evicted as a
+  leaf. Add it to the list.
+- N7 `read_cache.rs:876-890`: optionally add
+  `debug_assert!(batch_size <= RECLAIM_BATCH_SIZE)`, or cap `wanted` in the
+  window, so a future large-batch caller cannot reopen the scan.
+- N8 `read_cache.rs:912-927`: after a partial-progress round the pinned
+  window is never rotated, so later rounds rescan it. This is bounded at
+  about 8k entries per round. If it ever shows up, rotate pinned candidates
+  as the LRU loop does.
+
+### Default recommendation
+
+Unchanged, and now implemented: 0 (opt-in). Gate runs pass 25. Turn it on
+after one hybrid model passes G5 cap with the window on.
+
+### Verdict
+
+accept
