@@ -1102,6 +1102,171 @@ From now on:
 - The gate port race (vLLM `EADDRINUSE` on the gate's chosen port) is
   with the gate owner.
 
+## MF1: official run (`2026-10-24-dsv2-lite-p4-mf1`, GPU 0,1, TP2, 64gb, run_gate pgid 2454295, 05:40:44 to 08:09:39Z)
+
+The setup:
+- `"official": true`, `not_official_because: []`.
+- Gate tree `~/kexi/p4-gate-65dc1cc`. Its `rsi/` is identical to
+  feat/semantics-rsi 3068d06 (the rsi-g5 merge). It adds this model's
+  gate.json and spec.json.
+- Under test: `--under-test-path ~/kexi/p4-ut-65dc1cc/python`, rev 65dc1cc.
+  Both trees came from `git archive` and carry no pyc. The snapshot is
+  verified, the static scan has 0 flags and the provenance watch saw no
+  change.
+- CUDA 13 env, preflight problems [].
+- Arms: plain, baseline, old, native, `pegaflow.connector_v2:PegaKVConnectorV2`.
+  Workloads gsm8k (full 1319), replay (32 x 12) and cap (auto: 76 convs x
+  12).
+- Capacity floor: C(0.5) is 6.87 GB, 2.27x GPU KV. No timed pass was
+  contaminated.
+
+`old` failed every stage with an HTTP 500. vLLM 0.32's MultiConnector
+looks up `PegaKVConnector` in its registry to rebuild kv stats, and the
+gate's `VLLM_PLUGINS=""` left the name unregistered. That was a gate
+regression, fixed in 81e8f87 (feat/semantics-rsi 4fa78a0). `old` is
+`required: false`, so the run stays official. `old`'s numbers come from
+the supplementary run below.
+
+### Verdicts
+
+| check | v2 | native (record only) |
+|---|---|---|
+| G0.spec / G0.provenance | pass / pass | fail (LBHNC, known) / pass |
+| G2.split_control (baseline) | pass: measured split-variant, 647/1319 differ (0.4905), 1319 logprobs differ, 1319 pre-warmed | |
+| G2.gsm8k_outputs | pass: cold 0 differ; warm 0 differ vs plain `split` (aligned 0) | pass |
+| G2.gsm8k accuracy (baseline 0.6725) | cold +0.0 pp, warm +0.53 pp (= plain split 0.6778) | +0.0 / +0.45 pp |
+| G2.digest_self.gsm8k | 10526 ext matched, 0 mismatched | 9982 / 0 |
+| G2.digest_vs_baseline.gsm8k | 10526 / 0; computed 45008/45008 exact, coverage cold 1.0, warm 1.0 | 9982 / 0; coverage warm 0.93 |
+| G2.digest_self.replay | 27080 ext + 21898 local matched, 0 mismatched | 18012 / 0 |
+| G2.digest_self.cap (exhaustive) | 441102 ext matched, 0 mismatched, 6892 preempted-uncertain (allowed) | 504498 / 0 |
+| G3.gsm8k_warm / replay_warm | pass (E_ext 1.0 / 1.0, excess 0 / 0) | pass (excess 1230 / 210) |
+| G3.no_eviction | pass | n/a |
+| G4 (6 verdicts) | pass, all 6 | pass, all 6 |
+| G5.replay_warm, hard parts | load_errors 0, excess 0, unmatched 0, pool_ok, loads_ok | same |
+| G5.replay_warm in this run's summary | fail: E_C 0.513 < 0.9 | fail: E_C 0.631 |
+
+When this run was judged, the E_C bar was still hard, so the run's own
+summary has v2 `pass: false`, on `G5.replay_warm` only. Since
+2026-10-24 (2af374a) hit-rate levels are reported, not gated.
+I re-judged the record offline with the 4fa78a0 `verdicts()` /
+`hit_report()`. The output is `~/kexi/tmp/dsv2-p4/mf1-rejudge-4fa78a0.json`,
+and the run dir is unchanged. The result:
+- v2 `pass: true`.
+- The only verdict that changed is `G5.replay_warm`, from false to true.
+- `below_reference` lists only `efficiency_c`.
+
+In the G5 curve, v2's `cap025` digest is false: 6206 of 600154 loaded
+blocks (1.03%) are preempted-uncertain, against the 1% allowance, and 0
+are mismatched. Curve points are not gated.
+
+### G4 (median of timed passes vs baseline)
+
+| metric | baseline | v2 | vs baseline | native | vs baseline |
+|---|---|---|---|---|---|
+| replay warm p50 (s) | 0.930 | 0.303 | -67.4% | 0.281 | -69.8% |
+| replay warm req/s | 5.40 | 12.35 | +128.6% | 13.14 | +143.2% |
+| replay cold p50 (s) | 1.323 | 0.665 | -49.8% | 0.623 | -52.9% |
+| replay cold req/s | 5.03 | 8.40 | +66.9% | 7.92 | +57.5% |
+| gsm8k cold s | 193.9 | 194.4 | +0.28% | 195.2 | +0.67% |
+| gsm8k warm s | 194.0 | 189.5 | -2.27% | 190.8 | -1.61% |
+
+At 32 x 12, the cold pass already reuses within the pass: a turn whose
+history vLLM evicted is loaded from PegaFlow (cold H* 0.843 vs baseline
+local 0.478). That is why cold is so far ahead of baseline here, unlike the
+8 x 6 slices.
+
+Save batching ran under KV pressure the whole time:
+- Max GPU KV usage was 99.8% for v2 (baseline 95.3%).
+- The pressure send fired on 1296 of 1346 replay RPCs and 3641 of 3725 cap
+  RPCs.
+- The replay finish-to-report hold was mean 132 ms, max 3003 ms. It covers
+  the save itself, not just the batch hold.
+- No request was preempted more than once.
+- gsm8k: 15 finished requests, 3 RPCs.
+- `kv_usage_unknown_steps` was 0 everywhere, so vLLM's cache manager was
+  bound.
+
+### Hits (unlimited store)
+
+| arm | workload/pass | local | ext | total | H* | E_ext | excess |
+|---|---|---|---|---|---|---|---|
+| baseline | gsm8k warm | 0.940 | 0 | 0.940 | 0.993 | 0 | 0 |
+| v2 | gsm8k warm | 0.937 | 0.055 | 0.993 | 0.993 | 1.0 | 0 |
+| native | gsm8k warm | 0.940 | 0.053 | 0.993 | 0.993 | 1.0 | 1230 |
+| baseline | replay cold / warm2 | 0.478 / 0.465 | 0 | 0.478 / 0.465 | 0.843 / 0.998 | 0 | 0 |
+| v2 | replay cold | 0.492 | 0.351 | 0.843 | 0.843 | 1.0 | 0 |
+| v2 | replay warm / warm2 / warm3 | 0.464 / 0.469 / 0.470 | 0.535 / 0.529 / 0.529 | 0.998 | 0.998 | 1.0 | 0 |
+| native | replay cold | 0.500 | 0.343 | 0.842 | 0.843 | 0.9998 | 0 |
+| native | replay warm2 | 0.467 | 0.531 | 0.998 | 0.998 | 1.0 | 210 |
+
+### G5 (cap trace, warm_timed; `ref_local` = baseline's local)
+
+| arm | C/U | C (GB) | hit | H*_C | H_lru | E_C | E_C own-local | local |
+|---|---|---|---|---|---|---|---|---|
+| v2 | 0.25 | 3.43 | 0.428 | 0.853 | 0.673 | 0.007 | 0.051 | 0.405 |
+| native | 0.25 | 3.43 | 0.570 | 0.855 | 0.657 | 0.266 | 0.357 | 0.417 |
+| v2 | 0.5 | 6.87 | 0.765 | 0.925 | 0.847 | 0.513 | 0.695 | 0.401 |
+| native | 0.5 | 6.87 | 0.852 | 0.924 | 0.847 | 0.631 | 0.855 | 0.423 |
+| v2 | 0.75 | 10.30 | 0.855 | 0.968 | 0.917 | 0.581 | 0.799 | 0.405 |
+| native | 0.75 | 10.30 | 0.934 | 0.968 | 0.917 | 0.713 | 0.936 | 0.435 |
+
+H_freeze at 0.5 is 0.714 (freeze/H*_C 0.548), so the trace separates
+policies. Per pass at 0.5, v2's hit goes 0.824 (cold, E_C 0.916) / 0.791 /
+0.791 / 0.738, and native's 0.840 / 0.851 / 0.851 / 0.853.
+
+The server at 0.5 (v2):
+- Pool proven: `pool_capacity_bytes` = C.
+- `pegaflow_pool_used_bytes` / C at pass end: 0.97 to 1.00.
+- `pegaflow_cache_resident_bytes` / C: 0.64 to 0.77. At 0.25 it is 0.59 to
+  0.72, at 0.75 it is 0.66 to 0.76.
+- Evictions per pass: 18k to 38k blocks.
+- Load bytes are 2x the external-hit bytes (116.8 vs 58.4 GB), because
+  both TP ranks load each replicated MLA block (design: every holder
+  loads).
+
+### Hit-rate judgment
+
+With unlimited capacity, v2 is at the oracle:
+- gsm8k warm and every replay pass reach `H*` exactly (E_ext 1.0), with
+  excess 0.
+- native reaches the same hit with excess 1230 / 210.
+- Close enough: there is no gap.
+
+With bounded capacity, v2 trails the LRU model and native:
+- At C/U 0.5 it is 0.082 below H_lru and 0.087 below native, and 0.16
+  below H*_C.
+- At 0.25 it gets almost no external hit (E_C 0.007, native 0.266).
+- At 0.75 it is 0.06 below H_lru.
+
+The evidence puts this gap in the server's retention, not in the
+connector:
+1. The connector-side contract holds. There is no excess, no load error and
+   no unmatched request, every external hit is backed by server load bytes,
+   and the unlimited runs are at H*. With one Full group and one MLA copy
+   per block, there is no per-group or Kind miss to explain.
+2. The server holds only 0.6 to 0.77 C of cache-resident blocks while its
+   pool is 0.92 to 1.0 used. The LRU model keeps all of C resident. A store
+   that keeps about 0.65 C acts like LRU at a smaller C. That fits v2 at
+   0.5 (0.765) falling between H_lru at 0.25 (0.673) and at 0.5 (0.847),
+   and v2 at 0.25 getting almost nothing.
+3. It is the same mechanism as the Qwen3-4B G5 r3 record (resident 0.74
+   to 0.87 C, v2 0.842 vs H_lru 0.857). The gap is larger here, and so is
+   the shortfall in resident bytes.
+4. One more observation, not explained: v2's saved bytes over the four
+   passes (66.3 GB) exceed the LRU model's stored bytes (53.9 GB) by 23%.
+   Explaining it needs the server's save accounting, which is
+   pegaflow-core (server-owned, not read here).
+
+The connector cannot recover this within its scope. Save batching only
+changes when a save is sent, not what is kept. The pressure send already
+fires on nearly every RPC here.
+
+Judgment: G3 is close enough. G5 is not close at 0.25 and is a moderate
+gap at 0.5 and 0.75, but it is not attributable to the DSV2 mapping or to
+connector_v2. I don't block onboarding on it. It is reported to the
+server agent as a retention issue (resident bytes vs pool size), with
+these numbers.
+
 ## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
 
 Arms: plain, baseline, KOff, v2 with the shipped default (32 steps /
