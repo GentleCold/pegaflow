@@ -3,16 +3,19 @@
 //! `cuMemcpyAsync` per range.
 //!
 //! Batch submission is the default when the driver supports it. A layer-first
-//! load of Qwen3-4B is ~7.7k copies of 64 KiB that rarely merge, and per-call
-//! submission cost then bounds the transfer at ~13 GB/s.
+//! load with one 64 KiB page per (block, layer) is thousands of copies that
+//! rarely merge, and per-call submission cost then bounds the transfer at
+//! ~13 GB/s.
 //!
 //! `cuMemcpyBatchAsync*` was removed once (b96e80c) after "driver instability
 //! on some CUDA stacks"; no stack or failure was recorded. The per-range path is
 //! kept as the fallback:
 //! - `PEGAFLOW_DISABLE_BATCH_MEMCPY=1` selects it for the whole process;
 //! - drivers older than the batch API select it;
-//! - a batch call that returns an error is retried per range, and batching is
-//!   turned off for the rest of the process.
+//! - a batch call that returns an error is retried per range. If the retry
+//!   succeeds, the batch API is at fault on this stack and that backend submits
+//!   per range from then on. If the retry fails too, the ranges are at fault,
+//!   the transfer errors, and batching stays on.
 //!
 //! Both paths enqueue stream-ordered copies, so callers see the same semantics.
 
@@ -23,6 +26,7 @@ use cudarc::driver::{CudaStream, sys};
 use log::{debug, info, warn};
 
 use super::{CopyDesc, TransferBackend};
+use crate::metrics::{MEMCPY_FALLBACK_RETRY_FAILED, MEMCPY_FALLBACK_RETRY_OK, core_metrics};
 
 /// Oldest driver that exports the batch entry point this build calls.
 #[cfg(feature = "cuda-13")]
@@ -31,9 +35,6 @@ const MIN_BATCH_DRIVER: i32 = 13000;
 const MIN_BATCH_DRIVER: i32 = 12080;
 
 const DISABLE_BATCH_ENV: &str = "PEGAFLOW_DISABLE_BATCH_MEMCPY";
-
-/// Set after a batch call fails; every backend then submits per range.
-static BATCH_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// A run of input copies that are contiguous on both the device and the host
 /// side, submitted as a single copy.
@@ -94,8 +95,15 @@ impl Direction {
 }
 
 /// DMA copy-engine transfer backend.
+///
+/// Every GPU worker builds its own backend, so the batch-fault latch is scoped
+/// to one worker on one device.
 pub struct MemcpyBackend {
+    /// Batch submission was selected at construction.
     batch: bool,
+    /// A batch call failed and the per-range retry of the same ranges worked,
+    /// so this backend submits per range from now on.
+    batch_faulted: AtomicBool,
 }
 
 impl MemcpyBackend {
@@ -112,17 +120,28 @@ impl MemcpyBackend {
             "memcpy transfer submission: {} (driver={version}, min_batch_driver={MIN_BATCH_DRIVER}, {DISABLE_BATCH_ENV}={disabled})",
             if batch { "batch" } else { "per-range" }
         );
-        Self { batch }
+        Self::with_batch(batch)
     }
 
     /// One `cuMemcpyAsync` per merged range, regardless of driver support.
     pub fn per_range() -> Self {
-        Self { batch: false }
+        Self::with_batch(false)
+    }
+
+    fn with_batch(batch: bool) -> Self {
+        Self {
+            batch,
+            batch_faulted: AtomicBool::new(false),
+        }
+    }
+
+    fn uses_batch(&self) -> bool {
+        self.batch && !self.batch_faulted.load(Ordering::Relaxed)
     }
 
     /// The submission path the next transfer takes: "batch" or "per-range".
     pub fn submission(&self) -> &'static str {
-        if self.batch && !BATCH_FAILED.load(Ordering::Relaxed) {
+        if self.uses_batch() {
             "batch"
         } else {
             "per-range"
@@ -139,7 +158,7 @@ impl MemcpyBackend {
         if merged.is_empty() {
             return Ok(());
         }
-        let batch = self.batch && !BATCH_FAILED.load(Ordering::Relaxed);
+        let batch = self.uses_batch();
         if log::log_enabled!(log::Level::Debug) {
             let bytes: usize = merged.iter().map(|m| m.size).sum();
             debug!(
@@ -150,20 +169,37 @@ impl MemcpyBackend {
                 if batch { 1 } else { merged.len() }
             );
         }
-        if batch {
-            match submit_batch(direction, &merged, stream) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    // Re-issuing every range is safe: each copy is a plain
-                    // stream-ordered byte move, so a repeated one rewrites the
-                    // same bytes.
-                    if !BATCH_FAILED.swap(true, Ordering::Relaxed) {
-                        warn!("{e}; falling back to per-range memcpy for this process");
-                    }
+        if !batch {
+            return submit_per_range(direction, &merged, stream);
+        }
+        let Err(batch_err) = submit_batch(direction, &merged, stream) else {
+            return Ok(());
+        };
+        // Re-issuing every range is safe: each copy is a plain stream-ordered
+        // byte move, so a range the failed batch already enqueued rewrites the
+        // same bytes.
+        let retry = submit_per_range(direction, &merged, stream);
+        let metrics = core_metrics();
+        match retry {
+            Ok(()) => {
+                metrics
+                    .memcpy_batch_fallbacks
+                    .add(1, &*MEMCPY_FALLBACK_RETRY_OK);
+                // The same ranges went through per range, so the batch API is
+                // at fault here: stop using it on this backend.
+                if !self.batch_faulted.swap(true, Ordering::Relaxed) {
+                    warn!("{batch_err}; the per-range retry worked, so this worker submits per range from now on");
                 }
+                Ok(())
+            }
+            Err(e) => {
+                metrics
+                    .memcpy_batch_fallbacks
+                    .add(1, &*MEMCPY_FALLBACK_RETRY_FAILED);
+                // The ranges themselves are bad; batching stays on.
+                Err(format!("{batch_err}; per-range retry: {e}"))
             }
         }
-        submit_per_range(direction, &merged, stream)
     }
 }
 

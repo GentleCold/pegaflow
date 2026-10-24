@@ -36,6 +36,10 @@ pub(crate) static DEMOTION_RECLAIM_HINT: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("reason", "reclaim_hint")]);
 pub(crate) static DEMOTION_BACKUP_HINT: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("reason", "backup_hint")]);
+pub(crate) static MEMCPY_FALLBACK_RETRY_OK: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("outcome", "retry_ok")]);
+pub(crate) static MEMCPY_FALLBACK_RETRY_FAILED: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("outcome", "retry_failed")]);
 pub(crate) static SERVED_ROLE_SOURCE: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("role", "source")]);
 pub(crate) static SERVED_ROLE_BACKUP_TARGET: LazyLock<[KeyValue; 1]> =
@@ -86,6 +90,9 @@ pub(crate) struct CoreMetrics {
     pub load_bytes: Counter<u64>,
     pub load_duration_seconds: Histogram<f64>,
     pub load_failures: Counter<u64>,
+    /// Transfers whose batch memcpy call failed and were retried per range.
+    /// `outcome=retry_ok` also switches that worker to per range.
+    pub memcpy_batch_fallbacks: Counter<u64>,
 
     // SSD cache
     pub ssd_write_bytes: Counter<u64>,
@@ -408,6 +415,13 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             load_failures: meter
                 .u64_counter("pegaflow_load_failures")
                 .with_description("Load operation failures (e.g., transfer errors)")
+                .build(),
+            memcpy_batch_fallbacks: meter
+                .u64_counter("pegaflow_memcpy_batch_fallbacks")
+                .with_description(
+                    "Transfers whose batch memcpy call failed and were retried per range \
+                     (outcome=retry_ok|retry_failed; retry_ok switches that worker to per range)",
+                )
                 .build(),
 
             // SSD
