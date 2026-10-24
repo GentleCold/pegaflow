@@ -10,7 +10,8 @@
 //! `cuMemcpyBatchAsync*` was removed once (b96e80c) after "driver instability
 //! on some CUDA stacks"; no stack or failure was recorded. The per-range path is
 //! kept as the fallback:
-//! - `PEGAFLOW_DISABLE_BATCH_MEMCPY=1` selects it for the whole process;
+//! - `PEGAFLOW_DISABLE_BATCH_MEMCPY` set to anything but empty, `0`, `false`,
+//!   `no` or `off` selects it for the whole process;
 //! - drivers older than the batch API select it;
 //! - a batch call that returns an error is retried per range. If the retry
 //!   succeeds, the batch API is at fault on this stack and that backend submits
@@ -104,23 +105,63 @@ pub struct MemcpyBackend {
     /// A batch call failed and the per-range retry of the same ranges worked,
     /// so this backend submits per range from now on.
     batch_faulted: AtomicBool,
+    /// Make every batch call fail before it enqueues anything.
+    #[cfg(test)]
+    inject_batch_error: bool,
+}
+
+/// Why [`MemcpyBackend::new`] picked its submission path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Choice {
+    Batch,
+    /// `PEGAFLOW_DISABLE_BATCH_MEMCPY` is set to a value that is not false.
+    DisabledByEnv,
+    /// The driver version is unknown or older than the batch API.
+    OldDriver,
+}
+
+impl Choice {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::DisabledByEnv => "per-range (disabled by env)",
+            Self::OldDriver => "per-range (driver older than the batch API)",
+        }
+    }
+}
+
+/// `PEGAFLOW_DISABLE_BATCH_MEMCPY` turns batching off unless its value is
+/// empty, `0`, `false`, `no` or `off` (any case): a kill switch errs towards off.
+fn disables(value: &std::ffi::OsStr) -> bool {
+    let v = value.to_string_lossy().trim().to_ascii_lowercase();
+    !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
+}
+
+fn choose(env: Option<&std::ffi::OsStr>, driver_version: Option<i32>) -> Choice {
+    if env.is_some_and(disables) {
+        return Choice::DisabledByEnv;
+    }
+    match driver_version {
+        Some(v) if v >= MIN_BATCH_DRIVER => Choice::Batch,
+        _ => Choice::OldDriver,
+    }
 }
 
 impl MemcpyBackend {
     /// Batch submission when the driver supports it and it is not disabled
     /// through `PEGAFLOW_DISABLE_BATCH_MEMCPY`; per-range submission otherwise.
     pub fn new() -> Self {
-        let disabled = std::env::var_os(DISABLE_BATCH_ENV).is_some_and(|v| v != "0");
+        let env = std::env::var_os(DISABLE_BATCH_ENV);
         let mut version = 0;
         // SAFETY: writes one c_int; a CUDA context is not required.
         let result = unsafe { sys::cuDriverGetVersion(&mut version) };
-        let supported = result == sys::cudaError_enum::CUDA_SUCCESS && version >= MIN_BATCH_DRIVER;
-        let batch = supported && !disabled;
+        let driver = (result == sys::cudaError_enum::CUDA_SUCCESS).then_some(version);
+        let choice = choose(env.as_deref(), driver);
         info!(
-            "memcpy transfer submission: {} (driver={version}, min_batch_driver={MIN_BATCH_DRIVER}, {DISABLE_BATCH_ENV}={disabled})",
-            if batch { "batch" } else { "per-range" }
+            "memcpy transfer submission: {} (driver={version}, min_batch_driver={MIN_BATCH_DRIVER}, {DISABLE_BATCH_ENV}={env:?})",
+            choice.describe()
         );
-        Self::with_batch(batch)
+        Self::with_batch(choice == Choice::Batch)
     }
 
     /// One `cuMemcpyAsync` per merged range, regardless of driver support.
@@ -132,7 +173,22 @@ impl MemcpyBackend {
         Self {
             batch,
             batch_faulted: AtomicBool::new(false),
+            #[cfg(test)]
+            inject_batch_error: false,
         }
+    }
+
+    fn batch_call(
+        &self,
+        direction: Direction,
+        merged: &[Merged],
+        stream: &Arc<CudaStream>,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        if self.inject_batch_error {
+            return Err("injected batch error".into());
+        }
+        submit_batch(direction, merged, stream)
     }
 
     fn uses_batch(&self) -> bool {
@@ -172,7 +228,7 @@ impl MemcpyBackend {
         if !batch {
             return submit_per_range(direction, &merged, stream);
         }
-        let Err(batch_err) = submit_batch(direction, &merged, stream) else {
+        let Err(batch_err) = self.batch_call(direction, &merged, stream) else {
             return Ok(());
         };
         // Re-issuing every range is safe: each copy is a plain stream-ordered
@@ -188,7 +244,9 @@ impl MemcpyBackend {
                 // The same ranges went through per range, so the batch API is
                 // at fault here: stop using it on this backend.
                 if !self.batch_faulted.swap(true, Ordering::Relaxed) {
-                    warn!("{batch_err}; the per-range retry worked, so this worker submits per range from now on");
+                    warn!(
+                        "{batch_err}; the per-range retry worked, so this worker submits per range from now on"
+                    );
                 }
                 Ok(())
             }
@@ -409,6 +467,134 @@ mod tests {
 
         for second in [copy(104, second_host, 3, 2), copy(104, second_host, 1, 4)] {
             assert_eq!(merge(&[copy(100, first_host, 1, 2), second]).len(), 2);
+        }
+    }
+
+    #[test]
+    fn kill_switch_and_driver_version_pick_the_submission_path() {
+        use std::ffi::OsStr;
+        let new_driver = Some(MIN_BATCH_DRIVER);
+        let cases: [(&str, Option<&str>, Option<i32>, Choice); 9] = [
+            ("unset", None, new_driver, Choice::Batch),
+            ("empty", Some(""), new_driver, Choice::Batch),
+            ("zero", Some("0"), new_driver, Choice::Batch),
+            ("false", Some("FALSE"), new_driver, Choice::Batch),
+            ("one", Some("1"), new_driver, Choice::DisabledByEnv),
+            ("true", Some("true"), new_driver, Choice::DisabledByEnv),
+            (
+                "env wins over driver",
+                Some("1"),
+                None,
+                Choice::DisabledByEnv,
+            ),
+            (
+                "old driver",
+                None,
+                Some(MIN_BATCH_DRIVER - 10),
+                Choice::OldDriver,
+            ),
+            ("unknown driver", None, None, Choice::OldDriver),
+        ];
+        for (id, env, driver, want) in cases {
+            assert_eq!(choose(env.map(OsStr::new), driver), want, "case {id}");
+        }
+    }
+
+    /// A batch call that fails is retried per range: every range lands exactly
+    /// where it should, the backend switches to per range, and a per-range
+    /// failure leaves batching on. Covers an injected failure and the real one
+    /// the driver gives on the legacy default stream.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn failed_batch_retries_per_range_and_lands_every_range() {
+        use cudarc::driver::CudaContext;
+        const N: usize = 64;
+        const SEG: usize = 64 << 10;
+        let ctx = CudaContext::new(0).expect("ctx");
+        let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let r = unsafe { sys::cuMemHostAlloc(&mut host_ptr, N * SEG, 0) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuMemHostAlloc");
+        let host = host_ptr as *mut u8;
+        let mut device: sys::CUdeviceptr = 0;
+        let r = unsafe { sys::cuMemAlloc_v2(&mut device, N * SEG) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuMemAlloc");
+
+        // Reverse order with a per-range allocation id: nothing merges, so
+        // every range is a separate copy and a lost or misplaced one shows.
+        let copies: Vec<CopyDesc> = (0..N)
+            .map(|k| CopyDesc {
+                device: device + ((N - 1 - k) * SEG) as u64,
+                host: unsafe { host.add(k * SEG) },
+                host_device: 0,
+                size: SEG,
+                device_allocation: k,
+                host_allocation: k,
+            })
+            .collect();
+        let pattern: Vec<u8> = (0..N * SEG).map(|i| (i * 131 + 17) as u8).collect();
+        let host_slice = unsafe { std::slice::from_raw_parts_mut(host, N * SEG) };
+
+        let mut check_h2d = |backend: &MemcpyBackend, stream: &Arc<CudaStream>, id: &str| {
+            host_slice.copy_from_slice(&pattern);
+            let r = unsafe { sys::cuMemsetD8_v2(device, 0, N * SEG) };
+            assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "memset");
+            backend.h2d(&copies, stream).expect(id);
+            stream.synchronize().expect("sync");
+            let mut out = vec![0u8; N * SEG];
+            let r = unsafe { sys::cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, device, N * SEG) };
+            assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "DtoH");
+            for k in 0..N {
+                let want = &pattern[k * SEG..(k + 1) * SEG];
+                let got = &out[(N - 1 - k) * SEG..(N - k) * SEG];
+                assert!(got == want, "{id}: range {k} did not land");
+            }
+        };
+
+        let created = ctx.new_stream().expect("stream");
+        let mut injected = MemcpyBackend::with_batch(true);
+        injected.inject_batch_error = true;
+        assert_eq!(injected.submission(), "batch");
+        check_h2d(&injected, &created, "injected");
+        assert_eq!(injected.submission(), "per-range", "a good retry latches");
+
+        // The batch API rejects the legacy default stream; per range accepts it.
+        let legacy = ctx.default_stream();
+        let real = MemcpyBackend::with_batch(true);
+        check_h2d(&real, &legacy, "legacy stream");
+        assert_eq!(
+            real.submission(),
+            "per-range",
+            "the real batch failure latches"
+        );
+
+        // Bad ranges: batch and retry both fail, so batching stays on.
+        let mut bad_ranges = MemcpyBackend::with_batch(true);
+        bad_ranges.inject_batch_error = true;
+        let bad = [CopyDesc {
+            device,
+            host: std::ptr::null_mut(),
+            host_device: 0,
+            size: SEG,
+            device_allocation: 0,
+            host_allocation: 0,
+        }];
+        let err = bad_ranges
+            .d2h(&bad, &created)
+            .expect_err("null host must fail");
+        assert!(
+            err.contains("injected batch error") && err.contains("per-range retry"),
+            "{err}"
+        );
+        assert_eq!(
+            bad_ranges.submission(),
+            "batch",
+            "bad ranges must not latch"
+        );
+        created.synchronize().expect("sync");
+
+        unsafe {
+            sys::cuMemFree_v2(device);
+            sys::cuMemFreeHost(host_ptr);
         }
     }
 }

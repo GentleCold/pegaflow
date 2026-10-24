@@ -214,6 +214,11 @@ mod tests {
         let kernel = KernelBackend::new(&ctx).expect("kernel backend");
         let per_range = MemcpyBackend::per_range();
         let batch = MemcpyBackend::new();
+        assert_eq!(
+            batch.submission(),
+            "batch",
+            "driver or env picked per range"
+        );
 
         let host = alloc_mapped_host(total);
         let device = alloc_device(total);
@@ -260,6 +265,9 @@ mod tests {
                 backend.name()
             );
         }
+
+        // A silent per-range fallback would still move the right bytes.
+        assert_eq!(batch.submission(), "batch", "the batch backend fell back");
 
         unsafe {
             sys::cuMemFree_v2(device);
