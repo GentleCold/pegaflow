@@ -1048,6 +1048,48 @@ runs. gsm8k G4 has not been evaluated with batching on.
   (4 MB < 16 MiB), so no gate rerun. Unit case
   `test_merged_save_rpc_stays_under_size_budget`.
 
+## Run provenance rule (from 2026-10-24, review S2)
+
+Up to now, two things make P4 runs hard to tie to code. First, the remote
+tree was synced by tar, not checkout. Second, `.rsi-rev` (recorded as
+summary.json `rev`) was free-form from it4 on. Per run dir under
+`~/kexi/rsi-runs/` (arms read from the run's own files):
+
+| runs | `rev` | p4probe arms | real `PegaKVConnectorV2` arm |
+|---|---|---|---|
+| it1 slice/replay, old-slice, it2-slice, qwen it2-nonreg | b358ceb / 3d1de18 (commits) | none | yes |
+| it3 probe/defer/norpc/rpc/batch | 3d1de18 / 1bfb590 (commits) | NullV2, NoSaveV2, DeferV2, NoRpcV2, EmptyRpcV2, Batch8V2, Batch32V2, CountV2 | no |
+| it4-knob-01, it4-rep-01 | `it4-wip` | KB32(b/c), KT100, KT250 | yes |
+| it4-def-01, it4-sweep-01 | `it4-default-wip` | KD(b/c), KOff, KB32/64(T1000) | no |
+| qwen it4-nonreg | `it4-default-32-1000-wip` | KOff | yes |
+| qwen qrep / qrep-b, press-01 | `it4-default-32-1000-syncbypass` (qrep: none) | KD(b/c), KOff | no |
+| press-02 | `it4-default-32-1000-kv090` | KD(b), KOff | no |
+| it5-rep-01 | `it5-kv090` | KD(b/c), KOff | no |
+| it5-heldout, qwen it5-nonreg | `it5-kv090` | KOff | yes |
+
+What this means:
+- At commit revs, the tree matched the commit, but the it3 probe arms came
+  from an uncommitted module.
+- Free-form revs name a working state that no commit pins. The it5
+  `worker.py` at it5-rep-01, for example, predates the order fix noted
+  above, and no commit holds it.
+- KD/KDb/KDc are no-op subclasses, so they ran the tree's default code,
+  but they are still not the shipped class path.
+
+All these numbers stand as recorded, as probe evidence. None of them is
+acceptance evidence. That comes from the official runs (MF1, MF2).
+
+From now on:
+- `.rsi-rev` holds the full commit sha the remote tree was synced from. If
+  anything is uncommitted, append `-dirty` and the sha256 of `git diff`
+  (rsi-g5's own tree snapshot replaces this once merged).
+- Every arm runs committed code: `plain`, `baseline`, `old`, and
+  `pegaflow.connector_v2:PegaKVConnectorV2`. A knob comparison runs
+  separately from separate commits, or with a probe arm committed to the
+  repo for review. No remote-only module.
+- p4probe is retired: `p4probe.py` is renamed to `p4probe.py.retired`,
+  so `p4probe:*` arms fail to import.
+
 ## Open items
 
 - Under KV pressure the default's cold req/s stays 2 to 3% below batching
