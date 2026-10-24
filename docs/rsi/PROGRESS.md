@@ -463,10 +463,19 @@ names, magic constants that only exist in the old code).
   - Fixes from the review:
     - c04b6c7: drain the stream on a failed transfer.
     - ef53344: save each block once per call.
-  - `cargo test` and `check.sh` on .44 for each commit are in the doc,
-    with log paths. The first recorded run tested master by mistake and is
-    withdrawn. The failures that remain (`ssd_cache`, ruff format) also
-    occur on master.
+  - Fixes from the H4 review:
+    - 4a51e22: latch to per range per backend, and only if the per-range
+      retry works. Add the `pegaflow_memcpy_batch_fallbacks` metric.
+    - 46e7bb9: fallback tests.
+    - 29158e4: symbol probe.
+    - 3f42b7a: cuda-12 batch is opt-in, and its error carries `failIdx`.
+  - `cargo test` and `check.sh` on .44 are in the doc's "Tests and checks"
+    section, with the commit sha and log paths. Runs come from a `git
+    archive` of the commit. The first recorded run tested master by mistake
+    and is withdrawn. The failures that remain (`ssd_cache`, ruff format)
+    also occur on master.
+  - The sim scripts and outputs are in
+    `~/kexi/rsi-tools/server-reclaim/{sim,out}` on .44.
   - Official r3 cap plan (gate bf9ef3c, v2 8a05b7c), cap-only, 2 runs each.
     E_C at 0.5, old / v2:
     - base: 0.664-0.666 / 0.676-0.683.

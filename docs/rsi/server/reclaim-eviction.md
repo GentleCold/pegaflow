@@ -159,8 +159,9 @@ H_lru is 0.822-0.831 depending on the arm's trace.
   (4845 / 4236). The warm-pass gap (0.466 vs 0.529, over 50 k ext\*_C
   tokens) is not explained. The official run decides.
 
-Non-regression for H3 (replay always runs on the gate's 160 GB pool, so
-reclaim never runs there):
+Non-regression for H3 (the H1-H3 replays ran on the gate's 160 GB pool,
+so reclaim never ran there; the H4 swap pairs and `full-h4` below use
+64 GB, also with 0 evictions):
 - Correctness: gsm8k accuracy is 0.8594 on every arm, and there are no
   digest mismatches.
 - Slice replay (8x6), slice-h3 vs slice-h1: no change.
@@ -270,17 +271,47 @@ The b96e80c guard:
 - One failure mode was found here: the batch call returns
   `CUDA_ERROR_INVALID_VALUE` on the legacy default stream. It works on a
   created stream, which is what GPU workers use. The bench and the kernel
-  test now use a created stream too.
+  test use a created stream. `failed_batch_retries_per_range_and_lands_every_range`
+  pins the legacy-stream failure as a real fallback trigger.
 
-Fallback design (`transfer/memcpy.rs`):
-- The batch path needs driver 13.0+ (cuda-13 build, `_v2` entry point) or
-  12.8+ (cuda-12 build).
-- `PEGAFLOW_DISABLE_BATCH_MEMCPY=1` forces per-range submission.
-- A batch call that returns an error is retried per range, and the rest of
-  the process stays on per range. A repeated copy just rewrites the same
-  bytes. The fallback warns once.
-- At startup the server logs which path it uses ("memcpy transfer
-  submission: batch ..."). Every H4 run logged batch, and none fell back.
+Fallback design (`transfer/memcpy.rs`). `MemcpyBackend::new()` picks per
+range when any of these holds:
+- `PEGAFLOW_DISABLE_BATCH_MEMCPY` is set to anything but empty, `0`,
+  `false`, `no` or `off`.
+- The build is cuda-12 and `PEGAFLOW_ENABLE_BATCH_MEMCPY` is not `1`,
+  `true`, `yes` or `on`. No recorded run has used the cuda-12 entry point
+  on a 12.x driver, and the code b96e80c removed passed it a null `failIdx`.
+  The cuda-12 call now passes a valid slot and puts `failIdx` in the
+  error.
+- The driver is older than 13.0 (cuda-13 build, `_v2` entry point) or 12.8
+  (cuda-12 build).
+- libcuda does not export the entry point. cudarc resolves it lazily and
+  would panic, so `new()` looks it up first.
+
+When a batch call fails, the same ranges are retried per range:
+- A repeated copy just rewrites the same bytes.
+- If the retry works, the batch API is at fault on this stack. That
+  worker's backend (one per GPU worker) stays per range and warns once.
+- If the retry fails too, the ranges are at fault. The transfer returns
+  both errors and batching stays on.
+- `pegaflow_memcpy_batch_fallbacks{outcome=retry_ok|retry_failed}` counts
+  both outcomes.
+
+At startup the server logs which path it uses ("memcpy transfer
+submission: batch ..."). Every H4 run logged batch, and none fell back.
+Those runs predate the per-backend latch, the symbol probe and the cuda-12
+opt-in. They are cuda-13 builds, so the path they measured is unchanged.
+
+Tests: the `choose` table covers the env values, the cuda-12 opt-in, old
+drivers and a missing symbol. The GPU tests check two things:
+- the kernel test asserts the batch backend is still on batch after its
+  run, so a silent fallback fails it;
+- the retry test covers an injected failure, the real legacy-stream
+  failure (both latch, every range lands once), and bad ranges (both
+  errors, no latch).
+
+The GPU tests pass on cuda-13 and cuda-12 builds on driver 13.2, which
+exports both entry points.
 
 Swap-pair protocol: H4 and H1 run at the same time on GPU6/7 and then swap
 GPUs, 32x12 replay, 64 GB pool. Cells are warm2 / warm3 TTFT p50 in
@@ -288,7 +319,7 @@ seconds:
 
 | pair | v2 H1 | v2 H4 | old H1 | old H4 |
 |---|---|---|---|---|
-| `swA` (H4 GPU6, H1 GPU7) | 0.512 / 0.543 | 0.469 / 0.475 | 0.607 / 0.638 | 0.474 / 0.469 |
+| `swA` (H4 GPU6, H1 GPU7) | 0.512 / 0.543 | 0.468 / 0.475 | 0.607 / 0.638 | 0.474 / 0.469 |
 | `swB` (H4 GPU7, H1 GPU6) | 0.521 / 0.554 | 0.487 / 0.495 | 0.607 / 0.606 | 0.470 / 0.487 |
 
 - H4 is 7-14% below H1 for v2 and 20-26% below H1 for old, in both GPU
@@ -302,7 +333,8 @@ Other H4 checks:
 - Correctness: `gsm8k-h4` (64 questions) scores 0.8594 on every arm. Every
   gsm8k G2, G3, and G4 verdict passes for both arms, and digests match the
   baseline.
-- `full-h4` replay (160 GB pool): warm2/3 TTFT p50 is old 0.482 / 0.513 s
+- `full-h4` replay (64 GB pool, 0 evictions on every pass; `full-base` and
+  `full-h3` ran at 160 GB): warm2/3 TTFT p50 is old 0.482 / 0.513 s
   and v2 0.481 / 0.512 s. G4 replay passes on both arms.
 
 The official r3 cap plan (64 convs, C(0.5) = 27.2 GB) reruns for base vs H4
@@ -314,8 +346,11 @@ The r3 plan: 64 convs, U 54.43 GB, and C(0.5) = 27.2 GB = 11536 blocks
 (2.44x GPU KV). The numbers above used the older 32-conv plan, so they are
 not comparable with these.
 
-Cap-only reruns on GPU6/7. The arms are baseline, old, and v2 (8a05b7c via
-`--under-test-path`), all with the same cap plan:
+Cap-only reruns. The arms are baseline, old, and v2 (8a05b7c via
+`--under-test-path`), all with the same cap plan. The GPUs were not
+swapped: both base runs used GPU7 and both H4 runs used GPU6. E_C is a hit
+metric, so the confound is small, but scheduling interleaving can change
+cache state.
 
 E_C over the timed warm passes (C/U 0.25 / 0.5 / 0.75). The `-b` runs
 repeat the gated 0.5 point only:
@@ -340,14 +375,28 @@ repeat the gated 0.5 point only:
   - Base at 0.5 holds 1232-2636 dead blocks, 11-23% of the 11536-block pool.
   - At 0.75 it holds 2630-4458 dead blocks.
   - H4 holds 0 on every pass at every C.
-- The server's `pegaflow_cache_resident_bytes` gauge reports about twice
-  the slot bytes per block (4.72 MB vs 2.36 MB). These dead-memory numbers
-  use the block count instead. Not investigated further.
+- An earlier version reported `pegaflow_cache_resident_bytes` at twice the
+  slot bytes per block. That was an analysis artifact, not a server bug.
+  - The script summed every metric whose name starts with that prefix, so
+    `pegaflow_cache_resident_bytes_by_class` was added on top.
+  - The gauge itself is exactly 2359296 bytes per resident block on every
+    pass.
+  - `sim/cap3.py` now matches exact metric names.
 - G5 still fails at 0.9. Per-block allocation brings the store up to
   plain LRU. Getting past that takes a policy change; see below.
 
-Miss attribution at C/U 0.5 uses the r3 traces (base server). A
-server-faithful sim replays each arm's real query window. It reproduces
+Miss attribution at C/U 0.5 uses the r3 traces (base server). The scripts
+are in `~/kexi/rsi-tools/server-reclaim/sim/` on 10.1.0.44:
+- `r3sim.py` is the server-faithful sim, miss attribution and policies;
+- `gap*.py` walk from the gate model to that sim;
+- `cap3.py` produces the cap3 table and the dead-memory numbers.
+
+`sim/run-all.sh` reruns them against
+`~/kexi/rsi-runs/2026-10-23-qwen3-4b-g5-official-e9f3f33-r3` with the
+gate tree bf9ef3c. The outputs and script sha256s are in
+`~/kexi/rsi-tools/server-reclaim/out/`.
+
+A server-faithful sim replays each arm's real query window. It reproduces
 the logged per-query hit count for 90% (v2) and 84% (old) of timed
 requests. Sim E_C is 0.698 / 0.685 (v2 / old), against 0.684 / 0.681
 measured.
@@ -415,8 +464,9 @@ sync had copied the main checkout instead of this worktree, so `memcpy.rs`,
 `gpu_worker.rs`, `storage/mod.rs` and `offload.rs` on the remote matched
 75dfa4c. That run is withdrawn.
 
-Runs are now made from a `git archive` of the commit, unpacked into
-`~/kexi/pegaflow-rsi-server-reclaim-src`, with the commit in `.rsi-rev`.
+Runs are now made from a `git archive` of the commit, unpacked into a
+dedicated `~/kexi/pegaflow-rsi-server-reclaim-src[-<rev7>]`, with the commit
+in `.rsi-rev`.
 The script is `~/kexi/rsi-tools/server-reclaim/verify.sh <src> 6`, and it
 writes its logs to `~/kexi/logs/rsi-server-reclaim-verify-<rev7>/`. Each
 `env.txt` records the sha256 of those four files, and they match
@@ -452,7 +502,28 @@ Run at 67922b5 (code = ef53344; GPU6):
   `ruff check python/`, clippy `-D warnings` (default features), and
   `cargo check` for pegaflow-core and pegaflow-server. All pass.
 
-The should-fix commits below are verified the same way; see the last run.
+Run at 6a99d43, the final code, including the H4 review fixes 4a51e22,
+46e7bb9, 29158e4, 3f42b7a and 6a99d43. GPU6, logs in
+`~/kexi/logs/rsi-server-reclaim-verify-6a99d43/`. The `env.txt` sha256s
+match `git show 6a99d43:<file>`, for example `memcpy.rs` 41cea3e3.
+- `cargo-test.log` (rc 101, `ssd_cache` only, as above):
+  - pegaflow-core lib: 177 passed, 4 ignored, including
+    `env_switches_err_towards_off` and
+    `build_env_and_driver_pick_the_submission_path`;
+  - every other crate and integration target has the same counts as
+    67922b5.
+- `cargo-test-ignored.log` (cuda-13 build): 4 passed. The four tests are
+  `failed_submit_drains_copies_already_enqueued`,
+  `kernel_matches_direct_both_directions` (it fails on a silent fallback),
+  `failed_batch_retries_per_range_and_lands_every_range` and
+  `installed_driver_exports_the_batch_symbol`.
+- `cargo-test-ignored-cuda12.log`: the three transfer GPU tests pass on a
+  default-features (cuda-12) build. They use the build's
+  `cuMemcpyBatchAsync` entry point with `failIdx` on driver 13.2. No 12.x
+  driver was run.
+- `clippy-cuda13.log`: clean.
+- `check.log` (rc 1): the same 11 `ruff format` files as on master.
+- `check-rest.log` (rc 0): the steps after that failure all pass.
 
 ## Server bug candidates (low priority, not on this branch)
 
@@ -481,10 +552,14 @@ The should-fix commits below are verified the same way; see the last run.
   call (one per layer for Qwen3-4B) and is now one per saved block, so a
   call saving more than 36 blocks makes more allocations. Save duration did
   not move.
-- Batch memcpy runs on driver 595.91.07 / CUDA 13.2 (RTX 4090) only. The
-  stack b96e80c hit is unknown. A failing batch call falls back to per
-  range, but a call that returns success and then misbehaves would not.
-  `PEGAFLOW_DISABLE_BATCH_MEMCPY=1` is the kill switch.
+- Batch memcpy has run only on driver 595.91.07 / CUDA 13.2 (RTX 4090).
+  The stack b96e80c hit is unknown.
+  - A failing batch call falls back to per range, but a call that returns
+    success and then misbehaves would not. `PEGAFLOW_DISABLE_BATCH_MEMCPY=1`
+    is the kill switch.
+  - Before rollout, run one replay on the production driver.
+  - cuda-12 builds stay per range until someone runs them with
+    `PEGAFLOW_ENABLE_BATCH_MEMCPY=1` on a 12.8+ driver.
 - Each region is one allocator node. `PinnedMemoryPool::MAX_ALLOCS` is
   4,000,000 per shard, so regions under about 40 KiB on a 160 GB pool
   would run out of nodes before bytes. Today's regions are far larger.
