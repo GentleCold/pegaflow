@@ -623,15 +623,24 @@ names, magic constants that only exist in the old code).
 
 - P4 it4/it5 (2026-10-24, connector-only, no semantics or server change):
   save batching is a model-agnostic policy knob, on by default:
-  `save_batch_steps = 32`, `save_batch_ms = 1000`, and
-  `save_batch_max_kv_usage = 0.9`, which sends held saves at once when vLLM's
-  GPU KV usage is at least 90%. Sync-save layouts skip batching.
-  - Unpressured DSV2 TP2 3x (`it5-rep-01`): cold p50 -1.9 to +0.6% vs
-    baseline (G4 passes 3/3), against +5% for batching off.
+  `save_batch_steps = 32`, plus `save_batch_max_kv_usage = 0.9`, which sends
+  held saves at once when vLLM's GPU KV usage is at least 90%. A fixed 1 s
+  staleness cap (`Worker.SAVE_HOLD_MAX_S`, formerly the `save_batch_ms` knob,
+  folded per review M3) and a 16 MiB merged-RPC cap are constants.
+  Sync-save layouts skip batching. Every run below is non-official.
+  - Unpressured DSV2 TP2 3x (`it5-rep-01`, replay only, 8x6): the G4
+    replay verdicts pass 3/3 (cold p50 -1.9 to +0.6% vs baseline), against
+    +5% for batching off. gsm8k G2/G3/G4 have not been evaluated with
+    batching on.
   - Pressured DSV2 (`--num-gpu-blocks 1200`): without the KV-pressure send,
     the batch hold cost +53% cold p50. With it, the default is level with
     batching off, with no added preemptions.
-  - Qwen3-4B TP1: no regression (`it4-nonreg`, `it4-qrep-b`).
+  - Qwen3-4B TP1 (8x6, max KV usage 31%): no regression (`it4-nonreg`,
+    `it4-qrep-b`, `it5-nonreg`). The official-regime check (32x12, KV up to
+    99.6%, vs it2d) is pending (review M2).
+  - Review `reviews/P4-dsv2-lite.md`: accept after must-fix. M1 (official
+    DSV2 run under rsi-g5's split mode, including gsm8k) and M2 wait for
+    the rsi-g5 merge.
   - Gate issue seen: a vLLM `--port` bind race (`EADDRINUSE`) killed one
     run_gate (`qwen3-4b-p4-it4-qrep`).
 
