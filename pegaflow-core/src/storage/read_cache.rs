@@ -257,15 +257,41 @@ impl ReadCache {
     pub(super) fn link_group_members(&self, pairs: &[(BlockKey, BlockKey)]) {
         let mut inner = self.inner.lock();
         for (position, member) in pairs {
-            if !inner.cache.contains_key(position) || !inner.cache.contains_key(member) {
-                continue;
-            }
-            inner.links.link(position, member);
-            let depth = depth_of(&inner, position);
-            if let Some(metadata) = resident_metadata_mut(&mut inner, member) {
-                metadata.depth = depth;
-            }
+            link_group_member(&mut inner, position, member);
         }
+    }
+
+    /// Position-aligned membership: entry `i` is the block for `members[i]`,
+    /// or `None` on miss. Unlike [`Self::get_prefix_blocks`] this never stops
+    /// at the first gap — hybrid-cache checkpoint groups (recurrent state)
+    /// have sparse hit patterns by design, where the caller picks the
+    /// rightmost hit instead of a prefix.
+    ///
+    /// `positions[i]` is the group 0 hash of the same position (same
+    /// namespace). Each hit whose key differs from it (a group > 0 block) is
+    /// linked to that position under the same lock, as
+    /// [`Self::link_group_members`] does. Position keys are built for hits
+    /// only.
+    pub(super) fn get_group_members(
+        &self,
+        members: &[BlockKey],
+        positions: &[Vec<u8>],
+    ) -> Vec<Option<Arc<SealedBlock>>> {
+        debug_assert_eq!(members.len(), positions.len());
+        let mut inner = self.inner.lock();
+        members
+            .iter()
+            .zip(positions)
+            .map(|(member, position)| {
+                let block = inner.cache.get(member)?;
+                refresh_recency(&mut inner, member);
+                if member.hash != *position {
+                    let position = BlockKey::new(member.namespace.clone(), position.clone());
+                    link_group_member(&mut inner, &position, member);
+                }
+                Some(block)
+            })
+            .collect()
     }
 
     pub(super) fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
@@ -341,22 +367,6 @@ impl ReadCache {
             }
         }
         found
-    }
-
-    /// Position-aligned membership: entry `i` is the block for `keys[i]`, or
-    /// `None` on miss. Unlike [`Self::get_prefix_blocks`] this never stops at
-    /// the first gap — hybrid-cache checkpoint groups (recurrent state) have
-    /// sparse hit patterns by design, where the caller picks the rightmost
-    /// hit instead of a prefix.
-    pub(super) fn get_blocks_aligned(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
-        let mut inner = self.inner.lock();
-        keys.iter()
-            .map(|key| {
-                inner.cache.get(key).inspect(|_| {
-                    refresh_recency(&mut inner, key);
-                })
-            })
-            .collect()
     }
 
     /// Evict up to `batch_size` cache-owned blocks, reclaimable class first.
@@ -687,6 +697,20 @@ fn resident_metadata_mut<'a>(
         inner.reclaimable.peek_mut(key)
     } else {
         inner.retained.peek_mut(key)
+    }
+}
+
+/// Tie a resident group > 0 block to its resident group 0 position; it takes
+/// the position's depth (also [`UNKNOWN_DEPTH`], so it ranks first, while no
+/// prefix query has covered the position). A non-resident end is ignored.
+fn link_group_member(inner: &mut ReadCacheInner, position: &BlockKey, member: &BlockKey) {
+    if !inner.cache.contains_key(position) || !inner.cache.contains_key(member) {
+        return;
+    }
+    inner.links.link(position, member);
+    let depth = depth_of(inner, position);
+    if let Some(metadata) = resident_metadata_mut(inner, member) {
+        metadata.depth = depth;
     }
 }
 
@@ -1497,13 +1521,11 @@ mod tests {
         insert_all(&cache, &members);
         insert_all(&cache, &positions);
         assert_eq!(cache.get_prefix_blocks(&positions, true).0, 2);
-        cache.link_group_members(
-            &positions
-                .iter()
-                .cloned()
-                .zip(members.iter().cloned())
-                .collect::<Vec<_>>(),
-        );
+        // A membership query links each hit to its position.
+        let raw: Vec<Vec<u8>> = positions.iter().map(|k| k.hash.clone()).collect();
+        let hits = cache.get_group_members(&members, &raw);
+        assert!(hits.iter().all(Option::is_some));
+        drop(hits);
         // The deepest position goes first, its group block before it.
         assert_eq!(
             evict_order(&cache, 2),

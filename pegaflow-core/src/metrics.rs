@@ -72,9 +72,14 @@ pub(crate) struct CoreMetrics {
     pub cache_resident_blocks: UpDownCounter<i64>,
     pub cache_block_evictions_by_class: Counter<u64>,
     pub cache_block_evictions_still_referenced: Counter<u64>,
-    /// Evictions of a block that still had a resident dependent (a deeper
-    /// chain block or another group's block of the same resume point). Stays
-    /// 0 under tail-first eviction except for plain LRU and full cleanup.
+    /// Pressure evictions of a block that still had a known resident
+    /// dependent: a deeper chain block or another group's block of the same
+    /// position, linked by an earlier query. Dependents the server never
+    /// linked (a new turn not yet requeried, decode tails, prefetch inserts,
+    /// children of a re-saved head) are not counted. Nonzero under plain LRU
+    /// (window 0), under the reclaimable class's LRU, and when a tail-first
+    /// round falls back to LRU because pins cover the window. Full cleanup
+    /// (`remove_all`) never counts.
     pub cache_evictions_with_resident_children: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
     pub cache_residence_duration: Histogram<f64>,
@@ -351,7 +356,7 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .build(),
             cache_evictions_with_resident_children: meter
                 .u64_counter("pegaflow_cache_evictions_with_resident_children")
-                .with_description("Pressure evictions of a block whose resident dependents became unreachable")
+                .with_description("Pressure evictions of a block that still had a known (query-linked) resident dependent")
                 .build(),
             cache_eviction_reclaimed_bytes: meter
                 .u64_counter("pegaflow_cache_eviction_reclaimed_bytes")

@@ -449,17 +449,21 @@ impl StorageEngine {
 
     /// Position-aligned membership lookup in the resident read cache: entry
     /// `i` is the sealed block for `hashes[i]`, or `None` on miss. Hashes must
-    /// already carry any group encoding (see `group_hash`).
+    /// already carry any group encoding (see `group_hash`); `raw[i]` is the
+    /// group 0 hash of the same position. Each hit of a group > 0 block is
+    /// tied to its resident group 0 position, as in
+    /// [`Self::link_group_blocks`].
     pub(crate) fn get_membership(
         &self,
         namespace: &str,
+        raw: &[Vec<u8>],
         hashes: &[Vec<u8>],
     ) -> Vec<Option<Arc<crate::block::SealedBlock>>> {
         let keys: Vec<BlockKey> = hashes
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
-        self.read_cache.get_blocks_aligned(&keys)
+        self.read_cache.get_group_members(&keys, raw)
     }
 
     /// Evict all blocks from the resident in-memory read cache.

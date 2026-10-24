@@ -621,9 +621,10 @@ impl PegaEngine {
             .iter()
             .map(|hash| group_hash(hash, group_id))
             .collect();
-        let blocks = self.storage.get_membership(namespace, &encoded);
-        self.link_group_members(namespace, block_hashes, &encoded);
-        Ok(blocks)
+        // Hits are linked to their group 0 position under the lookup's lock.
+        Ok(self
+            .storage
+            .get_membership(namespace, block_hashes, &encoded))
     }
 
     /// Tie each group-encoded block to the group 0 block at the same position
