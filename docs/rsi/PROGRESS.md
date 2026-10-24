@@ -465,6 +465,16 @@ names, magic constants that only exist in the old code).
     - ef53344: save each block once per call.
   - `cargo test` and `check.sh` results are recorded in the doc. The
     failures there (`ssd_cache`, ruff format) also occur on master.
+  - Official r3 cap plan (gate bf9ef3c, v2 8a05b7c), cap-only, 2 runs each.
+    E_C at 0.5, old / v2:
+    - base: 0.664-0.666 / 0.676-0.683.
+    - H4: 0.708-0.716 / 0.710-0.711, hit 0.86, which is H_lru level.
+    - At 0.25 / 0.75, H4 gives +0.10 / +0.06.
+    - Base leaves 11-23% of the pool dead at 0.5; H4 leaves 0.
+  - G5 still fails. In the sim, most of the gap to H_lru comes from the
+    arm's own local hit (v2 sim 0.584 vs 0.828 with the baseline's local).
+    Tail-first eviction is the only policy that beats LRU, and only by
+    about +0.04 (H5 candidate).
 
 ## Semantics changelog
 

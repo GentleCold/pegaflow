@@ -317,7 +317,34 @@ not comparable with these.
 Cap-only reruns on GPU6/7. The arms are baseline, old, and v2 (8a05b7c via
 `--under-test-path`), all with the same cap plan:
 
-Pending: `cap3-base` (GPU7) and `cap3-h4` (GPU6) are running.
+E_C over the timed warm passes (C/U 0.25 / 0.5 / 0.75). The `-b` runs
+repeat the gated 0.5 point only:
+
+| server (run) | old E_C | v2 E_C | old hit | v2 hit |
+|---|---|---|---|---|
+| r3 official (semantics-rsi base) | 0.069 / 0.681 / 0.682 | 0.084 / 0.684 / 0.669 | 0.395 / 0.832 / 0.876 | 0.399 / 0.842 / 0.876 |
+| base (`cap3-base`) | 0.075 / 0.666 / 0.689 | 0.070 / 0.676 / 0.693 | 0.396 / 0.831 / 0.878 | 0.392 / 0.836 / 0.881 |
+| base (`cap3-base-b`) | - / 0.664 / - | - / 0.683 / - | - / 0.828 / - | - / 0.835 / - |
+| H4 (`cap3-h4`) | 0.171 / 0.708 / 0.747 | 0.174 / 0.711 / 0.754 | 0.450 / 0.861 / 0.916 | 0.445 / 0.861 / 0.915 |
+| H4 (`cap3-h4-b`) | - / 0.716 / - | - / 0.710 / - | - / 0.860 / - | - / 0.861 / - |
+
+- H\*_C is 0.861-0.867 / 0.929-0.930 / 0.970-0.971 on every run.
+- H_lru is 0.568-0.594 / 0.857-0.858 / 0.915-0.916.
+- At 0.5, H4 (which includes H1 and H3) adds +0.04-0.05 E_C on both arms:
+  base runs range 0.664-0.683, H4 runs 0.708-0.716. Hit rate rises from
+  0.828-0.836 to 0.860-0.861, which is LRU level (H_lru 0.857).
+- At 0.25 and 0.75 the gain is larger: +0.10 and +0.06 E_C. At 0.75, hit
+  reaches 0.915-0.916, against H_lru 0.915-0.916.
+- Dead memory (pool bytes used minus resident blocks x 2.25 MiB, at pass
+  ends):
+  - Base at 0.5 holds 1232-2636 dead blocks, 11-23% of the 11536-block pool.
+  - At 0.75 it holds 2630-4458 dead blocks.
+  - H4 holds 0 on every pass at every C.
+- The server's `pegaflow_cache_resident_bytes` gauge reports about twice
+  the slot bytes per block (4.72 MB vs 2.36 MB). These dead-memory numbers
+  use the block count instead. Not investigated further.
+- G5 still fails at 0.9. Per-block allocation brings the store up to
+  plain LRU. Getting past that takes a policy change; see below.
 
 Miss attribution at C/U 0.5 uses the r3 traces (base server). A
 server-faithful sim replays each arm's real query window. It reproduces
@@ -371,6 +398,15 @@ measured.
   that is far from 0.9, and its window is a tuning knob with a cliff.
   Scan resistance (SLRU) helps only at a small protected share and hurts
   beyond it.
+- The sim has no allocator, so its LRU (0.698 / 0.685) is what a
+  fragmentation-free server should reach. H4 measures 0.710-0.711 /
+  0.708-0.716, so it is at that level, and the remaining gap to H_lru is
+  the arm's own local hit, not the server.
+- Next hypothesis (H5, not started): tail-first eviction within a window
+  of the oldest blocks, model-agnostic (chain position only). The sim
+  predicts about +0.04 on both arms at 0.5. That is a policy change for a
+  modest gain, which the plain-LRU preference has to weigh. It needs a gate
+  run before it can be claimed.
 
 ## Tests and checks (10.1.0.44, RTX 4090, CUDA 13.2, branch head ef53344)
 
