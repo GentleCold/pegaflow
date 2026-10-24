@@ -299,6 +299,11 @@ def compare(
             _uncertain(g, tag, ref, key)
     counters = [k for k, v in _group().items() if isinstance(v, int)]
     total: dict[str, Any] = {k: sum(g[k] for g in groups.values()) for k in counters}
+    # State digests the probe could not take (``states`` skip reasons). A
+    # ``start_*`` one is a loaded state left unjudged.
+    total["state_skipped"] = dict(
+        Counter(s[3] for r in reqs for s in r.get("states", []) if s[3] not in ("offer", "start"))
+    )
     total["max_rel_l1"] = max((g["max_rel_l1"] for g in groups.values()), default=0.0)
     total["invariant"] = invariant
     total["split_invariant"] = split_invariant
