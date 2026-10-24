@@ -697,7 +697,11 @@ mod tests {
                 host_allocation: k,
             })
             .collect();
-        let pattern: Vec<u8> = (0..N * SEG).map(|i| (i * 131 + 17) as u8).collect();
+        // Mix the range index in: a byte pattern alone repeats every 256 B, so
+        // every range would hold the same bytes and a swapped slot would pass.
+        let pattern: Vec<u8> = (0..N * SEG)
+            .map(|i| ((i * 131 + 17) ^ (i / SEG * 37)) as u8)
+            .collect();
         let host_slice = unsafe { std::slice::from_raw_parts_mut(host, N * SEG) };
 
         let mut check_h2d = |backend: &MemcpyBackend, stream: &Arc<CudaStream>, id: &str| {

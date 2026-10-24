@@ -294,8 +294,9 @@ When a batch call fails, the same ranges are retried per range:
   worker's backend (one per GPU worker) stays per range and warns once.
 - If the retry fails too, the ranges are at fault. The transfer returns
   both errors and batching stays on.
-- `pegaflow_memcpy_batch_fallbacks{outcome=retry_ok|retry_failed}` counts
-  both outcomes.
+- The counter `pegaflow_memcpy_batch_fallbacks{outcome=retry_ok|retry_failed}`
+  counts both outcomes. Prometheus scrapes it as
+  `pegaflow_memcpy_batch_fallbacks_total`.
 
 At startup the server logs which path it uses ("memcpy transfer
 submission: batch ..."). Every H4 run logged batch, and none fell back.
@@ -307,7 +308,7 @@ drivers and a missing symbol. The GPU tests check two things:
 - the kernel test asserts the batch backend is still on batch after its
   run, so a silent fallback fails it;
 - the retry test covers an injected failure, the real legacy-stream
-  failure (both latch, every range lands once), and bad ranges (both
+  failure (both latch, every range lands in its own slot), and bad ranges (both
   errors, no latch).
 
 The GPU tests pass on cuda-13 and cuda-12 builds on driver 13.2, which
@@ -320,7 +321,7 @@ seconds:
 | pair | v2 H1 | v2 H4 | old H1 | old H4 |
 |---|---|---|---|---|
 | `swA` (H4 GPU6, H1 GPU7) | 0.512 / 0.543 | 0.468 / 0.475 | 0.607 / 0.638 | 0.474 / 0.469 |
-| `swB` (H4 GPU7, H1 GPU6) | 0.521 / 0.554 | 0.487 / 0.495 | 0.607 / 0.606 | 0.470 / 0.487 |
+| `swB` (H4 GPU7, H1 GPU6) | 0.521 / 0.554 | 0.487 / 0.495 | 0.607 / 0.606 | 0.470 / 0.486 |
 
 - H4 is 7-14% below H1 for v2 and 20-26% below H1 for old, in both GPU
   assignments. The old arm, which H3 regressed, is now faster than on H1.
@@ -556,7 +557,8 @@ match `git show 6a99d43:<file>`, for example `memcpy.rs` 41cea3e3.
   The stack b96e80c hit is unknown.
   - A failing batch call falls back to per range, but a call that returns
     success and then misbehaves would not. `PEGAFLOW_DISABLE_BATCH_MEMCPY=1`
-    is the kill switch.
+    is the kill switch. Alert on any increase of
+    `pegaflow_memcpy_batch_fallbacks_total`.
   - Before rollout, run one replay on the production driver.
   - cuda-12 builds stay per range until someone runs them with
     `PEGAFLOW_ENABLE_BATCH_MEMCPY=1` on a 12.8+ driver.
