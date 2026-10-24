@@ -1269,6 +1269,96 @@ Judgment, after the coordinator's review of this section:
   is still below native there, I look for a connector-side cause (the TP2
   single-writer save, or the batch hold delaying saves past eviction).
 
+## MF2: official Qwen3-4B non-regression (`2026-10-24-qwen3-4b-p4-mf2`, GPU 0, TP1, 64gb, run_gate pgid 2605995, 08:12:35 to 10:29:34Z)
+
+The setup:
+- `"official": true`, `not_official_because: []`.
+- Gate tree `~/kexi/p4-gate-d25fcc8`, whose `rsi/` is identical to
+  feat/semantics-rsi 4fa78a0 (old-arm plugin fix, hit rate reported). Under
+  test: d25fcc8 (`~/kexi/p4-ut-d25fcc8`).
+- Base server, sha256 d1970ead, the same binary as it2d and G5 r3.
+- Arms plain, baseline, old, v2. Workloads gsm8k (1319), replay (32 x 12)
+  and cap (64 x 12).
+- Capacity floor 2.44x GPU KV, no contamination. `vllm_plugins`: old
+  `pegaflow`, every other arm "".
+
+The pool size differs from it2d's 160gb. Measured U is 32.7 GB for
+gsm8k and 27.95 GB for replay, both under 64 GB, and `G3.no_eviction`
+passes for v2 and old. So the unlimited passes did not evict, and the
+pool difference does not invalidate the comparison.
+
+### Verdicts and G4 vs it2d (`2026-10-23-qwen3-4b-p3-it2d`, 8a05b7c)
+
+Every v2 verdict passes (`pass: true`). G2:
+- gsm8k outputs: 0 differ cold and warm (split-invariant: control 0/1319).
+- Accuracy delta 0.0 pp.
+- Digests: gsm8k 7163 ext matched, replay 18592, cap 230419 (1285
+  uncertain, all preempted). 0 mismatched.
+
+| verdict | it2d v2 | MF2 v2 | MF2 old |
+|---|---|---|---|
+| replay warm p50 vs baseline | -78.4% | -85.3% | -78.2% |
+| replay warm req/s vs baseline | +193% | +293% | +294% |
+| replay cold p50 vs baseline | -54.1% | -65.3% | -63.4% |
+| replay cold req/s vs baseline | +105% | +152% | +149% |
+| gsm8k cold s vs baseline | +0.92% | +0.80% | +2.51% (fail) |
+| gsm8k warm s vs baseline | +0.01% | +0.07% | +1.76% |
+
+The MF2 baseline is slower than it2d's (replay warm p50 3.87 vs 2.55 s).
+In absolute terms, v2's warm p50 is 0.567 vs 0.550 s and its warm req/s
+9.71 vs 10.03. G4 judges every verdict against the same run's baseline,
+and all pass, as they did for it2d.
+
+### Hits
+
+| arm | pass | local | ext | total | H* | E_ext | excess |
+|---|---|---|---|---|---|---|---|
+| v2 | gsm8k warm | 0.914 | 0.078 | 0.992 | 0.992 | 1.0 | 0 |
+| old | gsm8k warm | 0.925 | 0.068 | 0.993 | 0.992 | 1.0 | 1170 |
+| v2 | replay cold | 0.381 | 0.483 | 0.864 | 0.864 | 1.0 | 0 |
+| v2 | replay warm2 | 0.348 | 0.651 | 0.998 | 0.998 | 1.0 | 0 |
+| old | replay warm2 | 0.340 | 0.658 | 0.998 | 0.998 | 1.0 | 195 |
+| it2d v2 | replay warm2 | 0.348 | 0.651 | 0.998 | 0.998 | 1.0 | 0 |
+
+| arm | C/U | hit | H*_C | H_lru | E_C | resident/C (4 passes) |
+|---|---|---|---|---|---|---|
+| v2 MF2 (d25fcc8) | 0.25 | 0.368 | 0.865 | 0.588 | 0.029 | 0.64 to 0.73 |
+| old MF2 | 0.25 | 0.392 | 0.862 | 0.583 | 0.068 | 0.82 to 0.91 |
+| v2 r3 (8a05b7c) | 0.25 | 0.399 | 0.865 | 0.581 | 0.084 | 0.74 to 0.87 |
+| v2 MF2 | 0.5 | 0.777 | 0.929 | 0.857 | 0.592 | 0.59 to 0.69 |
+| old MF2 | 0.5 | 0.840 | 0.930 | 0.857 | 0.673 | 0.75 to 0.83 |
+| v2 r3 | 0.5 | 0.842 | 0.929 | 0.857 | 0.684 | 0.76 to 0.83 |
+| v2 MF2 | 0.75 | 0.865 | 0.971 | 0.916 | 0.673 | 0.65 to 0.74 |
+| old MF2 | 0.75 | 0.879 | 0.971 | 0.915 | 0.688 | 0.71 to 0.85 |
+| v2 r3 | 0.75 | 0.876 | 0.971 | 0.916 | 0.669 | 0.74 to 0.81 |
+
+### Hit-rate judgment: G5 regressed
+
+- Unlimited (G3): no change. v2 is at H* on every pass, the same as it2d.
+- Capacity (G5): **v2 regressed against its own 8a05b7c and against old in
+  the same run.**
+  - At 0.5, v2's hit is 0.777, against old 0.840 and r3 v2 0.842.
+  - At 8a05b7c, v2 was 0.835 to 0.842 in four base-server cap runs (r3,
+    srv-reclaim-cap3-base / -b), level with old (0.828 to 0.832).
+  - This is "差太多", too far off, and it is new in P4.
+- The signature: the server's cache-resident bytes fall from 0.76 to 0.83
+  C to 0.59 to 0.69 C at the same pool use. DSV2 MF1 shows the same
+  pattern (resident 0.64 to 0.77 C, v2 below native).
+
+The leading suspect is save batching, on by default since 3e6f7a3. It is
+the only P4 change on a dense model's save path. MLA and the TP2 single
+writer do not apply to Qwen3-4B. Batching merges up to 32 steps of saves
+into one RPC (here mostly pressure sends, 4001 of 4089 cap RPCs at 0.5).
+That changes how saves reach the server's allocator. A plausible
+mechanism is fragmentation under bursty saves, but it is not proven, and
+the allocator is pegaflow-core (not read).
+
+The test is a cap-only run with batching off (`save_batch_steps = 1`)
+against the default, on the same server, from committed trees. If the
+resident drop and the hit gap go away, batching costs G5 and the default
+has to change (for example, a byte cap well below 16 MiB, or batching
+off when the store is near full).
+
 ## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
 
 Arms: plain, baseline, KOff, v2 with the shipped default (32 steps /
