@@ -72,6 +72,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
      so evict a prefix's groups together and prefer evicting the tail;
    - scan resistance: one-pass sweeps must not flush reused prefixes;
    - save cost: no synchronous wait on the model step.
+   Hit rate has no hard threshold (user, 2026-10-24: "不要设置硬性门槛，只要agent
+   自己判断命中率足够就行了，不要差太多"). Write a "hit-rate judgment" in
+   ITERATIONS.md: measured hit vs H* / H*_C and the reference arms (LRU, old,
+   native), the gap and its cause, and whether it is close enough. Do not
+   block a model on hit-rate level alone; correctness checks stay hard.
    The server is in scope when the evidence points there (eviction, admission,
    pools, query): keep it Kind-aware and model-agnostic (no model names, no
    per-model branches), run `cargo test`, re-run the `old` arm to show no
