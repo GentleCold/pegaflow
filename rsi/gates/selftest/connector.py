@@ -13,23 +13,35 @@ gate run on a new model can prove the gate catches a wrong connector.
 - ``bitflip``: loads correctly, then flips one exponent bit in one element of
   layer 0 of the first loaded block of every group.
 - ``offbyone``: loads block ``i + 1``'s bytes into slot ``i``; a state group
-  (one block per load) gets the state saved just before the right one in
-  save order (the one after it if the right one was saved first).
+  (one block per load) gets the same prefix's state of the next state group
+  (same shapes, other layers), so it never depends on other saved prefixes.
+- ``sync`` (state-group models only): honest bytes, but every load is
+  synchronous. vLLM's align-mode precopy hands the forward the start-state
+  block before a synchronous ``start_load_kv`` writes it, so the forward runs
+  from a stale state; full-attention blocks still land in time.
 
-The negative modes must fail ``G2.digest_self`` and ``G2.digest_vs_baseline``.
+The negative modes must fail ``G2.digest_self`` and ``G2.digest_vs_baseline``
+in every group they corrupt (``sync``: the state groups). The worker appends
+what it corrupted to ``<report_dir>/sabotage-<pid>.jsonl`` (``{"mode",
+"group", "n"}`` per load and group; ``report_dir`` from
+``kv_connector_extra_config``), so the gate can tell a sabotage that changed
+nothing from one the digests missed.
 
 Groups: full attention (incl. MLA) and Mamba state in
 ``mamba_cache_mode=align`` (no speculative blocks). A state group saves the
 states vLLM offers (``boundary_state_offloads``) in ``wait_for_save`` of the
 step whose forward wrote them, and a hit at ``p`` loads one state per state
 group into block ``p / block_size - 1`` plus the full blocks past the local
-hit. Loads on such models are async: vLLM copies the previous state column
-forward before a synchronous ``start_load_kv`` would write it.
+hit. Loads on such models are async (except ``sync``): vLLM copies the
+previous state column forward before a synchronous ``start_load_kv`` would
+write it.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 
@@ -44,7 +56,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, group_kerne
 
 from rsi.gates.rsi_probe import _parts, prefix_keys
 
-MODES = ("honest", "liar", "bitflip", "offbyone")
+MODES = ("honest", "liar", "bitflip", "offbyone", "sync")
 
 
 @dataclass
@@ -82,6 +94,12 @@ class SelftestConnector(KVConnectorBase_V1, SupportsHMA):
                     f"(mamba_cache_mode={mode}); only full attention and align-mode "
                     "Mamba state are supported"
                 )
+        if self._mode == "sync" and not self._state:
+            raise ValueError("SelftestConnector mode sync needs an align-mode Mamba state group")
+        report = extra.get("report_dir")
+        self._report = (
+            os.path.join(str(report), f"sabotage-{os.getpid()}.jsonl") if report else None
+        )
         self._bs = [g.kv_cache_spec.block_size for g in self._groups]
         self._unit = math.lcm(*self._bs)
         if role == KVConnectorRole.SCHEDULER:
@@ -89,7 +107,6 @@ class SelftestConnector(KVConnectorBase_V1, SupportsHMA):
             # and states saved in every state group.
             self._saved: set[str] = set()
             self._state_saved: dict[str, set[int]] = {}
-            self._state_order: list[str] = []  # save order (offbyone's neighbour)
             self._local: dict[str, int] = {}
             self._reqs: dict[str, object] = {}
             self._saves: list[_Job] = []
@@ -134,32 +151,18 @@ class SelftestConnector(KVConnectorBase_V1, SupportsHMA):
             tokens = list(request.prompt_token_ids or [])
             n = self._hit_units(prefix_keys(tokens, [self._unit * (k + 1) for k in range(units)]))
         ext = max(0, n * self._unit - num_computed_tokens)
-        return ext, bool(self._state) and ext > 0
+        return ext, bool(self._state) and ext > 0 and self._mode != "sync"
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
         if num_external_tokens <= 0:
             return
-        if self._mode == "liar":
-            if self._state:  # async: report the (empty) load as done
-                self._loads.append(_Job(request.request_id, [[] for _ in self._groups]))
-            return
         local = self._local.get(request.request_id, 0)
         tokens = list(request.prompt_token_ids or [])
+        # liar: the job names what it claims; the worker loads none of it.
         job = self._job(
             request.request_id, tokens, local, local + num_external_tokens, blocks.get_block_ids()
         )
-        if self._mode == "offbyone":
-            for gid in self._state:
-                if job.blocks[gid]:
-                    key, bid = job.blocks[gid][0]
-                    job.blocks[gid] = [(self._neighbour(key), bid)]
         self._loads.append(job)
-
-    def _neighbour(self, key: str) -> str:
-        """Another state saved in every state group (the right one if none)."""
-        done = [k for k in self._state_order if self._state_saved.get(k) == self._state]
-        i = done.index(key)
-        return done[i - 1] if i > 0 else done[min(1, len(done) - 1)]
 
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         meta = SelftestMetadata(saves=self._saves, loads=self._loads)
@@ -189,10 +192,7 @@ class SelftestConnector(KVConnectorBase_V1, SupportsHMA):
                     continue
                 key = prefix_keys(tokens, [boundary])[0]
                 per_group[gid].append((key, bid))
-                got = self._state_saved.setdefault(key, set())
-                if not got:
-                    self._state_order.append(key)
-                got.add(gid)
+                self._state_saved.setdefault(key, set()).add(gid)
             if any(per_group):
                 jobs.append(_Job(rid, per_group))
         return jobs
@@ -250,6 +250,25 @@ class SelftestConnector(KVConnectorBase_V1, SupportsHMA):
                 for j, (key, _) in enumerate(blocks):
                     self._store[(gid, key)] = [c[j] for c in copies]
 
+    def _source_group(self, gid: int) -> int:
+        """offbyone on a state group: the next state group whose layer views
+        have the same shapes (``gid`` itself if none: no sabotage)."""
+        order = sorted(self._state)
+        shapes = [tuple(v.shape) for v in self._views[gid]]
+        for k in range(1, len(order)):
+            other = order[(order.index(gid) + k) % len(order)]
+            if [tuple(v.shape) for v in self._views[other]] == shapes:
+                return other
+        return gid
+
+    def _record(self, counts: dict[int, int]) -> None:
+        if self._report is None or not counts:
+            return
+        os.makedirs(os.path.dirname(self._report), exist_ok=True)
+        with open(self._report, "a") as f:
+            for gid, n in sorted(counts.items()):
+                f.write(json.dumps({"mode": self._mode, "group": gid, "n": n}) + "\n")
+
     def start_load_kv(self, forward_context, **kwargs) -> None:
         meta = self._get_connector_metadata()
         if not isinstance(meta, SelftestMetadata):
@@ -258,17 +277,29 @@ class SelftestConnector(KVConnectorBase_V1, SupportsHMA):
         self._save(meta.saves)
         with self._lock:
             self._sending.update(job.req_id for job in meta.saves)
+        counts: dict[int, int] = {}
         for job in meta.loads:
             for gid, blocks in enumerate(job.blocks):
                 if not blocks:
                     continue
+                if self._mode == "liar":
+                    counts[gid] = counts.get(gid, 0) + len(blocks)  # claimed, not loaded
+                    continue
+                if self._mode == "sync" and gid in self._state:
+                    counts[gid] = counts.get(gid, 0) + 1  # lands after the precopy
                 keys = [k for k, _ in blocks]
-                if self._mode == "offbyone" and len(keys) > 1:
-                    keys = keys[1:] + keys[-1:]
+                src_gid = gid
+                if self._mode == "offbyone":
+                    if gid in self._state:
+                        src_gid = self._source_group(gid)
+                        counts[gid] = counts.get(gid, 0) + (src_gid != gid)
+                    elif len(keys) > 1:
+                        keys = keys[1:] + keys[-1:]
+                        counts[gid] = counts.get(gid, 0) + 1
                 views = self._views[gid]
                 idx = torch.tensor([b for _, b in blocks], device=views[0].device)
                 for li, v in enumerate(views):
-                    src = torch.stack([self._store[(gid, k)][li] for k in keys])
+                    src = torch.stack([self._store[(src_gid, k)][li] for k in keys])
                     if self._mode == "bitflip" and li == 0:
                         raw = src[0].reshape(-1).view(torch.uint8)
                         # Highest byte of element 0 (little endian): an exponent
@@ -277,10 +308,12 @@ class SelftestConnector(KVConnectorBase_V1, SupportsHMA):
                         spec = self._groups[gid].kv_cache_spec
                         size = spec.dtypes[0].itemsize if gid in self._state else src.element_size()
                         raw[size - 1] ^= 0x40
+                        counts[gid] = counts.get(gid, 0) + 1
                     v.index_copy_(0, idx, src.to(v.device, non_blocking=False))
-            if self._state:
+            if self._state and self._mode != "sync":
                 with self._lock:
                     self._recving.add(job.req_id)
+        self._record(counts)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
