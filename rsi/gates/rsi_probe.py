@@ -238,6 +238,9 @@ class _DigestJob:
     req_id: str
     # Per group: list of (block_index, block_id, prefix_key, covered_tokens).
     blocks: list[list[tuple[int, int, str, int]]]
+    # Schedule episode the bytes belong to: set for a preempted request
+    # (digested in ``handle_preemptions``); None = finish (last episode).
+    episode: int | None = None
 
 
 @dataclass
@@ -256,6 +259,9 @@ class _StateJob:
 class ProbeMetadata(KVConnectorMetadata):
     jobs: list[_DigestJob] = field(default_factory=list)
     states: list[_StateJob] = field(default_factory=list)
+    # Requests preempted this step: digested before this step's forward can
+    # reuse their freed blocks.
+    preempted: list[_DigestJob] = field(default_factory=list)
 
 
 @dataclass
@@ -266,6 +272,11 @@ class _Live:
     request: Any = None  # vLLM's Request (token ids for state keys)
     # Mamba state digests: [episode, covered, group, "offer" | "start" | skip reason]
     states: list[list[Any]] = field(default_factory=list)
+    # Block table per group (scheduler output: new, appended, resumed) and
+    # computed tokens after the last scheduled step: what a preemption frees.
+    blocks: list[list[int]] = field(default_factory=list)
+    computed: int = 0
+    preempt_digested: list[int] = field(default_factory=list)  # episodes
 
 
 class RsiProbe(KVConnectorBase_V1, SupportsHMA):
@@ -515,18 +526,28 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         self._step += 1
         sched = scheduler_output.num_scheduled_tokens
         states: list[_StateJob] = []
+        # First: a request preempted (and possibly resumed) this step is
+        # digested from the block table of its previous episode.
+        preempted = [
+            job
+            for rid in sorted(getattr(scheduler_output, "preempted_req_ids", None) or ())
+            if (job := self._preempt_job(rid)) is not None
+        ]
         for req in scheduler_output.scheduled_new_reqs:
             self._episode(req.req_id, req.num_computed_tokens)
             self._advance(req.req_id, req.num_computed_tokens, sched.get(req.req_id, 0))
             self._start_states(req.req_id, req.block_ids, req.num_computed_tokens, states)
+            self._track(req.req_id, req.block_ids, True, req.num_computed_tokens, sched)
         cached = scheduler_output.scheduled_cached_reqs
         for i, rid in enumerate(cached.req_ids):
             before = cached.num_computed_tokens[i]
-            if rid in cached.resumed_req_ids:
+            resumed = rid in cached.resumed_req_ids
+            if resumed:
                 self._episode(rid, before)
                 # A resumed request's new_block_ids replace its block table.
                 self._start_states(rid, cached.new_block_ids[i], before, states)
             self._advance(rid, before, sched.get(rid, 0))
+            self._track(rid, cached.new_block_ids[i], resumed, before, sched)
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         offers = getattr(block_state, "boundary_state_offloads", None) or {}
         for rid, entries in offers.items():
@@ -539,7 +560,39 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             before |= dict(zip(cached.req_ids, cached.num_computed_tokens, strict=True))
             self._unoffered(before, sched, offers)
         jobs, self._pending = self._pending, []
-        return ProbeMetadata(jobs=jobs, states=states)
+        return ProbeMetadata(jobs=jobs, states=states, preempted=preempted)
+
+    def _track(self, rid: str, block_ids, replace: bool, before: int, sched) -> None:
+        """Keep the block table (``replace``: new or resumed request) and the
+        computed tokens after this step."""
+        live = self._live.get(rid)
+        if live is None:
+            return
+        groups = [list(b or []) for b in (block_ids or [None] * len(self._groups))]
+        if replace or not live.blocks:
+            live.blocks = groups
+        else:
+            for table, new in zip(live.blocks, groups, strict=True):
+                table.extend(new)
+        live.computed = before + sched.get(rid, 0)
+
+    def _preempt_job(self, rid: str) -> _DigestJob | None:
+        """The bytes a preempted episode leaves (its fully computed blocks),
+        tagged by that episode; without it its computations stay undigested
+        and its loads unjudged."""
+        live = self._live.get(rid)
+        if live is None or not live.episodes or live.request is None:
+            return None
+        digest = self._digest_mode(live)
+        if digest is None:
+            return None
+        ep = len(live.episodes) - 1
+        tokens = list(live.request.all_token_ids)
+        computed = min(live.computed, len(tokens))
+        per_group = self._entries(tokens, computed, live.episodes[-1][2], digest, live.blocks)
+        live.preempt_digested.append(ep)
+        live.blocks, live.computed = [], 0
+        return _DigestJob(rid, per_group, episode=ep) if any(per_group) else None
 
     def _unoffered(self, before: dict[str, int], sched: dict[str, int], offers) -> None:
         """A step ending exactly on a state boundary computes that state; one
@@ -668,6 +721,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                     "episodes": live.episodes,
                     "progress": live.progress,
                     **({"states": live.states} if self._state_groups else {}),
+                    "preempt_digested": live.preempt_digested,
                     "finish_step": self._step,
                     "digest": digest,
                     "key_tokens": kt,
@@ -681,11 +735,19 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
 
         # Bytes held at finish come from the last episode: blocks ending at
         # or below its start were loaded (local or external), the rest computed.
-        start = live.episodes[-1][2]
+        per_group = self._entries(tokens, computed, live.episodes[-1][2], digest, block_ids)
+        if not any(per_group):
+            return False, None
+        self._pending.append(_DigestJob(rid, per_group))
+        return True, None
+
+    def _entries(self, tokens, computed: int, start: int, digest: str, block_ids):
+        """Per group: (index, block id, key, covered) of the blocks to digest."""
         per_group = []
-        for gid, ids in enumerate(block_ids):
+        for gid in range(len(self._groups)):
+            ids = block_ids[gid] if gid < len(block_ids) else []
             if gid in self._skip_groups or gid in self._state_groups:
-                # State groups were digested in their steps (wait_for_save).
+                # State groups are digested in their steps (wait_for_save).
                 per_group.append([])
                 continue
             bt = self._groups[gid].kv_cache_spec.block_size
@@ -696,17 +758,14 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             entries = [
                 (i, bid)
                 for i, bid in enumerate(ids[:n])
-                if bid != 0 and (digest == "full" or (digest == "ref") == ((i + 1) * bt > start))
+                if bid and (digest == "full" or (digest == "ref") == ((i + 1) * bt > start))
             ]
             covered = [(i + 1) * bt for i, _ in entries]
             keys = prefix_keys(tokens, covered)
             per_group.append(
                 [(i, bid, k, c) for (i, bid), k, c in zip(entries, keys, covered, strict=True)]
             )
-        if not any(per_group):
-            return False, None
-        self._pending.append(_DigestJob(rid, per_group))
-        return True, None
+        return per_group
 
     def _digest_mode(self, live: _Live) -> str | None:
         """``full`` (every complete block), ``ref`` (computed blocks only, i.e.
@@ -773,8 +832,9 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         return self._weights[key]
 
     def _digest_group(self, req_id: str, gid: int, blocks, episode: int | None = None) -> None:
-        """``episode``: a state record (digested in its step), tagged by that
-        schedule episode; None = a finish-time record (last episode)."""
+        """``episode``: a state record (digested in its step) or a preempted
+        episode's blocks, tagged by that schedule episode; None = a
+        finish-time record (last episode)."""
         assert self._raw is not None
         raw = self._raw
         ids = [b[1] for b in blocks]
@@ -818,6 +878,18 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
 
     def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
         return
+
+    def handle_preemptions(self, kv_connector_metadata) -> None:
+        # Called before this step's forward (and before any load of it): the
+        # freed blocks still hold the preempted episode's bytes.
+        if not isinstance(kv_connector_metadata, ProbeMetadata):
+            return
+        if kv_connector_metadata.preempted:
+            self._open_digest_log()
+        for job in kv_connector_metadata.preempted:
+            for gid, blocks in enumerate(job.blocks):
+                if blocks:
+                    self._digest_group(job.req_id, gid, blocks, episode=job.episode)
 
     def wait_for_save(self):
         # Mamba states of this step: after its forward wrote them (same

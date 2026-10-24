@@ -264,12 +264,13 @@ LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 #   ... --gsm8k-limit 64 --replay-convs 8 --replay-turns 6 --cap-convs 8 --cap-turns 6
 ```
 
-Self-test at onboarding (gsm8k only, 128 questions per self-test arm, no PegaFlow):
+Self-test at onboarding (gsm8k, 128 questions per self-test arm, no PegaFlow;
+add `preempt` to judge loads after preemption, required on hybrid models):
 
 ```bash
 ... run_gate --model ... --tag <model>-selftest \
   --arms plain,baseline,selftest:honest,selftest:liar,selftest:bitflip,selftest:offbyone \
-  --workloads gsm8k --gsm8k-limit 128
+  --workloads gsm8k,preempt --gsm8k-limit 128
 ```
 
 Exit code 0 only for an **official** run in which every required verdict passes.
@@ -365,7 +366,7 @@ the last accepted run record by hand until `--accepted` exists.
   partial chunk is not saved by default), so its hit lengths are multiples of
   256 where the oracle counts 16-token blocks: its `E` / `E_C` include that
   granularity loss and are not a pure eviction-policy comparison),
-  `selftest:<mode>` (gsm8k only), `<module>:<Class>`. `old`, `native`,
+  `selftest:<mode>` (gsm8k and preempt only), `<module>:<Class>`. `old`, `native`,
   `lmcache` and the connector under test run as `MultiConnector[arm, RsiProbe]`.
   `--under-test-path DIR` (another tree's `python/`) stages a snapshot,
   `<run>/under-test-overlay/pegaflow`, and puts only that dir first on the
@@ -581,7 +582,8 @@ the last accepted run record by hand until `--accepted` exists.
   the value passed to `get_num_new_matched_tokens` at the last attempt before
   the episode was scheduled; `first_computed` = `start` of the first episode.
   Load failures (`invalid_block_ids`, `failed_recving`) go to
-  `load_errors.jsonl`.
+  `load_errors.jsonl`. `preempt_digested` lists the episodes digested at
+  their preemption (below).
 - Digest (V3): requests tagged `vllm_xargs.rsi_digest = full` (gsm8k: all;
   replay `warm`/`cold`: every 4th conversation, all of its turns) are digested
   at finish: every fully computed block of every transferable group, per layer,
@@ -589,7 +591,27 @@ the last accepted run record by hand until `--accepted` exists.
   64-bit position-weighted sums + float L1). `register_kv_caches` checks that
   geometry against every layer view and raises on mismatch. Tags, from the
   request's last episode: `local` (`covered <= local_hit`), `external`
-  (`<= start`), `computed`.
+  (`<= start`), `computed`. Two kinds of record carry `episode` and are
+  tagged from that episode instead:
+  - Mamba state groups in `mamba_cache_mode=align` (spec.json
+    `probe.state_groups`): vLLM frees a block-end state once compute moves
+    past it, so none is left at finish. The probe digests a state in
+    `wait_for_save` of the step that holds it: the states vLLM offers
+    (`kv_connector_block_state.boundary_state_offloads`, for requests that
+    step computes, boundary above the episode start) and each episode's
+    start state (block `start / block_size - 1`: the local hit or what a
+    connector loaded). `requests.jsonl` `states` lists `[episode, covered,
+    group, what]`; `what` other than `offer` / `start` is a skip
+    (`not_offered`: a step ended on a boundary vLLM did not offer, e.g.
+    past the prompt; `start_*`: a start state not digestable). A state
+    exists only where a step ended exactly on the boundary, so the
+    reference counts only those computations (`digest_compare`).
+    `state_skipped` reports the skips; any `start_*` fails the digest
+    verdict (a loaded state nobody judged).
+  - Preempted episodes: `handle_preemptions` (before the step that reuses
+    the freed blocks) digests the fully computed blocks the preempted
+    episode left, so its computations are references and its loads are
+    judged.
 - Digest comparison (`digest_compare.compare(REF, CAND, invariant)`): a loaded
   block (local or external) is `matched` if all its layers equal some computed
   copy of the same (rank, group, prefix key) in REF; `mismatched` if it equals
@@ -631,11 +653,23 @@ the last accepted run record by hand until `--accepted` exists.
   judged-fraction floor (untagged conversations share prefixes).
 - G2.digest_groups (baseline and every arm, gsm8k probe): every group the
   oracle scores (not skipped, not scratch) has digest records and is not in
-  `probe.digest_skipped_groups`. The probe lists every `MambaSpec` group
-  there (outside `mamba_cache_mode=align` a state block is the running
-  state; in align mode the block-end states are freed before finish, where
-  the probe digests), so a hybrid model fails G2 until Mamba state is
-  digested (the honest self-test needs it too).
+  `probe.digest_skipped_groups`. The probe lists a `MambaSpec` group there
+  outside `mamba_cache_mode=align` (a state block is the running state) or
+  with speculative blocks; align-mode state groups are digested per step.
+- G2.preempt (when `--workloads` includes `preempt`; not part of the
+  official profile): the first 32 gsm8k prompts, each decoding exactly 640
+  tokens (`ignore_eos`, no stop), cold then warm, on a GPU pool of
+  `preempt_gpu_blocks` blocks (4 requests of 2048 tokens, at least one
+  `max_model_len` request; `max_num_seqs` capped at the block count, which
+  vLLM requires for Mamba). Requests outgrow the pool, vLLM preempts and
+  resumes them, and every request and preempted episode is digested.
+  Passes iff the exhaustive digest verdict passes (as `G2.digest_self.cap`,
+  judged >= 0.9 for an arm), vLLM preempted some request
+  (`preempted_requests > 0`), and some load of a resumed episode was
+  compared (`after_preemption`). Required for the honest self-test when run;
+  a negative arm is judged by the gsm8k digest checks. On Qwen3.5-4B (40
+  blocks) the baseline preempts 16 of 64 requests and judges 62 resumed
+  loads, 0 mismatched.
 - G2.gsm8k: `|acc(pass) - acc(baseline cold)| <= 0.01` for cold and warm.
   G2.gsm8k_outputs (when gate.json declares batch invariance; otherwise
   reported only, see `G2.batch_control`): every completion equals
@@ -886,8 +920,14 @@ the last accepted run record by hand until `--accepted` exists.
     (`not_official_because: G5 trace does not separate freeze from H*_C`).
     This is workload validity, not a bar on the arm, so it stays hard.
 - Self-test arms (`rsi/gates/selftest/connector.py`, full-attention groups
-  only): `honest` saves at finish and loads saved prefixes (must pass every G2
-  check); `liar` claims every complete unit and loads nothing; `bitflip` flips
-  one byte of the first loaded block; `offbyone` loads block i+1 into slot i.
+  and align-mode Mamba state groups): `honest` saves full blocks at finish and
+  states when vLLM offers them (in `wait_for_save` of that step), and serves
+  the longest prefix whose full blocks and states (every state group) are
+  saved (must pass every G2 check); `liar` claims every complete unit and
+  loads nothing; `bitflip` flips one byte of the first loaded block (state
+  groups: an exponent bit of the first packed state); `offbyone` loads block
+  i+1 into slot i (state groups: another saved state). On state-group models
+  every load is async: vLLM's align-mode precopy runs before a synchronous
+  `start_load_kv` and would overwrite the loaded state.
   Each negative arm must fail both G2 digest checks; output deltas are reported
   only (one flipped byte need not change a greedy completion).

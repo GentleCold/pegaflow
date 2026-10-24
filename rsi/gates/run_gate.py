@@ -15,7 +15,7 @@ Arms:
   old                      reference connector (pegaflow.connector:PegaKVConnector), black box
   native                   reference: vLLM's OffloadingConnector (CPU offload), record only
   lmcache                  reference: LMCacheConnectorV1, local CPU backend only, record only
-  selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k only
+  selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k and preempt only
   <module>:<Class>         connector under test
 
 Every arm/workload pair gets fresh servers. Passes: ``cold``, then before each
@@ -133,6 +133,17 @@ MIN_PREWARMED = 0.9  # share of split requests whose hit reaches the last full b
 # ones establish gate.json ``batch_invariant``; any divergence refutes it.
 BATCH_PASS = "alone"
 BATCH_CONTROL_N = 64
+# Preempt workload (optional, ``--workloads ...,preempt``): the first
+# PREEMPT_N gsm8k prompts, each decoding exactly PREEMPT_OUT tokens, cold then
+# warm (reset + poison), on a GPU KV pool of ``preempt_gpu_blocks`` blocks
+# (PREEMPT_REQS requests of PREEMPT_SPAN tokens): requests outgrow the pool
+# and vLLM preempts and resumes them, so the digests (every request, every
+# preempted episode) judge loads after a preemption. G2.preempt.
+PREEMPT = "preempt"
+PREEMPT_N = 32
+PREEMPT_OUT = 640
+PREEMPT_SPAN = 2048
+PREEMPT_REQS = 4
 MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
 
 
@@ -849,7 +860,10 @@ def vllm_server(
     pf_port,
     log,
     cpu_bytes: int = 0,
+    num_gpu_blocks: int = 0,
 ):
+    """``num_gpu_blocks``: the stage's own GPU KV pool (preempt), else
+    ``--num-gpu-blocks``."""
     lease = PortLease(1, block=VLLM_PORT_BLOCK, log=log)
     (port,) = lease.ports
     env = os.environ.copy()
@@ -908,7 +922,9 @@ def vllm_server(
         "--max-num-batched-tokens",
         str(args.max_num_batched_tokens),
         "--max-num-seqs",
-        str(args.max_num_seqs),
+        # A small pool (preempt) holds at most one Mamba block per decoding
+        # sequence: vLLM refuses max_num_seqs above the block count.
+        str(min(args.max_num_seqs, num_gpu_blocks) if num_gpu_blocks else args.max_num_seqs),
         "--enable-prefix-caching",
         "--gpu-memory-utilization",
         str(args.gpu_mem),
@@ -928,8 +944,8 @@ def vllm_server(
     cfg = kv_transfer_config(arm, probe_dir, "tagged", cpu_bytes)
     if cfg is not None:
         cmd += ["--kv-transfer-config", json.dumps(cfg)]
-    if args.num_gpu_blocks:
-        cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks)]
+    if num_gpu_blocks or args.num_gpu_blocks:
+        cmd += ["--num-gpu-blocks-override", str(num_gpu_blocks or args.num_gpu_blocks)]
     vllm_cmd = cmd  # before the isolation prefix: summary.json records it per stage
     cmd = isolated(args, arm, log, cmd)
     url = f"http://127.0.0.1:{port}"
@@ -954,6 +970,26 @@ def reset_and_poison(url: str) -> dict[str, Any]:
     if not results or not all(isinstance(x, dict) and x.get("bytes") for x in results):
         raise RuntimeError(f"rsi_poison did not cover the KV cache: {results}")
     return {"poisoned": results}
+
+
+def preempt_gpu_blocks(spec: dict[str, Any], max_model_len: int) -> int:
+    """GPU KV blocks of the preempt stage: room for PREEMPT_REQS requests of
+    PREEMPT_SPAN tokens, and at least what vLLM needs to admit one request of
+    ``max_model_len`` (plus its null block). Full / window groups take a block
+    per ``block_size`` tokens; an align-mode Mamba group 2 (+ speculative)."""
+
+    def per_request(tokens: int) -> int:
+        n = 0
+        for g in spec["kv_cache_config"]["groups"]:
+            s = g["spec"]
+            if "MambaSpec" in s.get("mro", []):
+                n += 2 + int(s.get("num_speculative_blocks") or 0)
+            else:
+                w = s.get("sliding_window")
+                n += -(-min(tokens, w + s["block_size"] if w else tokens) // s["block_size"])
+        return n
+
+    return max(PREEMPT_REQS * per_request(PREEMPT_SPAN), per_request(max_model_len) + 1)
 
 
 def cap_names(repeats: int) -> list[str]:
@@ -1043,6 +1079,7 @@ def run_arm_workload(
         d.mkdir(parents=True)
     kind = arm_kind(arm)
     gsm = workload == "gsm8k"
+    pre = workload == PREEMPT
     cap = workload.startswith("cap")
     if cap and capacity <= 0 and kind != "baseline":
         raise ValueError("cap workload needs a capacity")
@@ -1073,6 +1110,7 @@ def run_arm_workload(
             pf_port,
             out / "vllm.log",
             store_bytes if kind in _OFFLOAD else 0,
+            args.preempt_blocks if pre else 0,
         )
         stack.enter_context(cm)
         if kind == "lmcache":
@@ -1091,6 +1129,10 @@ def run_arm_workload(
                 names += [*SPLIT_PASSES, BATCH_PASS]  # the split and batch controls
             elif kind == "baseline" and not split_inv:
                 names.append("split")  # same-split references for warm computed KV
+        elif pre:
+            prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, PREEMPT_N)
+            names = ["cold", "warm"]
+            result["gpu_blocks"] = args.preempt_blocks
         else:
             convs = workloads.build_turns(
                 Path(args.replay_file),
@@ -1121,7 +1163,7 @@ def run_arm_workload(
             pf_before = (
                 asyncio.run(workloads.scrape(pf_metrics, ("pegaflow",))) if pf_metrics else {}
             )
-            if gsm:
+            if gsm or pre:
                 # Digest every request: under batch invariance every copy is a
                 # reference, so nothing a connector loads goes unjudged.
                 xargs = {"rsi_pass": name, "rsi_digest": "full"}
@@ -1135,6 +1177,7 @@ def run_arm_workload(
                         xargs=xargs,
                         logprobs=kind == "plain" and (alone or name in SPLIT_PASSES),
                         prewarm=alone or name == "split",
+                        **({"max_tokens": PREEMPT_OUT, "free_run": True} if pre else {}),
                     )
                 )
                 (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
@@ -1690,6 +1733,28 @@ def _digest_verdict(
     }
 
 
+def _preempt_verdict(r: dict[str, Any] | None, min_judged: float | None) -> dict[str, Any]:
+    """G2.preempt (when the ``preempt`` workload ran): the stage's digests
+    are exhaustive (every request and every preempted episode digested), so
+    every loaded block is judged; vLLM must have preempted some request and
+    some block loaded by a resumed episode must have been compared."""
+    if r is None or "error" in r:
+        return {"pass": False, "reason": "not evaluated"}
+    d = r.get("digest_self")
+    v = _digest_verdict(d, min_judged, exhaustive=True)
+    if d is None:
+        return v
+    after = d.get("after_preemption", {})
+    v["preempted_requests"] = d.get("preempted_requests", 0)
+    v["after_preemption"] = after
+    v["gpu_blocks"] = r.get("gpu_blocks")
+    resumed_loads = after.get("local_compared", 0) + after.get("external_compared", 0)
+    if not v["preempted_requests"] or not resumed_loads:
+        v["pass"] = False
+        v.setdefault("reason", "no preemption, or no load after one was compared: vacuous")
+    return v
+
+
 def digest_groups(probe: Path) -> dict[str, Any]:
     """G2.digest_groups: every group whose blocks a connector transfers (not
     skipped by the oracle, not scratch) has digest records in the probe dir,
@@ -1991,6 +2056,7 @@ def verdicts(
         )
         if "cap" in base
         else {"pass": True, "na": "no cap workload"},
+        **({"G2.preempt": _preempt_verdict(base[PREEMPT], None)} if PREEMPT in base else {}),
     }
     base_errors = {wl: r["error"] for wl, r in base.items() if "error" in r}
     if base_errors:
@@ -2028,15 +2094,17 @@ def verdicts(
         diffs = {p: _differ(ref_cold, _outputs(run_dir, label, p)) for p in ("cold", "warm")}
         split_diffs = split_differ(ctrl, _outputs(run_dir, label, "warm"))
         g["G2.gsm8k_outputs"] = _outputs_verdict(diffs, invariant, split_inv, split_diffs)
+        if PREEMPT in per_all:
+            g["G2.preempt"] = _preempt_verdict(per_all[PREEMPT], MIN_JUDGED_GSM8K)
         if kind == "selftest":
             # Negative arms must be caught by both digest checks (a single
             # flipped byte need not change a greedy output, so outputs are
             # only reported); the honest arm must pass every G2 check.
             digests = ("G2.digest_self.gsm8k", "G2.digest_vs_baseline.gsm8k")
             if label == "selftest-honest":
-                g["pass"] = all(
-                    g[k]["pass"] for k in (*digests, "G2.gsm8k_outputs", "G2.digest_groups")
-                )
+                need = (*digests, "G2.gsm8k_outputs", "G2.digest_groups")
+                need += ("G2.preempt",) if "G2.preempt" in g else ()
+                g["pass"] = all(g[k]["pass"] for k in need)
                 g["expect"] = "pass every G2 check"
             else:
                 g["pass"] = not any(g[k]["pass"] for k in digests)
@@ -2374,7 +2442,7 @@ def official_problems(
     for need in ("plain", "baseline", "under_test"):
         if need not in kinds:
             out.append(f"arm {need} missing")
-    if set(wls) != set(WORKLOADS):
+    if set(wls) - {PREEMPT} != set(WORKLOADS):
         out.append(f"workloads {wls} != {','.join(WORKLOADS)}")
     if args.num_gpu_blocks or args.vllm_arg:
         out.append("--num-gpu-blocks / --vllm-arg override")
@@ -2759,6 +2827,13 @@ def main(argv: list[str] | None = None) -> int:
     model_dir = REPO / "docs" / "rsi" / "models" / Path(args.model).name
     gate_file, committed = model_dir / "gate.json", model_dir / "spec.json"
     gate = json.loads(gate_file.read_text()) if gate_file.exists() else {}
+    args.preempt_blocks = 0
+    if PREEMPT in args.workloads.split(","):
+        if not committed.exists():
+            ap.error(f"the {PREEMPT} workload sizes its GPU pool from {committed} (missing)")
+        args.preempt_blocks = preempt_gpu_blocks(
+            json.loads(committed.read_text()), args.max_model_len
+        )
     run_dir = Path(args.runs_root) / f"{date.today().isoformat()}-{args.tag}"
     run_dir.mkdir(parents=True, exist_ok=True)
     gate_pyc = (run_dir / PYCACHE_DIR).resolve()
@@ -2788,7 +2863,7 @@ def main(argv: list[str] | None = None) -> int:
     cuda_bad = cuda_problems(cuda)
     print(f"[gate] cuda env {json.dumps(cuda)} problems {cuda_bad}", flush=True)
     pool_checks: list[dict[str, Any]] = []
-    uncapped = [w for w in wls if w != "cap"]
+    uncapped = [w for w in wls if w not in ("cap", PREEMPT)]
     if any(arm_kind(a) in _STORES for a in arms) and uncapped:
         if committed.exists():
             spec = json.loads(committed.read_text())
@@ -2807,7 +2882,9 @@ def main(argv: list[str] | None = None) -> int:
         kind = arm_kind(arm)
         label = arm_label(arm)
         for wl in wls:
-            if wl != "gsm8k" and kind in ("plain", "selftest"):
+            if kind == "plain" and wl != "gsm8k":
+                continue
+            if kind == "selftest" and wl not in ("gsm8k", PREEMPT):
                 continue
             if wl != "cap":
                 if kind in _STORES and wl not in measured_u:

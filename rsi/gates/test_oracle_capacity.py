@@ -2153,3 +2153,80 @@ def test_workload_sessions_never_reuse_connections():
         if f.name == "workloads.py":
             text = text.replace(text[text.index("def session(") : text.index("# ---", text.index("def session("))], "")  # fmt: skip
         assert not re.search(r"ClientSession\(|TCPConnector\(", text), f
+
+
+def _preempt_probe(tmp_path, digested: bool, warm_byte: str):
+    """``a`` (cold) computes 3 full blocks in episode 0, is preempted and
+    recomputes them in episode 1 with other rounding (``F*'``). With
+    ``digested`` the probe digested episode 0's blocks at preemption
+    (``preempt_digested``, records ``episode`` 0). ``b`` (warm, resumed after
+    a preemption: episode 1) loads 2 blocks (``warm_byte`` at block 1):
+    the copy saved from episode 0."""
+    a = _req("p", 3, 1, "cold") | {"req_id": "a", "digest": "full"}
+    a["episodes"], a["progress"] = [[1, 0, 0], [5, 0, 0]], [[1, 3 * BT], [5, 3 * BT + 1]]
+    a["preempt_digested"] = [0] if digested else []
+    b = _req("p", 3, 10, "warm") | {"req_id": "b", "digest": "full"}
+    b["episodes"], b["progress"] = [[10, 0, 0], [12, 0, 2 * BT]], [[10, BT], [12, 3 * BT + 1]]
+    b["preempt_digested"] = [0]
+
+    def rec(rid, c, byte, **kw):
+        blk = {"key": f"p:{c // BT - 1}", "covered": c, "exact": [byte], "l1": [1.0]}
+        return {"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": [blk]} | kw  # fmt: skip
+
+    digests = [rec("a", c, f"F{c}'") for c in (BT, 2 * BT, 3 * BT)]
+    if digested:
+        digests += [rec("a", c, f"F{c}", episode=0) for c in (BT, 2 * BT, 3 * BT)]
+    digests += [rec("b", BT, f"F{BT}"), rec("b", 2 * BT, warm_byte), rec("b", 3 * BT, "Fb")]
+    return _probe(tmp_path, [a, b], digests)
+
+
+@pytest.mark.parametrize(
+    "digested,warm_byte,matched,mismatched,uncertain",
+    [
+        (True, f"F{2 * BT}", 2, 0, 0),
+        (True, "X", 1, 1, 0),
+        (False, f"F{2 * BT}", 0, 0, 2),  # the saved copy was never digested
+        (False, "X", 0, 0, 2),
+    ],
+    ids=["digested-match", "digested-wrong", "undigested-match", "undigested-wrong"],
+)
+def test_preempted_episode_blocks_complete_the_reference(
+    tmp_path, digested, warm_byte, matched, mismatched, uncertain
+):
+    """Without batch invariance only an exhaustive reference judges a load:
+    the blocks a preempted episode computed are digested at preemption, so a
+    copy saved from that episode is a reference and a wrong load mismatches."""
+    from rsi.gates import digest_compare
+
+    d = digest_compare.compare(
+        *[_preempt_probe(tmp_path, digested, warm_byte)] * 2, invariant=False
+    )
+    g = d["groups"]["0"]
+    assert (g["external_matched"], g["external_mismatched"], g["external_uncertain"]) == (matched, mismatched, uncertain)  # fmt: skip
+    assert d["preempted_requests"] == 2
+    after = d["after_preemption"]
+    assert (after["external_compared"], after["external_uncertain"]) == (2, uncertain)
+
+
+def _pre(preempted: int, resumed_loads: int, mismatched: int = 0) -> dict:
+    d = {k: 0 for k in run_gate.digest_compare._group() if k != "first_bad"}
+    d |= {"local_compared": 10, "local_matched": 10 - mismatched, "local_mismatched": mismatched}
+    d |= {"invariant": False, "groups": {}, "preempted_requests": preempted}
+    d["after_preemption"] = {"local_compared": resumed_loads, "external_compared": 0}
+    return {"digest_self": d, "gpu_blocks": 40}
+
+
+@pytest.mark.parametrize(
+    "r,ok",
+    [
+        (_pre(4, 3), True),
+        (_pre(0, 0), False),  # vLLM never preempted: vacuous
+        (_pre(4, 0), False),  # preempted, but no resumed load was judged
+        (_pre(4, 3, mismatched=1), False),
+        (None, False),
+        ({"error": "crashed"}, False),
+    ],
+    ids=["ok", "no-preemption", "no-resumed-load", "mismatch", "missing", "crashed"],
+)
+def test_preempt_verdict_needs_judged_loads_after_preemption(r, ok):
+    assert run_gate._preempt_verdict(r, None)["pass"] is ok

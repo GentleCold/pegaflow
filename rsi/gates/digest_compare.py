@@ -2,8 +2,9 @@
 
 Each digested block (all layers of one group on one rank) is tagged from the
 request's *last* schedule episode in ``requests.jsonl`` (the bytes held at
-finish come from it), or, for a state record (``episode`` set: a Mamba align
-state digested in its step), from that episode:
+finish come from it), or, for a record with ``episode`` set (a Mamba align
+state digested in its step, or the blocks a preempted episode left, digested
+before the step that reuses them), from that episode:
 
 - ``local``: ``covered <= local_hit`` (vLLM's own prefix cache);
 - ``external``: ``local_hit < covered <= start`` (loaded by the connector);
@@ -32,6 +33,9 @@ preempted or not.
 Computed blocks are compared against the other computed copies: ``exact``
 when equal to one of them; under batch invariance every copy must be exact.
 ``max_rel_l1`` reports the closest per-layer float L1 for the inexact ones.
+``after_preemption`` counts the loaded blocks of episodes after the first
+(a request resumed after preemption), per tag: compared / matched /
+mismatched / uncertain.
 Without split invariance (``split_invariant=False``: the computed KV depends
 on where the computation started, e.g. vLLM's MLA prefill attends to the
 cached context separately and merges), a computed block is judged only
@@ -111,11 +115,12 @@ def state_groups(probe_dir: Path) -> set[int]:
 
 def records(
     probe_dir: Path,
-) -> Iterator[tuple[Key, str, tuple[str, ...], list[float], str, Split]]:
-    """(key, tag, per-layer exact digests, per-layer l1, req_id, split) per
-    digested block; ``split`` = (start of the episode, its ``progress`` chunk
-    ends below the block's end). The episode is the record's ``episode``
-    (state records, digested in their step), else the last one (finish)."""
+) -> Iterator[tuple[Key, str, tuple[str, ...], list[float], str, Split, int]]:
+    """(key, tag, per-layer exact digests, per-layer l1, req_id, split,
+    episode index) per digested block; ``split`` = (start of the episode, its
+    ``progress`` chunk ends below the block's end). The episode is the
+    record's ``episode`` (state records, digested in their step), else the
+    last one (finish)."""
     views: dict[str, list[tuple[int, int, list[int]]]] = {}
     for r in _requests(probe_dir):
         if r["episodes"]:
@@ -140,7 +145,7 @@ def records(
                 tag = "local" if c <= local else "external" if c <= start else "computed"
                 key = (rec["rank"], rec["group"], blk["key"])
                 split = (start, tuple(e for e in ends if e < c))
-                yield key, tag, tuple(blk["exact"]), blk["l1"], rec["req_id"], split
+                yield key, tag, tuple(blk["exact"]), blk["l1"], rec["req_id"], split, ep
 
 
 class Reference:
@@ -153,7 +158,7 @@ class Reference:
         self.split_copies: dict[tuple[Key, Split], dict[tuple[str, ...], list[Any]]] = defaultdict(
             dict
         )
-        for key, tag, exact, l1, _, split in records(probe_dir):
+        for key, tag, exact, l1, _, split, _ep in records(probe_dir):
             if tag == "computed":
                 self.copies[key].setdefault(exact, [0, l1])[0] += 1
                 self.split_copies[(key, split)].setdefault(exact, [0, l1])[0] += 1
@@ -164,7 +169,8 @@ class Reference:
         self.state_groups = state_groups(probe_dir)
         self.computers: Counter[tuple[str, str]] = Counter()
         # Of those, computations whose bytes were never digested: a preempted
-        # (non-last) episode of a digested request, or an untagged request.
+        # (non-last) episode of a digested request the probe did not digest
+        # at preemption (``preempt_digested``), or an untagged request.
         # State records are digested per episode, so for "state" only
         # untagged requests count.
         self.preempted: Counter[tuple[str, str]] = Counter()
@@ -173,6 +179,7 @@ class Reference:
             kt = r["key_tokens"]
             ranges = computed_ranges(r)
             views = _episode_views(r) if r["episodes"] else []
+            done = set(r.get("preempt_digested", []))
             for k, (start, end) in enumerate(ranges):
                 ends = set(views[k][2]) if k < len(views) else set()
                 for e in range((start // kt + 1) * kt, end + 1, kt):
@@ -182,7 +189,7 @@ class Reference:
                         self.computers[(kind, key)] += 1
                         if r.get("digest") is None:
                             self.untagged[(kind, key)] += 1
-                        elif k + 1 < len(ranges) and kind == "block":
+                        elif k + 1 < len(ranges) and kind == "block" and k not in done:
                             self.preempted[(kind, key)] += 1
 
     def kind(self, key: Key) -> tuple[str, str]:
@@ -245,7 +252,10 @@ def compare(
         r["req_id"] for r in reqs if align and (not r.get("prompt_len") or r["prompt_len"] % align)
     }
     by_pass: dict[str, Counter[str]] = defaultdict(Counter)
-    for key, tag, exact, l1, rid, split in records(cand_dir):
+    after: Counter[str] = Counter(
+        {f"{t}_{k}": 0 for t in _LOADED for k in ("compared", "matched", "mismatched", "uncertain")}
+    )
+    for key, tag, exact, l1, rid, split, ep in records(cand_dir):
         g = groups[key[1]]
         copies = ref.copies.get(key, {})
         if tag == "computed":
@@ -275,16 +285,20 @@ def compare(
                 g["max_rel_l1"] = max(g["max_rel_l1"], rel)
             continue
         if not copies:
+            after[f"{tag}_uncertain"] += ep > 0 and bool(ref.computers[ref.kind(key)])
             if ref.computers[ref.kind(key)]:
                 _uncertain(g, tag, ref, key)
             else:
                 g[f"{tag}_unreferenced"] += 1
             continue
         g[f"{tag}_compared"] += 1
+        after[f"{tag}_compared"] += ep > 0
         if exact in copies:
             g[f"{tag}_matched"] += 1
+            after[f"{tag}_matched"] += ep > 0
         elif invariant or ref.occurrences(key) >= ref.computers[ref.kind(key)]:
             g[f"{tag}_mismatched"] += 1
+            after[f"{tag}_mismatched"] += ep > 0
             if g["first_bad"] is None:
                 best = min(copies, key=lambda d: sum(x != y for x, y in zip(d, exact, strict=True)))
                 bad = [i for i, (x, y) in enumerate(zip(best, exact, strict=True)) if x != y]
@@ -297,6 +311,7 @@ def compare(
                 }
         else:
             _uncertain(g, tag, ref, key)
+            after[f"{tag}_uncertain"] += ep > 0
     counters = [k for k, v in _group().items() if isinstance(v, int)]
     total: dict[str, Any] = {k: sum(g[k] for g in groups.values()) for k in counters}
     # State digests the probe could not take (``states`` skip reasons). A
@@ -305,6 +320,8 @@ def compare(
         Counter(s[3] for r in reqs for s in r.get("states", []) if s[3] not in ("offer", "start"))
     )
     total["max_rel_l1"] = max((g["max_rel_l1"] for g in groups.values()), default=0.0)
+    total["after_preemption"] = dict(after)
+    total["preempted_requests"] = sum(len(r["episodes"]) > 1 for r in reqs)
     total["invariant"] = invariant
     total["split_invariant"] = split_invariant
     # With ``align`` every pass reports ``unjudged_nonaligned`` (0 included).
