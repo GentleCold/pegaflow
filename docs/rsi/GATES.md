@@ -305,7 +305,9 @@ the last accepted run record by hand until `--accepted` exists.
   `provenance.REMOTE`), each tree's native-extension sha256, and the
   pegaflow-server binary's sha256 with its tree's `.rsi-rev` (a claim: a
   binary is not tied to a rev). A run with `--under-test-path` is official
-  only if the under-test tree is verified. G0.provenance (every arm, and
+  only if the under-test snapshot is verified, and any run only if the gate
+  tree and the venv `pegaflow` tree are verified too (an unverified judge or
+  oracle is not official; `run_gate.provenance_problems`). G0.provenance (every arm, and
   baseline): every spec dump (scheduler and each worker) records the module
   files of `rsi.gates.rsi_probe`, the worker extension, vLLM, torch,
   `pegaflow` (+ its loaded native module, `site/usercustomize` if loaded)

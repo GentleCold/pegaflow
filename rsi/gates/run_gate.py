@@ -1695,6 +1695,30 @@ def record_provenance(args, run_dir: Path) -> dict[str, Any]:
         trees.cleanup()
 
 
+_PROVENANCE_ROLES = {
+    "gate": "gate tree (rsi/, the judge)",
+    "venv_pegaflow": "venv pegaflow (oracle semantics, reference arms)",
+    "under_test": "connector under test (snapshot)",
+}
+
+
+def provenance_problems(prov: dict[str, Any]) -> list[str]:
+    """Official only if every tree the run imports is verified: the gate
+    tree, the venv's ``pegaflow`` and, with ``--under-test-path``, the
+    snapshot of the tree under test (M6)."""
+    out = []
+    for key, role in _PROVENANCE_ROLES.items():
+        rec = prov.get(key)
+        if rec is None:
+            if key != "under_test":
+                out.append(f"{role}: provenance not recorded")
+            continue
+        if not rec.get("verified"):
+            root = rec.get("root") or rec.get("source", {}).get("root")
+            out.append(f"{role} {root} at an unverified rev ({rec.get('reason')})")
+    return out
+
+
 def _teardown_failed(e: BaseException) -> bool:
     """``e`` or any exception it was raised from/during is a TeardownError
     (``launched``'s finally raises it while another error is in flight)."""
@@ -1914,11 +1938,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{CONTAMINATION_P99:g}x baseline {c['baseline_p99']:.3g}s"
         for c in contaminated
     ]
-    if "under_test" in prov and not prov["under_test"]["verified"]:
-        problems.append(
-            f"connector under test {prov['under_test']['root']} at an unverified rev"
-            f" ({prov['under_test'].get('reason')})"
-        )
+    problems += provenance_problems(prov)
     dirs = {arm_label(a): expected_pegaflow(args, arm_kind(a)) for a in arms}
     v = verdicts(results, run_dir, committed, gate, dirs)
     floor = None

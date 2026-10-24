@@ -746,6 +746,25 @@ def test_stage_copies_only_the_verified_rev(tmp_path):
     assert (snap / "a.py").read_text() == "x = 1\n"
 
 
+@pytest.mark.parametrize("bad", [None, "gate", "venv_pegaflow", "under_test"])
+def test_every_imported_tree_must_be_verified(bad):
+    """M6: an unverified gate tree (the judge) or venv ``pegaflow`` (the
+    oracle's semantics) makes the run non-official, as the tree under test
+    does."""
+    prov = {
+        "gate": {"root": "/g", "verified": True},
+        "venv_pegaflow": {"root": "/v", "verified": True},
+        "under_test": {"source": {"root": "/u"}, "verified": True},
+    }
+    if bad:
+        prov[bad] = prov[bad] | {"verified": False, "reason": "tree differs from rev"}
+    problems = run_gate.provenance_problems(prov)
+    assert len(problems) == (bad is not None), problems
+    assert run_gate.provenance_problems({"gate": {"verified": True}}) == [
+        "venv pegaflow (oracle semantics, reference arms): provenance not recorded"
+    ]
+
+
 def test_module_files_must_resolve_under_gate_and_venv(tmp_path):
     import sys
 
