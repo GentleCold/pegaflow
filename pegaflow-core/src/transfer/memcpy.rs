@@ -12,7 +12,11 @@
 //! kept as the fallback:
 //! - `PEGAFLOW_DISABLE_BATCH_MEMCPY` set to anything but empty, `0`, `false`,
 //!   `no` or `off` selects it for the whole process;
-//! - drivers older than the batch API select it;
+//! - `cuda-12` builds select it unless `PEGAFLOW_ENABLE_BATCH_MEMCPY` is `1`,
+//!   `true`, `yes` or `on`: their entry point has never run in a recorded test,
+//!   and the code b96e80c removed passed it a null `failIdx`;
+//! - drivers older than the batch API, or a libcuda without the symbol, select
+//!   it;
 //! - a batch call that returns an error is retried per range. If the retry
 //!   succeeds, the batch API is at fault on this stack and that backend submits
 //!   per range from then on. If the retry fails too, the ranges are at fault,
@@ -43,6 +47,10 @@ const BATCH_SYMBOL: &str = "cuMemcpyBatchAsync_v2";
 const BATCH_SYMBOL: &str = "cuMemcpyBatchAsync";
 
 const DISABLE_BATCH_ENV: &str = "PEGAFLOW_DISABLE_BATCH_MEMCPY";
+const ENABLE_BATCH_ENV: &str = "PEGAFLOW_ENABLE_BATCH_MEMCPY";
+
+/// Batching is opt-in on `cuda-12` builds; see the module doc.
+const BATCH_NEEDS_OPT_IN: bool = !cfg!(feature = "cuda-13");
 
 /// A run of input copies that are contiguous on both the device and the host
 /// side, submitted as a single copy.
@@ -123,6 +131,8 @@ enum Choice {
     Batch,
     /// `PEGAFLOW_DISABLE_BATCH_MEMCPY` is set to a value that is not false.
     DisabledByEnv,
+    /// A `cuda-12` build without `PEGAFLOW_ENABLE_BATCH_MEMCPY` set to true.
+    NotOptedIn,
     /// The driver version is unknown or older than the batch API.
     OldDriver,
     /// The driver is new enough but libcuda does not export [`BATCH_SYMBOL`].
@@ -134,6 +144,7 @@ impl Choice {
         match self {
             Self::Batch => "batch",
             Self::DisabledByEnv => "per-range (disabled by env)",
+            Self::NotOptedIn => "per-range (cuda-12 build, batch is opt-in)",
             Self::OldDriver => "per-range (driver older than the batch API)",
             Self::MissingSymbol => "per-range (libcuda does not export the batch symbol)",
         }
@@ -160,16 +171,31 @@ fn disables(value: &std::ffi::OsStr) -> bool {
     !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
 }
 
-/// `symbol_present` is only asked once the env and the driver version allow
-/// batching.
-fn choose(
-    env: Option<&std::ffi::OsStr>,
+/// `PEGAFLOW_ENABLE_BATCH_MEMCPY` opts in only for `1`, `true`, `yes` or `on`
+/// (any case): an opt-in errs towards off too.
+fn enables(value: &std::ffi::OsStr) -> bool {
+    let v = value.to_string_lossy().trim().to_ascii_lowercase();
+    matches!(v.as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// The environment and build inputs to [`choose`].
+struct Inputs<'a> {
+    disable_env: Option<&'a std::ffi::OsStr>,
+    enable_env: Option<&'a std::ffi::OsStr>,
+    needs_opt_in: bool,
     driver_version: Option<i32>,
-    symbol_present: impl FnOnce() -> bool,
-) -> Choice {
-    if env.is_some_and(disables) {
+}
+
+/// `symbol_present` is only asked once the env, the build and the driver
+/// version allow batching.
+fn choose(inputs: Inputs<'_>, symbol_present: impl FnOnce() -> bool) -> Choice {
+    if inputs.disable_env.is_some_and(disables) {
         return Choice::DisabledByEnv;
     }
+    if inputs.needs_opt_in && !inputs.enable_env.is_some_and(enables) {
+        return Choice::NotOptedIn;
+    }
+    let driver_version = inputs.driver_version;
     match driver_version {
         Some(v) if v >= MIN_BATCH_DRIVER => {
             if symbol_present() {
@@ -183,17 +209,35 @@ fn choose(
 }
 
 impl MemcpyBackend {
-    /// Batch submission when the driver supports it and it is not disabled
-    /// through `PEGAFLOW_DISABLE_BATCH_MEMCPY`; per-range submission otherwise.
+    /// Batch submission when the build, the env and the driver allow it (see
+    /// the module doc); per-range submission otherwise.
     pub fn new() -> Self {
-        let env = std::env::var_os(DISABLE_BATCH_ENV);
+        Self::detect(BATCH_NEEDS_OPT_IN)
+    }
+
+    /// [`Self::new`] without the `cuda-12` opt-in, so GPU tests exercise the
+    /// batch entry point of whichever build they run in.
+    #[cfg(test)]
+    pub(crate) fn new_without_opt_in() -> Self {
+        Self::detect(false)
+    }
+
+    fn detect(needs_opt_in: bool) -> Self {
+        let disable_env = std::env::var_os(DISABLE_BATCH_ENV);
+        let enable_env = std::env::var_os(ENABLE_BATCH_ENV);
         let mut version = 0;
         // SAFETY: writes one c_int; a CUDA context is not required.
         let result = unsafe { sys::cuDriverGetVersion(&mut version) };
         let driver = (result == sys::cudaError_enum::CUDA_SUCCESS).then_some(version);
-        let choice = choose(env.as_deref(), driver, batch_symbol_present);
+        let inputs = Inputs {
+            disable_env: disable_env.as_deref(),
+            enable_env: enable_env.as_deref(),
+            needs_opt_in,
+            driver_version: driver,
+        };
+        let choice = choose(inputs, batch_symbol_present);
         info!(
-            "memcpy transfer submission: {} (driver={version}, min_batch_driver={MIN_BATCH_DRIVER}, {DISABLE_BATCH_ENV}={env:?})",
+            "memcpy transfer submission: {} (driver={version}, min_batch_driver={MIN_BATCH_DRIVER}, {DISABLE_BATCH_ENV}={disable_env:?}, {ENABLE_BATCH_ENV}={enable_env:?})",
             choice.describe()
         );
         Self::with_batch(choice == Choice::Batch)
@@ -378,7 +422,7 @@ fn submit_batch(
     // call (the driver reads them before returning). Every range is a valid
     // device range plus pinned host memory kept alive by the caller until the
     // stream is synchronized. Merged ranges never overlap.
-    let result = unsafe {
+    let (result, fail_idx) = unsafe {
         batch_memcpy(
             dsts.as_mut_ptr(),
             srcs.as_mut_ptr(),
@@ -391,8 +435,9 @@ fn submit_batch(
         )
     };
     if result != sys::cudaError_enum::CUDA_SUCCESS {
+        let at = fail_idx.map_or(String::new(), |i| format!(" at range {i}"));
         return Err(format!(
-            "cuMemcpyBatchAsync {} of {} ranges failed: {result:?}",
+            "cuMemcpyBatchAsync {} of {} ranges failed{at}: {result:?}",
             direction.name(),
             merged.len()
         ));
@@ -414,13 +459,15 @@ unsafe fn batch_memcpy(
     attr_idxs: *mut usize,
     num_attrs: usize,
     stream: sys::CUstream,
-) -> sys::CUresult {
+) -> (sys::CUresult, Option<usize>) {
     // SAFETY: forwarded from `submit_batch`.
-    unsafe {
+    let result = unsafe {
         sys::cuMemcpyBatchAsync_v2(
             dsts, srcs, sizes, count, attrs, attr_idxs, num_attrs, stream,
         )
-    }
+    };
+    // The `_v2` entry point does not report which copy failed.
+    (result, None)
 }
 
 #[cfg(not(feature = "cuda-13"))]
@@ -437,10 +484,10 @@ unsafe fn batch_memcpy(
     attr_idxs: *mut usize,
     num_attrs: usize,
     stream: sys::CUstream,
-) -> sys::CUresult {
-    let mut fail_idx = 0usize;
+) -> (sys::CUresult, Option<usize>) {
+    let mut fail_idx = usize::MAX;
     // SAFETY: forwarded from `submit_batch`; `fail_idx` is a valid out slot.
-    unsafe {
+    let result = unsafe {
         sys::cuMemcpyBatchAsync(
             dsts,
             srcs,
@@ -452,7 +499,9 @@ unsafe fn batch_memcpy(
             &mut fail_idx,
             stream,
         )
-    }
+    };
+    // SIZE_MAX means the error is not tied to one copy.
+    (result, (fail_idx != usize::MAX).then_some(fail_idx))
 }
 
 impl TransferBackend for MemcpyBackend {
@@ -506,46 +555,108 @@ mod tests {
     }
 
     #[test]
-    fn kill_switch_and_driver_version_pick_the_submission_path() {
+    fn env_switches_err_towards_off() {
         use std::ffi::OsStr;
-        let new_driver = Some(MIN_BATCH_DRIVER);
-        let cases: [(&str, Option<&str>, Option<i32>, Choice); 9] = [
-            ("unset", None, new_driver, Choice::Batch),
-            ("empty", Some(""), new_driver, Choice::Batch),
-            ("zero", Some("0"), new_driver, Choice::Batch),
-            ("false", Some("FALSE"), new_driver, Choice::Batch),
-            ("one", Some("1"), new_driver, Choice::DisabledByEnv),
-            ("true", Some("true"), new_driver, Choice::DisabledByEnv),
+        for v in ["", "0", "false", "FALSE", " no ", "off"] {
+            assert!(!disables(OsStr::new(v)), "disable={v:?}");
+            assert!(!enables(OsStr::new(v)), "enable={v:?}");
+        }
+        for v in ["1", "true", "Yes", "on"] {
+            assert!(disables(OsStr::new(v)), "disable={v:?}");
+            assert!(enables(OsStr::new(v)), "enable={v:?}");
+        }
+        // Unrecognised values disable and do not enable.
+        assert!(disables(OsStr::new("2")) && !enables(OsStr::new("2")));
+    }
+
+    #[test]
+    fn build_env_and_driver_pick_the_submission_path() {
+        use std::ffi::OsStr;
+        fn inp(
+            dis: Option<&'static str>,
+            en: Option<&'static str>,
+            opt_in: bool,
+            drv: Option<i32>,
+        ) -> Inputs<'static> {
+            Inputs {
+                disable_env: dis.map(OsStr::new),
+                enable_env: en.map(OsStr::new),
+                needs_opt_in: opt_in,
+                driver_version: drv,
+            }
+        }
+        let new = Some(MIN_BATCH_DRIVER);
+        let old = Some(MIN_BATCH_DRIVER - 10);
+        let cases = [
+            ("default", inp(None, None, false, new), true, Choice::Batch),
             (
-                "env wins over driver",
-                Some("1"),
-                None,
+                "disabled",
+                inp(Some("1"), None, false, new),
+                true,
                 Choice::DisabledByEnv,
             ),
             (
                 "old driver",
-                None,
-                Some(MIN_BATCH_DRIVER - 10),
+                inp(None, None, false, old),
+                true,
                 Choice::OldDriver,
             ),
-            ("unknown driver", None, None, Choice::OldDriver),
+            (
+                "unknown driver",
+                inp(None, None, false, None),
+                true,
+                Choice::OldDriver,
+            ),
+            (
+                "missing symbol",
+                inp(None, None, false, new),
+                false,
+                Choice::MissingSymbol,
+            ),
+            (
+                "cuda-12 default",
+                inp(None, None, true, new),
+                true,
+                Choice::NotOptedIn,
+            ),
+            (
+                "cuda-12 enable=0",
+                inp(None, Some("0"), true, new),
+                true,
+                Choice::NotOptedIn,
+            ),
+            (
+                "cuda-12 enabled",
+                inp(None, Some("1"), true, new),
+                true,
+                Choice::Batch,
+            ),
+            (
+                "disable wins",
+                inp(Some("1"), Some("1"), true, new),
+                true,
+                Choice::DisabledByEnv,
+            ),
+            (
+                "cuda-12 old driver",
+                inp(None, Some("1"), true, old),
+                true,
+                Choice::OldDriver,
+            ),
         ];
-        for (id, env, driver, want) in cases {
-            assert_eq!(
-                choose(env.map(OsStr::new), driver, || true),
-                want,
-                "case {id}"
-            );
+        for (id, inputs, symbol, want) in cases {
+            assert_eq!(choose(inputs, || symbol), want, "case {id}");
         }
-        // A new enough driver without the symbol falls back; the probe is not
-        // consulted once the env or the version already decided.
-        assert_eq!(choose(None, new_driver, || false), Choice::MissingSymbol);
+        // The probe is not consulted once the env, the build or the version
+        // already decided.
         let probe = || -> bool { panic!("probe must not run") };
-        assert_eq!(
-            choose(Some(OsStr::new("1")), new_driver, probe),
-            Choice::DisabledByEnv
-        );
-        assert_eq!(choose(None, None, probe), Choice::OldDriver);
+        for decided in [
+            inp(Some("1"), None, false, new),
+            inp(None, None, true, new),
+            inp(None, None, false, old),
+        ] {
+            assert_ne!(choose(decided, probe), Choice::Batch);
+        }
     }
 
     /// The driver on a GPU host exports the symbol this build calls.

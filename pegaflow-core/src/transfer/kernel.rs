@@ -213,7 +213,7 @@ mod tests {
         let stream = ctx.new_stream().expect("stream");
         let kernel = KernelBackend::new(&ctx).expect("kernel backend");
         let per_range = MemcpyBackend::per_range();
-        let batch = MemcpyBackend::new();
+        let batch = MemcpyBackend::new_without_opt_in();
         assert_eq!(
             batch.submission(),
             "batch",
