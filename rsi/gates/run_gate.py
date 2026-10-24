@@ -1086,7 +1086,9 @@ def run_arm_workload(
         )
         stack.enter_context(cm)
         if kind == "lmcache":
-            result["lmcache"] = lmcache_config(out / "vllm.log", store_bytes, Path(args.lmcache_overlay))
+            result["lmcache"] = lmcache_config(
+                out / "vllm.log", store_bytes, Path(args.lmcache_overlay)
+            )
         if cap and pf_http:
             # What the server actually allocated: must not exceed C.
             m = asyncio.run(workloads.scrape(f"http://127.0.0.1:{pf_http}", ("pegaflow",)))
