@@ -1898,6 +1898,58 @@ def test_split_control_establishes_gate_claim(claim, ctrl, ok):
 
 
 @pytest.mark.parametrize(
+    "claim,ctrl,ok",
+    [
+        (True, _ctrl(0, 0), True),
+        (False, _ctrl(0, 0), False),  # declared non-invariant, measured invariant
+        (True, _ctrl(0, 1), False),  # one logprob moved: not batch-invariant
+        (False, _ctrl(0, 1), True),  # GDN: logprobs move alone vs batched
+        (True, _ctrl(1, 1), False),
+        (False, _ctrl(1, 1, prewarmed=9), True),
+        (False, _ctrl(1, 1, prewarmed=5), False),  # alone ran at another split
+        (False, _ctrl(0, 0, n=0, prewarmed=0), False),  # nothing compared
+        (False, None, False),
+    ],
+    ids=[
+        "inv-ok",
+        "false-variant-claim",
+        "logprob-refutes",
+        "variant-logprob",
+        "output-refutes",
+        "variant-ok",
+        "vacuous",
+        "empty",
+        "missing",
+    ],  # fmt: skip
+)
+def test_batch_control_establishes_gate_claim(claim, ctrl, ok):
+    assert run_gate._batch_control_verdict(ctrl, claim)["pass"] is ok
+
+
+def test_batch_control_compares_alone_with_the_batched_split_prefix(tmp_path):
+    """``alone`` repeats the first prompts of ``split``: each is compared with
+    the same prompt batched, and its pre-warm must reach the last full block."""
+    import json
+
+    d = tmp_path / run_gate.GATE_DIR / "plain" / "gsm8k"
+    d.mkdir(parents=True)
+    tok = {"logprobs": [-0.5], "prompt_tokens": 40, "cached": 32}
+    (d / "split-outputs.json").write_text(json.dumps(["a", "b", "c"]))
+    (d / "split-tokens.json").write_text(json.dumps([tok, tok, tok]))
+    (d / "alone-outputs.json").write_text(json.dumps(["a", "x"]))
+    (d / "alone-tokens.json").write_text(json.dumps([tok, tok | {"cached": 16}]))
+    ctrl = run_gate.batch_control(tmp_path)
+    assert (ctrl["n"], ctrl["differ"], ctrl["logprob_differ"], ctrl["prewarmed"]) == (
+        2,
+        [False, True],
+        [False, False],
+        1,
+    )
+    (d / "alone-outputs.json").write_text(json.dumps(["a", "b", "c", "d"]))
+    assert run_gate.batch_control(tmp_path) is None  # more than split: not comparable
+
+
+@pytest.mark.parametrize(
     "split_inv,cold,warm,vs_split,ok",
     [
         (True, 0, 0, (None, None), True),

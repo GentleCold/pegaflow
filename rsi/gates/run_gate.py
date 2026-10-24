@@ -127,6 +127,12 @@ SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 # same-split references for warm computed blocks.
 SPLIT_PASSES = ("split_ref", "split")
 MIN_PREWARMED = 0.9  # share of split requests whose hit reaches the last full block
+# Batch control (gsm8k, plain arm): ``alone`` repeats the first
+# BATCH_CONTROL_N prompts of ``split`` (same pre-warm, so the same split) one
+# request at a time. Completions and logprobs equal to the batched ``split``
+# ones establish gate.json ``batch_invariant``; any divergence refutes it.
+BATCH_PASS = "alone"
+BATCH_CONTROL_N = 64
 MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
 
 
@@ -1081,7 +1087,7 @@ def run_arm_workload(
             prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, limit)
             names = ["cold", "warm"]
             if kind == "plain":
-                names += list(SPLIT_PASSES)  # the split control
+                names += [*SPLIT_PASSES, BATCH_PASS]  # the split and batch controls
             elif kind == "baseline" and not split_inv:
                 names.append("split")  # same-split references for warm computed KV
         else:
@@ -1118,15 +1124,16 @@ def run_arm_workload(
                 # Digest every request: under batch invariance every copy is a
                 # reference, so nothing a connector loads goes unjudged.
                 xargs = {"rsi_pass": name, "rsi_digest": "full"}
+                alone = name == BATCH_PASS
                 res = asyncio.run(
                     workloads.run_gsm8k(
                         url,
                         "m",
-                        prompts,
-                        args.concurrency,
+                        prompts[:BATCH_CONTROL_N] if alone else prompts,
+                        1 if alone else args.concurrency,
                         xargs=xargs,
-                        logprobs=kind == "plain" and name in SPLIT_PASSES,
-                        prewarm=name == "split",
+                        logprobs=kind == "plain" and (alone or name in SPLIT_PASSES),
+                        prewarm=alone or name == "split",
                     )
                 )
                 (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
@@ -1452,6 +1459,63 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
         out["reason"] = "split_ref differs from plain cold: the control has no stable basis"
     elif not ok:
         out["reason"] = "pre-warm did not take: the control is vacuous"
+    return out
+
+
+def batch_control(run_dir: Path) -> dict[str, Any] | None:
+    """The plain arm's batch control: ``alone`` (the first prompts of
+    ``split``, one at a time, same pre-warm) vs the batched ``split`` ones.
+    Per request: completion differs, sampled-token logprobs differ, and the
+    pre-warm took in ``alone`` (``split``'s is ``split_control``'s)."""
+    ref, got = _outputs(run_dir, "plain", "split"), _outputs(run_dir, "plain", BATCH_PASS)
+    rt, gt = _tokens(run_dir, "plain", "split"), _tokens(run_dir, "plain", BATCH_PASS)
+    if not ref or not got or rt is None or gt is None or len(got) > len(ref) or len(gt) != len(got):  # fmt: skip
+        return None
+    al = _hit_alignment(run_dir)
+    warmed = [
+        b is not None
+        and b.get("prompt_tokens") is not None
+        and (b.get("cached") or 0) >= (b["prompt_tokens"] - 1) // al * al
+        for b in gt
+    ]
+    return {
+        "n": len(got),
+        "differ": [a != b for a, b in zip(ref, got, strict=False)],
+        "logprob_differ": [
+            a is None or b is None or a.get("logprobs") != b.get("logprobs")
+            for a, b in zip(rt, gt, strict=False)
+        ],
+        "prewarmed": sum(warmed),
+    }
+
+
+def _batch_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str, Any]:
+    """gate.json's ``batch_invariant`` must be what the control measures:
+    true needs identical completions and logprobs alone and batched, false
+    needs some divergence. The pre-warm must have taken for nearly every
+    ``alone`` request, else the two passes ran at different splits."""
+    if ctrl is None:
+        return {"pass": False, "reason": "not evaluated (plain arm split/alone passes missing)"}
+    n = ctrl["n"]
+    differ, lp = sum(ctrl["differ"]), sum(ctrl["logprob_differ"])
+    measured = differ == 0 and lp == 0
+    warm_ok = ctrl["prewarmed"] >= MIN_PREWARMED * n
+    out = {
+        "pass": n > 0 and measured == claim and warm_ok,
+        "batch_invariant": claim,
+        "measured_invariant": measured,
+        "n": n,
+        "differ": differ,
+        "logprob_differ": lp,
+        "prewarmed": ctrl["prewarmed"],
+    }
+    if measured != claim:
+        out["reason"] = (
+            f"gate.json batch_invariant={claim} but the control measured "
+            f"{'no' if measured else 'a'} divergence"
+        )
+    elif not out["pass"]:
+        out["reason"] = "pre-warm did not take or nothing compared: the control is vacuous"
     return out
 
 
@@ -1878,6 +1942,10 @@ def verdicts(
         ),
         # gate.json's split_invariant is established here, not declared.
         "G2.split_control": _split_control_verdict(ctrl, split_inv),
+        # Likewise batch_invariant (it decides whether outputs are compared).
+        "G2.batch_control": _batch_control_verdict(
+            batch_control(run_dir), bool((gate or {}).get("batch_invariant"))
+        ),
         "G2.digest_self.cap": _digest_verdict(
             base.get("cap", {}).get("digest_self"), None, exhaustive=True
         )
