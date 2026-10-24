@@ -326,15 +326,33 @@ def launched(
     timeout: float,
     lease: PortLease | None = None,
 ):
-    """``lease``: the stage's ports, released once its group is gone."""
+    """``lease``: the stage's ports, released once its group is gone.
+
+    N5: a stop signal from just before ``Popen`` until the group is in
+    ``_LIVE`` is deferred (``_STOP["teardown"]``), then honored inside the
+    ``try``. One landing after that but before ``stop`` owns the group (a
+    few bytecodes before ``try:`` or into ``finally:``) cannot be deferred
+    by a counter; the group is still in ``_LIVE``, so ``stop_live`` (at
+    exit) stops it."""
     try:
         with log.open("w") as fh:
             fh.write(" ".join(cmd) + "\n\n")
             fh.flush()
-            proc = subprocess.Popen(
-                cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True
-            )
+            _STOP["teardown"] += 1
             try:
+                proc = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    cwd=REPO,
+                    start_new_session=True,
+                )
+                _LIVE[proc.pid] = (proc, cmd[0])
+            finally:
+                _STOP["teardown"] -= 1
+            try:
+                check_stop()
                 try:
                     wait_http(health, proc, timeout, log)
                 except Exception as e:  # died or hung: a bind failure is a PortRace
@@ -351,6 +369,8 @@ def launched(
 
 
 _STOP: dict[str, Any] = {"signal": None, "teardown": 0}
+# Every launched process group not yet stopped (pid -> (proc, name)).
+_LIVE: dict[int, tuple[subprocess.Popen, str]] = {}
 
 
 def check_stop() -> None:
@@ -388,13 +408,23 @@ def stop(proc: subprocess.Popen, name: str, fh) -> None:
                     f" {time.monotonic() - t0:.0f}s after SIGTERM + SIGKILL"
                 )
     finally:
+        _LIVE.pop(proc.pid, None)  # gone, or given up on (TeardownError)
         _STOP["teardown"] -= 1
     msg = f"[gate] {name} group {proc.pid} gone after {how} in {time.monotonic() - t0:.1f}s"
-    with suppress(ValueError, OSError):
+    with suppress(ValueError, OSError, AttributeError):
         fh.write(f"\n{msg}\n")
         fh.flush()
     print(msg, flush=True)
     check_stop()
+
+
+def stop_live() -> None:
+    """At exit: stop every group a stop signal kept ``launched`` from
+    stopping (N5); a no-op on every ordinary path."""
+    for proc, name in list(_LIVE.values()):
+        print(f"[gate] {name} group {proc.pid} left by a signal window: stopping it", flush=True)
+        with suppress(SystemExit, TeardownError):
+            stop(proc, name, None)
 
 
 def _group_gone(proc: subprocess.Popen, timeout: float) -> bool:
@@ -1985,6 +2015,9 @@ def install_stop_handlers() -> None:
 
     for s in STOP_SIGNALS:
         signal.signal(s, handler)
+    import atexit
+
+    atexit.register(stop_live)
 
 
 def record_provenance(args, run_dir: Path) -> dict[str, Any]:

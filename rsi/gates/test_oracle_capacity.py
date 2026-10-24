@@ -705,6 +705,68 @@ def test_sigterm_tears_down_launched_groups(tmp_path):
         os.killpg(sleeper, 0)
 
 
+_WINDOW_LIKE = """
+import os, signal, subprocess, sys, time
+from pathlib import Path
+from rsi.gates import run_gate
+port, out, where = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+real_popen, real_stop = subprocess.Popen, run_gate.stop
+
+
+def popen(*a, **kw):  # the signal lands right after Popen returns
+    p = real_popen(*a, **kw)
+    (out / "pid").write_text(str(p.pid))
+    os.kill(os.getpid(), signal.SIGTERM)
+    return p
+
+
+def stop(proc, name, fh, _first=[True]):  # ... or on entering finally:
+    if _first.pop() if _first else False:
+        os.kill(os.getpid(), signal.SIGTERM)
+    return real_stop(proc, name, fh)
+
+
+if where == "popen":
+    run_gate.subprocess.Popen = popen
+else:
+    run_gate.stop = stop
+run_gate.install_stop_handlers()
+cmd = [sys.executable, "-m", "http.server", port, "--bind", "127.0.0.1"]
+with run_gate.launched(cmd, {}, out / "server.log", f"http://127.0.0.1:{port}/", 60) as p:
+    (out / "pid").write_text(str(p.pid))
+(out / "after").write_text("")
+"""
+
+
+@pytest.mark.parametrize("where", ["popen", "finally"])
+def test_stop_signal_in_a_launch_window_still_stops_the_group(tmp_path, where):
+    """N5: a stop signal right after ``Popen`` returns, or on entering the
+    ``finally:`` before ``stop`` owns the group, still stops the group
+    (deferred, or by ``stop_live`` at exit) and the gate exits 128 + sig."""
+    import os
+    import signal
+    import subprocess
+    from pathlib import Path
+
+    root = Path(run_gate.__file__).resolve().parents[2]
+    env = os.environ | {"PYTHONPATH": str(root)}
+    port = str(run_gate.free_port())
+    gate = subprocess.run(
+        [sys.executable, "-c", _WINDOW_LIKE, port, str(tmp_path), where],
+        env=env,
+        timeout=120,
+        capture_output=True,
+        text=True,
+    )
+    assert gate.returncode == 128 + signal.SIGTERM, gate.stdout + gate.stderr
+    assert not (tmp_path / "after").exists()
+    pid = int((tmp_path / "pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pid, 0)
+    if where == "finally":
+        assert "left by a signal window" in gate.stdout, gate.stdout
+
+
 # ------------------------------------------------------------ provenance
 
 

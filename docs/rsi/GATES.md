@@ -270,8 +270,10 @@ with `setsid`, the gate's pgid is its pid). Each aborts the whole run: the
 gate turns the signal into `SystemExit` (its own SIGINT handler replaces an
 inherited SIG_IGN and asyncio's cancel-only handler), records it so no later
 pass or stage starts even if a pass converts the exception, stops the
-current stage's process groups as above (a signal during teardown waits for
-the group) and exits 128 + signal, with no `summary.json`. Never SIGKILL the
+current stage's process groups as above (a signal during teardown or a
+launch waits for the group; one landing in the few bytecodes before
+`stop` owns a group leaves it in a live-group registry that an `atexit`
+hook stops) and exits 128 + signal, with no `summary.json`. Never SIGKILL the
 gate: its children, in their own sessions, would keep the GPU.
 
 Exit 0 does **not** cover G1 (run `cargo test -p pegaflow-semantics`) or the
