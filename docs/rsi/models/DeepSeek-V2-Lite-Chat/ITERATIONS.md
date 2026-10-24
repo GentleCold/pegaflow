@@ -994,3 +994,86 @@ Order fix after this run (unit-tested, not in the run's tree): the
 worker checked `send_saves` before the batch bound, so a step where both
 fired counted as a pressure RPC. Now the bound is checked first;
 `pressure_rpcs` counts only early sends. Behaviour is unchanged.
+
+## Policy budget (HEAD 3e6f7a3)
+
+- Knobs: 6 in total, all in `models/default.toml`, with no model profile
+  (no `models/<arch>.toml`): `min_hit_tokens`, `loading_wait_ms`,
+  `sync_load_tokens` (pre-P4), and the three P4 batching knobs
+  `save_batch_steps`, `save_batch_ms`, `save_batch_max_kv_usage`.
+- `policy.py`: 121 lines, none of them specific to a Kind. `accept` and
+  `choose_saves` are the identity for every Kind, and the knobs are
+  Kind-agnostic. `SaveItem.kind` is carried but no policy code reads it.
+  P4 added 0 lines of per-Kind policy (MLA maps to `Full`).
+
+Gate evidence per batching knob (DSV2 TP2, G4 replay cold p50 / cold
+req/s verdicts, P = pass, F = fail):
+
+| knob | evidence | changed alone? |
+|---|---|---|
+| `save_batch_steps` 1 -> 32 | `knob-01`: v2 (1) F/F, KB32 (32) P/P; `rep-01`: v2 F/F, KB32 x3 P/P, P/P, F/P; `sweep-01`: KOff F/P, KB32 P/P; `it5-rep-01`: KOff F/F, default x3 P/P (with the other two knobs at their defaults) | yes, in knob-01 / rep-01 / sweep-01 (time bound off): cold moves from +5 to +20% to -4.6 to +2.4% |
+| `save_batch_ms` 0 -> 1000 (at 32 steps) | `sweep-01`: KB32 P/P, KB32T1000 P/P (51 vs 50 RPCs, cold -4.6% vs +1.0%) | yes, and no verdict moved. It is a safety cap on the hold when steps are slow, never the trigger in any run. The only run where a time bound moved a verdict is `def-01` (250 ms: 3 of 3 cold p50 F, against KB32's 2 of 3 P), which is why it is 1000 and not 250. No measured gain backs it, only the hold bound. |
+| `save_batch_max_kv_usage` > 1 -> 0.9 | `press-01` (none): KD cold p50 F (+8.2% vs baseline, +53% vs KOff); `press-02` (0.9): KD, KDb P/P (cold p50 -23.7 / -30.8%) | yes (the same tree otherwise, the same `--num-gpu-blocks 1200`) |
+
+## Open items
+
+- Under KV pressure the default's cold req/s stays 2 to 3% below batching
+  off (`press-02`: 4.85 / 4.90 vs KOff 5.00; press-01 KOff 5.02). It is not
+  a G4 fail (G4 compares against baseline, 4.30, which the default beats by
+  13%), but it is a residual cost of batching. The cold hold is still about
+  260 ms: most of it falls while KV usage is under 90%, where the
+  pressure send does not fire. Candidates: a lower threshold, or a
+  waiting-queue signal. Neither has been tried.
+- The gate port race (vLLM `EADDRINUSE` on the gate's chosen port) is
+  with the gate owner.
+
+## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
+
+Arms: plain, baseline, KOff, v2 with the shipped default (32 steps /
+1000 ms / KV 0.9). gsm8k is the full 1319.
+
+| arm | pass | gsm8k acc | gsm8k cold / warm s | replay cold p50 | vs baseline | cold req/s | warm / warm2 / warm3 p50 | save RPCs gsm8k / replay | pressure RPCs |
+|---|---|---|---|---|---|---|---|---|---|
+| plain | | 0.8582 | 148.9 / 150.0 | | | | | | |
+| baseline | pass | 0.8582 | 169.8 / 171.2 | 0.2196 | | 5.012 | 0.2253 / 0.2190 / 0.2198 | | |
+| KOff | pass | 0.8582 | 171.3 / 170.2 | 0.2188 | -0.4% | 5.018 | 0.1187 / 0.0928 / 0.0921 | 7575 / 539 | |
+| v2 default | pass | 0.8582 | 171.3 / 171.2 | 0.2181 | -0.7% | 5.005 | 0.1205 / 0.0924 / 0.0916 | 321 / 51 | 0 |
+
+Every verdict passes for both saving arms. G2: gsm8k outputs 0 differ,
+accuracy delta 0.0 pp. G3: E_ext 1.0, excess 0, no eviction. Hits:
+gsm8k warm local 0.922 / ext 0.070 / total 0.992 / H* 0.992; replay warm
+local 0.730 / ext 0.268 / total 0.998 / H* 0.998, the same for both arms.
+Max KV usage 31%, so the pressure send never fired. The replay hold
+(all passes) is mean 255 / max 1106 ms for the default against 21 / 156 ms
+for KOff, with no measurable warm or cold cost on TP1. Batching cuts
+gsm8k save RPCs 24x (7575 -> 321) with gsm8k seconds unchanged.
+
+## Held-out check (`2026-10-24-dsv2-lite-p4-it5-heldout`, GPU 0,1, 64gb, run_gate pgid 2260465, 01:56:55 to 02:12:10Z, rev it5-kv090)
+
+The batching knobs were tuned on R2EGym conversations 0..7, the gate's
+default slice. This run uses conversations 8..15, which no tuning run
+has seen. The gate has no `--replay-skip` flag (`workloads.build_turns`
+takes `skip`, but `run_gate` does not pass it), so the run reads
+`~/kexi/tmp/dsv2-p4/r2egym-heldout-skip8.jsonl` = lines 9..256 of
+`r2egym-256.jsonl` (line 9 checked byte-identical by md5) through
+`--replay-file`. That is a non-official flag, recorded here. The other
+settings are the same as the tuning runs (8 convs x 6 turns). Host check:
+no other pegaflow server started or stopped during the run.
+
+| arm | cold p50 | vs baseline | cold req/s | vs baseline | G4 cold p50 / req/s | warm2 / warm3 p50 | G4 warm p50 / req/s | RPCs | hold mean / max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline | 0.2651 | | 6.141 | | | 0.201 / 0.216 | | | |
+| KOff | 0.2370 | -10.6% | 5.940 | -3.3% | pass / fail | 0.129 / 0.126 | pass / pass | 568 | 17 / 117 |
+| v2 default | 0.2146 | -19.0% | 6.100 | -0.7% | pass / pass | 0.128 / 0.128 | pass / pass | 52 | 167 / 955 |
+
+Both saving arms: replay digests 1768 external / 5520 local matched, 0
+mismatched; E_ext 1.0, excess 0, load_errors 0, no eviction; warm hits
+local 0.733 / ext 0.265 / total 0.998 / H* 0.998. Max KV usage 30%, and
+the pressure send did not fire.
+
+The default passes every G4 replay verdict on the held-out slice, and
+batching off fails cold req/s (-3.3%), as on the tuning slice. This
+slice's baseline cold p50 (0.265) sits well above its own warm passes
+(0.248 / 0.201 / 0.216), so the -10 / -19% cold p50 figures are mostly
+baseline noise. Cold req/s is the steadier comparison: -0.7% for the
+default, -3.3% for KOff.
