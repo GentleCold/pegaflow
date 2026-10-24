@@ -22,7 +22,7 @@ sync_load_tokens = 256
 # also sends held saves after a fixed 1 s staleness cap (checked once per
 # step, so a hold can run about one step past it). Preemption flushes and
 # shutdown send at once.
-save_batch_steps = 32
+save_batch_steps = 1
 
 # Held saves are sent at once on steps where vLLM's GPU KV cache usage
 # (0..1, after the step's allocations) is at least this: the held finished
