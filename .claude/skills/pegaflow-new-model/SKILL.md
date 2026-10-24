@@ -50,8 +50,13 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 3. **Adapter/policy**: add the minimum adapter code for unknown spec classes;
    put model knobs in `models/<model>`. Prefer policy changes over adapter changes.
 4. **Gates**: on .3 from `~/kexi/pegaflow-semantics-rsi`, run
-   `python -m rsi.gates.run_gate --model ... --tag <model>-it<N> --arms baseline,old,<module>:<Class>`
-   (full command in GATES.md "Implementation"; always include `plain`). Run
+   `python -m rsi.gates.run_gate --model ... --tag <model>-it<N> --arms plain,baseline,old,native,lmcache,<module>:<Class>`
+   with `--lmcache-overlay ~/kexi/overlays/lmcache-pr4467` (full command in
+   GATES.md "Implementation"; always include `plain`). Official runs carry
+   the reference arms `native` and `lmcache` next to `old`; drop `lmcache`
+   only where GATES.md G5 "lmcache status per model" says it is not
+   comparable on this model (cite it), and never use a wrong-KV
+   reference number (e.g. a curve point whose `digest_self` fails). Run
    record lands in `~/kexi/rsi-runs/<date>-<tag>/summary.json`; paste verdicts +
    hit table into ITERATIONS.md. Iterate on small slices first
    (`--gsm8k-limit 64 --replay-convs 8 --replay-turns 6`); such runs are
@@ -63,7 +68,7 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 5. **Optimize**: hit-rate levels (E_ext, E_C) are reported, not gated (user,
    2026-10-24; GATES.md "Hit rate"). Write a "hit-rate judgment" in
    ITERATIONS.md for every accepted run: measured hit rate vs H* / H*_C and
-   the reference arms (H_lru, old, native), every gap explained, and whether
+   the reference arms (H_lru, old, native, lmcache), every gap explained, and whether
    it is close enough. If it is not, or perf is below target, form a hypothesis from metrics (fallbacks per group, unused
    loads, write amplification, stranded bytes per group, save/load time), change
    the lowest layer that fixes it, rerun. One hypothesis per iteration, record
@@ -112,8 +117,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    and allowlisted). Fix or justify every finding in ITERATIONS.md.
 7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers:
    the hit-rate table (local / external / total hit, oracle H*, E_ext; at
-   capacity H*_C, H_lru, E_C) next to the G4 perf table, for the arm under
-   test and the reference arms. Do not wait for the user: the review agent's
+   capacity H*_C, H_lru, E_C) next to the G4 perf table, one row each for
+   the arm under test (v2), `old`, `native` and `lmcache` (or "not
+   comparable" with the GATES.md reason). Do not wait for the user: the review agent's
    pass is the acceptance; the user does one acceptance pass at the end.
 
 ## 3. Lessons (append)

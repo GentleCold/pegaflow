@@ -167,12 +167,35 @@ so such stranded bytes are possible today.
   there (`G2.digest_self.*` and `G2.digest_vs_baseline.gsm8k` pass with 0
   mismatches, warm accuracy within `ACC_TOL` of baseline):
 
-  | model | lmcache | status | evidence |
-  |---|---|---|---|
-  | Qwen3-4B (FLASH_ATTN, `LBNHC`) | 0.5.6 (PyPI) | not comparable: wrong KV | below |
-  | Qwen3-4B | source build of LMCache PR #4467 head `e05c2ea` | comparable | below |
-  | DeepSeek-V2-Lite-Chat (TP2, MLA) | PR #4467 `e05c2ea` | not comparable: crashes | below |
-  | DeepSeek-V2-Lite-Chat | 0.5.6 | not comparable: G2 fails (split, not bytes) | below |
+  | model | lmcache | chunk | status | evidence |
+  |---|---|---|---|---|
+  | Qwen3-4B (FLASH_ATTN, `LBNHC`) | 0.5.6 (PyPI) | 256 | not comparable: wrong KV | below |
+  | Qwen3-4B | source build of LMCache PR #4467 head `e05c2ea` | 256 | comparable, except the `cap075` curve point (wrong loads) | below |
+  | Qwen3-4B | PR #4467 `e05c2ea` | 16 (secondary) | not comparable: claimed hits never loaded | below |
+  | DeepSeek-V2-Lite-Chat (TP2, MLA) | PR #4467 `e05c2ea` | 256 | not comparable: crashes | below |
+  | DeepSeek-V2-Lite-Chat | 0.5.6 | 256 | digests pass with the resume reference; see below | below |
+
+  The gate pins an unmerged upstream PR (#4467) for the lmcache arm on
+  Qwen3-4B: an open item for the user's final acceptance.
+
+- Qwen3-4B, PR #4467, chunk 256: `2026-10-24-qwen3-4b-lmcache-ref-1afec5a`
+  (`--arms baseline,native,lmcache`, official flags, cap plan 64 convs as
+  in the official runs). gsm8k (1319) and replay: every G2 digest check
+  passes, external 64/64 (gsm8k) and 14971 (replay) matched, accuracy =
+  baseline. `G2.digest_self.cap` passes at the gated `C/U = 0.5` and at
+  0.25. At 0.75 it fails: 738 external blocks of 2 warm requests
+  (`cap_warm` conv 43 turn 5, `cap_warm2` conv 0 turn 6), every one of 36
+  layers, carry the bytes of computed blocks of other conversations at
+  other positions (e.g. `cap_cold` conv 25 turn 2): LMCache served another
+  prefix's chunks. No load error was reported. That curve point is wrong KV
+  and is not used; the gated point and the rest stand.
+- Qwen3-4B, PR #4467, chunk 16 (secondary config, to separate chunk
+  granularity from policy: `2026-10-24-qwen3-4b-lmcache-chunk16-91fbc41`,
+  gsm8k 64 + cap): 4 of 64 warm requests got a hit from LMCache's lookup
+  (`need to load` 48-112 tokens) but no `Retrieved` line ever followed. Their
+  19 external blocks hold the poison: one digest, all 36 layers, in all 19.
+  Warm accuracy 0.8125 vs 0.8594, 4 completions differ: not comparable.
+  So the 256 config stays the only one.
 
 - DeepSeek-V2-Lite-Chat, 2026-10-24, gsm8k 64 questions, TP2,
   TRITON_MLA, batch invariant, not split-invariant. vLLM 0.32 hands MLA
@@ -198,11 +221,34 @@ so such stranded bytes are possible today.
     warm-computed copy (split `(1024, ())`, layers 1-26 differ). Later
     requests reuse those blocks locally, so their computed KV differs from
     the cold copies with the same split key from layer 2 on. This looks like
-    MLA split-variance carried through the context (the split key does not
-    capture it), not a wrong load. The gate cannot verify that, though, so
-    under the comparability rule the arm is not comparable on this model.
+    MLA split-variance carried through the context (the split key did not
+    capture it), not a wrong load.
+  - It was the gate's reference. The baseline `split` pass resumes each
+    request at its last full prompt block (where a block-granular
+    connector's hit ends: 63 of 64 warm requests of `native` resume at
+    1120-1184). LMCache resumes at a 256-token chunk end, so every lmcache
+    warm request computes from 1088 (vLLM's own local hit) or 1024. None of
+    its warm computed blocks had a same-split copy except by accident: 0.77
+    coverage, 258 of them on non-aligned prompts. No load was missing (every
+    lookup hit was retrieved, 128/128 external matched). The fix, for every
+    arm (gate `b05e507`): the split key also fingerprints the context bytes
+    an episode starts from, and a baseline stage `resume-<label>` replays
+    each arm's warm pass at that arm's own resume points (Implementation,
+    "Split-variant references").
+  - Rerun with it (`2026-10-24-dsv2-lite-lmcache-056-resume-b05e507`,
+    0.5.6, 64 questions): `G2.resume_reference` 64/64 requests resumed
+    where lmcache did, 31 waves. `G2.digest_vs_baseline.gsm8k` passes:
+    local 17136/17136 and external 128/128 matched, computed 2708/2708
+    exact, cold and warm coverage 1.0. `G2.gsm8k_outputs` passes (warm 0
+    differ from the resume replay). `G2.digest_self.gsm8k` passes; its
+    computed blocks are all unjudged there, since no two copies in one run
+    share a context. `G2.gsm8k` fails: warm 0.672 vs 0.688, one question
+    (-1.56 pp, `ACC_TOL` 1 pp). The baseline's own replay at lmcache's
+    resume points scores 0.672 too, with the same completions. That is the
+    cost of resuming at chunk ends on a split-variant model, not of the
+    bytes. The full-size run decides the model's status (below).
     `native` passes the same checks in the official run
-    (`2026-10-24-dsv2-lite-p4-mf1`).
+    (`2026-10-24-dsv2-lite-p4-it6-off-a1e7fd2`) and under `b05e507`'s key.
 
 - lmcache 0.5.6 is wrong on vLLM 0.32's fused K/V page, 2026-10-23,
   re-confirmed 2026-10-24 (`2026-10-24-qwen3-4b-lmcache-repro056`, vLLM's
@@ -225,6 +271,7 @@ so such stranded bytes are possible today.
 - lmcache build used by the arm: `~/kexi/overlays/lmcache-pr4467`, a source
   build of https://github.com/LMCache/LMCache/pull/4467 head
   `e05c2ea9781b4021081f34dfb982189ec0fabc15` (base: dev `18651e8f`, 2026-10-21),
+  (an open, unmerged PR: pinned by commit; final acceptance is the user's),
   unmodified, wheel version `0.5.7.dev0+pr4467.e05c2ea`, CUDA 13.0 nvcc,
   `TORCH_CUDA_ARCH_LIST=8.9`, `--no-build-isolation` against the shared
   venv's torch (build tools in `~/kexi/tmp/lmcache-buildtools`, never in the
@@ -675,8 +722,13 @@ the last accepted run record by hand until `--accepted` exists.
   never computed the key. A computed block is `exact` if it equals another
   computed copy; with `split_invariant=false` only copies with the same
   *split* count as references: split = (start of the computing episode, the
-  `progress` chunk ends of that episode below the block's end), i.e. where the
-  cached context ended and how prefill was chunked up to the block. A computed
+  `progress` chunk ends of that episode below the block's end, a hash of the
+  digests of every block of the request at or below the start on that rank),
+  i.e. where the cached context ended, how prefill was chunked up to the
+  block, and which context bytes it attended to (a context block computed at
+  another split has other bytes, and so does everything computed on top of
+  it; wrong context bytes are judged where they enter, as loaded blocks).
+  REF may be several probe dirs (their computed copies pooled). A computed
   block with copies only at other splits is `computed_unmatched_split`, one
   REF never computed is `computed_unreferenced` (REF != CAND); both are not
   judged. `computed_by_pass` breaks these counts down by the candidate's
@@ -697,8 +749,9 @@ the last accepted run record by hand until `--accepted` exists.
   `computed_exact == computed_compared`. With `split_invariant=false`,
   digest_vs_baseline.gsm8k also needs, in each of `cold` and `warm`, judged
   computed blocks > 0 and `compared / (compared + unmatched_split +
-  unreferenced) >= 0.9` (`MIN_COMPUTED_COVERAGE`; warm is judged against the
-  baseline's `split` pass), and in `warm` zero unjudged computed blocks on
+  unreferenced) >= 0.9` (`MIN_COMPUTED_COVERAGE`; REF is the baseline's
+  gsm8k probe plus its `resume-<label>` replay of this arm, below), and in
+  `warm` zero unjudged computed blocks on
   prompts whose length is not a multiple of the hit alignment (a prompt
   without a recorded length counts as non-aligned; only aligned prompts,
   where the plain split stops one block short of a connector's hit, may
@@ -717,11 +770,38 @@ the last accepted run record by hand until `--accepted` exists.
   G2.gsm8k_outputs (when gate.json declares invariance): every completion equals
   baseline cold, cold and warm; with `split_invariant=false`: every cold
   completion equals baseline cold (same split), and every warm completion
-  equals the plain arm's `split` completion of the same prompt, except on
-  prompts with `prompt_len % cache_hit_alignment_tokens == 0`
-  (`warm_differ_vs_split_aligned`, reported only: vLLM's own hit stops one
-  block short there, a connector's need not). The warm differ count vs
-  baseline cold is reported only.
+  equals the baseline `resume-<label>` replay's completion of the same
+  prompt (`warm_reference`; without that stage, the plain arm's `split`
+  completion), except on prompts with `prompt_len %
+  cache_hit_alignment_tokens == 0` that the replay could not resume where
+  the arm did (`warm_differ_vs_split_aligned`, reported only: vLLM's own
+  hit stops one block short there, a connector's need not); a non-aligned
+  prompt the replay missed or resumed elsewhere counts as differing. The
+  warm differ count vs baseline cold is reported only.
+- Split-variant references (`split_invariant=false`, every arm with a
+  gsm8k stage, needs the baseline arm): right after the arm's gsm8k stage
+  the gate runs a fresh baseline stage `baseline/resume-<label>`
+  (`run_gate.resume_plan`, `workloads.run_resume`). From the arm's probe
+  trace it takes each warm request's prompt index (`rsi_conv`, set on every
+  gsm8k request), its last episode `[step, local, start]` and groups the
+  requests by `step` into waves in the arm's schedule order. After a
+  warmup and reset + poison it replays the waves. Each request whose start
+  exceeds its local hit is first sent as its first `start` prompt tokens
+  with `max_tokens=1` (`resume_prewarm`, never scored), then whole
+  (`resume`, streamed). A wave starts once every request of the previous
+  wave has its first token, so the replay's local hits come from its own
+  earlier requests, as the arm's did. Its digests join REF and its
+  completions are the warm outputs reference. `G2.resume_reference` (per
+  arm) passes iff the stage ran, its `digest_self` passes and the plan has
+  no problem (every prompt has exactly one warm request with a valid
+  index); how many requests the replay resumed elsewhere
+  (`start_differs`), or missed, is reported, and their blocks stay
+  unjudged (coverage) and their completions count as differing
+  (non-aligned). A resume stage that crashes fails that arm's
+  `G2.resume_reference`, not the baseline. The replay shows what the
+  baseline computes from the arm's resume points; it cannot make wrong
+  loaded bytes look right: those are matched against computed copies,
+  never against the arm's own.
 - Split invariance (`split_invariant`, `G2.split_control`, baseline verdicts).
   Batch invariance makes a token's KV independent of batch composition, not
   of *where the request's computation starts*. vLLM 0.32's MLA prefill
