@@ -1161,7 +1161,7 @@ def test_a_tree_changed_between_stages_is_named(tmp_path, monkeypatch, role, edi
     monkeypatch.setattr(run_gate, "REPO", gate)
     monkeypatch.setattr(run_gate.provenance, "gate_pegaflow_dir", lambda: None)
     monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "pyc"))
-    args = argparse.Namespace(under_test_path="/t", under_test_overlay=str(ov), pegaflow_server=str(srv / "pegaflow-server"))  # fmt: skip
+    args = argparse.Namespace(arms="baseline,pegaflow.m:C", under_test_path="/t", under_test_overlay=str(ov), pegaflow_server=str(srv / "pegaflow-server"))  # fmt: skip
     watch = run_gate.ProvenanceWatch(args, gate / "docs/rsi/models/M")
     (gate / "rsi/gates/__pycache__").mkdir()
     (gate / "rsi/gates/__pycache__/rsi_probe.cpython-312.pyc").write_bytes(b"pyc")
@@ -1181,7 +1181,8 @@ def test_a_tree_changed_between_stages_is_named(tmp_path, monkeypatch, role, edi
 
 def test_each_stage_gets_a_fresh_bytecode_cache_outside_the_arm(tmp_path):
     """M10: a stage's PYTHONPYCACHEPREFIX is its own dir, outside every arm
-    dir; the isolated arm gets only its current stage's cache bound rw."""
+    dir; the isolated arm gets only its current stage's cache and its own
+    compile cache (S5) bound rw."""
     import argparse
 
     run = tmp_path / "runs" / "r"
@@ -1193,7 +1194,7 @@ def test_each_stage_gets_a_fresh_bytecode_cache_outside_the_arm(tmp_path):
         runs_root=str(tmp_path / "runs"), under_test_path="", under_test_overlay=""
     )
     iso = run_gate.isolation(args, run / "ut" / "replay")
-    assert iso["rw"] == [str((run / "ut" / "replay").resolve()), str((run / ".pycache-stages" / "ut" / "replay").resolve())]  # fmt: skip
+    assert iso["rw"] == [str((run / "ut" / "replay").resolve()), str((run / ".pycache-stages" / "ut" / "replay").resolve()), str((run / ".compile-cache" / "ut").resolve())]  # fmt: skip
 
 
 @pytest.mark.parametrize("bad", [None, "gate", "venv_pegaflow", "under_test"])
@@ -2304,3 +2305,322 @@ def test_non_invariant_controls_compare_one_composition(
     assert (
         run_gate._plain_equals_baseline(tmp_path, ref_cold, batch_invariant=True)["pass"] is False
     )
+
+
+# ------------------------------------------- hybrid gate review fixes (M2, S1-S6)
+
+
+@pytest.mark.parametrize(
+    "tail,ok",
+    [
+        ([], True),
+        (["--prefix-cache-retention-interval=0"], False),
+        (["--prefix_cache_retention_interval", "0"], False),
+        (["--prefix-cache-ret", "0"], False),  # argparse abbreviation
+        (["--mamba_cache_mode=all"], False),
+        (["--prefix_cache_retention_interval=528"], True),  # same value, other spelling
+        (["-cc", "{}"], False),
+        (["--compilation-config={}"], False),
+        (["--compilation-config.inductor_compile_config.deterministic", "false"], False),
+        (["--compilation_config", _DET[1]], True),
+    ],
+    ids=[
+        "as-is", "eq-override", "underscore-override", "abbrev-override", "underscore-eq",
+        "same-value-respelled", "short-alias", "eq-compile", "dotted-compile", "underscore-compile",
+    ],
+)  # fmt: skip
+def test_gate_args_read_every_vllm_spelling(tail, ok):
+    """S4: a later flag overrides gate.json's in vLLM's parser whatever its
+    spelling (``=``, ``_``, abbreviation, ``-cc``, dotted keys appended last);
+    G0.vllm_args must see it."""
+    gate = {"vllm_args": _RET, "gsm8k_vllm_args": _DET}
+    results = {"baseline": {"gsm8k": {"vllm_cmd": ["vllm", "serve", "m", *_RET, *_DET, *tail]}}}
+    assert run_gate.gate_args_verdict(results, gate)["pass"] is ok
+
+
+@pytest.mark.parametrize(
+    "edit,ok",
+    [
+        (None, True),
+        ("drop-deterministic", False),
+        ("no-compilation-block", True),  # a record from before the dump: not judged
+    ],
+    ids=["pinned", "compile-differs", "record-predates"],
+)
+def test_g0_spec_pins_the_compile_config(tmp_path, edit, ok):
+    """S4: the effective compilation config is in the spec dump and G0.spec
+    holds it to the committed one (Qwen3.5-4B gsm8k: deterministic Inductor)."""
+    import json
+
+    committed = run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json"
+    spec = json.loads(committed.read_text())
+    assert spec["compilation"]["inductor_compile_config"]["deterministic"] is True
+    if edit == "drop-deterministic":
+        spec["compilation"]["inductor_compile_config"].pop("deterministic")
+    elif edit == "no-compilation-block":
+        spec.pop("compilation")
+    for label in ("baseline", "arm"):
+        probe = tmp_path / label / "gsm8k" / "probe"
+        probe.mkdir(parents=True)
+        (probe / "spec.json").write_text(json.dumps(spec))
+    assert run_gate.g0(tmp_path, "arm", committed)["pass"] is ok
+
+
+def _groups(**per: dict) -> dict:
+    return {"groups": {g: {"local_mismatched": 0, "external_mismatched": 0, "local_unreferenced": 0, "external_unreferenced": 0} | v for g, v in per.items()}}  # fmt: skip
+
+
+_BAD = {"external_mismatched": 3}
+_ALL4 = {"0": _BAD, "1": _BAD, "2": _BAD, "3": _BAD}
+
+
+@pytest.mark.parametrize(
+    "d_self,d_base,targets,sabotage,ok",
+    [
+        (_groups(**_ALL4), _groups(**_ALL4), [0, 1, 2, 3], {"0": 1, "1": 1, "2": 1, "3": 1}, True),
+        # offbyone before the fix: only full attention wrong
+        (_groups(**{"3": _BAD}), _groups(**{"3": _BAD}), [0, 1, 2, 3], {"3": 1}, False),
+        (
+            _groups(**_ALL4),
+            _groups(**{"3": _BAD}),
+            [0, 1, 2, 3],
+            {"0": 1, "1": 1, "2": 1, "3": 1},
+            False,
+        ),  # fmt: skip
+        (
+            _groups(**_ALL4),
+            _groups(**_ALL4),
+            [0, 1, 2, 3],
+            {"3": 1},
+            False,
+        ),  # claims no state sabotage
+        (
+            _groups(**{"0": {"local_unreferenced": 2}}),
+            _groups(**{"0": {"external_unreferenced": 1}}),
+            [0],
+            {"0": 2},
+            True,
+        ),  # liar  # fmt: skip
+        (_groups(**{"0": _BAD}), _groups(**{"0": _BAD}), [0], None, True),  # record predates counts
+        (_groups(), _groups(), [], {}, False),
+    ],
+    ids=[
+        "all-groups",
+        "full-only",
+        "one-check-only",
+        "no-sabotage",
+        "unreferenced",
+        "predates",
+        "nothing",
+    ],  # fmt: skip
+)
+def test_negative_arm_caught_in_every_group(d_self, d_base, targets, sabotage, ok):
+    """M2: a negative self-test arm counts as caught only if each group it
+    corrupts, judged on its own, has a load equal to no reference in both
+    gsm8k digest checks, and the connector reports a sabotage there."""
+    v = run_gate.caught_per_group(d_self, d_base, targets, sabotage)
+    assert v["pass"] is ok, v
+    assert set(v["groups"]) == {str(t) for t in targets}
+
+
+def test_sabotage_counts_sum_per_group(tmp_path):
+    import json
+
+    d = tmp_path / "selftest"
+    d.mkdir()
+    (d / "sabotage-1.jsonl").write_text(
+        "".join(
+            json.dumps({"mode": "offbyone", "group": g, "n": n}) + "\n"
+            for g, n in ((0, 1), (3, 2), (0, 2))
+        )  # fmt: skip
+    )
+    (d / "sabotage-2.jsonl").write_text(json.dumps({"mode": "offbyone", "group": 3, "n": 1}) + "\n")
+    assert run_gate.sabotage_counts(d) == {"0": 3, "3": 3}
+    assert run_gate.sabotage_counts(tmp_path / "missing") == {}
+
+
+def _acc(**p: float) -> dict:
+    return {"passes": {k: {"accuracy": v} for k, v in p.items()}}
+
+
+@pytest.mark.parametrize(
+    "arm,base,inv,ok",
+    [
+        (_acc(cold=0.70, warm=0.70), _acc(cold=0.70), True, True),
+        (_acc(cold=0.70, warm=0.68), _acc(cold=0.70), True, False),
+        # not invariant: batched warm moves with load timing (reported); alone_ref gates
+        (
+            _acc(cold=0.70, warm=0.68, alone_ref=0.71875),
+            _acc(cold=0.70, alone_ref=0.71875),
+            False,
+            True,
+        ),  # fmt: skip
+        (
+            _acc(cold=0.70, warm=0.70, alone_ref=0.70),
+            _acc(cold=0.70, alone_ref=0.71875),
+            False,
+            False,
+        ),  # fmt: skip
+        (_acc(cold=0.70, warm=0.70), _acc(cold=0.70, alone_ref=0.71875), False, False),  # missing
+    ],
+    ids=["inv-equal", "inv-off", "alone-equal", "alone-off", "alone-missing"],
+)
+def test_gsm8k_accuracy_gated_at_one_batch_composition(arm, base, inv, ok):
+    """S2: without batch invariance every arm (honest self-test included) is
+    held to ACC_TOL on its one-at-a-time ``alone_ref`` pass vs the
+    baseline's; batched deltas are reported."""
+    v = run_gate.gsm8k_accuracy_verdict(arm, base, inv)
+    assert v["pass"] is ok, v
+    assert ("batched_delta_pp" in v) is (not inv)
+
+
+def test_new_baseline_checks_are_na_for_older_records(tmp_path):
+    """S1: a record is judged by the gate rev it ran under: a run made before
+    G2.batch_control (no ``alone`` pass) and G0.vllm_args (no ``vllm_cmd``)
+    is ``na`` on them; a current record missing them fails."""
+    gsm = {"passes": {p: {"accuracy": 0.5} for p in ("cold", "warm", "split_ref", "split")}}
+    old = {"plain": {"gsm8k": gsm}, "baseline": {"gsm8k": {"passes": {"cold": {}, "warm": {}}}}}
+    v = run_gate.verdicts(old, tmp_path, tmp_path / "spec.json", {"batch_invariant": True})
+    for k in ("G2.batch_control", "G0.vllm_args"):
+        assert v["baseline"][k]["pass"] and v["baseline"][k]["na"], v["baseline"][k]
+    new = {
+        "plain": {"gsm8k": gsm | {"vllm_cmd": ["vllm"], "passes": gsm["passes"] | {"alone": {}}}},
+        "baseline": {"gsm8k": {"vllm_cmd": ["vllm"], "passes": {"cold": {}, "warm": {}}}},
+    }
+    v = run_gate.verdicts(new, tmp_path, tmp_path / "spec.json", {"batch_invariant": True})
+    assert not v["baseline"]["G2.batch_control"]["pass"]  # alone ran, outputs missing
+    assert v["baseline"]["G0.vllm_args"]["pass"]  # no gate args: nothing to miss
+
+
+@pytest.mark.parametrize(
+    "model,wls,missing",
+    [
+        ("Qwen3.5-4B", ["gsm8k", "replay", "cap"], True),
+        ("Qwen3.5-4B", ["gsm8k", "replay", "cap", "preempt"], False),
+        ("Qwen3-4B", ["gsm8k", "replay", "cap"], False),
+    ],
+    ids=["state-model-without", "state-model-with", "dense"],
+)
+def test_official_needs_preempt_on_state_models(model, wls, missing):
+    """S3: on a model with a Mamba state group the official profile includes
+    ``preempt`` (gsm8k loads one state key per group)."""
+    import argparse
+
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t"}))  # fmt: skip
+    committed = run_gate.REPO / f"docs/rsi/models/{model}/spec.json"
+    probs = run_gate.official_problems(args, ["plain", "baseline", "pegaflow.m:C"], wls, committed, committed)  # fmt: skip
+    assert any(p.startswith("workload preempt missing") for p in probs) is missing, probs
+
+
+@pytest.mark.parametrize(
+    "skipped,ok",
+    [
+        ({}, True),
+        ({"not_offered": 3, "offer_unaligned": 1}, True),  # computed states: not loads
+        ({"start_no_block": 1}, False),
+        ({"start_unaligned": 2}, False),
+        ({"start_no_tokens": 1}, False),
+    ],
+    ids=["none", "offers-only", "start-no-block", "start-unaligned", "start-no-tokens"],
+)
+def test_unjudged_start_state_fails_the_digest_verdict(skipped, ok):
+    """S6: a start state (local hit or a load) the probe could not digest is
+    a load nobody judged."""
+    d = _digest_ok() | {"state_skipped": skipped}
+    assert run_gate._digest_verdict(d, None)["pass"] is ok
+
+
+def _spec_groups(*groups: dict) -> dict:
+    return {"kv_cache_config": {"groups": [{"spec": g} for g in groups]}}
+
+
+_FULL16 = {"mro": ["FullAttentionSpec"], "block_size": 16}
+_MAMBA = {"mro": ["MambaSpec"], "block_size": 528, "num_speculative_blocks": 0}
+
+
+@pytest.mark.parametrize(
+    "spec,max_len,blocks",
+    [
+        (_spec_groups(_FULL16), 4096, 4 * 2048 // 16),  # 4 requests of 2048 tokens
+        (_spec_groups(_FULL16), 16384, 16384 // 16 + 1),  # one max_model_len request + null
+        (_spec_groups(_FULL16 | {"sliding_window": 128}), 4096, 4 * (128 + 16) // 16),
+        (_spec_groups(_MAMBA, _MAMBA | {"num_speculative_blocks": 1}), 4096, 4 * (2 + 3)),
+    ],
+    ids=["full", "max-len-bound", "window", "mamba-speculative"],
+)
+def test_preempt_gpu_blocks_sizing(spec, max_len, blocks):
+    """S6: the preempt pool holds PREEMPT_REQS requests of PREEMPT_SPAN tokens
+    (so longer ones force preemption) and admits one max_model_len request."""
+    assert run_gate.preempt_gpu_blocks(spec, max_len) == blocks
+
+
+def test_preempt_gpu_blocks_qwen35_committed():
+    """The Qwen3.5-4B self-test ran on 40 blocks (3 GDN groups x 2 + 4 of 528)."""
+    import json
+
+    spec = json.loads((run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json").read_text())
+    assert run_gate.preempt_gpu_blocks(spec, 4096) == 40
+    assert run_gate.has_state_group(spec)
+    assert not run_gate.has_state_group(json.loads((run_gate.REPO / "docs/rsi/models/Qwen3-4B/spec.json").read_text()))  # fmt: skip
+
+
+def test_plain_equals_baseline_needs_equal_logprobs(tmp_path):
+    """S6: equal completions with one different sampled-token logprob still
+    fail (the probe changed the numbers)."""
+    import json
+
+    _alone_dirs(tmp_path, ["a", "b"], ["a", "b"], ["a", "b"])
+    f = tmp_path / run_gate.GATE_DIR / "baseline" / "gsm8k" / "alone_ref-tokens.json"
+    toks = json.loads(f.read_text())
+    toks[1]["logprobs"] = [-0.25]
+    f.write_text(json.dumps(toks))
+    v = run_gate._plain_equals_baseline(tmp_path, ["c0", "cX"], batch_invariant=False)
+    assert (v["pass"], v["differ"], v["logprob_differ"]) == (False, 0, 1)
+
+
+def test_split_control_flags_a_vacuous_measurement(tmp_path):
+    """N2: when nearly every pair started at the same point the control
+    compared no split: reported ``vacuous`` with no measured value."""
+    _alone_dirs(tmp_path, ["a", "b"], ["a", "b"], ["a", "b"], cached=(32, 32))
+    ctrl = run_gate.split_control(tmp_path, batch_invariant=False)
+    assert ctrl["same_start"] == 2
+    v = run_gate._split_control_verdict(ctrl, True)
+    assert v["vacuous"] and v["measured_invariant"] is None
+
+
+def test_each_arm_gets_its_own_compile_cache(tmp_path, monkeypatch):
+    """S5: vLLM's cache root (torch compile, Inductor, Triton) is per arm
+    under the run dir, emptied before the arm's first stage, shared by its
+    later stages, never another arm's or the global one."""
+    seen: list[dict[str, str]] = []
+
+    class _Lease:
+        ports, block = [20001], [20010]
+
+    monkeypatch.setattr(run_gate, "PortLease", lambda *a, **kw: _Lease())
+    monkeypatch.setattr(run_gate, "launched", lambda cmd, env, *a: seen.append(env))
+    monkeypatch.setattr(run_gate, "isolated", lambda args, arm, log, cmd: cmd)
+    monkeypatch.setattr(run_gate, "_FRESH_CACHES", set())
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/global/triton")
+    args = SimpleNamespace(
+        gpu="0", model="m", tp=1, max_model_len=8, max_num_batched_tokens=8, max_num_seqs=1,
+        gpu_mem=0.5, vllm_arg=[], num_gpu_blocks=0, under_test_path="",
+    )  # fmt: skip
+    run = tmp_path / "run"
+    stale = run / ".compile-cache" / "baseline" / "torch_compile_cache" / "x"
+    stale.mkdir(parents=True)
+    for label, wl in (("baseline", "gsm8k"), ("baseline", "preempt"), ("selftest-liar", "gsm8k")):
+        (run / label / wl).mkdir(parents=True, exist_ok=True)
+        if label == "baseline" and wl == "preempt":
+            (run / ".compile-cache/baseline/artifact").write_text("from gsm8k")
+        run_gate.vllm_server(args, {}, "baseline", run / label / wl / "probe", False, None, run / label / wl / "vllm.log")  # fmt: skip
+    roots = [e["VLLM_CACHE_ROOT"] for e in seen]
+    assert roots == [
+        str(run / ".compile-cache" / x) for x in ("baseline", "baseline", "selftest-liar")
+    ]
+    assert not stale.exists()  # emptied before the arm's first stage
+    assert (run / ".compile-cache/baseline/artifact").exists()  # kept across its stages
+    for e in seen:  # no compiled-code cache outside the arm's root
+        root = Path(e["VLLM_CACHE_ROOT"])
+        for k in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE"):
+            assert Path(e[k]).is_relative_to(root), k

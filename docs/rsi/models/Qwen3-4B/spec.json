@@ -6,6 +6,16 @@
   "mamba_cache_mode": "none",
   "prefix_cache_retention_interval": 0
  },
+ "compilation": {
+  "backend": "inductor",
+  "cudagraph_mode": "FULL_AND_PIECEWISE",
+  "inductor_compile_config": {
+   "benchmark_combo_kernel": true,
+   "combo_kernels": true,
+   "enable_auto_functionalized_v2": false
+  },
+  "mode": 3
+ },
  "dtype": "bfloat16",
  "hf": {
   "architectures": [
