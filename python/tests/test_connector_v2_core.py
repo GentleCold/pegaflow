@@ -847,7 +847,14 @@ def test_miss_attribution_names_the_missing_group(sem):
     assert sched.get_num_new_matched_tokens(_req(), 0) == (4, True)
     sched._rpc.answers = {0: Ready(3, b"F"), 1: Ready(1, b"C", [2])}
     assert sched.get_num_new_matched_tokens(_req(req_id="s"), 0) == (12, True)
+    # vLLM re-queries a request it could not allocate: counted once per
+    # (request, resume point); a finished request id counts afresh.
+    sched._rpc.answers = {0: Ready(3, b"F"), 1: Ready(1, b"C", [0])}
+    sched.get_num_new_matched_tokens(_req(), 0)
     assert sched.hit_stats == {"lookups": 2, "missing=1": 1, "lost_tokens": 8}
+    sched.request_finished("r")
+    sched.get_num_new_matched_tokens(_req(), 0)
+    assert sched.hit_stats == {"lookups": 3, "missing=1": 2, "lost_tokens": 16}
 
 
 def test_saves_reoffer_after_missing_block_ids():

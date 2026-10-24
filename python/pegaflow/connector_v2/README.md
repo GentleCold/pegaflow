@@ -103,7 +103,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
 - **Hit stats.** Every 500 lookups (and at shutdown) the scheduler logs
   `hit stats`: lookups, and per set of storage groups missing at the
   longest resume point the full group backs, how often and how many tokens
-  were lost (`missing=` with no group: the policy lowered `p`). This is the
+  were lost, counted once per request and resume point (vLLM re-queries a
+  waiting request every scheduling pass) (`missing=` with no group: the policy lowered `p`). This is the
   group-coherence signal for server eviction. Nothing is logged while no
   miss was counted.
 - **Namespace.** It is a hash of:

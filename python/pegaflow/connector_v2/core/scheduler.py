@@ -162,8 +162,11 @@ class Scheduler:
         self._saves_disabled = False
         self._plan = StepPlan()
         # Lookups, and per missing-group set how often (and how many tokens)
-        # the full groups backed a longer hit than the one taken.
+        # the full groups backed a longer hit than the one taken. Counted once
+        # per (request, resume point): vLLM re-queries a waiting request every
+        # scheduling pass until it can be allocated.
         self.hit_stats: dict[str, int] = {}
+        self._counted: dict[str, tuple[int, int]] = {}
 
     # ------------------------------------------------------------------ hits
     def on_new_request(self, request: Any) -> None:
@@ -537,6 +540,10 @@ class Scheduler:
             contiguous += 1
         cap = max(request.num_tokens - 1, 0)
         p_full = min(contiguous * groups[0].sem.block_tokens, cap) // step * step
+        key = (num_computed, p_full)
+        if self._counted.get(request.request_id) == key:
+            return
+        self._counted[request.request_id] = key
         stats = self.hit_stats
         stats["lookups"] = stats.get("lookups", 0) + 1
         if p_full > max(p, num_computed):
@@ -585,6 +592,7 @@ class Scheduler:
         self._loading_since.pop(req_id, None)
         self._saved_upto.pop(req_id, None)
         self._requests.pop(req_id, None)
+        self._counted.pop(req_id, None)
         if req_id not in self._saving:
             return False
         self._saving.discard(req_id)
