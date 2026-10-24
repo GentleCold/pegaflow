@@ -30,6 +30,7 @@ from pegaflow.connector_v2.core import (
 )
 from pegaflow.connector_v2.core.layout import StorageRanks
 from pegaflow.connector_v2.core.scheduler import GroupSave, LoadPlan
+from pegaflow.connector_v2.core.worker import _wire_bytes
 from pegaflow.connector_v2.policy import Policy, SaveItem, load_policy
 
 BT = 4
@@ -1129,6 +1130,26 @@ def test_kv_pressure_sends_held_saves(kv_usage, threshold, send, caplog):
     assert worker.save_stats.kv_usage_unknown_steps == (1 if kv_usage is None else 0)
     assert worker.flush(5)
     assert [[ids for _, ids, _ in c] for c in calls] == [[[11, 12]]]
+    worker.shutdown()
+
+
+def test_merged_save_rpc_stays_under_size_budget(monkeypatch):
+    """A merged save RPC must stay under the gRPC message limit: a step that
+    would push the held batch past SAVE_RPC_MAX_BYTES sends the batch first.
+    Nothing is lost, and the order of blocks is kept."""
+    one_step = _wire_bytes([("layers.0.attn", [1], [b"h1"])])
+    monkeypatch.setattr(Worker, "SAVE_RPC_MAX_BYTES", 2 * one_step)
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
+    worker._batch_steps = 100
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    for b in (1, 2, 3):
+        worker.save(StepPlan(saves=[GroupSave(0, [b], [b"h%d" % b])]))
+    assert worker.flush(5)
+    assert [[ids for _, ids, _ in c] for c in calls] == [[[1, 2]], [[3]]]
+    assert worker.save_stats.rpcs == 2
     worker.shutdown()
 
 

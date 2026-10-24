@@ -1024,6 +1024,28 @@ runs. gsm8k G4 has not been evaluated with batching on.
 | `save_batch_max_kv_usage` > 1 -> 0.9 | `press-01` (none): KD cold p50 F (+8.2% vs baseline, +53% vs KOff); `press-02` (0.9): KD, KDb P/P (cold p50 -23.7 / -30.8%) | yes (the same tree otherwise, the same `--num-gpu-blocks 1200`) |
 | `Worker.SAVE_HOLD_MAX_S = 1.0` (constant, not a knob) | `sweep-01`: KB32 P/P, KB32T1000 P/P (50 vs 51 RPCs). The 250 ms variant (`def-01`) moved cold p50 to F 3 of 3. | kept only as a staleness cap: other requests see a step's blocks in the store within about 1 s plus one step when steps are slow |
 
+## Review fixes without a gate rerun (2026-10-24)
+
+- S6, unknown KV usage: if vLLM's KV cache manager is not bound, usage
+  used to read as 0.0, which silently turned off the KV-pressure send
+  (the press-01 regime). Now `plan_saves(kv_usage=None)` counts as
+  pressure, so every step sends (batching off). The scheduler warns once,
+  and `save stats` gains `kv_usage_unknown_steps`. Unit case
+  `test_kv_pressure_sends_held_saves[unknown]`.
+- S1, merged RPC size: a merged save RPC repeats every held block id and
+  hash in every layer entry. At the gate's `--max-num-batched-tokens 2048`
+  it stays under about 4 MB (128 blocks x 32 steps x 27 layers x about
+  37 B). At 16384 tokens on a 61-layer model it would reach about 74 MB,
+  over the 64 MiB gRPC limit (`python/src/lib.rs`), and every merged save
+  would fail as a warning only. `Worker.SAVE_RPC_MAX_BYTES = 16 MiB` now
+  caps it: a step whose job would push the held batch past the budget
+  sends the batch first. `_wire_bytes` estimates the size from the
+  protobuf layout (name plus framing per entry; a uint32 id and a
+  length-prefixed hash per block). A single step larger than the budget
+  still goes alone, as it did unbatched. No change at the gate's settings
+  (4 MB < 16 MiB), so no gate rerun. Unit case
+  `test_merged_save_rpc_stays_under_size_budget`.
+
 ## Open items
 
 - Under KV pressure the default's cold req/s stays 2 to 3% below batching
