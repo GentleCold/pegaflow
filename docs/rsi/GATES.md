@@ -474,6 +474,22 @@ the last accepted run record by hand until `--accepted` exists.
     would run a tree's code in every vLLM process, the API server included).
     Arms name their connector by module path. The connector module is still
     imported in the API server, by `MultiConnector`'s class lookup.
+    Exception: the `old` reference arm runs with `VLLM_PLUGINS=pegaflow` (that
+    entry point only). vLLM 0.32's API server rebuilds each MultiConnector
+    child's stats by registered name
+    (`MultiConnector.build_kv_connector_stats` ->
+    `KVConnectorFactory.get_connector_class_by_name`). `PegaKVConnector`
+    reports stats and only that plugin registers its name, so without it
+    every old-arm request fails with HTTP 500. The old arm is a reference arm
+    whose connector is imported from the venv's `pegaflow`, and the plugin
+    module comes from that same package, never from the tree under test. It
+    only registers connector names (lazy imports). The other arms' children
+    report no stats (probe, selftest, `connector_v2` today), or are vLLM
+    builtins registered under their class names (native
+    `OffloadingConnector`, lmcache `LMCacheConnectorV1`). An arm under test
+    whose connector starts reporting stats hits the same lookup and fails
+    loudly (HTTP 500), never silently; it does not get the plugin.
+    `summary.vllm_plugins` records each arm's value.
   - Independent signal. Completions are read by the gate *client-side*, from
     the `/v1/completions` HTTP response (`workloads.run_gsm8k`), and judged
     in the gate process. What the gate judges from and writes itself (pass

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1369,6 +1370,50 @@ def test_connector_under_test_is_wired_to_the_probe(tmp_path):
     cfg = run_gate.kv_transfer_config(f"{mod}:PegaKVConnectorV2", tmp_path, "tagged")
     probe_cfg = cfg["kv_connector_extra_config"]["connectors"][1]
     assert probe_cfg["kv_connector_extra_config"]["connector_modules"] == [mod]
+
+
+@pytest.mark.parametrize(
+    "arm,plugins",
+    [
+        ("old", run_gate.PEGAFLOW_PLUGIN),
+        ("plain", ""),
+        ("baseline", ""),
+        ("native", ""),
+        ("lmcache", ""),
+        ("selftest:honest", ""),
+        ("pegaflow.connector_v2:PegaKVConnectorV2", ""),
+    ],
+)
+def test_only_the_old_arm_loads_the_pegaflow_plugin(tmp_path, monkeypatch, arm, plugins):
+    """vLLM's API server looks MultiConnector children up by registered
+    name to rebuild their stats; ``PegaKVConnector`` is registered only by
+    the pegaflow plugin. Every other arm runs with no plugin (M7d)."""
+    # The name is the venv package's entry point (python/pyproject.toml).
+    eps = (
+        (run_gate.REPO / "python/pyproject.toml")
+        .read_text()
+        .split('[project.entry-points."vllm.general_plugins"]\n', 1)[1]
+    )
+    assert eps.startswith(f'{run_gate.PEGAFLOW_PLUGIN} = "pegaflow.vllm_plugin:register"')
+    seen: dict[str, str] = {}
+
+    class _Lease:
+        ports, block = [20001], [20010]
+
+    def launched(cmd, env, log, url, timeout, lease):
+        seen["plugins"] = env["VLLM_PLUGINS"]
+        return None
+
+    monkeypatch.setattr(run_gate, "PortLease", lambda *a, **kw: _Lease())
+    monkeypatch.setattr(run_gate, "launched", launched)
+    monkeypatch.setattr(run_gate, "isolated", lambda args, arm, log, cmd: cmd)
+    args = SimpleNamespace(
+        gpu="0", model="m", tp=1, max_model_len=8, max_num_batched_tokens=8, max_num_seqs=1,
+        gpu_mem=0.5, vllm_arg=[], num_gpu_blocks=0, under_test_path="",
+        lmcache_overlay=str(tmp_path),
+    )  # fmt: skip
+    run_gate.vllm_server(args, {}, arm, tmp_path / "probe", False, None, tmp_path / "log", 1 << 30)
+    assert seen["plugins"] == plugins == run_gate.vllm_plugins(arm)
 
 
 def test_module_files_must_resolve_under_gate_and_venv(tmp_path):
