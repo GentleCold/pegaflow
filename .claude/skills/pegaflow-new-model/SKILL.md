@@ -213,3 +213,23 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   Never give a sync load a deadline: the server's copy may still land.
 - A 64-question gsm8k slice cannot resolve a 2% bound (~10 s of wall time);
   use the full 1319 questions in slices when a G4 gsm8k check is the target.
+- Mamba align mode (vLLM 0.32): the block table holds only the running
+  state block, so checkpoint saves must come from
+  `kv_connector_block_state.boundary_state_offloads`. Offers exist only for
+  boundaries vLLM retains (`--prefix-cache-retention-interval`, gate-owned);
+  offered blocks are not kept alive, so save synchronously.
+- Byte-level checks outside the gate: run vLLM in-process
+  (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) with a connector subclass that
+  captures pages after the sync save and after each load; poison the whole
+  KV cache before the warm pass. `LLM.reset_prefix_cache()` returns False
+  while blocks wait for `finished_sending`: step the engine with 1-token
+  requests until it succeeds. Use natural text prompts; random tokens make
+  greedy outputs diverge on rounding alone.
+- The shared venv's `pegaflow_llm.pth` points at
+  `~/kexi/pegaflow-semantics-rsi/python`, and `run_gate` only prepends the
+  repo root (for `rsi`) to vLLM's PYTHONPATH. Launch every gate from a
+  feature tree with `PYTHONPATH=<tree>/python`, or the run tests the shared
+  tree's connector under your `.rsi-rev`. Once feat/rsi-g5 is merged, use
+  the gate's `--under-test-path <tree>/python` instead. Before trusting a
+  run, check `/proc/<vllm pid>/environ` or the connector's `from=` line in
+  the arm's vllm.log.

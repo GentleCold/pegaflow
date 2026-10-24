@@ -98,7 +98,7 @@ names, magic constants that only exist in the old code).
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 pending (G5 r3 official) |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
-| P5 | onboard Qwen3.5-4B | it0 (`feat/rsi-qwen3.5-4b`): spec dump, mapping, adapter draft; blocked on core checkpoint saves and `feat/rsi-gate-hybrid` |
+| P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed, Qwen3-4B + DSV2 non-regression; review of it0+it1 pending; gate runs wait for `feat/rsi-gate-hybrid` and the retention-528 gate.json |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ## Log
@@ -633,6 +633,34 @@ names, magic constants that only exist in the old code).
   - Adapter draft `adapters/mamba.py` + stub-spec tests. `LayerDecl.layout`
     (namespace-only) added for the packed state shapes/dtypes; empty for
     existing adapters, so Qwen3-4B's namespace is unchanged.
+- P5 it1 (Qwen3.5-4B, `feat/rsi-qwen3.5-4b`):
+  - Core: checkpoint groups save from vLLM's `boundary_state_offloads`
+    (only the boundary `saveable` picks, only if offered); layouts with a
+    checkpoint group save synchronously; loads unchanged (the state at p is
+    always past the local hit). `hit stats` log: per-group miss attribution.
+  - `--prefix-cache-retention-interval 528` requested from the gate owner
+    for every arm; not set by the connector.
+  - Ordering check on GPU4 (temporary tool `~/kexi/rsi-tools/p5`, not in the
+    repo): all checkpoint saves from offered blocks, saved bytes equal an
+    unprimed recompute up to rounding, every load byte-equal to the saved
+    page after poisoning the GPU cache, outputs equal (order2: 6/6; order3
+    with 6 preemptions: 5/6, divergence at token 152 with byte-equal loads).
+  - Non-regression on c4c1615: the Qwen3-4B slice
+    (`2026-10-24-qwen3-4b-p5-it1-nonreg-b`, GPU4) passes every verdict, with
+    the same deltas as P3 it2e. The DSV2 TP2 slice
+    (`2026-10-23-dsv2-lite-p5-it1-nonreg-b`, GPU 4,5, 64gb, P4 55e4ff1 +
+    P5 merged) matches P4's it2 slice: loads are byte-exact, the split-only
+    failures are unchanged, and replay cold TTFT fails at +10.2%, the open
+    P4 item. See ITERATIONS.md it1.
+  - Two earlier non-regression launches were invalid. They lacked
+    `PYTHONPATH=<tree>/python`, so vLLM imported the shared tree's
+    connector through the venv `.pth`. They are discarded, and the skill
+    has a lesson on it.
+  - `LayerDecl.layout` is connector-side (python `adapters/__init__.py`),
+    not in pegaflow-semantics and not in key derivation: no S-entry. The
+    namespace V1 vector for Qwen3-4B is unchanged: stub `cf6b5725`, native
+    `cd8acc0c` at 6545352; on P4's base (55e4ff1) `a25ea150` / `bdda8997`
+    before and after the P5 changes.
 
 ## Semantics changelog
 
@@ -656,6 +684,13 @@ Each entry: what was added, why, which vectors cover it.
   exact). seal_plan: all parts of a layer must share segment sizes; zero-byte
   segments rejected; writer = de-dup hint, store accepts any holder.
   Vectors: `resolve.json` (18), `seal_plan.json` (12), `key.json` (3).
+- Audit note, not an S-entry (P5 it1): `LayerDecl.layout` (connector
+  python, `adapters/__init__.py`) adds the Mamba state shapes/dtypes to the
+  connector's namespace fingerprint, only when non-empty. pegaflow-semantics,
+  `key(hash, group)` and `seal_plan` are untouched. V1 check: Qwen3-4B's
+  namespace is unchanged (stub `cf6b5725`, native `cd8acc0c` at 6545352;
+  `a25ea150` / `bdda8997` on P4's 55e4ff1 base with and without P5), pinned by
+  `test_namespace_vector_unchanged_for_full_attention`.
 
 ## Open questions
 

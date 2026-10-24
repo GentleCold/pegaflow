@@ -234,3 +234,125 @@ compares the remote tree's installed version, unrelated.
 
 Kind: none new. Checkpoint covers align mode. The open items are core
 work: save from offers, always load the state at p, and fences.
+
+## it1 (2026-10-24): core checkpoint support, ordering check, non-regression
+
+### Core change (Kind-driven, no model or spec names)
+
+- `Scheduler.plan_saves` takes the step's `boundary_state_offloads`. For a
+  checkpoint group, the block ids come from the offers (`_offered_ids`:
+  boundary `k*bt` -> block `k-1`), not from the block table; a boundary that
+  `saveable` picks but vLLM did not offer is skipped. Full and window groups
+  are unchanged.
+- Loads: no code. The checkpoint's needed block `[p - bt, p)` always lies
+  past the local hit (`p - num_computed >= step >= bt`), so the state at p
+  is always loaded, and vLLM drops its local state for an external hit.
+- `layout.py`: the checkpoint `Unsupported` is gone.
+- Worker: a layout with any checkpoint group saves synchronously in
+  `wait_for_save` (an offered block is only kept until vLLM frees or reuses
+  it). This model already had `may_zero_or_copy_blocks`.
+- Miss attribution (`Scheduler.hit_stats`, logged every 500 lookups and at
+  shutdown as `hit stats`): for each lookup, the longest resume point the
+  full group backs vs the planned `p`; when it is longer, count the set of
+  storage groups missing there (`missing=<sids>`) and the lost tokens.
+- `--prefix-cache-retention-interval 528` went to the gate owner as a
+  gate.json request (every arm, baseline included). The connector does not
+  set it. Without it vLLM offers only the replay boundary and junctions.
+- Tests: `test_checkpoint_saves_from_offers` (4 cases),
+  `test_checkpoint_loads_state_at_p` (cold, after a local hit, older
+  checkpoint), `test_miss_attribution_names_the_missing_group`; the
+  checkpoint case of `test_layout_rejects` is gone. 174 passed on .44 (stub
+  and native semantics).
+
+### Ordering check (GPU4, temporary, not in the repo)
+
+Tool: `~/kexi/rsi-tools/p5/` (`p5_check.py` connector subclass,
+`p5_check_run.py` driver, `p5_analyze.py`). One process
+(`VLLM_ENABLE_V1_MULTIPROCESSING=0`), its own pegaflow-server, retention
+528, `max_num_batched_tokens 1056`, `max_num_seqs 4`, natural text (the
+model's LICENSE). Six prompts cover: decode across a boundary, a forced
+stop at exactly 3 x 528, a junction at 1056 shared with another prompt, an
+extension of another prompt. Phases:
+- R: one request at a time, prefix cache reset before each, loads disabled
+  (the unprimed recompute).
+- A: all prompts batched with tight GPU blocks; every checkpoint save is
+  captured (GPU page bytes after the sync save).
+- C: reset vLLM's prefix cache, overwrite every KV byte with random data,
+  rerun A's prompts; every loaded page is captured right after the load.
+
+| Run | GPU blocks | Saves from offers | Loads byte-equal to saved | Saved vs recompute (R) | Outputs |
+|---|---|---|---|---|---|
+| order2 | 26 | 42/42 | 18/18 | rounding only: max conv 0.0625, ssm 0.024 (control between two states: 28.9 / 3.89) | C == A == R for all 6 |
+| order3 | 16, 300 output tokens, 2 GB pool, 6 preemptions | 39 saves, all offered (78 offers) | 27/27 | 24 states in both: rounding only, max conv 0.0625, ssm 0.014 (control 28.6 / 4.28) | C == A for 5/6; p4 diverges at token 152 |
+
+- No save used a block that was not offered at that step, and no saved
+  state was overwritten before the copy (the bytes match R up to bf16/fp32
+  rounding).
+- order3 p4: its loads were byte-equal, so this is not a transfer error.
+  The batch composition differs between A and C after preemption (no
+  batch-invariant mode for GDN), which is the likely cause. A-vs-R is not
+  comparable past token 64 there (R ran 64 output tokens).
+- Unused offers are boundaries already inside a local or external hit, or
+  offers on steps whose computed boundary is a different one.
+- hit stats (order3): `{"lookups": 1445}`, no group-incoherent miss.
+
+Run dirs: `~/kexi/rsi-runs/2026-10-24-qwen3.5-4b-p5-it1-order2`, `...-order3`.
+
+### Shared-core non-regression: Qwen3-4B slice (GPU4)
+
+`~/kexi/rsi-runs/2026-10-24-qwen3-4b-p5-it1-nonreg-b` (rev c4c1615, full
+gsm8k 1319, replay 8 x 6; pgid 2133248, 00:12:47Z-00:42:10Z host UTC). The
+v2 vllm.log `from=` line points at `~/kexi/pegaflow-rsi-qwen35/python`. The
+run is not official (it is a slice). Every v2 verdict passes. The in-run
+deltas match P3's accepted it2e slice (`2026-10-23-qwen3-4b-p3-it2e-slice`):
+
+| Check | it2e (P3) | P5 it1 |
+|---|---|---|
+| G2 (digests, outputs, acc 0.8582 cold/warm) | pass | pass |
+| G3 gsm8k warm E_ext / external hit | 1.0 / 0.899 | 1.0 / 0.899 |
+| G3 replay warm E_ext / external hit | 1.0 / 0.991 | 1.0 / 0.991 |
+| G3 no_eviction | pass | pass |
+| replay warm TTFT p50 (v2 vs baseline, warm2/warm3) | 0.096/0.091 vs 0.213/0.212 | 0.093/0.092 vs 0.210/0.213 |
+| replay warm req/s | 6.84/6.84 vs 5.49/5.48 | 6.85/6.86 vs 5.49/5.49 |
+| replay cold TTFT p50 / req/s | +1.3% / +0.05% | -1.0% / -0.5% |
+| gsm8k cold s (v2 vs baseline) | 181.9 vs 165.5 (fail; the rerun passed) | 166.0 vs 164.8 (+0.7%, pass) |
+| gsm8k warm s | 165.3 vs 165.4 | 165.1 vs 164.8 (+0.2%) |
+
+No `hit stats` line was logged. The layout has one full group and no
+policy cut, so no miss was counted.
+
+### Shared-core non-regression: DSV2-Lite TP2 slice (GPU 4,5)
+
+`~/kexi/rsi-runs/2026-10-23-dsv2-lite-p5-it1-nonreg-b`. Tree: P4's
+`feat/rsi-deepseek-v2-lite` 55e4ff1 (contains 1bfb590, P4's gate.json and
+spec) plus the P5 it1 commits, merged in a temporary tree (`.rsi-rev`
+7f51197, not pushed). Settings: `--tp 2 --gpu 4,5 --pool-size 64gb`, full
+gsm8k, replay 8 x 6, arms plain, baseline, v2. pgid 2094470,
+23:36:03Z-00:12:03Z host UTC. The v2 vllm.log `from=` line points at the
+merged tree. Compared with P4's it2 slice (`2026-10-23-dsv2-lite-p4-it2-slice`,
+3d1de18, GPU 0,1):
+
+| Check | P4 it2 slice | P5 it1 |
+|---|---|---|
+| loaded blocks, gsm8k ext / local (matched, 0 mismatched) | 10526 / 357952 | 10390 / 358088 |
+| loaded blocks, replay ext / local | 1382 / 7094 | 1382 / 7094 |
+| accuracy cold / warm (baseline 0.6725) | 0.6725 / 0.6778 | 0.6725 / 0.6778 |
+| split-only fails (`split_invariant` false): warm_differ, computed_exact self, vs baseline | 647, 0/23032, 27526/39042 | the same |
+| E_ext gsm8k / replay; no_eviction | 1.0 / 1.0; pass | 1.0 / 1.0; pass |
+| replay warm TTFT p50 (v2 vs baseline) | 0.102/0.110 vs 0.164/0.165 | 0.096/0.111 vs 0.164/0.178 |
+| replay warm req/s | 7.45/7.31 vs 5.94/5.94 | 7.48/7.48 vs 5.95/5.96 |
+| replay cold TTFT p50 | +6.4% (fail) | +10.2% (fail) |
+| replay cold req/s | -2.3% (fail) | +0.0% (pass) |
+| gsm8k cold / warm s | +0.2% / -2.3% | +0.0% / -2.6% |
+
+The cold replay TTFT failure is P4's open item. Save batching is off at
+55e4ff1, and P4's in-run batching-off control measured +5 to +20% across
+runs. The checkpoint change does not touch this layout: one MLA group, no
+offers, `sync_saves` unchanged. No pass is contaminated: the worst p99 is
+cold, 0.760 vs 0.732.
+
+An earlier attempt (`...-dsv2-lite-p5-it1-nonreg`, pgid 2065961) is
+invalid. The launch lacked `PYTHONPATH=<tree>/python`, so vLLM imported the
+shared tree's connector, which has no MLA adapter, and the v2 arm failed at
+init. The first Qwen3-4B slice (`2026-10-23-qwen3-4b-p5-it1-nonreg`) had
+the same fault and is discarded.

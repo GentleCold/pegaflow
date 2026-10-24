@@ -88,9 +88,28 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     blocks (a failed save is a future miss). A save RPC that hangs blocks
     `flush` and held requests for good (logged every 10 s): the client has
     no per-call deadline, and the server may still be copying.
+- **Checkpoint groups** (Mamba / GDN state, vLLM `mamba_cache_mode="align"`).
+  vLLM's block table for such a group is null except the running state
+  block, so positions do not say which block holds which state. Saves come
+  from `SchedulerOutput.kv_connector_block_state.boundary_state_offloads`
+  (`(group, block id, boundary tokens)`): `saveable` still decides which
+  boundary a step computed, and only an offer for exactly that boundary is
+  saved. A boundary vLLM did not offer (it retains only what
+  `--prefix-cache-retention-interval` keeps) is not saved. An offered block
+  holds its state only until vLLM frees or reuses it, so layouts with a
+  checkpoint group save synchronously in `wait_for_save`. Loads need nothing
+  special: the needed block `[p - bt, p)` is always past the local hit, and
+  vLLM allocates a fresh state block for an external hit.
+- **Hit stats.** Every 500 lookups (and at shutdown) the scheduler logs
+  `hit stats`: lookups, and per set of storage groups missing at the
+  longest resume point the full group backs, how often and how many tokens
+  were lost (`missing=` with no group: the policy lowered `p`). This is the
+  group-coherence signal for server eviction. Nothing is logged while no
+  miss was counted.
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
-    and shards, transfer backend, page_first;
+    and shards, transfer backend, page_first, and `LayerDecl.layout` when an
+    adapter declares it (e.g. the Mamba state shapes and dtypes);
   - vLLM's `kv_cache_layout` (the page byte order, e.g. LBNHC `[N, H, C]` vs
     LBHNC `[H, N, C]`);
   - the parallel shape;
@@ -110,8 +129,6 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   - failed saves.
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;
-  - so are checkpoint groups, until the core handles vLLM's
-    `boundary_state_offloads` (P5);
   - every TP rank's declarations must pass `semantics.seal_plan` (V0).
 
   At registration, every declared segment must equal `LayerView.bytes_per_block`,
@@ -130,7 +147,7 @@ Registered adapters:
 | Spec class | Module | Declares | Onboarded by |
 |---|---|---|---|
 | `FullAttentionSpec` | `full_attention` | `Group.full(block_size)`; one segment = the whole page (K/V interleaved per cell); `Heads` shard, replicas beyond `max_tp_shards` (checked against `kv_tp_replicas`); dense layer-compact pages only, no kernel-split HNC pages; rejects window, chunked, padded, packed, quantized and `non_causal` specs | Qwen3-4B (`docs/rsi/models/Qwen3-4B/ITERATIONS.md`) |
-| `MambaSpec` | `mamba` | `Group.checkpoint(block_size)`; one segment = the whole (padded) state page; state shapes/dtypes in `LayerDecl.layout`; `Heads` shard (or `Replicated` for `tp_replicated`); `align` mode only, rejects speculative/prefill-checkpoint blocks, per-token states, DCP. Draft: the core still rejects checkpoint groups | Qwen3.5-4B (draft, `docs/rsi/models/Qwen3.5-4B/ITERATIONS.md`) |
+| `MambaSpec` | `mamba` | `Group.checkpoint(block_size)`; one segment = the whole (padded) state page; state shapes/dtypes in `LayerDecl.layout`; `Heads` shard (or `Replicated` for `tp_replicated`); `align` mode only, rejects speculative/prefill-checkpoint blocks, per-token states, DCP | Qwen3.5-4B (in progress, `docs/rsi/models/Qwen3.5-4B/ITERATIONS.md`) |
 
 The shared rules live in the semantics crate, so an adapter only declares
 facts: the dependency kind, the tokens per block, the bytes per segment, and
