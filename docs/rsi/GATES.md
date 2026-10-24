@@ -543,7 +543,8 @@ the last accepted run record by hand until `--accepted` exists.
     the worker extension, `sys.modules`, the poison RPC or any run artifact.
     No instrument or run-artifact access, by code or by string.
 - Per-model settings: `docs/rsi/models/<model>/gate.json` (gate-owned):
-  `batch_invariant`, `split_invariant` (default true, established by
+  `batch_invariant` (established by `G2.batch_control`, see below),
+  `split_invariant` (default true, established by
   `G2.split_control`, see below), `invariant_attention_backend`,
   `attention_backend`, `vllm_args` (e.g. `mamba_cache_mode`). Pinned for every arm:
   `--max-num-batched-tokens 2048 --max-num-seqs 256 --enable-prefix-caching
@@ -563,7 +564,7 @@ the last accepted run record by hand until `--accepted` exists.
   bf16/fp16 value), then the pass. Warm reuse can only come from the
   connector; stale cold-pass bytes cannot rescue a connector that loads nothing.
   gsm8k: `cold`, `warm` (plain arm also `split_ref`, `split`: the split
-  control, below; with `split_invariant=false` the baseline arm also runs
+  control, and `alone`: the batch control, below; with `split_invariant=false` the baseline arm also runs
   `split`, the same-split references for warm computed KV; its pre-warm
   requests are tagged `<pass>_prewarm` and never scored). Replay: `cold`, `warm` (digested), `warm2..warmN`
   (timed, N = `--replay-repeats`). Each request carries
@@ -680,6 +681,20 @@ the last accepted run record by hand until `--accepted` exists.
   Measured on DeepSeek-V2-Lite TP2: honest self-test 0/128 differ from
   `split`, liar/bitflip/offbyone 128/128; the old connector 38/1319, all 38
   aligned (82 aligned prompts).
+- Batch invariance (`batch_invariant`, `G2.batch_control`, baseline
+  verdicts). It decides whether outputs are compared at all
+  (`G2.warm_equals_cold`, `G2.gsm8k_outputs`), so the run measures it too:
+  the plain arm's `alone` pass repeats the first 64 prompts of `split` (same
+  pre-warm, so the same split) at concurrency 1. `G2.batch_control` passes
+  iff measured invariance (every completion and sampled-token logprob of
+  `alone` equal to the same prompt's batched `split` one) equals gate.json's
+  `batch_invariant` and the `alone` pre-warm took for >= 0.9 of them. vLLM
+  0.32 cannot be batch invariant on GDN (Qwen3.5): the backend selector
+  rejects `VLLM_BATCH_INVARIANT` for Mamba backends without
+  `supports_batch_invariance`, and plain vLLM batched vs alone flips a
+  completion. With `batch_invariant=false` the loaded-block digest checks
+  stay exact because gsm8k digests every computation (the reference is
+  exhaustive: `digest_compare`), and only accuracy is compared on outputs.
 - G3 (`oracle.py`): replays `requests.jsonl` with unlimited capacity. A block
   ending at token e is stored at the first step whose `progress` reaches e
   (checkpoint groups: only a step ending exactly on e) and is visible to
