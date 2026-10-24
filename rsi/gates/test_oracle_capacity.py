@@ -286,6 +286,50 @@ def test_capacity_record_without_a_field_fails_not_crashes(drop):
     assert drop in v["reason"]
 
 
+def _g3_result(e: float | None, oracle_rate: float, excess: int, errors: int) -> dict:
+    warm = {"efficiency": e, "oracle_hit_rate": oracle_rate, "excess_tokens": excess,
+            "excess_limit": 16, "external_hit_rate": 0.5, "hit_rate": 0.6,
+            "local_hit_tokens": 10, "prompt_tokens": 100}  # fmt: skip
+    return {"hit": {"warm": warm}, "load_errors": [{}] * errors}
+
+
+@pytest.mark.parametrize(
+    "e,oracle_rate,excess,errors,ok,below",
+    [
+        (1.0, 0.99, 0, 0, True, []),
+        (0.5, 0.99, 0, 0, True, ["efficiency"]),  # low E_ext: reported, not gated
+        (None, 0.2, 0, 0, True, ["efficiency", "oracle_hit_rate"]),
+        (1.0, 0.99, 17, 0, False, []),  # excess beyond one block per request
+        (1.0, 0.99, 0, 1, False, []),  # load errors
+    ],
+    ids=["at-bar", "low-e", "no-e-low-oracle", "excess", "load-errors"],
+)
+def test_g3_hit_level_is_reported_correctness_is_gated(e, oracle_rate, excess, errors, ok, below):
+    """User, 2026-10-24: no hard hit-rate threshold. E_ext and the oracle hit
+    rate are reported with their reference; excess and load errors still fail."""
+    v = run_gate._hit_verdict(_g3_result(e, oracle_rate, excess, errors), "replay")
+    assert v["pass"] is ok
+    assert [k for k, x in v["reported"].items() if x["below"]] == below
+    assert v["efficiency"] == e and v["oracle_hit_rate"] == oracle_rate
+
+
+def test_g5_low_e_c_is_reported_not_gated():
+    """A capacity record whose E_C is far below 0.9 passes G5 on correctness
+    and validity; the number and its reference stay in the verdict and in the
+    run's hit report."""
+    r = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    r["capacity"]["warm_timed"]["efficiency_c"] = 0.3
+    v = run_gate._capacity_verdict(r, pegaflow=True, gated=True)
+    assert v["pass"] and v["efficiency_c"] == 0.3
+    assert v["reported"]["efficiency_c"] == {"value": 0.3, "reference": 0.9, "below": True}
+    r["load_errors"] = [{}]
+    assert not run_gate._capacity_verdict(r, pegaflow=True, gated=True)["pass"]
+    rep = run_gate.hit_report({"baseline": {}, "X": {"G5.replay_warm": v}})
+    assert rep["X"]["status"] == "reported"
+    assert rep["X"]["G5.replay_warm"]["efficiency_c"] == 0.3
+    assert rep["X"]["G5.replay_warm"]["below_reference"] == ["efficiency_c"]
+
+
 def test_verdicts_reference_arms_not_required_and_errors_isolated(tmp_path):
     good = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
     good["digest_self"] |= {"external_compared": 1}
