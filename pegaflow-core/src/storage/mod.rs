@@ -76,9 +76,9 @@ pub struct StorageConfig {
     pub pool_shards: usize,
     /// Share of the cache, in percent, that decode backups keep reclaimable.
     pub backup_reclaimable_percent: u64,
-    /// Tail-first eviction window: share of a replacement class, in percent,
-    /// oldest first, whose deepest chain blocks are evicted first. `0` is
-    /// plain LRU.
+    /// Tail-first eviction window: share of the retained class, in percent,
+    /// oldest first, whose deepest chain blocks are evicted first. `0` (the
+    /// default) is plain LRU.
     pub tail_window_percent: u64,
     /// Most decode backup candidates one heartbeat reports.
     pub backup_max_candidates: usize,

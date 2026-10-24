@@ -187,12 +187,14 @@ pub struct Cli {
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=100))]
     pub backup_reclaimable_percent: u64,
 
-    /// Tail-first eviction window, in percent of each replacement class
-    /// (oldest first). Pressure eviction takes the deepest prefix-chain blocks
-    /// in this window first and never evicts a block before its resident
-    /// descendants. 0 is plain LRU. Larger windows reach into recently used
-    /// chains and lose hits; see docs/rsi/server/evict-tail.md.
-    #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u64).range(0..=100))]
+    /// Tail-first eviction window, in percent of the retained class (oldest
+    /// first, at most 4096 blocks). Pressure eviction takes the deepest
+    /// prefix-chain blocks in this window first and never evicts a retained
+    /// block before its retained descendants; the reclaimable class stays
+    /// plain LRU. 0 (default) is plain LRU. 25 is the evaluated setting;
+    /// larger windows reach into recently used chains and lose hits. See
+    /// docs/rsi/server/evict-tail.md.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=100))]
     pub tail_window_percent: u64,
 
     /// Decode backup: most candidate blocks one heartbeat reports. Bounds the

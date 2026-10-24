@@ -55,8 +55,10 @@ const BACKUP_REPORT_USAGE_PERCENT: u64 = 90;
 pub(crate) const DEFAULT_BACKUP_RECLAIMABLE_PERCENT: u64 = 10;
 /// Retained entries a candidate scan may look at per candidate wanted.
 const BACKUP_SCAN_FACTOR: usize = 4;
-/// Default tail-first window: the oldest quarter of a class.
-pub(crate) const DEFAULT_TAIL_WINDOW_PERCENT: u64 = 25;
+/// Default tail-first window: 0, plain LRU. Tail-first is opt-in until a
+/// hybrid model has passed the capacity gate with it on (25 is what the
+/// Qwen3-4B gate runs use); see docs/rsi/server/evict-tail.md.
+pub(crate) const DEFAULT_TAIL_WINDOW_PERCENT: u64 = 0;
 /// Most retained entries one tail-first pass looks at, for the window and
 /// again for the pinned-leaf fallback, so a pressure round holds the cache
 /// lock for a bounded scan whatever the resident count. In the sim the
@@ -1455,7 +1457,7 @@ mod tests {
         // The old connector queries from vLLM's local hit, so the chain head
         // is queried once, never loaded, and never refreshed again: it is the
         // LRU front while its descendants stay hot.
-        let cache = make_cache();
+        let cache = make_cache().with_tail_window_percent(25);
         let chain = keys(1, 4);
         let newer = keys(2, 4);
         insert_all(&cache, &chain);

@@ -7,18 +7,61 @@ evict the deepest chain block among the oldest blocks.
 
 ## What changes
 
-`--tail-window-percent` (default 25, 0 = plain LRU). Pressure eviction, per
-replacement class (reclaimable first, then retained):
-1. The window is the oldest `max(25% of the class, blocks still wanted)`
-   blocks.
-2. Candidates are taken deepest first. Ties go to the oldest. A block whose
-   depth was never observed counts as deepest.
-3. Taking a candidate walks down to its deepest resident descendant and
-   evicts that leaf, then the next, up to the candidate. A block is never
-   evicted while a block that depends on it is resident.
-4. If the next leaf is pinned (query lease, transfer lock, backup copy),
-   the subtree is skipped. If pins cover the whole window, the class's
-   other leaves are tried in LRU order.
+`--tail-window-percent`, default 0 (plain LRU, opt-in). The evaluated
+setting is 25, and every gate run passes it explicitly. Default 0 follows
+the review (`docs/rsi/reviews/server-evict-tail-h5.md` §7): no hybrid model
+has run with the window on, the group > 0 rule depends on a client
+contract (§Group coherence), and old loses E_C at C/U 0.25 for a reason
+that is not understood. Revisit 25 as the default after one hybrid model
+passes G5 cap with it on.
+
+Pressure eviction, reclaimable class first, then retained:
+- The reclaimable class is always plain LRU. Each of its blocks has a copy
+  on another node (decode backup, a finished P2P transfer, a reclaim hint),
+  so dropping a head there strands nothing that RDMA prefetch cannot
+  refill. Before review fix M1 the reclaimable pass walked into retained
+  descendants. With decode backup it then dropped the cluster's only copy
+  of a chain's tail to drop a backed-up head, and freed retained bytes, so
+  backup reporting stalled.
+- The retained class, with a window set:
+  1. The window is the oldest `max(min(25% of the class, 4096), blocks still
+     wanted)` blocks. The 4096 cap (review M2/S2) bounds the scan under
+     the cache lock. In the sim the oldest 4096 scored 0.762 / 0.726 at
+     0.5, against 0.764 / 0.734 for 25% (§Choosing the window). The gated
+     Qwen3-4B cache holds about 11.5k blocks, so 25% is under the cap
+     there, and the gate measures the uncapped rule.
+  2. Candidates are taken deepest first. Ties go to the oldest. A block
+     whose depth was never observed counts as deepest.
+  3. Taking a candidate walks down to its deepest retained descendant and
+     evicts that leaf, then the next, up to the candidate. The walk never
+     follows a reclaimable child, and a block whose children are all
+     reclaimable is a leaf. A retained block is never evicted while a
+     retained block that depends on it is resident.
+  4. If the next leaf is pinned (query lease, transfer lock, backup copy),
+     the subtree is skipped. If pins cover every candidate, the oldest
+     4096 retained entries are searched for unpinned leaves, and only the
+     victims are cloned. If that finds nothing either, the round falls
+     back to plain LRU, so reclaim never stops where H4 would progress.
+     Those evictions can strand descendants and show in the counter below.
+
+Lock hold per pressure round, from the ignored bench
+`tail_first_round_lock_hold_at_2_6m_blocks` (2.6M resident blocks in
+64-block chains, batch 512, 20 rounds, release build, 10.1.0.44; the
+time is `remove_lru_batch` including its metrics, so it is an upper
+bound):
+
+| case | plain LRU | tail-first 25%, capped | tail-first 25%, uncapped (pre-M2) |
+|---|---|---|---|
+| nothing pinned, mean / max | 0.81 / 0.89 ms | 1.45 / 1.81 ms | 19.6 / 24.8 ms |
+| oldest 8192 pinned, mean / max | 0.95 / 3.5 ms | 1.97 / 12.2 ms | 19.8 / 24.8 ms |
+
+The uncapped column is the same bench with the cap set to `usize::MAX`, a
+one-off patch in the remote wip tree that was reverted and not committed.
+With the oldest 8192 pinned, the whole 4096-block window is pinned. By the
+code path (the bench does not time rounds separately), the first round
+finds no candidate and no unpinned leaf, and falls back to plain LRU. That
+LRU pass moves the pinned blocks to the MRU end, as H4 does, which is why
+both policies have their max there. Later rounds see an unpinned window.
 
 Depth and links come from what the server sees, with no model knowledge:
 - A group 0 prefix query (`query_prefetch`, group 0) marks each block of its

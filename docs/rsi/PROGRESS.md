@@ -494,6 +494,12 @@ names, magic constants that only exist in the old code).
     LRU). It evicts leaves first, so no block goes while a dependent stays
     resident. Depth and links come from query hit prefixes; group > 0
     blocks are tied to their group 0 position. Model-agnostic.
+  - Review (`docs/rsi/reviews/server-evict-tail-h5.md`, accept after
+    must-fix) fixes:
+    - M1: the reclaimable class stays plain LRU, and tail-first runs only
+      in retained.
+    - M2: the window and fallback scans are capped at 4096 blocks.
+    - The default is now 0 (opt-in), and gate runs pass 25.
   - Recency is refreshed only by queries, serving and re-saves, never by
     load. So old's head blocks age out under LRU; H5 keeps them while
     their descendants stay.
