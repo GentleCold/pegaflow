@@ -1,11 +1,41 @@
 # RSI gates (human-owned)
 
 Agents may add checks or tighten thresholds here; they may not remove or relax
-anything. Changes to this file need the review agent's sign-off and a log line in
+anything (only the human gate owner can, as on 2026-10-24 for hit-rate levels). Changes to this file need the review agent's sign-off and a log line in
 `PROGRESS.md`. Status: DRAFT until the user confirms the metric set.
 
 A model is "supported" only when every hard gate passes on that model and no
 earlier model regresses.
+
+## Hit rate: reported, judged by the agent (user, 2026-10-24)
+
+User, 2026-10-24: "命中率那块，不要设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多"
+("for hit rate, set no hard threshold; the agent judges whether the hit rate
+is enough, it must not be far off"). The human gate owner's decision; it
+replaces the hit-rate bars below (G2 "> 0.9 of oracle", G3 `E_ext >= 0.95`
+and `oracle_hit_rate >= 0.5`, G5 `E_C >= 0.9`, and the "no `H` / `E_C`
+regression" clauses).
+
+- Reported, never gated: `H`, `H*`, `E_ext`, `H*_C`, `H_lru`, `H_freeze`,
+  `E_C`, the oracle hit rate and per-group attribution. Every number is
+  still computed. Each verdict carries a `reported` block (value, former
+  bar as `reference`, `below`). `summary.hit_report` (also printed as the
+  `[gate] hit rates (reported, not gated)` line) lists them per arm with
+  `status: reported`.
+- Still hard, unchanged: load errors, mismatched / unreferenced blocks,
+  digest coverage (`MIN_JUDGED_*`, `MIN_COMPUTED_COVERAGE`,
+  `MIN_PREWARMED`), `excess` within one block per request, `G3.no_eviction`
+  on the unlimited runs, the cap pool and load proofs (`pool_ok`,
+  `loads_ok`, `unmatched_requests == 0`), the G5 capacity floor and freeze
+  separation (run validity, `not_official_because`), and every G0 / G2 / G4
+  check.
+- Hit-rate judgment: the onboarding agent writes a "hit-rate judgment" in
+  the model's `ITERATIONS.md` for each accepted run. It compares the
+  measured hit rate with `H*` / `H*_C` and the reference arms (`H_lru`,
+  `old`, `native`), explains every gap (Kind limits, retention, eviction,
+  per-group misses), and says whether it is close enough. The review agent
+  checks that judgment (numbers against `summary.hit_report`, the
+  explanation against the attribution) and can reject the run on it.
 
 ## G0 Layout (hard)
 
@@ -32,10 +62,10 @@ earlier model regresses.
      reset via `/reset_prefix_cache` before the pass, so reuse must come from
      PegaFlow)
    - gate: `|warm - baseline| <= 1.0pp` and `|cold - baseline| <= 1.0pp`
-   - warm external hit rate must be > 0.9 of oracle, otherwise the accuracy
-     number says nothing about loaded KV.
+   - warm external hit rate vs oracle: reported. A warm pass that loads little
+     says little about loaded KV, and the hit-rate judgment has to say so.
 
-## G3 Hit rate (hard on regressions, primary RSI objective)
+## G3 Hit rate (reported, primary RSI objective; see "Hit rate" above)
 
 Definitions, per run, prompt tokens only:
 
@@ -52,9 +82,10 @@ Also reported, per group: hit tokens, resolve fallback count and tokens lost to
 fallback (P shrunk because some group lacked data), lease/prefetch failures,
 loaded-but-unused bytes, saved-but-never-loaded bytes (write amplification).
 
-Gate: `E >= 0.95` on the replay workload at the configured capacity, and no
-model's `H` drops vs. its last accepted iteration. Old connector's `H` on the same
-trace is recorded as a black-box reference number only.
+Gate: none on the level since 2026-10-24. `E` (reference 0.95) and `H` against
+the model's last accepted iteration go into the hit-rate judgment. Old
+connector's `H` on the same trace is recorded as a black-box reference number
+only.
 
 ## G4 Performance (hard gate, RSI objective)
 
@@ -71,7 +102,7 @@ cold replay and gsm8k may be at most 2% worse than baseline (see G4 under
 precise definitions); no >5% regression vs. last accepted iteration of the
 same model.
 
-## G5 Capacity hit rate (hard, RSI objective; added 2026-10-23, status: implemented, see G5 under precise definitions)
+## G5 Capacity hit rate (RSI objective; added 2026-10-23; `E_C` reported since 2026-10-24, correctness and validity hard; see G5 under precise definitions)
 
 User: actual hit rate has to approach the theoretical one at a fixed capacity.
 G3 runs with an unlimited pool, so it cannot see eviction policy, write
@@ -121,11 +152,11 @@ so such stranded bytes are possible today.
   simulated stores; the server side reports eviction and save/load byte
   counters and its resident / used bytes at each pass end. TODO: actual
   stranded bytes need a server-side resident-key dump (server change, own PR).
-- Gate: `G5.replay_warm.E_C >= 0.9` at `f = 0.5`; no load errors; the cap
-  passes' digests pass `G2.digest_self` (eviction must never produce a wrong
-  load); server load bytes cover every external hit; `excess` bounded as in G3
-  against the unlimited oracle; no `E_C` regression vs the last accepted
-  iteration. A slice-size G5 (below the capacity floor) is a smoke test of
+- Gate at `f = 0.5`: no load errors; the cap passes' digests pass
+  `G2.digest_self` (eviction must never produce a wrong load); server load
+  bytes cover every external hit; `excess` bounded as in G3 against the
+  unlimited oracle. `E_C` (reference 0.9) and its change vs the last
+  accepted iteration are reported and go into the hit-rate judgment. A slice-size G5 (below the capacity floor) is a smoke test of
   flow and digests only; its `E_C` supports no conclusion.
 - Reference arms: `old`, `native` (vLLM `OffloadingConnector` with exactly
   `C` CPU bytes) and `lmcache` (LMCache local CPU backend of exactly `C`
@@ -474,6 +505,27 @@ the last accepted run record by hand until `--accepted` exists.
     would run a tree's code in every vLLM process, the API server included).
     Arms name their connector by module path. The connector module is still
     imported in the API server, by `MultiConnector`'s class lookup.
+    Exception: the `old` reference arm runs with `VLLM_PLUGINS=pegaflow` (that
+    entry point only). vLLM 0.32's API server rebuilds each MultiConnector
+    child's stats by registered name
+    (`MultiConnector.build_kv_connector_stats` ->
+    `KVConnectorFactory.get_connector_class_by_name`). `PegaKVConnector`
+    reports stats and only that plugin registers its name, so without it
+    every old-arm request fails with HTTP 500. The old arm is a reference arm
+    whose connector is imported from the venv's `pegaflow`, and the plugin
+    module comes from that same package, never from the tree under test. It
+    only registers connector names (lazy imports). The other arms' children
+    report no stats (probe, selftest, `connector_v2` today), or are vLLM
+    builtins registered under their class names (native
+    `OffloadingConnector`, lmcache `LMCacheConnectorV1`). If the connector
+    under test starts reporting stats, it hits the same lookup and fails
+    loudly (HTTP 500 on every request), never silently. The fix is in that
+    connector: its own module registers its class under its class name when
+    it is imported (`KVConnectorFactory.register_connector(name, __name__,
+    name)`). vLLM imports that module in the API server by module path. The
+    arm under test never gets the plugin, which would run the venv's
+    `pegaflow` code in the arm's processes. `summary.vllm_plugins` records
+    each arm's value.
   - Independent signal. Completions are read by the gate *client-side*, from
     the `/v1/completions` HTTP response (`workloads.run_gsm8k`), and judged
     in the gate process. What the gate judges from and writes itself (pass
@@ -637,9 +689,10 @@ the last accepted run record by hand until `--accepted` exists.
   error). Per request: `ext = max(0, min(actual, oracle) - local)`,
   `ext* = max(0, oracle - local)`; `E_ext = Σext / Σext*`;
   `excess = Σ max(0, actual - max(oracle, local))`. G3.gsm8k_warm and
-  G3.replay_warm: `E_ext >= 0.95` (None fails), `oracle_hit_rate >= 0.5`,
-  `excess <= one block per request`, no load errors; replay G3 also requires
-  G2.digest_self.replay.
+  G3.replay_warm: `excess <= one block per request`, no load errors; replay
+  G3 also requires G2.digest_self.replay. Reported (`reported`, not in
+  `pass`): `E_ext` (reference 0.95, `None` is `below`) and
+  `oracle_hit_rate` (reference 0.5), with hit, local and external rates.
 - G3.no_eviction: `pegaflow_cache_block_evictions_total` delta = 0 in every
   gsm8k and replay pass (the oracle has unlimited capacity; `cap*` passes are
   meant to evict and are excluded; `native` / `lmcache` have no PegaFlow server: n/a, pass).
@@ -760,8 +813,9 @@ the last accepted run record by hand until `--accepted` exists.
     bytes of the blocks `needed` at `actual` that `needed` at the request's
     own local hit does not hold; `loaded_bytes(pass)` = the
     `pegaflow_load_bytes_total` delta of the pass.
-  - `G5.replay_warm` (gated fraction 0.5): `E_C >= 0.9` on `warm_timed`,
-    `excess <= one block per request` (unlimited oracle, own local, as G3),
+  - `G5.replay_warm` (gated fraction 0.5): `E_C` on `warm_timed` reported
+    (reference 0.9, not in `pass`); gated: `excess <= one block per request`
+    (unlimited oracle, own local, as G3),
     no load errors, `unmatched_requests == 0`, `G2.digest_self.cap` passes,
     and for a
     PegaFlow arm `pool_capacity_bytes` present and `<= C` and Σ
@@ -798,9 +852,10 @@ the last accepted run record by hand until `--accepted` exists.
     under-estimates freeze against real traces, so rotation is the gate's
     mechanism and the self-check below is its guard.
   - Separation self-check: if `freeze_vs_oracle_c` of the connector under
-    test at the gated fraction is `>= 0.9`, the trace does not separate a
-    frozen store from the bar and the run is not official
+    test at the gated fraction is `>= 0.9` (`FREEZE_SEPARATION`), the trace
+    does not separate a frozen store from the bar and the run is not official
     (`not_official_because: G5 trace does not separate freeze from H*_C`).
+    This is workload validity, not a bar on the arm, so it stays hard.
 - Self-test arms (`rsi/gates/selftest/connector.py`, full-attention groups
   only): `honest` saves at finish and loads saved prefixes (must pass every G2
   check); `liar` claims every complete unit and loads nothing; `bitflip` flips
