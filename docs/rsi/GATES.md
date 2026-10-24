@@ -190,12 +190,29 @@ output, they do not edit it.
 | `rsi_probe.py` | `RsiProbe` connector, never loads/saves. Stacked after the connector under test in `MultiConnector`; dumps G0 spec, per-request trace, V3 digests |
 | `digest_compare.py` | G2.1 byte comparison of digested blocks |
 | `oracle.py` | G3 `H*` replay through `semantics.resolve`; G5 `U`, `H*_C` (clairvoyant) and `H_lru` capacity simulation |
-| `test_oracle_capacity.py` | G5 oracle contract on synthetic traces (`python -m pytest rsi/gates/test_oracle_capacity.py`, no GPU) |
+| `test_oracle_capacity.py` | G5 oracle and gate contract on synthetic traces, no GPU (command below) |
 | `workloads.py` | gsm8k, multi-turn replay, Prometheus scrape |
 | `run_gate.py` | orchestrator: arms x workloads, cold/warm passes, verdicts |
 | `provenance.py` | tree verification, under-test snapshot, static scan + allowlist |
 | `isolate.py` | runs the arm under test with the runs root hidden (mount namespace) |
 | `selftest/connector.py` | gate self-test connector: `honest` / `liar` / `bitflip` / `offbyone` |
+
+Tests. They need `pytest`, `requests` and a built `pegaflow.semantics` (the
+native module), so they run in a venv where `python/` is built. Everything
+else they import is stdlib. From a checkout:
+
+```bash
+cd python && uv sync --extra test                 # pytest, requests
+uv pip install 'maturin>=1.0,<2.0'
+uv run maturin develop -r                         # CUDA 13: add --no-default-features --features cuda-13
+cd .. && PYTHONPATH=. python/.venv/bin/python -m pytest -q -p no:cacheprovider rsi/gates
+```
+
+The full suite is the gate's test run, signal and teardown tests (real
+subprocesses) included: 164 tests in about 45 s on the 4090 host. Nothing is
+deselected. The isolation tests (`isolate.py`) need Linux and root and skip
+elsewhere. The shared venv on the GPU hosts already has the built
+`pegaflow`, so there only the last line is needed.
 
 Trees on the host carry no bytecode by construction (M5 rejects any `.pyc`
 in the tree under test): extract a rev with

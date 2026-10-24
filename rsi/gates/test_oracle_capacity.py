@@ -1,7 +1,6 @@
-"""G5 capacity oracle and verdict contract (no GPU; needs the built
-``pegaflow.semantics`` and the gate's Python deps).
-
-Run from the repo root: ``python -m pytest rsi/gates/test_oracle_capacity.py``.
+"""G5 capacity oracle and verdict contract (no GPU). Needs ``pytest``,
+``requests`` and a built ``pegaflow.semantics``; the command is in
+docs/rsi/GATES.md ("Tests"). The isolation tests run only on Linux as root.
 """
 
 from __future__ import annotations
@@ -742,7 +741,7 @@ def test_sigterm_tears_down_launched_groups(tmp_path):
     from pathlib import Path
 
     root = Path(run_gate.__file__).resolve().parents[2]
-    env = os.environ | {"PYTHONPATH": str(root)}
+    env = _env_with_path(root)
     port = str(run_gate.free_port())
     gate = subprocess.Popen([sys.executable, "-c", _GATE_LIKE, port, str(tmp_path)], env=env)
     pid_file = tmp_path / "pid"
@@ -802,7 +801,7 @@ def test_stop_signal_in_a_launch_window_still_stops_the_group(tmp_path, where):
     from pathlib import Path
 
     root = Path(run_gate.__file__).resolve().parents[2]
-    env = os.environ | {"PYTHONPATH": str(root)}
+    env = _env_with_path(root)
     port = str(run_gate.free_port())
     gate = subprocess.run(
         [sys.executable, "-c", _WINDOW_LIKE, port, str(tmp_path), where],
@@ -1206,7 +1205,7 @@ def test_isolated_arm_is_torn_down_with_its_group(tmp_path):
     import time
 
     root = Path(run_gate.__file__).resolve().parents[2]
-    env = os.environ | {"PYTHONPATH": str(root)}
+    env = _env_with_path(root)
     port = str(run_gate.free_port())
     gate = subprocess.Popen([sys.executable, "-c", _ISOLATED_GATE, port, str(tmp_path)], env=env)
     pid_file = tmp_path / "pid"
@@ -1227,6 +1226,15 @@ def test_isolated_arm_is_torn_down_with_its_group(tmp_path):
     with pytest.raises(ProcessLookupError):
         os.killpg(leader, 0)
     assert _dead(escaped), "setsid'd child survived teardown"
+
+
+def _env_with_path(root: Path) -> dict[str, str]:
+    """The test's env with the repo root prepended to ``PYTHONPATH`` (kept,
+    not replaced: it may be what finds the built ``pegaflow``)."""
+    import os
+
+    path = [str(root), *filter(None, [os.environ.get("PYTHONPATH")])]
+    return os.environ | {"PYTHONPATH": os.pathsep.join(path)}
 
 
 def _dead(pid: int) -> bool:
@@ -1524,7 +1532,7 @@ def test_stop_signal_aborts_the_run(tmp_path, sig, where):
     from pathlib import Path
 
     root = Path(run_gate.__file__).resolve().parents[2]
-    env = os.environ | {"PYTHONPATH": str(root)}
+    env = _env_with_path(root)
     port = str(run_gate.free_port())
 
     def ignore_sigint():
