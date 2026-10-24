@@ -27,9 +27,9 @@ Pressure eviction, reclaimable class first, then retained:
   1. The window is the oldest `max(min(25% of the class, 4096), blocks still
      wanted)` blocks. The 4096 cap (review M2/S2) bounds the scan under
      the cache lock. In the sim the oldest 4096 scored 0.762 / 0.726 at
-     0.5, against 0.764 / 0.734 for 25% (§Choosing the window). The gated
-     Qwen3-4B cache holds about 11.5k blocks, so 25% is under the cap
-     there, and the gate measures the uncapped rule.
+     0.5, against 0.764 / 0.734 for 25% (§Choosing the window). On the
+     gated Qwen3-4B caches (5.8k / 11.5k / 17.3k blocks) 25% is under the
+     cap at 0.25 and 0.5, and slightly over at 0.75.
   2. Candidates are taken deepest first. Ties go to the oldest. A block
      whose depth was never observed counts as deepest.
   3. Taking a candidate walks down to its deepest retained descendant and
@@ -296,6 +296,63 @@ GPU:
 - Cap warm TTFT p50 does not regress: at 0.5, H5 is 2.07-2.28 s (old) and
   2.10-2.17 s (v2), against H4's 2.22-2.30 and 2.20-2.28 s.
 
+### Rerun after the review fixes
+
+One more cap pair on the same gate tree, plan and arms, after the review
+fixes M1, M2, the default change and N4. Server builds:
+- H5: built from a `git archive` of 10e7afa
+  (`~/kexi/pegaflow-rsi-server-evict-tail-src-10e7afa`, tar sha256
+  055aa8f9…, same on both ends) as `bin/pegaflow-server-h5-10e7afa`,
+  sha256 ebce745b…. The window is passed explicitly: the run uses the
+  wrapper `bin/pegaflow-server-h5-10e7afa-w25` (sha256 eb4b824c…, the
+  hash in the run's `summary.json`), which execs that binary with
+  `--tail-window-percent 25`.
+- H4: the same d45a366 binary as before.
+
+The pair ran at the same time, with H5 on GPU7. The first pair had H5 on
+GPU6.
+
+| tag | server | GPU | pgid | UTC start - end |
+|---|---|---|---|---|
+| `cap4-h5fix` | H5 10e7afa, window 25 | 7 | 2656838 | 08:54:14 - 10:00:36 |
+| `cap4-h4` | H4 | 6 | 2656839 | 08:54:15 - 10:00:44 |
+
+Both runs exit rc 1, non-official, as above. Timed warm passes, old / v2:
+
+| C/U | run | E_C | hit | H\*_C | H_lru |
+|---|---|---|---|---|---|
+| 0.25 | H4 `cap4-h4` | 0.208 / 0.195 | 0.474 / 0.455 | 0.865 / 0.863 | 0.584 / 0.588 |
+| 0.25 | H5 `cap4-h5fix` | 0.126 / 0.168 | 0.453 / 0.462 | 0.865 / 0.864 | 0.594 / 0.587 |
+| 0.5 | H4 `cap4-h4` | 0.712 / 0.712 | 0.860 / 0.860 | 0.929 / 0.929 | 0.858 / 0.857 |
+| 0.5 | H5 `cap4-h5fix` | 0.759 / 0.769 | 0.887 / 0.890 | 0.930 / 0.929 | 0.858 / 0.858 |
+| 0.75 | H4 `cap4-h4` | 0.749 / 0.750 | 0.916 / 0.917 | 0.971 / 0.971 | 0.915 / 0.916 |
+| 0.75 | H5 `cap4-h5fix` | 0.778 / 0.791 | 0.930 / 0.933 | 0.971 / 0.971 | 0.917 / 0.917 |
+
+- The 0.5 gain holds: +0.047 / +0.057 E_C over the H4 run beside it, and
+  0.759 / 0.769 against 0.763-0.769 for the 7791c30 build. Hit is
+  0.887 / 0.890 against 0.860.
+- At 0.75, +0.03 / +0.04 E_C.
+- At 0.25, old loses again: 0.126 against 0.208, the widest gap of the
+  three pairs, since this H4 run is the highest H4 so far. v2 loses
+  0.027.
+- Pressure evictions at 0.5: 63.7k / 63.2k against H4's 75.4k / 75.2k,
+  the same ratio as the first build. `with_children` is 0 on both
+  servers, and dead blocks are 0 at every pass end.
+- Warm TTFT p50 at 0.5, warm2 / warm3: H5 2.19 / 2.13 s (old) and
+  2.11 / 2.08 s (v2), against H4's 2.29 / 2.33 and 2.24 / 2.31 s.
+
+The fixes barely touch this run's path:
+- Qwen3-4B has one group and there is no MetaServer, so nothing is
+  demoted to reclaimable (M1).
+- 25% of the class is about 1.4k blocks at 0.25 and 2.9k at 0.5, under
+  the 4096 cap. At 0.75 it is about 4.3k, so the cap trims the window
+  slightly there (M2).
+- The pinned-leaf fallback and the LRU fallback only run when pins cover
+  the candidates.
+
+So this pair mainly shows that the fixed build keeps the gain. It is not
+evidence for the backup path.
+
 Miss attribution on each run's own traces (`sim/attr.py`) replays the run's
 logged queries through the sim policy that matches the server: LRU for H4,
 H5 25% for H5. "match" is the share of timed requests whose sim hit equals
@@ -438,11 +495,41 @@ H4 (`gsm8k-h4`). G2 gsm8k digests match baseline.
 
 ## Tests and checks (10.1.0.44, RTX 4090, driver 595.91.07, CUDA 13.2)
 
-From a `git archive` of 81fdb6d in
+After the review fixes: `verify.sh` on the 10e7afa export (the gate
+rerun's source), GPU6, started 10:04:02 UTC, logs in
+`~/kexi/logs/rsi-server-reclaim-verify-10e7afa/`.
+- `env.txt` now lists rev and a sha256 of every Rust source
+  (`src-sha256.txt`, 143 files), not 4 unrelated files (review N2). The 5
+  files the review fixes changed (`storage/read_cache.rs`,
+  `storage/mod.rs`, `pegaflow-core/src/lib.rs`, `metrics.rs`,
+  `pegaflow-server/src/lib.rs`) equal `git show 10e7afa:<file>`.
+- `cargo-test.log` (rc 101, `ssd_cache` only): 378 passed. pegaflow-core
+  lib has 180 passed and 5 ignored, the 5th being the new bench. These
+  pass:
+  - the eviction-order table, now 5 cases: narrow, whole, lru,
+    reclaimable head keeps its retained tail (M1), and the retained walk
+    stopping at a reclaimable child. Each checks that both link maps are
+    empty after a full drain (S5);
+  - `queried_never_loaded_head_outlives_its_resident_descendants`;
+  - `group_blocks_leave_before_their_position_and_pins_hold_the_chain`,
+    now through the single-lock membership lookup (N4) and the LRU
+    fallback.
+
+  `ssd_cache` fails all 11 with "pinned pool exhausted", as on master
+  (below).
+- `cargo-test-ignored.log`: 5 passed, including
+  `tail_first_round_lock_hold_at_2_6m_blocks`. `cargo-test-ignored-cuda12`:
+  3 passed. `clippy-cuda13`: clean. `check-rest` (rc 0): ruff check,
+  default-feature clippy and cargo check pass. `check.log` (rc 1): typos is
+  not installed, and `ruff format --check` fails on the same 11 untouched
+  Python files.
+
+Before the review, from a `git archive` of 81fdb6d in
 `~/kexi/pegaflow-rsi-server-evict-tail-src-81fdb6d` (tar sha256 4c2382e6…,
 same on both ends). `~/kexi/rsi-tools/server-reclaim/verify.sh <src> 6`,
-logs in `~/kexi/logs/rsi-server-reclaim-verify-81fdb6d/`. The `env.txt`
-sha256s match `git show 81fdb6d:<file>`.
+logs in `~/kexi/logs/rsi-server-reclaim-verify-81fdb6d/`. That run's
+`env.txt` hashed 4 files, none of them changed by H5. The reviewer checked
+`read_cache.rs`, `lib.rs` and `storage/mod.rs` against git separately.
 - `cargo-test.log` (rc 101, `ssd_cache` only): pegaflow-core lib 180
   passed, 4 ignored. That includes
   `tail_first_evicts_deepest_block_of_oldest_window_first`,

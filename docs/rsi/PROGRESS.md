@@ -500,6 +500,11 @@ names, magic constants that only exist in the old code).
       in retained.
     - M2: the window and fallback scans are capped at 4096 blocks.
     - The default is now 0 (opt-in), and gate runs pass 25.
+    - Rerun of one cap pair on 10e7afa, window 25 passed explicitly
+      (`cap4-h5fix` vs `cap4-h4`). At 0.5, E_C is 0.759 / 0.769 against
+      0.712 / 0.712, so the gain holds. At 0.75 it is 0.778 / 0.791
+      against 0.749 / 0.750. At 0.25 old still loses (0.126 against
+      0.208).
   - Recency is refreshed only by queries, serving and re-saves, never by
     load. So old's head blocks age out under LRU; H5 keeps them while
     their descendants stay.
