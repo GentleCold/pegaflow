@@ -644,8 +644,13 @@ ruff clean. The teardown backport df01403 (gate owner, fast-forwarded) passes
 ### it2d official run
 
 `~/kexi/rsi-runs/2026-10-23-qwen3-4b-p3-it2d` (rev 8a05b7c, GPU4, separate
-remote tree `~/kexi/pegaflow-rsi-qwen3-it2d`, import path checked in
-vllm.log; arms plain, baseline, old, v2; 32 x 12 replay, full gsm8k).
+remote tree `~/kexi/pegaflow-rsi-qwen3-it2d` on PYTHONPATH set outside the
+gate; arms plain, baseline, old, v2; 32 x 12 replay, full gsm8k). vLLM did
+not log which tree it imported. Corrected in it2e: the it2d review established
+provenance from the it2d tree's
+`connector_v2/__pycache__/connector.cpython-312.pyc` (mtime 17:42:05, the
+second the v2 gsm8k vLLM started) and that tree's connector_v2 `.py` md5s
+matching 8a05b7c. The connector now logs its import dir at init (`from=`).
 `official: true`. Every v2 verdict passes. `old` fails G4.gsm8k_warm (+3.4%);
 this branch's gate still counts `old` as a required verdict set, so the exit
 code is 1 for that reason only. The first attempt (`...-it2d-aborted1`) died in
@@ -685,6 +690,128 @@ blocks, submit 13.2 ms, rpc 1147 ms, max job 190 ms; both max 3 pending,
 loads: replay 792 warm requests, 69 sync / 723 async, p50 3184 tokens; gsm8k
 1300 sync / 19 async.
 
-Status: G0-G4 accepted pending the it2d review
-(`docs/rsi/reviews/P3-qwen3-4b-it2d.md`); G5 waits for the gate rerun. `old`
-is a reference arm: its G4.gsm8k_warm failure is recorded, not fixed.
+Status: G0-G4 accepted at 8a05b7c (it2d review ACCEPT-WITH-FIXES, no
+must-fix, `docs/rsi/reviews/P3-qwen3-4b-it2d.md`); G5 waits for the G5 r3
+rerun. `old` is a reference arm: its G4.gsm8k_warm failure is recorded, not
+fixed, and it is the only reason for the gate's exit code 1.
+
+### Native reference (record only, noisy)
+
+vLLM's OffloadingConnector, `--arms baseline,native --workloads gsm8k,replay`,
+GPU4, gate trees from `feat/rsi-g5` (not this branch's gate), with up to four
+gate runs on the host at once, so timings are noisy and not comparable across
+runs. The same-run v2 vs native comparison comes from the G5 r3 official run.
+
+- `2026-10-23-qwen3-4b-p3-it2d-native-aborted1` (gate bb75843): died in
+  baseline replay. aiohttp keep-alive race, the gate stopped vLLM itself;
+  fixed by 8462ed9.
+- `2026-10-23-qwen3-4b-p3-it2d-native` (gate bb75843): complete.
+
+| check | native | baseline (same run) | native G4 |
+|---|---|---|---|
+| gsm8k cold / warm seconds | 176.8 / 171.6 | 164.4 / 165.0 | fail (+7.5% / +4.0%) |
+| replay cold TTFT p50 / req/s | 1.581 s / 4.83 | 2.811 s / 3.27 | pass |
+| replay warm TTFT p50 (warm/2/3) | 0.881 / 0.505 / 0.459 s | 2.81 / 2.56 / 2.56 s | pass |
+| replay warm req/s (warm/2/3) | 6.81 / 9.63 / 9.76 | 3.26 / 3.42 / 3.41 | pass |
+
+| native pass | local | ext | total | H* | E_ext | excess |
+|---|---|---|---|---|---|---|
+| gsm8k warm | 0.933 | 0.060 | 0.993 | 0.992 | 1.0 | 1170 |
+| replay cold | 0.384 | 0.480 | 0.864 | 0.863 | 1.0 | 0 |
+| replay warm / warm2 / warm3 | 0.400 / 0.378 / 0.378 | 0.599 / 0.621 / 0.621 | 0.998 | 0.998 | 1.0 | 195 |
+
+Native fails G0.spec and G2.digest_vs_baseline.gsm8k (0 of 171348 local
+blocks match). It runs vLLM with LBHNC instead of the gate's LBNHC, so its
+page bytes are permuted. Its KV is not wrong: G2 accuracy 0.8582 and outputs
+match, and digest_self passes. Its warm pass is slower than warm2/3 while
+its CPU cache fills.
+
+### it3 candidate: load-path cost (not started, no code change)
+
+Trigger: native's warm2/3 TTFT p50 (0.505 / 0.459 s, noisy run above) is
+below v2's (0.563 / 0.538 s, it2d official). If the G5 r3 same-run numbers
+confirm it, load cost is the next Qwen3 hypothesis. The table measures from
+the records named above. Native numbers come from vLLM's `kv_offload_*`
+metrics (CUDA-event time on the transfer stream). v2 numbers come from
+`pegaflow_load_*` (wall time on the server load thread, including the final
+event sync). So the two are close but not identical measures.
+
+| replay warm2 | v2 (it2d official) | native (record only) |
+|---|---|---|
+| loads / bytes | 265 / 122.4 GB | 264 / 116.7 GB |
+| mean bytes per load | 462 MB (~196 blocks x 36 layers) | 442 MB |
+| copy time per load, mean | 32.5 ms (histogram: 53 <= 10 ms, 196 <= 50 ms, all <= 100 ms) | 20.2 ms |
+| effective H2D bandwidth | 14.2 GB/s | 21.9 GB/s |
+| copy unit | one 64 KiB page per (block, layer); `MemcpyBackend` merges runs contiguous on both sides, then one `cuMemcpyAsync` per run | one 64 KiB page per (block, layer tensor), all submitted in one `cuMemcpyBatchAsync` (`ops.swap_blocks_batch`; Triton path only below 28 KiB pages) |
+| CPU layout | per layer (layer-first slots) | 36 per-layer CPU tensors ("Allocating 36 CPU tensors") |
+| mean TTFT / queue / prefill (vLLM metrics) | 0.750 / 0.671 / 0.057 s | 0.852 / 0.725 / 0.079 s |
+| TTFT p50 / p90 | 0.563 / 1.749 s | 0.505 / 2.061 s |
+| ms per engine step (pass seconds / steps) | 23.8 | 26.0 |
+
+What the records show:
+- Both arms copy the same unit: one 64 KiB page per (block, layer), up to
+  ~7000 descriptors per load. Native's GPU layout (LBHNC) is still
+  layer-first, and its CPU cache is per layer, so it does not get one
+  contiguous span per block across layers. The coordinator's layout guess
+  does not hold.
+- The difference is submission. Native issues one batched driver call. v2
+  issues one `cuMemcpyAsync` per merged run. How many runs v2 actually
+  merges is not in the record: the per-load `copies=` line is debug level.
+- v2 wins on mean TTFT, queue time and p90. Native wins only on p50. So the
+  candidate is about bandwidth per load and the median, not the tail.
+
+Not measured, because the record cannot show it:
+- Per-request latency from the scheduler's query to load done.
+- Steps between admission and the first computed step for async loads. The
+  probe records `first_step` only when vLLM schedules the request after
+  `finished_recving`. `progress` is recorded only at 16-token key
+  boundaries, so its p50 of 7 steps to first progress is the same for both
+  arms and says nothing about load wait.
+
+Next measurements, before any code:
+1. A replay warm slice with `RUST_LOG=pegaflow_core::gpu_worker=debug`, to
+   get the merged `copies=` per load and the ms per load.
+2. The same slice with the existing kernel transfer backend (one launch per
+   load, a `LayerDecl.transfer_backend` choice), to see whether submission
+   is the cost.
+3. Only then consider a batched submit in the server
+   (`cuMemcpyBatchAsync`; `memcpy.rs` avoids it for driver instability on
+   some stacks).
+
+Any change must keep v2's G4 win on gsm8k: native loses there (+7.5% / +4.0%)
+because its store path costs step time.
+
+## it2e (2026-10-24): it2d review fixes
+
+Review `docs/rsi/reviews/P3-qwen3-4b-it2d.md` (ACCEPT-WITH-FIXES, no
+must-fix). None of these changes touches the success path on Qwen3-4B (no
+sync-load failure, no `min_hit_tokens` override), so the it2d official run
+still stands for G0-G4. The next official run (it3 or the G5 rerun) covers
+the final code.
+
+- S1: after `on_load_errors`, every hit loads asynchronously
+  (`hit.sync` also requires `not _saves_disabled`). A failed async load's
+  blocks never enter vLLM's prefix cache, so a later failure adds no bad KV.
+  The README records the residual risk: until the rewound holder
+  recomputes, requests that hit the failed blocks in vLLM's prefix cache
+  can produce wrong tokens. vLLM 0.32 has no connector hook to evict them.
+- S2: `test_lifecycle_after_saves_disabled` covers three cases.
+  `preempted-still-flushes` and `finished-still-held` cover a request that
+  saved before the failure. `later-loads-async` covers S1. Each of the
+  review's two mutants (the early return moved above the preemption loop,
+  and `request_finished` returning False once disabled) fails exactly one
+  case, and so does dropping the S1 condition.
+- S3: the it2d provenance sentence above is corrected. The connector logs
+  its import dir (`from=`) at init, the same line as P4's branch.
+- S5: `min_hit_tokens` is deleted: no accepted model sets it, and it was a
+  no-op at 0. `loading_wait_ms` stays, and its evidence gap is recorded.
+  This setup has no SSD or RDMA tier, so the server never answers
+  `QueryLoading`, and the it2d official run has 0 `prefetch wait expired`
+  lines. Deleting it would change behaviour once a tier exists: a Loading
+  answer would become an immediate miss. It needs gate evidence when
+  SSD/RDMA is onboarded.
+- S4: no action. The exit code is 1 only because of the reference `old`
+  arm. Every v2 and baseline verdict passes.
+
+Tests: 167 passed on .44 (`test_connector_v2_core.py`,
+`test_semantics_bindings.py`); ruff clean. Non-regression slice: see below.
