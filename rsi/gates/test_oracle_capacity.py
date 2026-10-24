@@ -681,7 +681,7 @@ def test_port_race_fails_the_stage_naming_the_port(tmp_path, monkeypatch):
     finally:
         squatter.close()
     assert got[0]._fds == [] and got[0].record["released_at"] is not None
-    err = json.loads((out / "stage-error.json").read_text())
+    err = json.loads((run_gate.gate_dir(out) / "stage-error.json").read_text())
     assert err["type"] == "PortRace" and f"{p} (leased)" in err["error"]
     assert err["port_leases"][-1]["files"] == [str(locks / str(p))]
 
@@ -1027,8 +1027,10 @@ import os, sys
 base, arm, gate_pid = sys.argv[1], sys.argv[2], int(sys.argv[3])
 seen = {}
 seen["baseline_dir"] = os.path.exists(f"{base}/baseline/gsm8k/warm-outputs.json")
-seen["own_dir"] = os.path.exists(f"{arm}/mine.txt")
-open(f"{arm}/written.txt", "w").write("ok")
+seen["own_dir"] = os.path.exists(f"{arm}/gsm8k/mine.txt")
+seen["earlier_stage"] = os.path.exists(f"{arm}/replay/digest.jsonl")
+seen["gate_dir"] = os.path.exists(f"{base}/.gate/ut/gsm8k/warm-outputs.json")
+open(f"{arm}/gsm8k/written.txt", "w").write("ok")
 for how in ("root", "cwd"):
     try:
         seen[how] = os.path.exists(f"/proc/{gate_pid}/{how}{base}/baseline/gsm8k/warm-outputs.json")
@@ -1051,9 +1053,10 @@ print(repr(seen))
 
 @_needs_isolation
 def test_isolated_arm_cannot_read_other_arms(tmp_path):
-    """M7(a): the arm under test sees its own dir (rw) and not the
-    baseline's outputs, neither by path nor through ``/proc/<gate>/root``
-    or ``cwd``, and cannot unmount the cover."""
+    """M7(a), M9: the arm under test sees its current stage dir (rw) and
+    not the baseline's outputs, its own earlier stages or the gate dir,
+    neither by path nor through ``/proc/<gate>/root`` or ``cwd``, and cannot
+    unmount the cover."""
     import argparse
     import os
     import subprocess
@@ -1064,14 +1067,18 @@ def test_isolated_arm_cannot_read_other_arms(tmp_path):
     (base / "baseline" / "gsm8k" / "warm-outputs.json").write_text("[]")
     arm = base / "ut"
     (arm / "gsm8k").mkdir(parents=True)
-    (arm / "mine.txt").write_text("")
+    (arm / "gsm8k" / "mine.txt").write_text("")
+    (arm / "replay").mkdir()
+    (arm / "replay" / "digest.jsonl").write_text("")
+    (base / ".gate" / "ut" / "gsm8k").mkdir(parents=True)
+    (base / ".gate" / "ut" / "gsm8k" / "warm-outputs.json").write_text("[]")
     args = argparse.Namespace(runs_root=str(runs), under_test_path="", under_test_overlay="")
     cmd = run_gate.isolated(args, "m:C", arm / "gsm8k" / "vllm.log", [sys.executable, "-c", _PROBE_ESCAPE, str(base), str(arm), str(os.getpid())])  # fmt: skip
     assert cmd[0] == sys.executable and "--hide" in cmd
     out = subprocess.check_output(cmd, text=True, timeout=60)
     seen = eval(out)  # noqa: S307 - our own child's repr
-    assert seen == {"baseline_dir": False, "own_dir": True, "root": False, "cwd": False, "setns": False, "umount": False}, seen  # fmt: skip
-    assert (arm / "written.txt").read_text() == "ok"  # rw bind reaches the host dir
+    assert seen == {"baseline_dir": False, "own_dir": True, "earlier_stage": False, "gate_dir": False, "root": False, "cwd": False, "setns": False, "umount": False}, seen  # fmt: skip
+    assert (arm / "gsm8k" / "written.txt").read_text() == "ok"  # rw bind reaches the host dir
     assert os.path.exists(base / "baseline" / "gsm8k" / "warm-outputs.json")  # host unchanged
 
 
@@ -1596,12 +1603,36 @@ def test_split_differ_separates_aligned_prompts():
     assert run_gate.split_differ(None, ["a"]) == (None, None)
 
 
+def test_arm_writes_to_its_dir_cannot_change_a_verdict(tmp_path):
+    """M9: the gate judges outputs from ``<run>/.gate/<label>/<wl>`` (never
+    bound into an arm). A forged ``warm-outputs.json`` in the arm's own
+    stage dir changes nothing; a symlink the arm leaves there (e.g. its
+    digest file -> the baseline's) fails the stage."""
+    import json
+
+    for label, warm in (("baseline", ["a", "b"]), ("ut", ["a", "x"])):
+        g = tmp_path / run_gate.GATE_DIR / label / "gsm8k"
+        g.mkdir(parents=True)
+        (g / "cold-outputs.json").write_text(json.dumps(["a", "b"]))
+        (g / "warm-outputs.json").write_text(json.dumps(warm))
+    own = tmp_path / "ut" / "gsm8k"
+    own.mkdir(parents=True)
+    (own / "warm-outputs.json").write_text(json.dumps(["a", "b"]))  # the forgery
+    ref = run_gate._outputs(tmp_path, "baseline", "cold")
+    assert run_gate._differ(ref, run_gate._outputs(tmp_path, "ut", "warm")) == 1
+    assert run_gate.gate_dir(own) == tmp_path / ".gate" / "ut" / "gsm8k"
+    assert run_gate.untrusted_problems(own) == []
+    (own / "probe").mkdir()
+    (own / "probe" / "digest-pp0-tp0.jsonl").symlink_to(tmp_path / "baseline-digest.jsonl")
+    assert run_gate.untrusted_problems(own) == ["symlink probe/digest-pp0-tp0.jsonl"]
+
+
 def test_missing_token_record_is_not_aligned(tmp_path):
     """S7: a request without a token record is never exempted from the
     exact warm-vs-split comparison."""
     import json
 
-    d = tmp_path / "plain" / "gsm8k"
+    d = tmp_path / run_gate.GATE_DIR / "plain" / "gsm8k"
     d.mkdir(parents=True)
     for name in ("cold", "split_ref", "split"):
         (d / f"{name}-outputs.json").write_text(json.dumps(["a", "b"]))
@@ -1617,7 +1648,7 @@ def test_split_control_prewarm_must_reach_last_full_block(tmp_path):
     last full block (one block more than split_ref is not enough)."""
     import json
 
-    d = tmp_path / "plain" / "gsm8k"
+    d = tmp_path / run_gate.GATE_DIR / "plain" / "gsm8k"
     d.mkdir(parents=True)
     outs = ["o0", "o1", "o2"]
     for name in ("cold", "split_ref", "split"):

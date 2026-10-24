@@ -4,7 +4,10 @@ Runs arms on one model and writes a run record:
 
     RUN_DIR/
       summary.json            numbers, verdicts, ``official`` flag
-      <arm>/<workload>/       probe dir, vllm.log, pegaflow.log, pass results
+      <arm>/<workload>/       what the stage's processes write: probe dir,
+                              vllm.log, pegaflow.log (untrusted, M9)
+      .gate/<arm>/<workload>/ what the gate writes and judges from: pass
+                              outputs / tokens, result.json, stage-error.json
 
 Arms:
   plain                    vLLM without any KV connector (gsm8k only; control)
@@ -451,6 +454,31 @@ def pycache_env(env: dict[str, str], log: Path) -> None:
 
 
 PYCACHE_DIR = ".pycache"
+# M9: everything the gate judges from that the gate itself writes (pass
+# outputs and tokens, result.json, stage-error.json) lives here, never in a
+# dir an arm gets: <run>/.gate/<label>/<workload>. The runs root is under the
+# arm's tmpfs and only its current stage dir is bound back.
+GATE_DIR = ".gate"
+
+
+def gate_dir(stage: Path) -> Path:
+    """``<run>/<label>/<wl>`` -> ``<run>/.gate/<label>/<wl>``."""
+    return stage.parents[1] / GATE_DIR / stage.parent.name / stage.name
+
+
+def untrusted_problems(stage: Path) -> list[str]:
+    """What an arm left in its stage dir (bound rw) that the gate must not
+    follow: a symlink or non-regular file (``probe/digest-*.jsonl`` ->
+    the baseline's would make the gate judge the baseline's records)."""
+    out = []
+    for dirpath, dirs, names in os.walk(stage, followlinks=False):
+        for n in [*dirs, *names]:
+            q = Path(dirpath) / n
+            if q.is_symlink():
+                out.append(f"symlink {q.relative_to(stage)}")
+            elif n in names and not q.is_file():
+                out.append(f"non-regular file {q.relative_to(stage)}")
+    return out
 
 
 def fresh_pycache(run_dir: Path, labels: list[str]) -> None:
@@ -482,17 +510,23 @@ def isolation_available() -> bool:
     return sys.platform.startswith("linux") and os.geteuid() == 0
 
 
-def isolation(args, arm_dir: Path) -> dict[str, Any]:
-    """M7(a): what the arm under test sees of the runs root: only its own
-    dir (rw) and its snapshot (ro); every other arm's outputs, digests and
-    requests (the baseline's included) are under a tmpfs in its private
-    mount namespace (``isolate.py``)."""
+def isolation(args, stage: Path) -> dict[str, Any]:
+    """M7(a), M9: what the arm under test sees of the runs root: only the
+    current stage's dir and the arm's bytecode cache (rw) and its snapshot
+    (ro). Every other arm's outputs, digests and requests (the baseline's
+    included), its own earlier stages, and the gate dir (``GATE_DIR``) are
+    under a tmpfs in its private mount namespace (``isolate.py``)."""
+    stage = stage.resolve()
     return {
         "helper": str(ISOLATE),
         "hide": str(Path(args.runs_root).resolve()),
-        "rw": [str(arm_dir.resolve())],
+        "rw": [str(stage), str(stage.parent / PYCACHE_DIR)],
         "ro": [str(Path(args.under_test_overlay).resolve())] if args.under_test_path else [],
     }
+
+
+# Stage dir -> the isolate.py prefix its processes ran with (summary.json).
+_ISOLATED: dict[str, list[str]] = {}
 
 
 def isolated(args, arm: str, log: Path, cmd: list[str]) -> list[str]:
@@ -503,7 +537,12 @@ def isolated(args, arm: str, log: Path, cmd: list[str]) -> list[str]:
     reads work as before)."""
     if arm_kind(arm) != "under_test" or not isolation_available():
         return cmd
-    return [*isolation_prefix(isolation(args, log.parent.parent)), *cmd]
+    iso = isolation(args, log.parent)
+    for d in iso["rw"]:
+        Path(d).mkdir(parents=True, exist_ok=True)  # a bind needs its target
+    pre = isolation_prefix(iso)
+    _ISOLATED[str(log.parent.resolve())] = pre
+    return [*pre, *cmd]
 
 
 def isolation_prefix(iso: dict[str, Any]) -> list[str]:
@@ -841,6 +880,10 @@ def run_arm_workload(
     probe = out / "probe"
     if probe.exists():
         shutil.rmtree(probe)
+    gdir = gate_dir(out)
+    if gdir.exists():
+        shutil.rmtree(gdir)
+    gdir.mkdir(parents=True)
     kind = arm_kind(arm)
     gsm = workload == "gsm8k"
     cap = workload.startswith("cap")
@@ -936,9 +979,9 @@ def run_arm_workload(
                         prewarm=name == "split",
                     )
                 )
-                (out / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
+                (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
                 if "tokens" in res:
-                    (out / f"{name}-tokens.json").write_text(json.dumps(res.pop("tokens")))
+                    (gdir / f"{name}-tokens.json").write_text(json.dumps(res.pop("tokens")))
             else:
                 # Replay: digest a conversation sample in the untimed passes;
                 # all turns of a sampled conversation, so its references are
@@ -981,8 +1024,11 @@ def run_arm_workload(
             print(f"[{arm}/{workload}/{name}] {summary_line(res)}", flush=True)
 
     if kind == "plain":
-        (out / "result.json").write_text(json.dumps(result, indent=1))
+        (gdir / "result.json").write_text(json.dumps(result, indent=1))
         return result
+    bad = untrusted_problems(out)
+    if bad:
+        raise RuntimeError(f"{arm}/{workload}: stage dir holds what the gate must not read: {bad[:10]}")  # fmt: skip
     spec = json.loads((probe / "spec.json").read_text())
     reqs = oracle.load_requests(probe / "requests.jsonl")
     bad = oracle.warmup_problems(reqs, workloads.WARMUP_PASS)
@@ -1010,7 +1056,7 @@ def run_arm_workload(
         [json.loads(x) for x in errs.read_text().splitlines()] if errs.exists() else []
     )
     result["digest_self"] = digest_compare.compare(probe, probe, invariant, split_inv)
-    (out / "result.json").write_text(json.dumps(result, indent=1))
+    (gdir / "result.json").write_text(json.dumps(result, indent=1))
     return result
 
 
@@ -1156,7 +1202,7 @@ def g0_provenance(
 
 
 def _outputs(run_dir: Path, label: str, name: str) -> list[str] | None:
-    f = run_dir / label / "gsm8k" / f"{name}-outputs.json"
+    f = run_dir / GATE_DIR / label / "gsm8k" / f"{name}-outputs.json"
     return json.loads(f.read_text()) if f.exists() else None
 
 
@@ -1167,7 +1213,7 @@ def _differ(ref: list[str] | None, got: list[str] | None) -> int | None:
 
 
 def _tokens(run_dir: Path, label: str, name: str) -> list[dict[str, Any] | None] | None:
-    f = run_dir / label / "gsm8k" / f"{name}-tokens.json"
+    f = run_dir / GATE_DIR / label / "gsm8k" / f"{name}-tokens.json"
     return json.loads(f.read_text()) if f.exists() else None
 
 
@@ -2219,10 +2265,11 @@ def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
         # names the port and the lease files); a required arm's failure still
         # aborts the run.
         with suppress(OSError):
-            out.mkdir(parents=True, exist_ok=True)
+            gdir = gate_dir(out)
+            gdir.mkdir(parents=True, exist_ok=True)
             err = {"arm": arm, "workload": wl, "type": type(e).__name__, "error": str(e)[:4000]}
             err["port_leases"] = release_leases(since)
-            (out / "stage-error.json").write_text(json.dumps(err, indent=1))
+            (gdir / "stage-error.json").write_text(json.dumps(err, indent=1))
         check_stop()
         if arm_kind(arm) not in _RECORD_ONLY or _teardown_failed(e):
             raise
@@ -2419,8 +2466,8 @@ def main(argv: list[str] | None = None) -> int:
                 r = stage(arm, name, out, capacity=int(f * u), ref_local=base_cap.get("ref_local"))
                 r["unique_bytes"] = u
                 r["capacity_fraction"] = f
-                if out.exists():
-                    (out / "result.json").write_text(json.dumps(r, indent=1))
+                if gate_dir(out).exists():
+                    (gate_dir(out) / "result.json").write_text(json.dumps(r, indent=1))
                 results.setdefault(label, {})[name] = r
 
     def strip(r: dict[str, Any]) -> dict[str, Any]:
@@ -2444,10 +2491,12 @@ def main(argv: list[str] | None = None) -> int:
     iso_rec = None
     if any(arm_kind(a) == "under_test" for a in arms):
         label = next(arm_label(a) for a in arms if arm_kind(a) == "under_test")
-        iso_rec = isolation(args, run_dir / label)
+        iso_rec = isolation(args, run_dir / label / "<workload>")
         iso_rec |= {
             "available": isolation_available(),
             "command_prefix": isolation_prefix(iso_rec),
+            # What each stage of the arm ran with (rw: that stage's dir only).
+            "stages": dict(sorted(_ISOLATED.items())),
             "residual": ISOLATION_RESIDUAL,
         }
         if not iso_rec["available"]:

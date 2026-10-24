@@ -373,8 +373,10 @@ the last accepted run record by hand until `--accepted` exists.
   it does not prevent it:
   - Isolation (a). The arm under test's vLLM and pegaflow-server are exec'd
     through `rsi/gates/isolate.py`, which uses a private mount namespace. The
-    runs root is under an empty tmpfs; only `<run>/<arm>` (rw) and its
-    snapshot (ro) are bound back. Block devices and `/dev/{mem,kmem,port}`
+    runs root is under an empty tmpfs. Only the current stage's dir
+    `<run>/<arm>/<workload>` (rw) and the snapshot (ro) are bound back, along
+    with the arm's bytecode cache. Its earlier stages and the gate dir stay
+    hidden. Block devices and `/dev/{mem,kmem,port}`
     are masked. `CAP_SYS_ADMIN` / `CAP_SYS_PTRACE` / ... leave the bounding
     set, so the arm cannot unmount the cover or reach the host tree through
     `/proc/<gate pid>/root`. The baseline's outputs, digests and requests,
@@ -415,7 +417,13 @@ the last accepted run record by hand until `--accepted` exists.
     imported in the API server, by `MultiConnector`'s class lookup.
   - Independent signal. Completions are read by the gate *client-side*, from
     the `/v1/completions` HTTP response (`workloads.run_gsm8k`), and judged
-    in the gate process. A connector that fakes digests while loading
+    in the gate process. What the gate judges from and writes itself (pass
+    outputs and tokens, `result.json`, `stage-error.json`) is in
+    `<run>/.gate/<arm>/<workload>` (M9). No arm process ever gets that dir.
+    Only what the arm's processes must write (the probe's records, logs) is
+    in its stage dir, and it is untrusted. A symlink or non-regular file left
+    there fails the stage. A later stage of the arm cannot see an earlier
+    one. A connector that fakes digests while loading
     garbage still changes completions (exact vs baseline cold, or vs `split`
     on non-aligned prompts on split-variant models). A connector patching
     the API server could in principle forge completions too. That is what
