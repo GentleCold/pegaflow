@@ -548,6 +548,12 @@ Each entry: what was added, why, which vectors cover it.
   baseline cold, `computed_exact` only against same-split copies with
   per-pass coverage >= 0.9; the flag is checked by `G2.split_control` in
   every run. Needs the user's confirmation.
+- For final acceptance, next to the split rule: the untimed warmup request
+  (dc70805, `passes._warmup`) is a measurement change in the lenient
+  direction. It warms every arm equally, but the connector's one-time
+  save-path cost (first save, gRPC setup) now lands outside
+  `G4.replay_cold` and `G4.gsm8k_cold`. It is reported per arm vs baseline
+  as `G4.warmup_seconds` (not gated). Needs the user's confirmation.
 
 - "agentx" perf workload: not found in repo; asked the user. Fallback: multi-turn
   agent traces from `/ppio/data_sets/R2EGym-SFT-Trajectories`.
