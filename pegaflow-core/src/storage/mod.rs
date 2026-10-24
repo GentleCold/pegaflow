@@ -26,7 +26,9 @@ use pegaflow_common::NumaNode;
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
-pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
+pub(crate) use read_cache::{
+    DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DEFAULT_TAIL_WINDOW_PERCENT, DemotionReason, ReadCache,
+};
 use write_path::{InsertDeps, WritePipeline};
 
 // Most blocks one reclaim round evicts. Rounds stop as soon as the allocator
@@ -74,6 +76,10 @@ pub struct StorageConfig {
     pub pool_shards: usize,
     /// Share of the cache, in percent, that decode backups keep reclaimable.
     pub backup_reclaimable_percent: u64,
+    /// Tail-first eviction window: share of the retained class, in percent,
+    /// oldest first, whose deepest chain blocks are evicted first. `0` (the
+    /// default) is plain LRU.
+    pub tail_window_percent: u64,
     /// Most decode backup candidates one heartbeat reports.
     pub backup_max_candidates: usize,
     /// Most bytes one decode backup plan copies (backup targets only).
@@ -105,6 +111,7 @@ impl Default for StorageConfig {
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
             backup_reclaimable_percent: DEFAULT_BACKUP_RECLAIMABLE_PERCENT,
+            tail_window_percent: DEFAULT_TAIL_WINDOW_PERCENT,
             backup_max_candidates: crate::internode::DEFAULT_BACKUP_MAX_CANDIDATES,
             backup_pull_max_bytes: DEFAULT_BACKUP_PULL_MAX_BYTES,
             backup_max_bandwidth: DEFAULT_BACKUP_MAX_BANDWIDTH,
@@ -171,7 +178,8 @@ impl StorageEngine {
         // Sub-components
         let read_cache = Arc::new(
             ReadCache::new(capacity_bytes, config.enable_lfu_admission, value_size_hint)
-                .with_backup_reclaimable_percent(config.backup_reclaimable_percent),
+                .with_backup_reclaimable_percent(config.backup_reclaimable_percent)
+                .with_tail_window_percent(config.tail_window_percent),
         );
 
         let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
@@ -441,17 +449,21 @@ impl StorageEngine {
 
     /// Position-aligned membership lookup in the resident read cache: entry
     /// `i` is the sealed block for `hashes[i]`, or `None` on miss. Hashes must
-    /// already carry any group encoding (see `group_hash`).
+    /// already carry any group encoding (see `group_hash`); `raw[i]` is the
+    /// group 0 hash of the same position. Each hit of a group > 0 block is
+    /// tied to its resident group 0 position, as in
+    /// [`Self::link_group_blocks`].
     pub(crate) fn get_membership(
         &self,
         namespace: &str,
+        raw: &[Vec<u8>],
         hashes: &[Vec<u8>],
     ) -> Vec<Option<Arc<crate::block::SealedBlock>>> {
         let keys: Vec<BlockKey> = hashes
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
-        self.read_cache.get_blocks_aligned(&keys)
+        self.read_cache.get_group_members(&keys, raw)
     }
 
     /// Evict all blocks from the resident in-memory read cache.
@@ -522,12 +534,16 @@ impl StorageEngine {
     }
 
     /// Check prefix blocks and schedule backing-store reads if needed.
+    ///
+    /// `chain` marks `hashes` as one prefix chain in order, so the resident
+    /// hit prefix teaches tail-first eviction each block's depth and parent.
     pub(crate) async fn check_prefix_and_prefetch(
         &self,
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
         wait_for_full_prefix: bool,
+        chain: bool,
     ) -> PrefetchStatus {
         self.prefetch
             .check_and_prefetch(
@@ -536,8 +552,28 @@ impl StorageEngine {
                 namespace,
                 hashes,
                 wait_for_full_prefix,
+                chain,
             )
             .await
+    }
+
+    /// Tie each resident group > 0 block to the group 0 block at the same
+    /// position (`(position, member)` hashes, already group-encoded): the
+    /// group block is evicted no later than its position.
+    pub(crate) fn link_group_blocks(&self, namespace: &str, pairs: &[(&[u8], &[u8])]) {
+        if pairs.is_empty() {
+            return;
+        }
+        let keys: Vec<(BlockKey, BlockKey)> = pairs
+            .iter()
+            .map(|(position, member)| {
+                (
+                    BlockKey::new(namespace.to_string(), position.to_vec()),
+                    BlockKey::new(namespace.to_string(), member.to_vec()),
+                )
+            })
+            .collect();
+        self.read_cache.link_group_members(&keys);
     }
 
     fn reclaim_until_allocator_can_allocate(
@@ -669,7 +705,8 @@ impl StorageEngine {
         if !prefix_only {
             return self.read_cache.get_blocks(keys);
         }
-        let (_, blocks) = self.read_cache.get_prefix_blocks(keys);
+        // Remote offsets are not this node's chain depths: learn nothing.
+        let (_, blocks) = self.read_cache.get_prefix_blocks(keys, false);
         keys.iter().cloned().zip(blocks).collect()
     }
 

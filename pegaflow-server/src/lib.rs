@@ -187,6 +187,16 @@ pub struct Cli {
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=100))]
     pub backup_reclaimable_percent: u64,
 
+    /// Tail-first eviction window, in percent of the retained class (oldest
+    /// first, at most 4096 blocks). Pressure eviction takes the deepest
+    /// prefix-chain blocks in this window first and never evicts a retained
+    /// block before its retained descendants; the reclaimable class stays
+    /// plain LRU. 0 (default) is plain LRU. 25 is the evaluated setting;
+    /// larger windows reach into recently used chains and lose hits. See
+    /// docs/rsi/server/evict-tail.md.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=100))]
+    pub tail_window_percent: u64,
+
     /// Decode backup: most candidate blocks one heartbeat reports. Bounds the
     /// heartbeat size (32 bytes per sha256 hash; the 65536 maximum is 2 MiB,
     /// under the MetaServer's 4 MiB gRPC limit) and the MetaServer snapshot
@@ -590,6 +600,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
         backup_reclaimable_percent: cli.backup_reclaimable_percent,
+        tail_window_percent: cli.tail_window_percent,
         backup_max_candidates: cli.backup_max_candidates,
         backup_pull_max_bytes: cli.backup_pull_max_bytes as u64,
         backup_max_bandwidth: cli.backup_max_bandwidth as u64,

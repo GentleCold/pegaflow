@@ -487,6 +487,44 @@ names, magic constants that only exist in the old code).
     Tail-first eviction is the only policy that beats LRU, and only by
     about +0.04 (H5 candidate).
 
+- Server tail-first eviction H5 (branch `feat/rsi-server-evict-tail`,
+  stacked on `feat/rsi-server-reclaim`; see `docs/rsi/server/evict-tail.md`).
+  - 7791c30 + 81fdb6d: pressure eviction takes the deepest prefix-chain
+    block among the oldest 25% of a class (`--tail-window-percent`, 0 =
+    LRU). It evicts leaves first, so no block goes while a dependent stays
+    resident. Depth and links come from query hit prefixes; group > 0
+    blocks are tied to their group 0 position. Model-agnostic.
+  - Review (`docs/rsi/reviews/server-evict-tail-h5.md`, accept after
+    must-fix) fixes:
+    - M1: the reclaimable class stays plain LRU, and tail-first runs only
+      in retained.
+    - M2: the window and fallback scans are capped at 4096 blocks.
+    - The default is now 0 (opt-in), and gate runs pass 25.
+    - Rerun of one cap pair on 10e7afa, window 25 passed explicitly
+      (`cap4-h5fix` vs `cap4-h4`). At 0.5, E_C is 0.759 / 0.769 against
+      0.712 / 0.712, so the gain holds. At 0.75 it is 0.778 / 0.791
+      against 0.749 / 0.750. At 0.25 old still loses (0.126 against
+      0.208).
+  - Recency is refreshed only by queries, serving and re-saves, never by
+    load. So old's head blocks age out under LRU; H5 keeps them while
+    their descendants stay.
+  - Official r3 cap plan, 2 pairs with a GPU swap, E_C old / v2:
+    - 0.5: H4 0.699-0.719, H5 0.763-0.769; hit 0.861 -> 0.889, against
+      H_lru 0.857 and H\*_C 0.929.
+    - 0.75: H4 0.748-0.757, H5 0.760-0.792.
+    - 0.25: regresses, H4 0.170-0.194, H5 0.129-0.163.
+      Window 0 recovers it and 10% does not. The cause is unknown: the
+      loss is in previously hit (known-depth) blocks, and H5 serves more
+      never-hit blocks than H4. The earlier "unknown depth first"
+      explanation is withdrawn. Old's hit drops by 0.021 in two of three
+      pairs.
+  - No-cap replay and gsm8k: no warm-TTFT regression, accuracy 0.8594 on
+    every arm. cargo test, clippy and check.sh were run from a git archive
+    of 81fdb6d; only the known ssd_cache and ruff-format failures remain.
+    Master 75dfa4c fails the same 11 ssd_cache tests on .44 (log kept).
+  - G5 has no hard threshold any more. At 0.5 and 0.75 the hit is within
+    0.04 of H\*_C and above LRU, which is judged close enough.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.

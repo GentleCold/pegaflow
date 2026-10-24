@@ -526,7 +526,7 @@ impl PegaEngine {
 
         let status = self
             .storage
-            .check_prefix_and_prefetch(req_id, namespace, block_hashes, wait_for_full_prefix)
+            .check_prefix_and_prefetch(req_id, namespace, block_hashes, wait_for_full_prefix, true)
             .await;
 
         match &status {
@@ -577,9 +577,12 @@ impl PegaEngine {
 
         let status = self
             .storage
-            .check_prefix_and_prefetch(req_id, namespace, &encoded, true)
+            .check_prefix_and_prefetch(req_id, namespace, &encoded, true, false)
             .await;
 
+        if let PrefetchStatus::Ready { .. } = &status {
+            self.link_group_members(namespace, block_hashes, &encoded);
+        }
         if let PrefetchStatus::Ready { blocks, missing } = &status {
             let metrics = core_metrics();
             metrics.cache_block_hits.add(blocks.len() as u64, &[]);
@@ -618,7 +621,24 @@ impl PegaEngine {
             .iter()
             .map(|hash| group_hash(hash, group_id))
             .collect();
-        Ok(self.storage.get_membership(namespace, &encoded))
+        // Hits are linked to their group 0 position under the lookup's lock.
+        Ok(self
+            .storage
+            .get_membership(namespace, block_hashes, &encoded))
+    }
+
+    /// Tie each group-encoded block to the group 0 block at the same position
+    /// (same raw hash), so eviction never leaves a group block whose position
+    /// is gone. Group 0 is the prefix chain every resume point needs; the
+    /// server knows no more of a group's kind than that.
+    fn link_group_members(&self, namespace: &str, raw: &[Vec<u8>], encoded: &[Vec<u8>]) {
+        let pairs: Vec<(&[u8], &[u8])> = raw
+            .iter()
+            .zip(encoded)
+            .filter(|(raw, encoded)| raw != encoded)
+            .map(|(raw, encoded)| (raw.as_slice(), encoded.as_slice()))
+            .collect();
+        self.storage.link_group_blocks(namespace, &pairs);
     }
 
     /// Create an opaque lease that owns query-ready blocks.

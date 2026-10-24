@@ -116,6 +116,7 @@ struct PrefixScan<'a> {
     hashes: &'a [Vec<u8>],
     emit_tier_metrics: bool,
     wait_for_full_prefix: bool,
+    chain: bool,
 }
 
 struct PrefetchStart<'a> {
@@ -212,6 +213,7 @@ impl PrefetchScheduler {
         namespace: &str,
         hashes: &[Vec<u8>],
         wait_for_full_prefix: bool,
+        chain: bool,
     ) -> PrefetchStatus {
         // Default: this call may be the first decision and should attribute.
         match self.poll_existing(read_cache, req_id).await {
@@ -230,6 +232,7 @@ impl PrefetchScheduler {
                 hashes,
                 emit_tier_metrics: true,
                 wait_for_full_prefix,
+                chain,
             },
         )
         .await
@@ -324,7 +327,7 @@ impl PrefetchScheduler {
         let key_build = key_build_start.elapsed();
 
         let cache_scan_start = Instant::now();
-        let (hit, prefix_blocks) = read_cache.get_prefix_blocks(&keys);
+        let (hit, prefix_blocks) = read_cache.get_prefix_blocks(&keys, scan.chain);
         let cache_scan = cache_scan_start.elapsed();
         let remaining = &keys[hit..];
 
