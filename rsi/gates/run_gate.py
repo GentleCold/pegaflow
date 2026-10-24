@@ -14,7 +14,7 @@ Arms:
   baseline                 vLLM + RsiProbe only (no PegaFlow)
   old                      reference connector (pegaflow.connector:PegaKVConnector), black box
   native                   reference: vLLM's OffloadingConnector (CPU offload), record only
-  lmcache                  reference: LMCacheConnectorV1, local CPU backend only, record only
+  lmcache                  reference: LMCache in-process connector, local CPU backend only, record only
   selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k only
   <module>:<Class>         connector under test
 
@@ -709,6 +709,10 @@ _RECORD_ONLY = ("old", "native", "lmcache")
 # Reference stores without a PegaFlow server (a CPU cache inside vLLM).
 _OFFLOAD = ("native", "lmcache")
 LMCACHE_OVERLAY = Path.home() / "kexi" / "overlays" / "lmcache"
+LMCACHE_CONNECTOR = "LMCacheConnectorV1Dynamic"
+LMCACHE_CONNECTOR_MODULE = "lmcache.integration.vllm.lmcache_connector_v1"
+# ``LMCacheEngine.__init__`` logs its whole config on this line (0.5.6 and dev).
+LMCACHE_CONFIG_MARK = "Creating LMCacheEngine with config:"
 
 
 def lmcache_env(cpu_bytes: int) -> dict[str, str]:
@@ -727,14 +731,19 @@ def lmcache_env(cpu_bytes: int) -> dict[str, str]:
     }
 
 
-def lmcache_config(log: Path, cpu_bytes: int) -> dict[str, Any]:
-    """What the lmcache arm ran with: the env we set and LMCache's own
-    ``LMCache Configuration:`` log line (chunk size, backends, CPU GiB)."""
-    line = next((x for x in log.read_text().splitlines() if "LMCache Configuration:" in x), None)
+def lmcache_config(log: Path, cpu_bytes: int, overlay: Path) -> dict[str, Any]:
+    """What the lmcache arm ran with: the overlay and its lmcache dist (the
+    version names the source commit for a source build), the connector, the
+    env we set and LMCache's own config log line (``LMCACHE_CONFIG_MARK``:
+    chunk size, backends, CPU GiB)."""
+    line = next((x for x in log.read_text().splitlines() if LMCACHE_CONFIG_MARK in x), None)
     return {
+        "overlay": str(overlay),
+        "dist": sorted(p.name for p in overlay.glob("lmcache-*.dist-info")),
+        "connector": f"{LMCACHE_CONNECTOR_MODULE}:{LMCACHE_CONNECTOR}",
         "cpu_bytes": cpu_bytes,
         "env": lmcache_env(cpu_bytes),
-        "logged": line.split("LMCache Configuration:", 1)[1].strip()[:4000] if line else None,
+        "logged": line.split(LMCACHE_CONFIG_MARK, 1)[1].strip()[:4000] if line else None,
     }
 
 
@@ -808,8 +817,16 @@ def kv_transfer_config(
             "kv_connector_extra_config": {"cpu_bytes_to_use": cpu_bytes},
         }
     elif kind == "lmcache":
-        # LMCache's vLLM connector; sized by env (``lmcache_env``).
-        under_test = {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both"}
+        # LMCache's in-process vLLM connector, loaded from the overlay by
+        # module path (LMCache's documented dynamic connector). vLLM's builtin
+        # ``LMCacheConnectorV1`` imports ``lmcache.integration.vllm.
+        # vllm_v1_adapter``, which LMCache dev moved under ``lmcache.inprocess``;
+        # this path exists in 0.5.6 and in dev. Sized by env (``lmcache_env``).
+        under_test = {
+            "kv_connector": LMCACHE_CONNECTOR,
+            "kv_connector_module_path": LMCACHE_CONNECTOR_MODULE,
+            "kv_role": "kv_both",
+        }
     else:
         if kind == "selftest":
             module, cls = SELFTEST.split(":")
@@ -1069,7 +1086,7 @@ def run_arm_workload(
         )
         stack.enter_context(cm)
         if kind == "lmcache":
-            result["lmcache"] = lmcache_config(out / "vllm.log", store_bytes)
+            result["lmcache"] = lmcache_config(out / "vllm.log", store_bytes, Path(args.lmcache_overlay))
         if cap and pf_http:
             # What the server actually allocated: must not exceed C.
             m = asyncio.run(workloads.scrape(f"http://127.0.0.1:{pf_http}", ("pegaflow",)))
