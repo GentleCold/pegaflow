@@ -1031,6 +1031,13 @@ def test_contamination_marks_not_drops():
     got = {(c["arm"], c["pass"]) for c in run_gate.contamination(results)}
     # 9x and exactly 10x pass; 12x is flagged; untimed warm / _warmup ignored.
     assert got == {("old", "warm2")}
+    # S8: a baseline stall (p99 > 10x the arms' median for that pass).
+    results["baseline"] = rep(cold=1.0, warm2=0.5, warm3=40.0)
+    got = {(c["arm"], c["pass"]) for c in run_gate.contamination(results)}
+    assert ("baseline", "warm3") in got  # median(0.4, 5.0) = 2.7; 40 > 27
+    results["baseline"] = rep(cold=1.0, warm2=0.5, warm3=27.0)
+    got = {(c["arm"], c["pass"]) for c in run_gate.contamination(results)}
+    assert ("baseline", "warm3") not in got
 
 
 def test_warmup_shares_no_prefix_with_workload():

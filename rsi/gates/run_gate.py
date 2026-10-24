@@ -1687,23 +1687,34 @@ CONTAMINATION_P99 = 10.0  # x the baseline's p99 TTFT of the same pass
 
 
 def contamination(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """G4-timed replay passes whose p99 TTFT exceeds ``CONTAMINATION_P99`` x the
-    in-run baseline's p99 for the same pass: a stall from outside the arm
-    (another process's pinned-pool allocation, JIT, a shared GPU) is not a
-    G4 measurement. Nothing is dropped: the run becomes non-official."""
+    """G4-timed replay passes with a stall from outside the arm (another
+    process's pinned-pool allocation, JIT, a shared GPU), both ways:
+    - an arm's p99 TTFT above ``CONTAMINATION_P99`` x the in-run baseline's
+      p99 for the same pass;
+    - the baseline's p99 above ``CONTAMINATION_P99`` x the median of the
+      arms' p99 for that pass (a baseline stall inflates every arm's G4
+      margin, S8).
+    Nothing is dropped: the run becomes non-official."""
     base = results.get("baseline", {}).get("replay", {}).get("passes", {})
     out = []
+    arms: dict[str, list[float]] = {}
     for label, per in results.items():
         if label == "baseline":
             continue
         for name, p in per.get("replay", {}).get("passes", {}).items():
-            b = base.get(name, {}).get("ttft_p99")
             mine = p.get("ttft_p99") if isinstance(p, dict) else None
             # G4-timed passes only: cold, warm2.. (``warm`` is the digested one).
-            if name.startswith("_") or name == "warm" or not b or mine is None:
+            if name.startswith("_") or name == "warm" or mine is None:
                 continue
-            if mine > CONTAMINATION_P99 * b:
+            arms.setdefault(name, []).append(mine)
+            b = base.get(name, {}).get("ttft_p99")
+            if b and mine > CONTAMINATION_P99 * b:
                 out.append({"arm": label, "pass": name, "ttft_p99": mine, "baseline_p99": b})
+    for name, ps in sorted(arms.items()):
+        b = base.get(name, {}).get("ttft_p99")
+        med = statistics.median(ps)
+        if b and med and b > CONTAMINATION_P99 * med:
+            out.append({"arm": "baseline", "pass": name, "ttft_p99": b, "arms_median_p99": med})
     return out
 
 
@@ -2067,7 +2078,11 @@ def main(argv: list[str] | None = None) -> int:
     contaminated = contamination(results)
     problems += [
         f"contaminated: {c['arm']} replay/{c['pass']} p99 TTFT {c['ttft_p99']:.3g}s > "
-        f"{CONTAMINATION_P99:g}x baseline {c['baseline_p99']:.3g}s"
+        + (
+            f"{CONTAMINATION_P99:g}x baseline {c['baseline_p99']:.3g}s"
+            if "baseline_p99" in c
+            else f"{CONTAMINATION_P99:g}x the arms' median {c['arms_median_p99']:.3g}s"
+        )
         for c in contaminated
     ]
     problems += provenance_problems(prov)
