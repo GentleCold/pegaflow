@@ -408,3 +408,218 @@ The first slice at 3d6b8e6 (default compile,
 `scratch/*-3d6b8e6-defaultcompile`) showed per-arm caches break Qwen3-4B's
 cross-arm comparisons without deterministic inductor (35 completions
 differ), which 2404394 fixes.
+
+## Re-review (0249697)
+
+Scope: 8789dde..0249697 (9204863, fcd0534, aab101c, 687c5b2, fbcc3fd,
+3d6b8e6, 2404394, 0249697). Evidence read on .44, read only:
+`2026-10-25-qwen3.5-4b-selftest-3d6b8e6`,
+`2026-10-25-qwen3-4b-gate-hybrid-slice-2404394`, `scratch/`, and the swap
+probe `~/kexi/tmp/rsi-gate-hybrid-test/swap`. No GPU reruns.
+
+Verdict: **ACCEPT-WITH-FIXES**. M1 and M2 are fixed, and no MUST-FIX is
+open. R1 is a regression in the S1 claim and should land before anyone
+re-judges older records with this tree. R4 is for the DSV2 branch: it must
+land in the same change that moves DSV2 onto this gate.
+
+Correction to M1. The runs use vLLM's V2 model runner (`Using V2 Model
+Runner` in every `vllm.log`, Qwen3-4B slice included), not the V1
+`gpu_model_runner.py` order I cited. The V2 order per step is:
+
+1. `update_requests`, which zeroes new blocks and applies COW copies
+   (`v1/worker/gpu/model_runner.py:1236-1265`).
+2. `preprocess_state`, which runs the align precopy (`:1820`,
+   `model_states/mamba_hybrid.py:180-228`).
+3. `kv_connector.pre_forward`, which calls `handle_preemptions` and then a
+   sync `start_load_kv` (`v1/worker/gpu/kv_connector.py:70-89`).
+4. The forward.
+
+The M1 hazard is the same in V2: a sync state load lands after the precopy.
+
+### Items
+
+| item | status | notes |
+|---|---|---|
+| M1 | fixed | Start states are digested in `RsiProbe.handle_preemptions` (`rsi_probe.py:920-935`). In V2 that is after the precopy, not before as `rsi_probe.py:921` and GATES.md:614 say. It still digests the bytes the forward computes from. The precopy only reads the start block: src = `(start-1)//bs` and dst = `cdiv(start+sched, bs)-1`, so dst > src (`mamba_hybrid.py:112-125`, `mamba_utils.py:503-546`). And the digest runs before a sync `start_load_kv`. `selftest:sync` is caught: 2/2 sabotaged state loads are mismatched in each GDN group in both checks. External loads are 6/10 mismatched (honest: 130/130 matched). `alone_ref` shows 1 completion differing at -1.56 pp. Docs fix: R2. |
+| M2 | fixed | `caught_per_group` (`run_gate.py:2296`) judges each corrupted group on its own and needs a nonzero sabotage count. offbyone now loads the next GDN group's state (21 per group; preempt 75/75/75/47 bad). The table in the response matches `summary.json`. The bar is still "at least 1 per group": R3. |
+| S1 | partly | `G0.vllm_args`, `G2.batch_control` and the sabotage count are `na` on older records. The committed `compilation` block is dropped when the dump has none (`run_gate.py:1441`). `prefix_cache_retention_interval` is not, and this branch added it to Qwen3-4B's committed spec: R1. |
+| S2 | fixed | `G2.gsm8k` gates `alone_ref` vs baseline `alone_ref` (`run_gate.py:2244`). Honest: 0.0 pp, 0/64 completions differ. At n=64 the 0.01 tolerance means any changed answer fails. In practice it judges the one 1056 prefix: 1/64 `alone_ref` requests loads externally, and the other 63 hit vLLM's local cache of those loaded bytes. This is the S3 limit, not a new hole. |
+| S3 | fixed (limit stated) | `preempt` is required in the official profile when the committed spec has a Mamba group (`run_gate.py:2794`). The honest self-test fails without it. Cap and replay are required in every official run anyway. |
+| S4 | fixed | `--flag=value`, `_`, abbreviations, `-cc` and dotted keys are handled. `compilation` is pinned in `G0.spec`. `-O` (optimization level) is not mapped: N1. |
+| S5 | fixed | Each arm gets its own `VLLM_CACHE_ROOT`/`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR`/`FLASHINFER_WORKSPACE_BASE` under `<run>/.compile-cache/<label>`. It is emptied before first use and bound rw into its own isolated arm only (`run_gate.py:726`). Nothing under `/root/.cache/vllm`, `/root/.triton`, `/root/.cache/flashinfer` or `/root/.nv` is newer than the run's baseline dir. Autotune seed: see "Autotune seed" below. |
+| S6 | fixed | Tests added. 283 passed on .44 (`git archive 0249697`, `CUDA_VISIBLE_DEVICES=""`, 52 s). CI is unchanged. GATES.md calls the suite a manual gate, and PROGRESS has it as a user decision. |
+| N1-N7 | fixed / as answered | N2: see Q5. N3: `not_offered` is now recorded only if the next step does not offer either. N6 and N7 are enforced (`run_gate.py:2430-2470`). |
+
+### Questions
+
+1. Autotune seed (3d6b8e6).
+   - Channel. There is none in either direction. The source is
+     `<run>/.compile-cache/baseline`, which is under the runs root. The
+     isolated arm sees an empty tmpfs there, with only its own stage,
+     pycache and cache dirs bound back. `/proc/<pid>/root` is blocked (M7a).
+   - Timing. Baseline runs all its stages first (`run_gate.py:3213` and the
+     arm loop). Each arm's copy is made before that arm's first stage
+     (`fresh_compile_cache`, `:646`).
+   - Isolation of the copies. Later arms and later runs seed from that
+     run's baseline, never from another arm. Each run's cache dir is
+     emptied first. An arm can rewrite only its own copy, which changes
+     only its own numbers. Those are judged against the baseline.
+   - Contents. Only `*/*.autotune.json` is copied, never cubins or graphs.
+     This run: 6 files, the same set in every arm. Each file holds
+     `configs_timings` (Config kwargs, warps, stages, ctas, maxnreg,
+     `pre_hook`, `ir_override`). `ir_override` is a path to IR that Triton
+     compiles instead of the kernel (`triton/compiler/compiler.py:330-333`,
+     Triton 3.7.1). So "never compiled code" holds for this data but not
+     for the format. Only the unreachable baseline file feeds the copy, so
+     this is a NIT: N2.
+   - Connector config numerics. The swap probe compares 4 prompts'
+     first-token logprobs:
+     - baseline full cache, and a fresh baseline compile with only the
+       picks: `-0.389455 -1.307971 -0.90808 -0.769167`;
+     - fresh plain compile with the picks: the same;
+     - plain with its own picks: `-0.385402 ...`.
+
+     The baseline arm is the RsiProbe connector config.
+     `KVTransferConfig.compute_hash` has no factors, so MultiConnector arms
+     compile the same graph. For those arms the evidence is honest
+     `alone_ref` 0/64 completions differing vs baseline and 5/5 computed
+     blocks exact. That is completions, not logprobs, but sufficient.
+2. Qwen3-4B gate.json and spec (2404394).
+   - Nothing is laxer. The deterministic compile applies to every arm,
+     `G0.vllm_args` enforces the flag, and the committed `compilation`
+     block pins it in `G0.spec`. The slice measures `G2.batch_control` as
+     invariant (0/64, 0/64) and plain == baseline. connector_v2 matched
+     1034 external and 16055 local, with 1969/1969 computed exact.
+   - Old records. The P4 records (`qwen3-4b-p4-m2-a59a254`,
+     `-p4-it6-cap-b5cf567`, `dsv2-lite-p4-m2-a59a254`) record gate rev
+     ce645d7 in `provenance.gate.rev`, so they are judged by that tree.
+   - Re-judge with this tree. On `2026-10-24-qwen3-4b-p4-it5-nonreg` I ran
+     the same script against d252bfe and 0249697. The only differences are
+     the two new `na` checks and `G0.spec` going from pass to fail for both
+     connector arms (`committed...prefix_cache_retention_interval: 0 !=
+     None`). That is R1. It fails closed, but it contradicts GATES.md:658.
+   - DSV2. Its branch (4e50f0f, merge base d252bfe) has no
+     `gsm8k_vllm_args` and no `compilation` or retention fields in
+     `DeepSeek-V2-Lite-Chat/spec.json`. That does not block merging this
+     gate: every outcome fails closed (G0.spec, and likely
+     `plain_equals_baseline`, as Qwen3-4B showed 35 differing outputs
+     before 2404394). It does block DSV2 taking this gate: R4. P4's ce645d7
+     runs are unaffected if judged by ce645d7.
+3. Is sync on gsm8k enough for M1?
+   - As existence proof, yes: every sabotaged state load is caught. The
+     check fails closed if the count ever drops to 0.
+   - The preempt path uses the same code. Resumed episodes queue their
+     start state through `_start_states` into `start_states`, the same list
+     (`rsi_probe.py:570-575`, unit `test_probe_steps.py:119`). So a sync
+     connector under test that avoided the crash would still show
+     mismatched resumed-episode state loads in preempt, which is
+     exhaustive.
+   - A connector that triggers the vLLM crash fails its preempt stage,
+     which is required on state models.
+   - The weakness is the bar, not the coverage: R3.
+4. Logprobs only on control arms (687c5b2). No gated check loses coverage.
+   - Logprobs feed only `_plain_equals_baseline`, `split_control` and
+     `batch_control`, all over plain and baseline passes.
+   - Arm `alone_ref` passes are new in this round and never had logprobs.
+     Arm cold and warm never did either.
+   - Optional strengthening: for the arm under test, also gate
+     `alone_ref_differ == 0`. Honest is 0 and sync is 1. The composition
+     matches the baseline's except the first request's split.
+5. Vacuous `G2.split_control` on Qwen3.5. Acceptable as a flagged pass.
+   - With `batch_invariant=false`, `split_invariant` changes no gated
+     check. `_outputs_verdict` returns ungated before it, computed-block
+     exactness is gated only when invariant, and `_coverage_verdict` runs
+     only when the claim is false.
+   - On invariant models, `true` is the stricter setting. A wrong `true`
+     can only fail a right load.
+   - So an unmeasured `true` cannot pass a wrong load anywhere. Failing
+     closed would only block the model.
+   - The Qwen3-4B slice measures it for real (`same_start` 0/128, 0
+     differ).
+
+### SHOULD-FIX (remaining)
+
+- R1. `G0.spec` re-judges older records as failing (`run_gate.py:1437-1444`).
+  The committed Qwen3-4B spec now has `prefix_cache_retention_interval` in
+  `cache` and `kv_cache_config`. Dumps from before this branch lack it, so
+  any older connector arm fails `G0.spec` under this tree; d252bfe passes
+  them. Fix: treat fields missing from the dump as `na` (same as
+  `compilation`). Better, re-judge with the tree at the record's
+  `provenance.gate.rev`, and say so in GATES.md "Record vs gate rev".
+- R2. GATES.md:614-618 and `rsi_probe.py:921` give the V1 step order. The
+  V2 runner, which is what runs, calls `handle_preemptions` after
+  `update_requests` (zeroing, COW copies) and after the precopy. M1 holds,
+  for the reason above. The preempted-episode digest, though, now runs after
+  vLLM may have zeroed or COW-copied into a freed block that was reallocated
+  in the same step. Its record would then be zeros, and a no-op load (vLLM
+  zeroes new attention blocks) would match that copy. None of the 2,313
+  digested blocks in baseline and honest (gsm8k and preempt) is all-zero,
+  and the baseline's references are out of the arm's reach, so this is
+  latent. Fix:
+  - in `build_connector_meta`, drop preempted blocks that appear in
+    `new_block_ids_to_zero` or as `kv_cache_block_copies` destinations, and
+    tag them;
+  - never count an all-zero digest as a reference;
+  - record the runner (V1/V2) in the spec dump;
+  - correct the doc text.
+- R3. `caught_per_group` needs only 1 bad load per group. Every arm in this
+  run meets a stronger bar: bad ≥ sabotaged per group (sync 2/2, offbyone
+  192/21, bitflip 192/33, liar 320/4). Require
+  `mismatched + unreferenced >= sabotaged - external_uncertain` per group,
+  so a gate that catches only some sabotaged loads (e.g. under another
+  runner order) fails its self-test.
+- R4. DSV2 adopting this gate (DSV2 branch, not this one). Add
+  `gsm8k_vllm_args` with deterministic inductor. Regenerate the committed
+  spec with `prefix_cache_retention_interval` and `compilation`. Run one
+  plain+baseline gsm8k slice, all in the commit that merges this gate.
+  Until then, re-judge DSV2 records with ce645d7.
+
+### NITS
+
+- N1. `_flag_values` does not map `-O`/`-O3`/`-O=` to
+  `--optimization-level` (`vllm/utils/argparse_utils.py:358-368`). It is
+  reachable only via `--vllm-arg` (non-official), and `G0.spec` pins the
+  resulting compile settings.
+- N2. `seed_autotune` should refuse entries with a non-null `ir_override`
+  or `pre_hook`. GATES.md "Triton autotune picks" should say the file
+  format can name IR. All 6 baseline files have `ir_override: null`.
+- N3. The response puts the suite at 283 tests. GATES.md says 282.
+
+### Verified (re-review)
+
+- `git fetch`: origin is at 0249697, and the worktree fast-forwarded.
+  `cz check --rev-range 1749353..HEAD` OK, `typos` OK,
+  `ruff check rsi` OK.
+- `pytest rsi/gates` at 0249697 on .44 (`~/kexi/tmp/review/rsi-gate-hybrid-review-0249697`):
+  283 passed.
+- Self-test 3d6b8e6:
+  - baseline and honest pass, and all four negatives pass as caught;
+  - not official, as expected;
+  - `[cache] <arm>: 6 Triton autotune picks from baseline` for all 6
+    arms;
+  - plain == baseline `alone_ref`: 0/64 completions and 0/64 logprobs;
+  - `G2.batch_control` 17/64;
+  - `G2.split_control` vacuous at 63/64;
+  - honest `G2.gsm8k` 0.71875 vs 0.71875;
+  - sync `G2.gsm8k` -1.56 pp, `alone_ref_differ` 1, sabotage
+    `{0: 2, 1: 2, 2: 2}`.
+- External episodes (`requests.jsonl`):
+
+  | arm | warm | `alone_ref` |
+  |---|---|---|
+  | honest | 25/128 | 1/64 |
+  | bitflip | 32/128 | 1/64 |
+  | sync | 1/128 | 1/64 |
+  | baseline | 0 | 0 |
+
+- No digest vector is shared by two keys, and no all-zero digest appears,
+  in baseline or honest, gsm8k or preempt.
+- vLLM 0.32 V2 order read in `v1/worker/gpu/model_runner.py:1719-1745`,
+  `:1812-1825`, `:2003`, `:2028`, `v1/worker/gpu/kv_connector.py:70-89`
+  and `model_states/mamba_hybrid.py:112-228`. Triton 3.7.1
+  `runtime/autotuner.py:170-210` checks the disk cache, with the key
+  including the config list and loading only when no config has a
+  `pre_hook`.
+- Differential re-judge, d252bfe vs 0249697 trees, on
+  `2026-10-24-qwen3-4b-p4-it5-nonreg` (result above). Two more records
+  timed out (10 min per call) and are not reported.
