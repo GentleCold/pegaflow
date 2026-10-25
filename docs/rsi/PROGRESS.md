@@ -852,8 +852,10 @@ names, magic constants that only exist in the old code).
 - Cap sizing (feat/rsi-gate-cap-sizing): `UniqueEstimate` counted every
   block boundary of every Checkpoint group, but the oracle stores a
   Checkpoint block only at step ends on its boundary; Qwen3.5-4B's auto
-  plan (203 conversations, est. 147.05 GB) would have measured below the
-  floor. It now applies the oracle's rules per Kind with vLLM 0.32's
+  plan (203 conversations, est. 147.05 GB) was at the floor with no
+  margin: on the 4f3cb97 trace its first 203 conversations measure
+  133.20 GB = 2.001x GPU KV vs a 133.15 GB floor (a real 203-conversation
+  run interleaves differently at the tail, so either outcome). It now applies the oracle's rules per Kind with vLLM 0.32's
   align-mode step ends (`prefill_step_ends`). s1 8 x 6: 3.39 GB est vs
   3.49 GB measured (was 4.47 GB). Official plans: Qwen3-4B 64 and
   DeepSeek-V2-Lite 76 unchanged (same bytes); Qwen3.5-4B all 256
@@ -867,6 +869,18 @@ names, magic constants that only exist in the old code).
   A cap-only run
   (`--workloads cap`) had no earlier baseline spec dump and fell back to
   64 conversations; auto now sizes from the committed dump there.
+  - Qwen3.5-4B's official plan uses all 256 conversations
+    (`enough: false`, measured 2.52x GPU KV). That is expected, not a
+    defect: the file has no headroom left, so a vLLM change that cuts the
+    measured `U` by more than about 21% fails every official Qwen3.5-4B
+    run closed (`capacity below 2x GPU KV (whole replay file used)`).
+  - Review (`docs/rsi/reviews/cap-sizing.md`, ACCEPT) fixes: the plan's
+    spec is the baseline gsm8k (else replay) dump, never preempt's shrunk
+    pool (S1); docs say only non-official runs reach the committed
+    fallback (S2) and that the estimate ratios are observations, not a
+    bound (S3); a Checkpoint spec with `hash_block_size != block_size`,
+    Eagle / speculative or prefill checkpoint blocks is recorded as
+    `cap_plan.unmodeled` and the run is not official (N2).
 
 ## Semantics changelog
 

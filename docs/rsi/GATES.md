@@ -955,9 +955,12 @@ the last accepted run record by hand until `--accepted` exists.
     `--replay-skip N` (replay and cap) starts at conversation N of the file.
     The official value is 0. Any N > 0 is a held-out slice
     (`summary.held_out`, `summary.replay_skip`), never official.
-    `auto`: before the baseline cap stage, from the baseline's spec dump of
-    an earlier stage (a cap-only run: the committed dump; `cap_plan.spec`),
-    conversations are added from the file start (at least 64) until the
+    `auto`: before the baseline cap stage, from the baseline's gsm8k spec
+    dump of this run (else replay; never preempt, whose GPU pool is shrunk;
+    else the committed dump; `cap_plan.spec`). An official run always has
+    gsm8k before cap, so only non-official runs such as `--workloads cap`
+    reach the committed fallback; the floor reads GPU KV from the cap
+    stage's own dump in every case. Then conversations are added from the file start (at least 64) until the
     estimated `U` reaches `1.1 x 2 x GPU KV / 0.5`. `UniqueEstimate` applies
     the oracle's store rules per group Kind, at block bytes: Full / Window
     groups count distinct prompt-prefix blocks plus each request's generated
@@ -969,9 +972,15 @@ the last accepted run record by hand until `--accepted` exists.
     block boundary, stops at the last cacheable boundary and at the
     shared-prefix junction, `--max-num-batched-tokens` per step), and decode
     stores every boundary it crosses. A request running alone is assumed;
-    concurrent requests share the step budget, which only adds step ends,
-    so the Checkpoint part is a lower bound and the error is toward more
-    conversations. Qwen3.5-4B: s1 8 x 6 estimates 3.39 GB vs 3.49 GB
+    concurrent requests share the step budget, which moves step ends as
+    well as adding them, so this is not a bound. The ratios below are
+    observations (estimate below measured on the recorded traces); an
+    over-estimate gives fewer conversations and the measured floor fails
+    the run closed (not official). The Checkpoint model also assumes
+    `hash_block_size == block_size`, no Eagle / speculative blocks and
+    `num_prefill_checkpoint_blocks == 0`; a spec with a Checkpoint group
+    that shows otherwise is recorded in `cap_plan.unmodeled` and the run is
+    not official. Qwen3.5-4B: s1 8 x 6 estimates 3.39 GB vs 3.49 GB
     measured (0.97; the Full-only rule gave 4.47 GB, 1.28x); the official
     256 x 12 (32 workers) estimates 136.33 GB vs 167.96 GB measured (0.81,
     full-attention group exact; run `qwen3.5-4b-cap-sizing-baseline-4f3cb97`).
