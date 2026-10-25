@@ -2173,6 +2173,82 @@ classes), `lru_variants.py` / `head_sim.py` (gate-model variants),
 over the pass), `r3sim_p4.py` + `p4sim.py` (server-faithful sim, sha256
 2ae28f28... / 8023ee17...).
 
+## it7 (2026-10-25): one save entry per (group, request)
+
+The M2 lever, kept: a59a254 (`perf(connector_v2): plan one save entry per
+group and request`), fast-forwarded onto `feat/rsi-deepseek-v2-lite`. Its
+only code change is `Scheduler.plan_saves` (see "M2"). The policy budget
+is unchanged: no knob, 4 knobs as before.
+
+### M1a: official DSV2 run on it7 (`2026-10-25-dsv2-lite-p4-it7-off-a59a254`, GPU 0,1, TP2, 64gb, run_gate pgid 3326012, 03:38:27 to 06:35:01Z)
+
+Setup:
+- `"official": true`, `not_official_because: []`.
+- Gate ce645d7, base server d1970ead, under test a59a254 (verified,
+  `~/kexi/p4-ut-a59a254`, git archive, no pyc).
+- Arms plain, baseline, old, native, v2. Workloads gsm8k (1319), replay
+  (32 x 12), cap (76 x 12 auto). C(0.5) = 6.87 GB, 2.27x GPU KV.
+- No contamination; scan `flagged: []`; `vllm_plugins` old `pegaflow`,
+  every other arm "". `split_invariant: false` (control 647 / 1319).
+- lmcache not run (arm not comparable yet).
+
+Verdicts: v2 and old pass every verdict. native fails only G0.spec (LBHNC
+layout, by construction); its `G2.digest_self.cap` passes this time.
+v2 G2:
+- gsm8k 10662 ext matched; vs baseline 45008 / 45008 computed exact.
+- Accuracy delta 0.0 / +0.53 pp; outputs: warm differs only where split
+  does.
+- Replay 27948 ext matched.
+- Cap 516116 ext matched, 0 mismatched; preempted-uncertain 9390 = 0.85%
+  (old 0.54%, native 0.45%).
+
+G4 (vs same-run baseline; warm = warm2 / warm3):
+
+| metric | baseline | v2 it7 | old | native | MF4 v2 it6 |
+|---|---|---|---|---|---|
+| replay warm TTFT p50 (s) | 0.930 / 0.927 | 0.296 / 0.304 (-68.2 / -67.3%) | 0.393 / 0.336 (-57.8 / -63.8%) | 0.280 / 0.304 (-69.9 / -67.2%) | -67.6 / -66.6% |
+| replay warm req/s | 5.41 / 5.40 | 12.49 / 12.20 (+131 / +126%) | 12.48 / 12.22 (+131 / +126%) | 13.01 / 13.16 (+141 / +144%) | +131 / +129% |
+| replay cold TTFT p50 (s) | 0.909 | 0.619 (-31.8%) | 0.629 (-30.8%) | 0.556 (-38.8%) | 0.599 (-34.1%) |
+| replay cold req/s | 5.35 | 8.55 (+59.7%) | 8.44 (+57.6%) | 8.77 (+63.8%) | +60.7% |
+| gsm8k cold (s) | 193.9 | 194.6 (+0.32%) | 196.0 (+1.04%) | 195.2 (+0.63%) | +0.15% |
+| gsm8k warm (s) | 193.8 | 190.0 (-1.96%) | 191.9 (-0.98%) | 190.8 (-1.57%) | -2.26% |
+| G4 verdicts | | all pass | all pass | all pass | all pass |
+
+The full-replay cold check binds: v2's cold p50 is 0.619 s against 0.599 s
+on it6 (MF4), with the same baseline (0.909). That is +3%, within the
+spread of v2's cold p50 across runs (MF1 0.665, it6 0.599). Cold req/s
+8.55 vs 8.63. v2 stays ahead of old on every replay metric.
+
+Hits, unlimited store (local / ext / total; H*; E_ext; excess):
+
+| pass | v2 | old | native | lmcache | H* |
+|---|---|---|---|---|---|
+| gsm8k warm | 0.937 / 0.056 / 0.993, E 1.0, excess 0 | 0.938 / 0.055 / 0.993, E 1.0, excess 1230 | 0.940 / 0.053 / 0.993, E 1.0, excess 1230 | pending (arm not comparable yet) | 0.993 |
+| replay cold | 0.493 / 0.349 / 0.843, E 1.0 | 0.491 / 0.352 / 0.843, E 1.0 | 0.498 / 0.345 / 0.842, E 0.9998 | pending | 0.843 |
+| replay warm2 | 0.465 / 0.533 / 0.998, E 1.0, excess 0 | 0.519 / 0.479 / 0.998, E 1.0, excess 210 | 0.461 / 0.537 / 0.998, E 1.0, excess 210 | pending | 0.998 |
+| replay warm3 | 0.457 / 0.542 / 0.998, E 1.0, excess 0 | 0.499 / 0.500 / 0.998, E 1.0, excess 210 | 0.468 / 0.531 / 0.998, E 1.0, excess 210 | pending | 0.998 |
+
+G5 (cap 76 x 12, warm_timed; H_lru / H*_C from v2's trace. On the
+reference arms' own traces H_lru is 0.651 (old) / 0.680 (native) at 0.25
+and within 0.001 at 0.5 and 0.75):
+
+| C/U | v2 it7 | v2 it6 (MF4) | old | native | lmcache | H_lru | H*_C | E_C v2 / old / native | resident/C v2 / old | local v2 / old |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0.25 | 0.452 | 0.436 | 0.522 | 0.579 | pending (arm not comparable yet) | 0.671 | 0.854 | 0.070 / 0.180 / 0.282 | 0.89 to 0.93 / 0.88 to 0.93 | 0.401 / 0.422 |
+| 0.5 | 0.847 | 0.844 | 0.845 | 0.851 | pending | 0.847 | 0.925 | 0.620 / 0.614 / 0.622 | 0.92 to 0.95 / 0.89 to 0.92 | 0.404 / 0.422 |
+| 0.75 | 0.899 | 0.863 | 0.886 | 0.933 | pending | 0.918 | 0.968 | 0.659 / 0.616 / 0.708 | 0.93 to 0.95 / 0.91 to 0.94 | 0.409 / 0.437 |
+
+- Server insertions over 4 passes: v2 315465 / 106100 / 82190, old
+  258504 / 107997 / 88019 (MF4 v2: 341261 / 108075 / 97701).
+- Cap 0.5 save stats (tp0): 3867 RPCs, 3790 of them pressure sends,
+  failed 0.
+- Excess 0 at every fraction for v2; old 0 / 75 / 345, native 0 / 165 /
+  540.
+- The A/B reproduces on an official run: 0.5 level with old, native and
+  H_lru; 0.75 +0.036 over it6 and 0.013 above old; resident/C at old's
+  level everywhere. 0.25 is +0.016 over it6 and 0.070 below old (old's
+  own 0.25 across runs: 0.512 / 0.531 / 0.550 / 0.522).
+
 ## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
 
 Arms: plain, baseline, KOff, v2 with the shipped default (32 steps /
