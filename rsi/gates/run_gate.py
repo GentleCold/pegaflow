@@ -847,6 +847,8 @@ LMCACHE_CONNECTOR = "LMCacheConnectorV1Dynamic"
 LMCACHE_CONNECTOR_MODULE = "lmcache.integration.vllm.lmcache_connector_v1"
 # ``LMCacheEngine.__init__`` logs its whole config on this line (0.5.6 and dev).
 LMCACHE_CONFIG_MARK = "Creating LMCacheEngine with config:"
+# One line per local CPU backend LMCache creates (0.5.6 and #4467).
+LMCACHE_BACKEND_MARK = "Created backend: LocalCPUBackend"
 # LMCache's default chunk (tokens): the primary reference config. Any other
 # value (e.g. the vLLM block size, to isolate chunk granularity) is a
 # secondary config and makes the run non-official.
@@ -870,22 +872,100 @@ def lmcache_env(cpu_bytes: int, chunk: int = LMCACHE_CHUNK) -> dict[str, str]:
     }
 
 
+def lmcache_dists(overlay: Path) -> list[str]:
+    """The lmcache dist(s) an overlay holds (``<name>-<version>``)."""
+    return sorted(p.name.removesuffix(".dist-info") for p in overlay.glob("lmcache-*.dist-info"))
+
+
+def lmcache_storing_ranks(spec: dict[str, Any] | None, tp: int) -> int | None:
+    """LMCache CPU backends a TP group creates (S1). LMCache sizes its local
+    CPU backend per worker; on an MLA model (one latent KV, the same on
+    every rank) only the first rank stores ("save only first rank"), else
+    every rank stores its own shard. None: unknown (no spec dump at TP > 1)."""
+    if tp == 1:
+        return 1
+    if spec is None:
+        return None
+    groups = (spec.get("kv_cache_config") or {}).get("groups", [])
+    mla = bool(groups) and all(
+        "MLAAttentionSpec" in (g.get("spec", {}).get("mro") or []) for g in groups
+    )
+    return 1 if mla else tp
+
+
 def lmcache_config(
-    log: Path, cpu_bytes: int, overlay: Path, chunk: int = LMCACHE_CHUNK
+    log: Path,
+    cpu_bytes: int,
+    overlay: Path,
+    chunk: int = LMCACHE_CHUNK,
+    ranks: int = 1,
 ) -> dict[str, Any]:
     """What the lmcache arm ran with: the overlay and its lmcache dist (the
     version names the source commit for a source build), the connector, the
-    env we set and LMCache's own config log line (``LMCACHE_CONFIG_MARK``:
-    chunk size, backends, CPU GiB)."""
-    line = next((x for x in log.read_text().splitlines() if LMCACHE_CONFIG_MARK in x), None)
+    env we set (each of ``ranks`` storing ranks gets ``cpu_bytes // ranks``),
+    LMCache's own config log line (``LMCACHE_CONFIG_MARK``: chunk size,
+    backends, CPU GiB) and how many local CPU backends it logged creating."""
+    text = log.read_text().splitlines()
+    line = next((x for x in text if LMCACHE_CONFIG_MARK in x), None)
+    per_rank = cpu_bytes // ranks
     return {
         "overlay": str(overlay),
-        "dist": sorted(p.name for p in overlay.glob("lmcache-*.dist-info")),
+        "dist": lmcache_dists(overlay),
         "connector": f"{LMCACHE_CONNECTOR_MODULE}:{LMCACHE_CONNECTOR}",
         "cpu_bytes": cpu_bytes,
-        "env": lmcache_env(cpu_bytes, chunk),
+        "storing_ranks": ranks,
+        "per_rank_bytes": per_rank,
+        "backends": sum(LMCACHE_BACKEND_MARK in x for x in text),
+        "env": lmcache_env(per_rank, chunk),
         "logged": line.split(LMCACHE_CONFIG_MARK, 1)[1].strip()[:4000] if line else None,
     }
+
+
+def lmcache_size_problem(cfg: dict[str, Any]) -> str | None:
+    """S1, fail-closed: LMCache must have created exactly the storing ranks'
+    backends, so its total CPU store is ``backends * per_rank_bytes <= C``."""
+    n, per, c = cfg["backends"], cfg["per_rank_bytes"], cfg["cpu_bytes"]
+    if n != cfg["storing_ranks"] or n * per > c:
+        return (
+            f"lmcache created {n} local CPU backends of {per} B (expected "
+            f"{cfg['storing_ranks']}, total <= {c} B)"
+        )
+    return None
+
+
+def lmcache_build_problem(gate: dict[str, Any], dists: list[str]) -> str | None:
+    """S2: the lmcache build of a model's reference numbers is declared in
+    its gate.json (``lmcache_dist``: ``<name>-<version>`` of the overlay's
+    dist, e.g. PR #4467 on Qwen3-4B, 0.5.6 on DeepSeek-V2-Lite where #4467
+    crashes on MLA). The overlay must hold exactly that dist; a model
+    without a declared build has no official lmcache arm."""
+    want = gate.get("lmcache_dist")
+    if not want:
+        return "lmcache arm: gate.json declares no lmcache_dist for this model"
+    if dists != [want]:
+        return f"lmcache overlay holds {dists}, gate.json lmcache_dist is {want}"
+    return None
+
+
+def lmcache_build_verdict(
+    per_wl: dict[str, dict[str, Any]], gate: dict[str, Any]
+) -> dict[str, Any]:
+    """G0.lmcache_build (lmcache arm): every stage recorded the overlay dist
+    gate.json declares (``lmcache_build_problem``) and a CPU store of at most
+    C (``lmcache_size_problem``; a record from before ``storing_ranks`` is
+    judged on the dist only)."""
+    bad: dict[str, str] = {}
+    for wl, r in per_wl.items():
+        cfg = r.get("lmcache")
+        if cfg is None:
+            bad[wl] = "no lmcache config recorded"
+            continue
+        msg = lmcache_build_problem(gate, [d.removesuffix(".dist-info") for d in cfg.get("dist", [])])  # fmt: skip
+        if msg is None and "storing_ranks" in cfg:
+            msg = lmcache_size_problem(cfg)
+        if msg:
+            bad[wl] = msg
+    return {"pass": bool(per_wl) and not bad, "want": gate.get("lmcache_dist"), "bad": bad}
 
 
 def arm_kind(arm: str) -> str:
@@ -1010,6 +1090,8 @@ def vllm_server(
     """``num_gpu_blocks``: the stage's own GPU KV pool (preempt), else
     ``--num-gpu-blocks``. ``gsm8k``: the stage also gets gate.json's
     ``gsm8k_vllm_args`` (the cross-arm exact comparisons run there)."""
+    if arm_kind(arm) == "lmcache" and not getattr(args, "lmcache_ranks", None):
+        raise ValueError("lmcache: storing ranks unknown (TP > 1 without a committed spec dump)")
     lease = PortLease(1, block=VLLM_PORT_BLOCK, log=log)
     (port,) = lease.ports
     env = os.environ.copy()
@@ -1061,7 +1143,8 @@ def vllm_server(
         # LMCache lives in an overlay (its pins would downgrade the shared
         # venv); only this arm's vLLM sees it.
         env["PYTHONPATH"] = f"{env['PYTHONPATH']}:{args.lmcache_overlay}"
-        env |= lmcache_env(cpu_bytes, args.lmcache_chunk_size)
+        # S1: LMCache sizes each storing rank's CPU backend; together they hold C.
+        env |= lmcache_env(cpu_bytes // args.lmcache_ranks, args.lmcache_chunk_size)
     cmd = [
         "vllm",
         "serve",
@@ -1391,8 +1474,15 @@ def run_arm_workload(
         stack.enter_context(cm)
         if kind == "lmcache":
             result["lmcache"] = lmcache_config(
-                out / "vllm.log", store_bytes, Path(args.lmcache_overlay), args.lmcache_chunk_size
+                out / "vllm.log",
+                store_bytes,
+                Path(args.lmcache_overlay),
+                args.lmcache_chunk_size,
+                args.lmcache_ranks,
             )
+            bad = lmcache_size_problem(result["lmcache"])
+            if bad:
+                raise RuntimeError(f"{arm}/{workload}: {bad}")
         if cap and pf_http:
             # What the server actually allocated: must not exceed C.
             m = asyncio.run(workloads.scrape(f"http://127.0.0.1:{pf_http}", ("pegaflow",)))
@@ -2750,6 +2840,8 @@ def verdicts(
         if pegaflow_dirs is not None:
             mod, root = connectors.get(label, (None, None))
             g["G0.provenance"] = g0_provenance(run_dir, label, pegaflow_dirs.get(label), mod, root)
+        if kind == "lmcache":
+            g["G0.lmcache_build"] = lmcache_build_verdict(per_wl, gate or {})
         g["G2.digest_self.gsm8k"] = _digest_verdict(gsm and gsm["digest_self"], MIN_JUDGED_GSM8K)
         g["G2.digest_groups"] = digest_groups(run_dir / label / "gsm8k" / "probe")
         # Split-variant: the baseline's replay of this arm's warm resume
@@ -3266,7 +3358,12 @@ def contamination(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def official_problems(
-    args, arms: list[str], wls: list[str], gate_file: Path, committed: Path
+    args,
+    arms: list[str],
+    wls: list[str],
+    gate_file: Path,
+    committed: Path,
+    gate: dict[str, Any] | None = None,
 ) -> list[str]:
     def same(k: str, v: Any) -> bool:
         got = getattr(args, k)
@@ -3298,6 +3395,10 @@ def official_problems(
         out.append("--num-gpu-blocks / --vllm-arg override")
     if "lmcache" in kinds and args.lmcache_chunk_size != LMCACHE_CHUNK:
         out.append(f"lmcache_chunk_size={args.lmcache_chunk_size} (official {LMCACHE_CHUNK})")
+    if "lmcache" in kinds:
+        bad = lmcache_build_problem(gate or {}, lmcache_dists(Path(args.lmcache_overlay)))
+        if bad:
+            out.append(bad)
     for a in arms:
         mod = a.split(":")[0]
         if arm_kind(a) == "under_test" and not (mod == "pegaflow" or mod.startswith("pegaflow.")):
@@ -3701,6 +3802,11 @@ def main(argv: list[str] | None = None) -> int:
     model_dir = REPO / "docs" / "rsi" / "models" / Path(args.model).name
     gate_file, committed = model_dir / "gate.json", model_dir / "spec.json"
     gate = json.loads(gate_file.read_text()) if gate_file.exists() else {}
+    # S1: LMCache's storing ranks (MLA: the first only), from the committed
+    # dump; None at TP > 1 without one fails the lmcache arm's stages.
+    args.lmcache_ranks = lmcache_storing_ranks(
+        json.loads(committed.read_text()) if committed.exists() else None, args.tp
+    )
     args.preempt_blocks = 0
     if PREEMPT in args.workloads.split(","):
         if not committed.exists():
@@ -3837,7 +3943,7 @@ def main(argv: list[str] | None = None) -> int:
     def strip(r: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
-    problems = official_problems(args, arms, wls, gate_file, committed)
+    problems = official_problems(args, arms, wls, gate_file, committed, gate)
     contaminated = contamination(results)
     problems += [
         f"contaminated: {c['arm']} replay/{c['pass']} p99 TTFT {c['ttft_p99']:.3g}s > "
