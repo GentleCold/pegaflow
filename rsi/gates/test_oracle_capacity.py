@@ -407,6 +407,38 @@ def test_capacity_verdict_requires_pool_and_load_proof():
 
 
 @pytest.mark.parametrize(
+    "spec,reqs,items,win",
+    [
+        (_spec(FULL, CKPT), _fallback_trace(), 3, "oracle_c_fallback"),
+        (CYCLIC[0], CYCLIC[1], 8, "oracle_c"),
+    ],
+    ids=["fallback-wins", "full-only"],
+)
+def test_capacity_verdict_diagnostics_are_the_winning_store(spec, reqs, items, win):
+    """The verdict's per-group / per-pass oracle_C diagnostics describe the
+    store that set H*_C on warm_timed (plain Belady also reported, as
+    belady_*, when it did not win); a record without the winner's
+    diagnostics fails, not crashes."""
+    r = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    r["capacity"] = oracle.summarize_capacity(
+        spec, reqs, items * PAGE * LAYERS, {"warm_timed": {"a"}}, [0] * len(reqs)
+    )
+    diag = r["capacity"]["diagnostics"]
+    v = run_gate._capacity_verdict(r, pegaflow=False, gated=True)
+    assert v["oracle_c_groups"] == diag[win]["groups"], v
+    assert v["oracle_c_passes"] == diag[win]["passes"]
+    if win == "oracle_c":
+        assert "belady_groups" not in v
+    else:
+        assert diag[win]["groups"] != diag["oracle_c"]["groups"]
+        assert v["belady_groups"] == diag["oracle_c"]["groups"]
+        assert v["belady_passes"] == diag["oracle_c"]["passes"]
+        del diag[win]
+        v = run_gate._capacity_verdict(r, pegaflow=False, gated=True)
+        assert v["pass"] is False and f"capacity.diagnostics.{win}.groups" in v["reason"], v
+
+
+@pytest.mark.parametrize(
     "drop",
     [
         "capacity.warm_timed.efficiency_c_own_local",  # pre-20e6b58 records

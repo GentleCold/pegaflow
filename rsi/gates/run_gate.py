@@ -2461,6 +2461,18 @@ _CAPACITY_FIELDS = (
 )  # fmt: skip
 
 
+_DIAG = ("groups", "passes")
+# ``capacity.diagnostics`` key of each H*_C candidate store.
+_ORACLE_C_DIAG = {"belady": "oracle_c", "belady_fallback": "oracle_c_fallback", "lru": "lru"}
+
+
+def _oracle_c_diag(w: dict[str, Any]) -> str:
+    """The diagnostics key of the store that set ``H*_C`` on segment ``w``
+    (plain Belady for records written before ``oracle_c_policy``)."""
+    policy = w.get("oracle_c_policy", "belady")
+    return _ORACLE_C_DIAG.get(policy, f"<unknown policy {policy}>")
+
+
 def _missing_fields(r: dict[str, Any], paths: tuple[str, ...]) -> list[str]:
     out = []
     for path in paths:
@@ -2486,6 +2498,9 @@ def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> 
     # the field existed) cannot be evaluated, which is a fail, not a crash
     # that loses every other verdict of the run.
     missing = _missing_fields(r, _CAPACITY_FIELDS)
+    if not missing:
+        win = _oracle_c_diag(r["capacity"]["warm_timed"])
+        missing = _missing_fields(r, tuple(f"capacity.diagnostics.{win}.{k}" for k in _DIAG))
     if missing:
         return {"pass": False, "reason": f"cannot evaluate: missing {', '.join(missing)}"}
     c = r["capacity"]
@@ -2524,6 +2539,10 @@ def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> 
         and w["unmatched_requests"] == 0
     )
     diag = c["diagnostics"]
+    # oracle_c_* describe the store that set H*_C on warm_timed; the plain
+    # Belady goes under belady_* when another candidate won.
+    win = _oracle_c_diag(w)
+    plain = {} if win == "oracle_c" else {f"belady_{k}": diag["oracle_c"][k] for k in _DIAG}
     return {
         "pass": ok,
         "gated": gated,
@@ -2558,10 +2577,11 @@ def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> 
         "evicted": evicted,
         "server_end_bytes": resident_end,
         "server_io_bytes": io,
-        "oracle_c_groups": diag["oracle_c"]["groups"],
+        "oracle_c_groups": diag[win]["groups"],
         "lru_groups": diag["lru"]["groups"],
-        "oracle_c_passes": diag["oracle_c"]["passes"],
+        "oracle_c_passes": diag[win]["passes"],
         "lru_passes": diag["lru"]["passes"],
+        **plain,
     }
 
 

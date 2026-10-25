@@ -356,7 +356,8 @@ def _fallback_keys(
 
 def prefix_closed(spec: dict[str, Any], reqs: list[dict[str, Any]]) -> bool:
     """Whether every group's ``needed(q)`` is a subset of ``needed(p)`` for
-    all resume points ``q < p`` up to the longest prompt of the trace (from
+    all resume points ``q < p`` that ``resolve`` probes (up to the longest
+    prompt minus one token) in the trace (from
     ``semantics.needed``, so from the Kind: true for Full, false for
     Checkpoint and for Window once ``p`` exceeds the window). Only then does
     the use set at the unlimited resume point already cover every fallback
@@ -365,7 +366,7 @@ def prefix_closed(spec: dict[str, Any], reqs: list[dict[str, Any]]) -> bool:
     if not kinds:
         return True
     step = _step(kinds)
-    top = max((r["prompt_len"] for r in reqs), default=0)
+    top = max((r["prompt_len"] - 1 for r in reqs), default=0)  # resolve's cap
     for label, g, _ in kinds:
         if label == "scratch":
             continue
@@ -646,7 +647,8 @@ def summarize_capacity(
     with the largest ``Σ ext*_C`` (``oracle_c_policy``, ties in candidate
     order; every candidate's tokens in ``oracle_c_candidates``). Exact
     optimality (variable item sizes, all-groups coherence) is not tractable,
-    so this is a lower bound on the optimum that is never below ``H_lru``.
+    so this is a lower bound on the optimum that is never below ``H_lru`` in
+    ``Σ ext*_C`` (the selection key).
 
     - ``ext = max(0, min(a, o) - max(ref, own))`` (capped by the unlimited
       oracle, so a connector cannot score above what an unlimited store could
