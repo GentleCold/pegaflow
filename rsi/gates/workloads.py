@@ -196,6 +196,7 @@ async def run_gsm8k(
     xargs: dict[str, Any] | None = None,
     logprobs: bool = False,
     prewarm: bool = False,
+    free_run: bool = False,
 ) -> dict[str, Any]:
     """``xargs`` go to ``vllm_xargs`` (``SamplingParams.extra_args``), e.g. probe tags.
 
@@ -204,7 +205,9 @@ async def run_gsm8k(
     ``--enable-prompt-tokens-details`` for the cached count).
     ``prewarm``: send each prompt once with ``max_tokens=1`` right before its
     real request, so vLLM's prefix cache holds the whole prompt and the real
-    request starts computing at its last full prompt block (the split control)."""
+    request starts computing at its last full prompt block (the split control).
+    ``free_run``: no stop strings and ``ignore_eos``, so every request decodes
+    exactly ``max_tokens`` (the preempt workload: KV grows by a known amount)."""
     import aiohttp
 
     sem = asyncio.Semaphore(concurrency)
@@ -213,6 +216,8 @@ async def run_gsm8k(
 
     async def one(session: aiohttp.ClientSession, i: int) -> None:
         body = _gsm8k_body(model, prompts[i][0], max_tokens)
+        if free_run:
+            body |= {"stop": [], "ignore_eos": True}
         if xargs:
             # ``rsi_conv``: the prompt index (workload position), so a
             # reference stage can replay a request of this pass by index.

@@ -5,13 +5,14 @@ docs/rsi/GATES.md ("Tests"). The isolation tests run only on Linux as root.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from rsi.gates import oracle, run_gate
+from rsi.gates import digest_compare, oracle, run_gate
 
 BT = 4  # tokens per block, every group
 PAGE = 500  # bytes per layer page
@@ -85,8 +86,16 @@ CKPT8 = _group(1, "MambaSpec", ["MambaSpec", "KVCacheSpec"], bt=2 * BT, page=3 *
 MIXED = (_spec(FULL, CKPT8), _trace(["p0", "p1"], 4, ["a", "b"]))
 
 
+# Qwen3.5 shape: groups 0-2 MambaSpec (GDN), group 3 full attention, one block size.
+_MAMBA = ["MambaSpec", "KVCacheSpec"]
+QWEN35_SPEC = _spec(*(_group(g, "MambaSpec", _MAMBA) for g in range(3)), dict(FULL, id=3))
+QWEN35 = (QWEN35_SPEC, _trace(["p0", "p1"], 2, ["a", "b"]))
+
+
 @pytest.mark.parametrize(
-    "case", [CYCLIC, HYBRID, MIXED], ids=["cyclic-full", "full+checkpoint", "mixed-block-sizes"]
+    "case",
+    [CYCLIC, HYBRID, MIXED, QWEN35],
+    ids=["cyclic-full", "full+checkpoint", "mixed-block-sizes", "qwen3.5-3ckpt+full"],
 )
 @pytest.mark.parametrize("policy", ["belady", "lru"])
 def test_capacity_at_least_u_equals_unlimited_oracle(case, policy):
@@ -171,6 +180,59 @@ def test_local_hit_blocks_count_as_present_and_are_not_external():
     assert ext == [(0, "p0:1"), (1, "p0:1")]
     resident = dict.fromkeys(ext, 0)
     assert oracle._resolve(kinds, r, resident, BT) == 2 * BT
+
+
+def test_checkpoint_needs_and_saves_only_block_ends():
+    """GDN = Checkpoint(bt): resuming at p needs exactly block p/bt - 1; a
+    state is saveable only when a step ends on a block boundary."""
+    g = oracle.group_kinds(QWEN35_SPEC)[0][1]
+    assert (g.kind, g.block_tokens) == ("checkpoint", BT)
+    assert [oracle.sem.needed(g, p) for p in (BT, 3 * BT)] == [(0, 1), (2, 3)]
+    assert oracle.sem.saveable(g, 0, 3 * BT) == (2, 3)  # only the state at the chunk end
+    assert oracle.sem.saveable(g, 0, 3 * BT - 1) == (0, 0)  # mid-block: nothing
+
+
+@pytest.mark.parametrize(
+    "ends,hit",
+    [
+        ([BT, 2 * BT, 3 * BT, 3 * BT + 1], 3 * BT),  # every boundary materialized
+        ([2 * BT, 3 * BT + 1], 2 * BT),  # last state on a boundary: block 1
+        ([BT + 2, 3 * BT + 1], 0),  # no chunk ends on a boundary: no state
+        ([BT, 3 * BT - 1, 3 * BT + 1], BT),  # full blocks 1-2 stored, state only at 1 block
+    ],
+    ids=["aligned", "last-state-mid", "no-aligned-end", "full-ahead-of-state"],
+)
+def test_qwen35_replay_counts_only_chunk_end_states(ends, hit):
+    """A second request on the same prompt hits only up to the last block end
+    some step of the first one stopped at (vLLM writes state at chunk ends)."""
+    plen = 3 * BT + 1
+    first = _req("p0", 3, 1, "a") | {"progress": [[1 + k, e] for k, e in enumerate(ends)]}
+    again = _req("p0", 3, len(ends) + 2, "b")
+    assert oracle.replay(QWEN35_SPEC, [first, again]) == [0, hit]
+    assert hit < plen
+
+
+@pytest.mark.parametrize(
+    "ckpt,full,hit",
+    [
+        ([{1, 2}] * 3, {0, 1, 2}, 3 * BT),
+        ([{1, 2}, {1, 2}, {1}], {0, 1, 2}, 2 * BT),  # group 2 lacks block 2's state
+        ([{2}, {2}, {1}], {0, 1, 2}, 0),  # no length where all three states exist
+        ([{0, 1, 2}] * 3, {0, 2}, BT),  # full-attention gap at block 1
+        ([{0, 1, 2}] * 3, set(), 0),  # states alone resume nothing
+    ],
+    ids=["all", "one-group-short", "groups-disagree", "full-gap", "no-full"],
+)
+def test_qwen35_hit_needs_every_group(ckpt, full, hit):
+    """H* (and H*_C, same ``_resolve``) counts a length only where all three
+    GDN groups hold that length's state and full attention holds the prefix."""
+    kinds = oracle._active(QWEN35_SPEC)
+    r = _req("p0", 3, 1, "a")
+    resident = {(gi, f"p0:{b}"): 0 for gi, bs in enumerate([*ckpt, full]) for b in bs}
+    assert oracle._resolve(kinds, r, resident) == hit
+    # Resuming at ``hit`` loads one state per GDN group plus the full prefix.
+    want = [(gi, f"p0:{hit // BT - 1}") for gi in range(3)] + [(3, f"p0:{b}") for b in range(hit // BT)]  # fmt: skip
+    assert oracle._needed_keys(kinds, r, hit) == (want if hit else [])
 
 
 def test_reference_local_hit_fixes_the_bar():
@@ -524,6 +586,24 @@ def test_capacity_floor_fails_closed_and_g5_problems():
     assert run_gate.g5_problems({"X": flat}, high, None) == ["G5 trace does not separate freeze from H*_C"]  # fmt: skip
     assert run_gate.g5_problems({"X": {}}, high, None)  # freeze not evaluated: not official
     assert run_gate.g5_problems({"X": sep}, low, {"enough": False}) == ["capacity below 2x GPU KV (whole replay file used)"]  # fmt: skip
+    assert run_gate.g5_problems({"X": sep}, high, {"unmodeled": ["x"]}) == ["cap plan sized from an unmodeled spec: x"]  # fmt: skip
+
+
+def test_unmodeled_spec_only_flags_checkpoint_models():
+    """The Checkpoint step-end model assumes ``hash_block_size ==
+    block_size``, no Eagle, no prefill checkpoint blocks; Full-only specs
+    are counted exactly whatever those values are."""
+    ckpt = _spec(FULL, CKPT) | {"cache": {"mamba_cache_mode": "align"}}
+    assert run_gate.unmodeled_spec(ckpt) == []
+    committed = run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json"
+    assert run_gate.unmodeled_spec(json.loads(committed.read_text())) == []
+    sub = {**ckpt, "kv_cache_config": {**ckpt["kv_cache_config"], "hash_block_size": BT // 2}}
+    assert len(run_gate.unmodeled_spec(sub)) == 2  # both groups
+    full = _spec(FULL)
+    assert run_gate.unmodeled_spec({**full, "kv_cache_config": {**full["kv_cache_config"], "hash_block_size": 1}}) == []  # fmt: skip
+    pcb = json.loads(json.dumps(ckpt))
+    pcb["kv_cache_config"]["groups"][1]["spec"]["num_prefill_checkpoint_blocks"] = 1
+    assert run_gate.unmodeled_spec(pcb) == ["group 1: num_prefill_checkpoint_blocks 1"]
 
 
 def test_reference_locals_unmatched_path():
@@ -542,10 +622,80 @@ def test_reference_locals_unmatched_path():
 def test_unique_estimate_counts_shared_prefix_once():
     spec = _spec(FULL)
     # vLLM computes prompt + out - 1 tokens: out = BT + 1 completes one block.
-    est = run_gate.UniqueEstimate(spec, out_tokens=BT + 1)
+    est = run_gate.UniqueEstimate(spec, out_tokens=BT + 1, budget=4 * BT)
     a = list(range(3 * BT))
     est.add([a[: 2 * BT], a])  # turn 2 extends turn 1: 3 distinct blocks + 2 generated
     assert est.bytes == (3 + 2) * PAGE * LAYERS
+
+
+@pytest.mark.parametrize(
+    "start,plen,budget,align,junction,ends",
+    [
+        pytest.param(0, 1722, 2048, True, 0, [1584, 1722], id="stop-at-last-cacheable"),
+        pytest.param(0, 1796, 2048, True, 1056, [1056, 1584, 1796], id="stop-at-junction"),
+        pytest.param(1584, 5314, 2048, True, 0, [3168, 4752, 5280, 5314], id="chunks-end-aligned"),
+        pytest.param(0, 1722, 2048, False, 0, [1722], id="no-align-one-chunk"),
+        pytest.param(0, 5000, 2048, False, 0, [2048, 4096, 5000], id="no-align-budget"),
+    ],
+)  # fmt: skip
+def test_prefill_step_ends_follow_the_align_split(start, plen, budget, align, junction, ends):
+    assert run_gate.prefill_step_ends(start, plen, 528, budget, align, junction) == ends
+
+
+def test_unique_estimate_counts_only_saved_checkpoints():
+    """Checkpoint groups store a block only where a step ends on its boundary
+    (the oracle's rule): a 4-block prompt prefilled in one chunk stores the
+    last cacheable checkpoint only; full attention stores all 4."""
+    spec = _spec(FULL, CKPT) | {"cache": {"mamba_cache_mode": "align"}}
+    est = run_gate.UniqueEstimate(spec, out_tokens=1, budget=8 * BT)
+    est.add([list(range(4 * BT + 1))])
+    assert est.bytes == (4 + 1) * PAGE * LAYERS
+    # The next turn resumes at that checkpoint: one more chunk, one more state.
+    est.add([list(range(6 * BT + 1))])
+    assert est.bytes == (6 + 2) * PAGE * LAYERS
+
+
+def test_cap_only_run_sizes_from_the_committed_spec(tmp_path):
+    """``--workloads cap`` has no earlier baseline stage: auto must size from
+    the committed dump, not fall back to ``CAP_MIN_CONVS``."""
+    committed = tmp_path / "spec.json"
+    arm = tmp_path / "baseline"
+    assert run_gate.cap_plan_spec(arm, ["cap"], committed) is None
+    committed.write_text("{}")
+    assert run_gate.cap_plan_spec(arm, ["cap"], committed) == committed
+    # The preempt stage's dump has a shrunk GPU pool: never size from it.
+    (arm / "preempt" / "probe").mkdir(parents=True)
+    (arm / "preempt" / "probe" / "spec.json").write_text("{}")
+    assert run_gate.cap_plan_spec(arm, ["preempt", "cap"], committed) == committed
+    for w in ("replay", "gsm8k"):
+        (arm / w / "probe").mkdir(parents=True)
+        (arm / w / "probe" / "spec.json").write_text("{}")
+    wls = ["preempt", "replay", "gsm8k", "cap"]
+    assert run_gate.cap_plan_spec(arm, wls, committed) == arm / "gsm8k/probe/spec.json"
+    assert run_gate.cap_plan_spec(arm, ["preempt", "replay", "cap"], committed) == arm / "replay/probe/spec.json"  # fmt: skip
+
+
+S1_CAP = Path(__file__).parent / "testdata/qwen3.5-4b-s1-cap-cold.json"
+
+
+def test_unique_estimate_matches_the_measured_hybrid_trace():
+    """Qwen3.5-4B's committed spec on the s1 cap trace (8 x 6, out 64,
+    measured on the baseline arm): within 5% of the measured ``U``, and not
+    above it (an under-estimate only adds conversations). The estimate
+    before the Checkpoint rule was 4.47 GB, 1.28x the measured 3.49 GB."""
+    spec = json.loads((run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json").read_text())
+    data = json.loads(S1_CAP.read_text())
+    a = data["args"]
+    est = run_gate.UniqueEstimate(spec, a["replay_out_tokens"], a["max_num_batched_tokens"])
+    convs: dict[int, list] = {}
+    for conv, turn, plen, keys in sorted(data["requests"]):
+        # Same keys = same prefix: one token value per key keeps the chain.
+        ids = [t for k in keys for t in [int(k, 16)] * 528]
+        convs.setdefault(conv, []).append(ids + [-1 - turn] * (plen - len(ids)))
+    for c in sorted(convs):
+        est.add(convs[c])
+    measured = data["measured_unique_bytes"]
+    assert 0.95 * measured <= est.bytes <= measured, est.bytes / measured
 
 
 @pytest.mark.parametrize(
@@ -1113,7 +1263,7 @@ def test_a_tree_changed_between_stages_is_named(tmp_path, monkeypatch, role, edi
     monkeypatch.setattr(run_gate, "REPO", gate)
     monkeypatch.setattr(run_gate.provenance, "gate_pegaflow_dir", lambda: None)
     monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "pyc"))
-    args = argparse.Namespace(under_test_path="/t", under_test_overlay=str(ov), pegaflow_server=str(srv / "pegaflow-server"))  # fmt: skip
+    args = argparse.Namespace(arms="baseline,pegaflow.m:C", under_test_path="/t", under_test_overlay=str(ov), pegaflow_server=str(srv / "pegaflow-server"))  # fmt: skip
     watch = run_gate.ProvenanceWatch(args, gate / "docs/rsi/models/M")
     (gate / "rsi/gates/__pycache__").mkdir()
     (gate / "rsi/gates/__pycache__/rsi_probe.cpython-312.pyc").write_bytes(b"pyc")
@@ -1133,7 +1283,8 @@ def test_a_tree_changed_between_stages_is_named(tmp_path, monkeypatch, role, edi
 
 def test_each_stage_gets_a_fresh_bytecode_cache_outside_the_arm(tmp_path):
     """M10: a stage's PYTHONPYCACHEPREFIX is its own dir, outside every arm
-    dir; the isolated arm gets only its current stage's cache bound rw."""
+    dir; the isolated arm gets only its current stage's cache and its own
+    compile cache (S5) bound rw."""
     import argparse
 
     run = tmp_path / "runs" / "r"
@@ -1145,7 +1296,7 @@ def test_each_stage_gets_a_fresh_bytecode_cache_outside_the_arm(tmp_path):
         runs_root=str(tmp_path / "runs"), under_test_path="", under_test_overlay=""
     )
     iso = run_gate.isolation(args, run / "ut" / "replay")
-    assert iso["rw"] == [str((run / "ut" / "replay").resolve()), str((run / ".pycache-stages" / "ut" / "replay").resolve())]  # fmt: skip
+    assert iso["rw"] == [str((run / "ut" / "replay").resolve()), str((run / ".pycache-stages" / "ut" / "replay").resolve()), str((run / ".compile-cache" / "ut").resolve())]  # fmt: skip
 
 
 @pytest.mark.parametrize("bad", [None, "gate", "venv_pegaflow", "under_test"])
@@ -1686,6 +1837,113 @@ def test_g0_spec_ignores_module_paths(tmp_path):
     assert not run_gate.g0(tmp_path, "arm", committed)["pass"]
 
 
+# ------------------------------------------------- Mamba align state records
+
+
+def _state_probe(tmp_path, warm_byte: str, preempt: bool):
+    """Group 1 is a state group (probe ``state_groups``), group 0 full.
+
+    - ``a`` (cold): a step ends on 2 blocks; the probe digested that state in
+      its step (record ``episode`` 0). With ``preempt``, ``a`` is preempted
+      after it and recomputes from 0 in episode 1, which crosses 2 blocks
+      without ending a step there (no state computed).
+    - ``b`` (warm): starts at 2 blocks (loaded state, ``warm_byte``) and digests
+      that start state as episode 0; its full blocks at finish as usual."""
+    import json
+
+    a = _req("p", 3, 1, "cold") | {"req_id": "a", "digest": "full"}
+    a["progress"] = [[1, 2 * BT], [2, 3 * BT + 1]]
+    a["episodes"] = [[1, 0, 0]]
+    if preempt:
+        a["episodes"].append([5, 0, 0])
+        a["progress"] += [[5, 3 * BT + 1]]
+    b = _req("p", 3, 10, "warm") | {"req_id": "b", "digest": "full"}
+    b["episodes"], b["progress"] = [[10, 0, 2 * BT]], [[10, 3 * BT + 1]]
+
+    def rec(rid, gid, covered, byte, **kw):
+        blk = {"key": f"p:{covered // BT - 1}", "covered": covered, "exact": [byte], "l1": [1.0]}
+        return {"req_id": rid, "rank": "pp0-tp0", "group": gid, "layers": ["l0"], "blocks": [blk]} | kw  # fmt: skip
+
+    digests = [
+        rec("a", 1, 2 * BT, "S", episode=0),
+        rec("b", 1, 2 * BT, warm_byte, episode=0),
+        *(rec(rid, 0, c, f"F{c}") for rid in ("a", "b") for c in (BT, 2 * BT, 3 * BT)),
+    ]
+    probe = _probe(tmp_path, [a, b], digests)
+    (probe / "spec.json").write_text(json.dumps({"probe": {"state_groups": [1]}}))
+    return probe
+
+
+def _zero_probe(tmp_path, cold_byte: str, dropped: bool):
+    """Key ``p:1`` (2 blocks) computed by ``a`` in a preempted episode 0
+    (digested at preemption, bytes ``cold_byte``) and loaded by ``b``
+    (external, bytes of an all-zero page, i.e. a load that wrote nothing
+    into a zeroed block). ``dropped``: the probe dropped a's block because
+    vLLM zeroed it before the digest."""
+    z = digest_compare.ZERO_DIGEST
+    a = _req("p", 2, 1, "cold") | {"req_id": "a", "digest": "full"}
+    a["episodes"], a["progress"] = [[1, 0, 0], [5, 0, 0]], [[1, 2 * BT + 1], [5, 2 * BT + 1]]
+    a["computed"], a["preempt_digested"] = 2 * BT + 1, [0]
+    if dropped:
+        a["preempt_dropped"] = [[0, 0, 2 * BT, "zeroed"]]
+    b = _req("p", 2, 10, "warm") | {"req_id": "b", "digest": "full"}
+    b["episodes"], b["progress"] = [[10, 0, 2 * BT]], [[10, 2 * BT + 1]]
+
+    def rec(rid, byte, **kw):
+        blk = {"key": "p:1", "covered": 2 * BT, "exact": [byte], "l1": [0.0]}
+        return {"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": [blk]} | kw  # fmt: skip
+
+    digests = [rec("b", z), rec("a", "F")]  # a's last episode, digested at finish
+    if not dropped:
+        digests.append(rec("a", cold_byte, episode=0))
+    return _probe(tmp_path, [a, b], digests)
+
+
+@pytest.mark.parametrize(
+    "cold_byte,dropped,matched,mismatched,uncertain",
+    [
+        ("F", False, 0, 1, 0),  # a real copy: the no-op load is caught
+        (digest_compare.ZERO_DIGEST, False, 0, 0, 1),  # zero copy is no reference
+        ("F", True, 0, 0, 1),  # dropped: an undigested computation
+    ],
+    ids=["real-copy", "zero-copy", "dropped"],
+)
+def test_zero_digest_is_never_a_reference(tmp_path, cold_byte, dropped, matched, mismatched, uncertain):  # fmt: skip
+    """R2: vLLM zeroes new attention blocks, so a preempted block digested
+    after vLLM zeroed it would make a load that wrote nothing ``matched``.
+    An all-zero computed copy is never a reference, and a block the probe
+    dropped counts as an undigested computation (``uncertain``, not
+    ``mismatched``: the reference is not exhaustive)."""
+    probe = _zero_probe(tmp_path, cold_byte, dropped)
+    d = digest_compare.compare(probe, probe, invariant=False)
+    g = d["groups"]["0"]
+    assert (g["external_matched"], g["external_mismatched"], g["external_uncertain"]) == (matched, mismatched, uncertain)  # fmt: skip
+    assert d["ref_zero_copies"] == (cold_byte == digest_compare.ZERO_DIGEST)
+
+
+@pytest.mark.parametrize(
+    "warm_byte,preempt,matched,mismatched",
+    [("S", False, 1, 0), ("X", False, 0, 1), ("S", True, 1, 0), ("X", True, 0, 1)],
+    ids=["match", "wrong-state", "match-preempted", "wrong-state-preempted"],
+)
+def test_state_records_tagged_by_their_episode(tmp_path, warm_byte, preempt, matched, mismatched):
+    """A state digested in a preempted episode is that episode's computation
+    (not the last episode's), and a state exists only where a step ended:
+    episode 1 crossing 2 blocks mid-chunk computes no state, so the reference
+    stays exhaustive and a wrong loaded state is mismatched, not uncertain."""
+    from rsi.gates import digest_compare
+
+    probe = _state_probe(tmp_path, warm_byte, preempt)
+    d = digest_compare.compare(probe, probe, invariant=False)
+    g = d["groups"]["1"]
+    assert (g["external_matched"], g["external_mismatched"], g["external_uncertain"]) == (matched, mismatched, 0)  # fmt: skip
+    assert g["computed_compared"] == 0  # one computed copy: nothing to compare it with
+    full = d["groups"]["0"]
+    assert full["external_matched"] == 2 and full["external_mismatched"] == 0
+    v = run_gate._digest_verdict(d, 0.9)
+    assert v["pass"] is (mismatched == 0)
+
+
 # ------------------------------------------------------------ split invariance
 
 
@@ -1791,6 +2049,58 @@ def test_split_control_establishes_gate_claim(claim, ctrl, ok):
 
 
 @pytest.mark.parametrize(
+    "claim,ctrl,ok",
+    [
+        (True, _ctrl(0, 0), True),
+        (False, _ctrl(0, 0), False),  # declared non-invariant, measured invariant
+        (True, _ctrl(0, 1), False),  # one logprob moved: not batch-invariant
+        (False, _ctrl(0, 1), True),  # GDN: logprobs move alone vs batched
+        (True, _ctrl(1, 1), False),
+        (False, _ctrl(1, 1, prewarmed=9), True),
+        (False, _ctrl(1, 1, prewarmed=5), False),  # alone ran at another split
+        (False, _ctrl(0, 0, n=0, prewarmed=0), False),  # nothing compared
+        (False, None, False),
+    ],
+    ids=[
+        "inv-ok",
+        "false-variant-claim",
+        "logprob-refutes",
+        "variant-logprob",
+        "output-refutes",
+        "variant-ok",
+        "vacuous",
+        "empty",
+        "missing",
+    ],  # fmt: skip
+)
+def test_batch_control_establishes_gate_claim(claim, ctrl, ok):
+    assert run_gate._batch_control_verdict(ctrl, claim)["pass"] is ok
+
+
+def test_batch_control_compares_alone_with_the_batched_split_prefix(tmp_path):
+    """``alone`` repeats the first prompts of ``split``: each is compared with
+    the same prompt batched, and its pre-warm must reach the last full block."""
+    import json
+
+    d = tmp_path / run_gate.GATE_DIR / "plain" / "gsm8k"
+    d.mkdir(parents=True)
+    tok = {"logprobs": [-0.5], "prompt_tokens": 40, "cached": 32}
+    (d / "split-outputs.json").write_text(json.dumps(["a", "b", "c"]))
+    (d / "split-tokens.json").write_text(json.dumps([tok, tok, tok]))
+    (d / "alone-outputs.json").write_text(json.dumps(["a", "x"]))
+    (d / "alone-tokens.json").write_text(json.dumps([tok, tok | {"cached": 16}]))
+    ctrl = run_gate.batch_control(tmp_path)
+    assert (ctrl["n"], ctrl["differ"], ctrl["logprob_differ"], ctrl["prewarmed"]) == (
+        2,
+        [False, True],
+        [False, False],
+        1,
+    )
+    (d / "alone-outputs.json").write_text(json.dumps(["a", "b", "c", "d"]))
+    assert run_gate.batch_control(tmp_path) is None  # more than split: not comparable
+
+
+@pytest.mark.parametrize(
     "split_inv,cold,warm,vs_split,ok",
     [
         (True, 0, 0, (None, None), True),
@@ -1812,6 +2122,69 @@ def test_split_control_establishes_gate_claim(claim, ctrl, ok):
 def test_outputs_exact_against_same_split(split_inv, cold, warm, vs_split, ok):
     v = run_gate._outputs_verdict({"cold": cold, "warm": warm}, True, split_inv, vs_split)
     assert v["pass"] is ok, v
+
+
+def test_outputs_reported_not_gated_without_batch_invariance():
+    """batch_invariant=false: no warm reference shares the warm pass's batch
+    composition, so differing completions are reported, never a pass/fail."""
+    v = run_gate._outputs_verdict({"cold": 3, "warm": 7}, False, True, (5, 1))
+    assert (v["pass"], v["gated"], v["warm_differ"], v["warm_differ_vs_split"]) == (
+        True,
+        False,
+        7,
+        5,
+    )
+
+
+_RET = ["--mamba-cache-mode", "align", "--prefix-cache-retention-interval", "528"]
+
+
+@pytest.mark.parametrize(
+    "cmd,ok",
+    [
+        (["vllm", "serve", "m", "--seed", "42", *_RET], True),
+        (["vllm", "serve", "m", *_RET, "--prefix-cache-retention-interval", "0"], False),
+        (["vllm", "serve", "m", "--mamba-cache-mode", "align"], False),
+        (None, False),  # not recorded
+    ],
+    ids=["applied", "overridden-later", "missing", "unrecorded"],
+)
+def test_gate_vllm_args_applied_to_every_stage(cmd, ok):
+    gate = {"vllm_args": _RET}
+    good = {"vllm_cmd": ["vllm", "serve", "m", *_RET]}
+    results = {
+        "plain": {"gsm8k": good},
+        "baseline": {"gsm8k": good, "cap": {"error": "crashed"}},  # crash: G2 judges it
+        "selftest-honest": {"gsm8k": {} if cmd is None else {"vllm_cmd": cmd}},
+    }
+    v = run_gate.gate_args_verdict(results, gate)
+    assert v["pass"] is ok, v
+    assert set(v["bad"]) <= {"selftest-honest/gsm8k"}
+
+
+_DET = ["--compilation-config", '{"inductor_compile_config":{"deterministic":true}}']
+
+
+@pytest.mark.parametrize(
+    "gsm,other,ok",
+    [
+        ([*_RET, *_DET], _RET, True),
+        (_RET, _RET, False),  # gsm8k stage without its compile flag
+        ([*_RET, *_DET, "--compilation-config", "{}"], _RET, False),  # overridden later
+    ],
+    ids=["gsm8k-only", "missing-on-gsm8k", "overridden-later"],
+)
+def test_gsm8k_vllm_args_apply_to_gsm8k_stages_only(gsm, other, ok):
+    """gate.json ``gsm8k_vllm_args``: required on every gsm8k stage, not on
+    the others (replay/cap/preempt keep vLLM's default compile)."""
+    gate = {"vllm_args": _RET, "gsm8k_vllm_args": _DET}
+    results = {
+        label: {"gsm8k": {"vllm_cmd": ["vllm", *gsm]}, "preempt": {"vllm_cmd": ["vllm", *other]}}
+        for label in ("plain", "baseline")
+    }
+    v = run_gate.gate_args_verdict(results, gate)
+    assert v["pass"] is ok, v
+    assert all(k.endswith("/gsm8k") for k in v["bad"]), v
 
 
 def test_split_differ_separates_aligned_prompts():
@@ -2087,3 +2460,592 @@ def test_workload_sessions_never_reuse_connections():
         if f.name == "workloads.py":
             text = text.replace(text[text.index("def session(") : text.index("# ---", text.index("def session("))], "")  # fmt: skip
         assert not re.search(r"ClientSession\(|TCPConnector\(", text), f
+
+
+def _preempt_probe(tmp_path, digested: bool, warm_byte: str):
+    """``a`` (cold) computes 3 full blocks in episode 0, is preempted and
+    recomputes them in episode 1 with other rounding (``F*'``). With
+    ``digested`` the probe digested episode 0's blocks at preemption
+    (``preempt_digested``, records ``episode`` 0). ``b`` (warm, resumed after
+    a preemption: episode 1) loads 2 blocks (``warm_byte`` at block 1):
+    the copy saved from episode 0."""
+    a = _req("p", 3, 1, "cold") | {"req_id": "a", "digest": "full"}
+    a["episodes"], a["progress"] = [[1, 0, 0], [5, 0, 0]], [[1, 3 * BT], [5, 3 * BT + 1]]
+    a["preempt_digested"] = [0] if digested else []
+    b = _req("p", 3, 10, "warm") | {"req_id": "b", "digest": "full"}
+    b["episodes"], b["progress"] = [[10, 0, 0], [12, 0, 2 * BT]], [[10, BT], [12, 3 * BT + 1]]
+    b["preempt_digested"] = [0]
+
+    def rec(rid, c, byte, **kw):
+        blk = {"key": f"p:{c // BT - 1}", "covered": c, "exact": [byte], "l1": [1.0]}
+        return {"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": [blk]} | kw  # fmt: skip
+
+    digests = [rec("a", c, f"F{c}'") for c in (BT, 2 * BT, 3 * BT)]
+    if digested:
+        digests += [rec("a", c, f"F{c}", episode=0) for c in (BT, 2 * BT, 3 * BT)]
+    digests += [rec("b", BT, f"F{BT}"), rec("b", 2 * BT, warm_byte), rec("b", 3 * BT, "Fb")]
+    return _probe(tmp_path, [a, b], digests)
+
+
+@pytest.mark.parametrize(
+    "digested,warm_byte,matched,mismatched,uncertain",
+    [
+        (True, f"F{2 * BT}", 2, 0, 0),
+        (True, "X", 1, 1, 0),
+        (False, f"F{2 * BT}", 0, 0, 2),  # the saved copy was never digested
+        (False, "X", 0, 0, 2),
+    ],
+    ids=["digested-match", "digested-wrong", "undigested-match", "undigested-wrong"],
+)
+def test_preempted_episode_blocks_complete_the_reference(
+    tmp_path, digested, warm_byte, matched, mismatched, uncertain
+):
+    """Without batch invariance only an exhaustive reference judges a load:
+    the blocks a preempted episode computed are digested at preemption, so a
+    copy saved from that episode is a reference and a wrong load mismatches."""
+    from rsi.gates import digest_compare
+
+    d = digest_compare.compare(
+        *[_preempt_probe(tmp_path, digested, warm_byte)] * 2, invariant=False
+    )
+    g = d["groups"]["0"]
+    assert (g["external_matched"], g["external_mismatched"], g["external_uncertain"]) == (matched, mismatched, uncertain)  # fmt: skip
+    assert d["preempted_requests"] == 2
+    after = d["after_preemption"]
+    assert (after["external_compared"], after["external_uncertain"]) == (2, uncertain)
+
+
+def _pre(preempted: int, resumed_loads: int, mismatched: int = 0) -> dict:
+    d = {k: 0 for k in run_gate.digest_compare._group() if k != "first_bad"}
+    d |= {"local_compared": 10, "local_matched": 10 - mismatched, "local_mismatched": mismatched}
+    d |= {"invariant": False, "groups": {}, "preempted_requests": preempted}
+    d["after_preemption"] = {"local_compared": resumed_loads, "external_compared": 0}
+    return {"digest_self": d, "gpu_blocks": 40}
+
+
+@pytest.mark.parametrize(
+    "r,ok",
+    [
+        (_pre(4, 3), True),
+        (_pre(0, 0), False),  # vLLM never preempted: vacuous
+        (_pre(4, 0), False),  # preempted, but no resumed load was judged
+        (_pre(4, 3, mismatched=1), False),
+        (None, False),
+        ({"error": "crashed"}, False),
+    ],
+    ids=["ok", "no-preemption", "no-resumed-load", "mismatch", "missing", "crashed"],
+)
+def test_preempt_verdict_needs_judged_loads_after_preemption(r, ok):
+    assert run_gate._preempt_verdict(r, None)["pass"] is ok
+
+
+def _alone_dirs(tmp_path, plain_ref, base_ref, alone, cached=(48, 48)):
+    """``alone_ref`` (plain, baseline) and ``alone`` (plain, pre-warmed) passes."""
+    import json
+
+    for label, passes in (
+        ("plain", {"alone_ref": plain_ref, "alone": alone, "cold": ["c0", "c1"], "split": alone}),
+        ("baseline", {"alone_ref": base_ref, "cold": ["c0", "cX"]}),
+    ):
+        d = tmp_path / run_gate.GATE_DIR / label / "gsm8k"
+        d.mkdir(parents=True, exist_ok=True)
+        for name, outs in passes.items():
+            (d / f"{name}-outputs.json").write_text(json.dumps(outs))
+            c = cached if name in ("alone", "split") else (32, 32)
+            toks = [
+                {"logprobs": [len(o)], "cached": n, "prompt_tokens": 50}
+                for o, n in zip(outs, c, strict=True)
+            ]
+            (d / f"{name}-tokens.json").write_text(json.dumps(toks))
+
+
+@pytest.mark.parametrize(
+    "plain_ref,base_ref,alone,plain_ok,split_measured",
+    [
+        (["a", "b"], ["a", "b"], ["a", "b"], True, True),
+        (["a", "b"], ["a", "x"], ["a", "b"], False, True),  # the probe changed an output
+        (["a", "b"], ["a", "b"], ["a", "bb"], True, False),  # the split changed one
+    ],
+    ids=["equal", "probe-changes", "split-changes"],
+)
+def test_non_invariant_controls_compare_one_composition(
+    tmp_path, plain_ref, base_ref, alone, plain_ok, split_measured
+):
+    """batch_invariant=false: batched cold passes differ by composition, so
+    plain vs baseline and the split control compare one-at-a-time passes."""
+    _alone_dirs(tmp_path, plain_ref, base_ref, alone)
+    ref_cold = ["c0", "cX"]  # batched: differs from plain cold, reported only
+    v = run_gate._plain_equals_baseline(tmp_path, ref_cold, batch_invariant=False)
+    assert (v["pass"], v["cold_differ"]) == (plain_ok, 1)
+    ctrl = run_gate.split_control(tmp_path, batch_invariant=False)
+    assert ctrl["pair"] == ["alone_ref", "alone"] and ctrl["prewarmed"] == 2
+    assert ctrl["ref_equals_cold"] is plain_ok
+    sv = run_gate._split_control_verdict(ctrl, True)
+    assert sv["measured_invariant"] is split_measured
+    assert "batched" in sv  # the batched pair stays reported (None: passes missing)
+    assert (
+        run_gate._plain_equals_baseline(tmp_path, ref_cold, batch_invariant=True)["pass"] is False
+    )
+
+
+# ------------------------------------------- hybrid gate review fixes (M2, S1-S6)
+
+
+@pytest.mark.parametrize(
+    "tail,ok",
+    [
+        ([], True),
+        (["--prefix-cache-retention-interval=0"], False),
+        (["--prefix_cache_retention_interval", "0"], False),
+        (["--prefix-cache-ret", "0"], False),  # argparse abbreviation
+        (["--mamba_cache_mode=all"], False),
+        (["--prefix_cache_retention_interval=528"], True),  # same value, other spelling
+        (["-cc", "{}"], False),
+        (["--compilation-config={}"], False),
+        (["--compilation-config.inductor_compile_config.deterministic", "false"], False),
+        (["--compilation_config", _DET[1]], True),
+    ],
+    ids=[
+        "as-is", "eq-override", "underscore-override", "abbrev-override", "underscore-eq",
+        "same-value-respelled", "short-alias", "eq-compile", "dotted-compile", "underscore-compile",
+    ],
+)  # fmt: skip
+def test_gate_args_read_every_vllm_spelling(tail, ok):
+    """S4: a later flag overrides gate.json's in vLLM's parser whatever its
+    spelling (``=``, ``_``, abbreviation, ``-cc``, dotted keys appended last);
+    G0.vllm_args must see it."""
+    gate = {"vllm_args": _RET, "gsm8k_vllm_args": _DET}
+    results = {"baseline": {"gsm8k": {"vllm_cmd": ["vllm", "serve", "m", *_RET, *_DET, *tail]}}}
+    assert run_gate.gate_args_verdict(results, gate)["pass"] is ok
+
+
+@pytest.mark.parametrize(
+    "edit,ok",
+    [
+        (None, True),
+        ("drop-deterministic", False),
+        ("no-compilation-block", True),  # a record from before the dump: not judged
+    ],
+    ids=["pinned", "compile-differs", "record-predates"],
+)
+def test_g0_spec_pins_the_compile_config(tmp_path, edit, ok):
+    """S4: the effective compilation config is in the spec dump and G0.spec
+    holds it to the committed one (Qwen3.5-4B gsm8k: deterministic Inductor)."""
+    import json
+
+    committed = run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json"
+    spec = json.loads(committed.read_text())
+    assert spec["compilation"]["inductor_compile_config"]["deterministic"] is True
+    if edit == "drop-deterministic":
+        spec["compilation"]["inductor_compile_config"].pop("deterministic")
+    elif edit == "no-compilation-block":
+        # A schema-1 dump (before 9204863): retention, no compile/runner/schema.
+        for k in ("compilation", "model_runner"):
+            spec.pop(k)
+        spec["probe"].pop("schema")
+    for label in ("baseline", "arm"):
+        probe = tmp_path / label / "gsm8k" / "probe"
+        probe.mkdir(parents=True)
+        (probe / "spec.json").write_text(json.dumps(spec))
+    assert run_gate.g0(tmp_path, "arm", committed)["pass"] is ok
+
+
+def _schema0(spec: dict) -> dict:
+    """The committed spec as a probe before e620462 wrote it: no retention,
+    compilation, runner or schema fields."""
+    import copy
+
+    s = copy.deepcopy(spec)
+    for path in (*run_gate.SPEC_FIELDS, ("probe", "schema")):
+        run_gate._pop(s, path)
+    return s
+
+
+@pytest.mark.parametrize(
+    "model,edit,ok,na",
+    [
+        ("Qwen3-4B", "schema0", True, 4),  # qwen3-4b-p4-it5-nonreg's dump shape
+        ("Qwen3-4B", "schema0-retention-differs", False, 2),  # a field it had, differing
+        ("Qwen3-4B", "schema0-layout-differs", False, 4),
+        ("Qwen3-4B", "schema2-retention-missing", False, 1),  # its rev knew retention
+        ("Qwen3-4B", "current", True, 0),
+        ("Qwen3-4B", "current-runner-missing", False, 0),
+        ("Qwen3-4B", "current-runner-differs", False, 0),
+        ("Qwen3.5-4B", "schema0", True, 4),
+    ],
+    ids=[
+        "older-record",
+        "older-record-field-differs",
+        "older-record-layout-differs",
+        "known-field-missing",
+        "current",
+        "current-field-missing",
+        "current-field-differs",
+        "older-hybrid-record",
+    ],  # fmt: skip
+)
+def test_g0_spec_fields_unknown_to_the_record_are_na(tmp_path, model, edit, ok, na):
+    """R1: a spec field missing from a recorded dump is ``na`` only when the
+    record's probe schema did not know it (recorded, else the newest known
+    field present); a known field missing, or any field present with another
+    value, fails."""
+    import json
+
+    committed = run_gate.REPO / f"docs/rsi/models/{model}/spec.json"
+    spec = json.loads(committed.read_text())
+    if edit.startswith("schema0"):
+        spec = _schema0(spec)
+        if edit == "schema0-retention-differs":
+            spec["cache"]["prefix_cache_retention_interval"] = 64
+            spec["kv_cache_config"]["prefix_cache_retention_interval"] = 64
+        elif edit == "schema0-layout-differs":
+            spec["kv_cache_config"]["kv_cache_layout"] = "LBHNC"
+    elif edit == "schema2-retention-missing":
+        spec = _schema0(spec)
+        spec["compilation"] = json.loads(committed.read_text())["compilation"]
+    elif edit == "current-runner-missing":
+        spec.pop("model_runner")
+    elif edit == "current-runner-differs":
+        spec["model_runner"] = "V1"
+    for label in ("baseline", "arm"):
+        probe = tmp_path / label / "gsm8k" / "probe"
+        probe.mkdir(parents=True)
+        (probe / "spec.json").write_text(json.dumps(spec))
+    v = run_gate.g0(tmp_path, "arm", committed)
+    assert v["pass"] is ok, v
+    assert len(v.get("na_fields", [])) == na, v
+
+
+def test_seeded_autotune_holds_only_tile_configs(tmp_path):
+    """N2: Triton's autotune format can name IR to compile instead of the
+    kernel (``ir_override``) or a ``pre_hook``; a seeded file must hold
+    plain tile configs only, else seeding refuses."""
+    import json
+
+    good = {"key": [1], "configs_timings": [[{"kwargs": {"BK": 32}, "num_warps": 4, "num_ctas": 1, "num_stages": 2, "maxnreg": None, "pre_hook": None, "ir_override": None}, [0.1, 0.2, 0.3]]]}  # fmt: skip
+    assert run_gate.autotune_file_problem(good) is None
+    cfg = good["configs_timings"][0][0]
+    for bad in (
+        {"ir_override": "/tmp/k.ttgir"},
+        {"pre_hook": "f"},
+        {"extra": 1},
+        {"kwargs": {"BK": "32"}},
+        {"num_warps": "4"},
+    ):
+        assert run_gate.autotune_file_problem({"configs_timings": [[cfg | bad, [0.1]]]}), bad
+    assert run_gate.autotune_file_problem({"configs_timings": []})
+    caches = tmp_path / ".compile-cache"
+    src = caches / "baseline" / "triton" / "H1"
+    src.mkdir(parents=True)
+    bad_file = good | {"configs_timings": [[cfg | {"ir_override": "/x.ttir"}, [0.1]]]}
+    (src / "k.autotune.json").write_text(json.dumps(bad_file))
+    (caches / "plain").mkdir()
+    with pytest.raises(ValueError, match="ir_override"):
+        run_gate.seed_autotune(caches / "plain")
+
+
+def _groups(**per: dict) -> dict:
+    return {"groups": {g: {"local_mismatched": 0, "external_mismatched": 0, "local_unreferenced": 0, "external_unreferenced": 0} | v for g, v in per.items()}}  # fmt: skip
+
+
+_BAD = {"external_mismatched": 3}
+_ALL4 = {"0": _BAD, "1": _BAD, "2": _BAD, "3": _BAD}
+
+
+@pytest.mark.parametrize(
+    "d_self,d_base,targets,sabotage,ok",
+    [
+        (_groups(**_ALL4), _groups(**_ALL4), [0, 1, 2, 3], {"0": 1, "1": 1, "2": 1, "3": 1}, True),
+        # offbyone before the fix: only full attention wrong
+        (_groups(**{"3": _BAD}), _groups(**{"3": _BAD}), [0, 1, 2, 3], {"3": 1}, False),
+        (
+            _groups(**_ALL4),
+            _groups(**{"3": _BAD}),
+            [0, 1, 2, 3],
+            {"0": 1, "1": 1, "2": 1, "3": 1},
+            False,
+        ),  # fmt: skip
+        (
+            _groups(**_ALL4),
+            _groups(**_ALL4),
+            [0, 1, 2, 3],
+            {"3": 1},
+            False,
+        ),  # claims no state sabotage
+        (
+            _groups(**{"0": {"local_unreferenced": 2}}),
+            _groups(**{"0": {"external_unreferenced": 2}}),
+            [0],
+            {"0": 2},
+            True,
+        ),  # liar  # fmt: skip
+        (_groups(**{"0": _BAD}), _groups(**{"0": _BAD}), [0], None, True),  # record predates counts
+        (_groups(), _groups(), [], {}, False),
+        # R3: 3 bad of 4 sabotaged in one check: a sabotaged load got through
+        (_groups(**{"0": _BAD}), _groups(**{"0": _BAD}), [0], {"0": 4}, False),
+        # ... unless that check could not judge it (external uncertain)
+        (
+            _groups(**{"0": _BAD | {"external_uncertain": 1}}),
+            _groups(**{"0": _BAD | {"external_uncertain": 1}}),
+            [0],
+            {"0": 4},
+            True,
+        ),  # fmt: skip
+        # a local uncertain is no sabotaged load: it does not excuse one
+        (
+            _groups(**{"0": _BAD | {"local_uncertain": 1}}),
+            _groups(**{"0": _BAD | {"local_uncertain": 1}}),
+            [0],
+            {"0": 4},
+            False,
+        ),  # fmt: skip
+        (_groups(**{"0": _BAD}), _groups(**{"0": _BAD}), [0], {"0": 3}, True),
+    ],
+    ids=[
+        "all-groups",
+        "full-only",
+        "one-check-only",
+        "no-sabotage",
+        "unreferenced",
+        "predates",
+        "nothing",
+        "fewer-bad-than-sabotaged",
+        "uncertain-excused",
+        "local-uncertain-not-excused",
+        "bad-equals-sabotaged",
+    ],  # fmt: skip
+)
+def test_negative_arm_caught_in_every_group(d_self, d_base, targets, sabotage, ok):
+    """M2/R3: a negative self-test arm counts as caught only if each group it
+    corrupts, judged on its own, has in both gsm8k digest checks at least as
+    many loads equal to no reference as the connector sabotaged there (less
+    the external loads that check left uncertain), and a sabotage at all."""
+    v = run_gate.caught_per_group(d_self, d_base, targets, sabotage)
+    assert v["pass"] is ok, v
+    assert set(v["groups"]) == {str(t) for t in targets}
+
+
+def test_sabotage_counts_sum_per_group(tmp_path):
+    import json
+
+    d = tmp_path / "selftest"
+    d.mkdir()
+    (d / "sabotage-1.jsonl").write_text(
+        "".join(
+            json.dumps({"mode": "offbyone", "group": g, "n": n}) + "\n"
+            for g, n in ((0, 1), (3, 2), (0, 2))
+        )  # fmt: skip
+    )
+    (d / "sabotage-2.jsonl").write_text(json.dumps({"mode": "offbyone", "group": 3, "n": 1}) + "\n")
+    assert run_gate.sabotage_counts(d) == {"0": 3, "3": 3}
+    assert run_gate.sabotage_counts(tmp_path / "missing") == {}
+
+
+def _acc(**p: float) -> dict:
+    return {"passes": {k: {"accuracy": v} for k, v in p.items()}}
+
+
+@pytest.mark.parametrize(
+    "arm,base,inv,ok",
+    [
+        (_acc(cold=0.70, warm=0.70), _acc(cold=0.70), True, True),
+        (_acc(cold=0.70, warm=0.68), _acc(cold=0.70), True, False),
+        # not invariant: batched warm moves with load timing (reported); alone_ref gates
+        (
+            _acc(cold=0.70, warm=0.68, alone_ref=0.71875),
+            _acc(cold=0.70, alone_ref=0.71875),
+            False,
+            True,
+        ),  # fmt: skip
+        (
+            _acc(cold=0.70, warm=0.70, alone_ref=0.70),
+            _acc(cold=0.70, alone_ref=0.71875),
+            False,
+            False,
+        ),  # fmt: skip
+        (_acc(cold=0.70, warm=0.70), _acc(cold=0.70, alone_ref=0.71875), False, False),  # missing
+    ],
+    ids=["inv-equal", "inv-off", "alone-equal", "alone-off", "alone-missing"],
+)
+def test_gsm8k_accuracy_gated_at_one_batch_composition(arm, base, inv, ok):
+    """S2: without batch invariance every arm (honest self-test included) is
+    held to ACC_TOL on its one-at-a-time ``alone_ref`` pass vs the
+    baseline's; batched deltas are reported."""
+    v = run_gate.gsm8k_accuracy_verdict(arm, base, inv)
+    assert v["pass"] is ok, v
+    assert ("batched_delta_pp" in v) is (not inv)
+
+
+def test_new_baseline_checks_are_na_for_older_records(tmp_path):
+    """S1: a record is judged by the gate rev it ran under: a run made before
+    G2.batch_control (no ``alone`` pass) and G0.vllm_args (no ``vllm_cmd``)
+    is ``na`` on them; a current record missing them fails."""
+    gsm = {"passes": {p: {"accuracy": 0.5} for p in ("cold", "warm", "split_ref", "split")}}
+    old = {"plain": {"gsm8k": gsm}, "baseline": {"gsm8k": {"passes": {"cold": {}, "warm": {}}}}}
+    v = run_gate.verdicts(old, tmp_path, tmp_path / "spec.json", {"batch_invariant": True})
+    for k in ("G2.batch_control", "G0.vllm_args"):
+        assert v["baseline"][k]["pass"] and v["baseline"][k]["na"], v["baseline"][k]
+    new = {
+        "plain": {"gsm8k": gsm | {"vllm_cmd": ["vllm"], "passes": gsm["passes"] | {"alone": {}}}},
+        "baseline": {"gsm8k": {"vllm_cmd": ["vllm"], "passes": {"cold": {}, "warm": {}}}},
+    }
+    v = run_gate.verdicts(new, tmp_path, tmp_path / "spec.json", {"batch_invariant": True})
+    assert not v["baseline"]["G2.batch_control"]["pass"]  # alone ran, outputs missing
+    assert v["baseline"]["G0.vllm_args"]["pass"]  # no gate args: nothing to miss
+
+
+@pytest.mark.parametrize(
+    "model,wls,missing",
+    [
+        ("Qwen3.5-4B", ["gsm8k", "replay", "cap"], True),
+        ("Qwen3.5-4B", ["gsm8k", "replay", "cap", "preempt"], False),
+        ("Qwen3-4B", ["gsm8k", "replay", "cap"], False),
+    ],
+    ids=["state-model-without", "state-model-with", "dense"],
+)
+def test_official_needs_preempt_on_state_models(model, wls, missing):
+    """S3: on a model with a Mamba state group the official profile includes
+    ``preempt`` (gsm8k loads one state key per group)."""
+    import argparse
+
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t"}))  # fmt: skip
+    committed = run_gate.REPO / f"docs/rsi/models/{model}/spec.json"
+    probs = run_gate.official_problems(args, ["plain", "baseline", "pegaflow.m:C"], wls, committed, committed)  # fmt: skip
+    assert any(p.startswith("workload preempt missing") for p in probs) is missing, probs
+
+
+@pytest.mark.parametrize(
+    "skipped,ok",
+    [
+        ({}, True),
+        ({"not_offered": 3, "offer_unaligned": 1}, True),  # computed states: not loads
+        ({"start_no_block": 1}, False),
+        ({"start_unaligned": 2}, False),
+        ({"start_no_tokens": 1}, False),
+    ],
+    ids=["none", "offers-only", "start-no-block", "start-unaligned", "start-no-tokens"],
+)
+def test_unjudged_start_state_fails_the_digest_verdict(skipped, ok):
+    """S6: a start state (local hit or a load) the probe could not digest is
+    a load nobody judged."""
+    d = _digest_ok() | {"state_skipped": skipped}
+    assert run_gate._digest_verdict(d, None)["pass"] is ok
+
+
+def _spec_groups(*groups: dict) -> dict:
+    return {"kv_cache_config": {"groups": [{"spec": g} for g in groups]}}
+
+
+_FULL16 = {"mro": ["FullAttentionSpec"], "block_size": 16}
+_MAMBA = {"mro": ["MambaSpec"], "block_size": 528, "num_speculative_blocks": 0}
+
+
+@pytest.mark.parametrize(
+    "spec,max_len,blocks",
+    [
+        (_spec_groups(_FULL16), 4096, 4 * 2048 // 16),  # 4 requests of 2048 tokens
+        (_spec_groups(_FULL16), 16384, 16384 // 16 + 1),  # one max_model_len request + null
+        (_spec_groups(_FULL16 | {"sliding_window": 128}), 4096, 4 * (128 + 16) // 16),
+        (_spec_groups(_MAMBA, _MAMBA | {"num_speculative_blocks": 1}), 4096, 4 * (2 + 3)),
+    ],
+    ids=["full", "max-len-bound", "window", "mamba-speculative"],
+)
+def test_preempt_gpu_blocks_sizing(spec, max_len, blocks):
+    """S6: the preempt pool holds PREEMPT_REQS requests of PREEMPT_SPAN tokens
+    (so longer ones force preemption) and admits one max_model_len request."""
+    assert run_gate.preempt_gpu_blocks(spec, max_len) == blocks
+
+
+def test_preempt_gpu_blocks_qwen35_committed():
+    """The Qwen3.5-4B self-test ran on 40 blocks (3 GDN groups x 2 + 4 of 528)."""
+    import json
+
+    spec = json.loads((run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json").read_text())
+    assert run_gate.preempt_gpu_blocks(spec, 4096) == 40
+    assert run_gate.has_state_group(spec)
+    assert not run_gate.has_state_group(json.loads((run_gate.REPO / "docs/rsi/models/Qwen3-4B/spec.json").read_text()))  # fmt: skip
+
+
+def test_plain_equals_baseline_needs_equal_logprobs(tmp_path):
+    """S6: equal completions with one different sampled-token logprob still
+    fail (the probe changed the numbers)."""
+    import json
+
+    _alone_dirs(tmp_path, ["a", "b"], ["a", "b"], ["a", "b"])
+    f = tmp_path / run_gate.GATE_DIR / "baseline" / "gsm8k" / "alone_ref-tokens.json"
+    toks = json.loads(f.read_text())
+    toks[1]["logprobs"] = [-0.25]
+    f.write_text(json.dumps(toks))
+    v = run_gate._plain_equals_baseline(tmp_path, ["c0", "cX"], batch_invariant=False)
+    assert (v["pass"], v["differ"], v["logprob_differ"]) == (False, 0, 1)
+
+
+def test_split_control_flags_a_vacuous_measurement(tmp_path):
+    """N2: when nearly every pair started at the same point the control
+    compared no split: reported ``vacuous`` with no measured value."""
+    _alone_dirs(tmp_path, ["a", "b"], ["a", "b"], ["a", "b"], cached=(32, 32))
+    ctrl = run_gate.split_control(tmp_path, batch_invariant=False)
+    assert ctrl["same_start"] == 2
+    v = run_gate._split_control_verdict(ctrl, True)
+    assert v["vacuous"] and v["measured_invariant"] is None
+
+
+def test_each_arm_gets_its_own_compile_cache(tmp_path, monkeypatch):
+    """S5: vLLM's cache root (torch compile, Inductor, Triton) is per arm
+    under the run dir, emptied before the arm's first stage, shared by its
+    later stages, never another arm's or the global one."""
+    seen: list[dict[str, str]] = []
+
+    class _Lease:
+        ports, block = [20001], [20010]
+
+    monkeypatch.setattr(run_gate, "PortLease", lambda *a, **kw: _Lease())
+    monkeypatch.setattr(run_gate, "launched", lambda cmd, env, *a: seen.append(env))
+    monkeypatch.setattr(run_gate, "isolated", lambda args, arm, log, cmd: cmd)
+    monkeypatch.setattr(run_gate, "_FRESH_CACHES", set())
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/global/triton")
+    args = SimpleNamespace(
+        gpu="0", model="m", tp=1, max_model_len=8, max_num_batched_tokens=8, max_num_seqs=1,
+        gpu_mem=0.5, vllm_arg=[], num_gpu_blocks=0, under_test_path="",
+    )  # fmt: skip
+    run = tmp_path / "run"
+    stale = run / ".compile-cache" / "baseline" / "torch_compile_cache" / "x"
+    stale.mkdir(parents=True)
+    for label, wl in (("baseline", "gsm8k"), ("baseline", "preempt"), ("selftest-liar", "gsm8k")):
+        (run / label / wl).mkdir(parents=True, exist_ok=True)
+        if label == "baseline" and wl == "preempt":
+            (run / ".compile-cache/baseline/artifact").write_text("from gsm8k")
+        run_gate.vllm_server(args, {}, "baseline", run / label / wl / "probe", False, None, run / label / wl / "vllm.log")  # fmt: skip
+    roots = [e["VLLM_CACHE_ROOT"] for e in seen]
+    assert roots == [
+        str(run / ".compile-cache" / x) for x in ("baseline", "baseline", "selftest-liar")
+    ]
+    assert not stale.exists()  # emptied before the arm's first stage
+    assert (run / ".compile-cache/baseline/artifact").exists()  # kept across its stages
+    for e in seen:  # no compiled-code cache outside the arm's root
+        root = Path(e["VLLM_CACHE_ROOT"])
+        for k in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE"):
+            assert Path(e[k]).is_relative_to(root), k
+        assert e["TRITON_CACHE_AUTOTUNING"] == "1"
+
+
+def test_arms_run_the_baselines_triton_autotune_picks(tmp_path):
+    """A fresh arm root gets a copy of the baseline's ``*.autotune.json``
+    (FLA kernels outside Inductor pick tiles by timing, and the picks change
+    the numbers) and nothing else of the baseline's cache."""
+    import json
+
+    caches = tmp_path / ".compile-cache"
+    base = caches / "baseline" / "triton"
+    (base / "H1").mkdir(parents=True)
+    pick = json.dumps({"key": [1], "configs_timings": [[{"kwargs": {"BK": 32}, "num_warps": 4, "num_stages": 2}, [0.1]]]})  # fmt: skip
+    (base / "H1" / "chunk_fwd_kernel_o.autotune.json").write_text(pick)
+    (base / "H1" / "chunk_fwd_kernel_o.cubin").write_text("kernel")
+    (caches / "baseline" / "torch_compile_cache").mkdir()
+    arm = caches / "selftest-honest"
+    arm.mkdir()
+    assert run_gate.seed_autotune(arm) == 1
+    assert (arm / "triton/H1/chunk_fwd_kernel_o.autotune.json").read_text() == pick
+    assert sorted(p.name for p in arm.rglob("*") if p.is_file()) == ["chunk_fwd_kernel_o.autotune.json"]  # fmt: skip
+    assert run_gate.seed_autotune(caches / "baseline") == 0  # the source itself
+    assert run_gate.seed_autotune(tmp_path / "x" / "plain") == 0  # no baseline yet
