@@ -2721,33 +2721,146 @@ def capacity_floor(base_cap: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-class UniqueEstimate:
-    """``U`` of a cap trace before running it, accumulated per conversation:
-    distinct prompt-prefix blocks per group (the trace's shared history) plus
-    each request's generated complete blocks, at ``oracle.block_bytes``. For
-    sizing only; the floor is checked on the measured ``U``."""
+def prefill_step_ends(start: int, prompt_len: int, bt: int, budget: int, align: bool,
+                      junction: int = 0) -> list[int]:  # fmt: skip
+    """Step ends of one request's prefill from ``start`` (its local hit) when
+    it runs alone with ``budget`` scheduled tokens per step: vLLM 0.32's
+    ``Scheduler._mamba_block_aligned_split`` in align mode (a non-final chunk
+    ends on a block boundary; never run past the last cacheable boundary
+    ``(prompt_len - 1) // bt * bt`` or the block-floored shared-prefix
+    junction mid-chunk), plain budget chunks otherwise. Not modeled: budget
+    shared with other requests in the step (moved and extra chunk ends),
+    sub-block hash hits, Eagle and prefill checkpoint blocks
+    (:func:`unmodeled_spec`)."""
+    last = (prompt_len - 1) // bt * bt
+    out, s = [], start
+    while s < prompt_len:
+        e = min(s + budget, prompt_len)
+        if align:
+            if e < prompt_len:
+                aligned = e // bt * bt
+                if aligned > s or bt <= budget:
+                    e = aligned
+            floored = s + (junction - s) // bt * bt
+            stops = ((s // bt + 1) * bt if s % bt else 0, last, floored if s < junction < e else 0)
+            e = min((x for x in stops if s < x < e), default=e)
+        if e <= s:  # cannot happen with an aligned start; never loop
+            e = min(s + budget, prompt_len)
+        out.append(e)
+        s = e
+    return out
 
-    def __init__(self, spec: dict[str, Any], out_tokens: int):
-        kinds = [(label, bt) for label, g, bt in oracle.group_kinds(spec) if g is not None]
+
+class UniqueEstimate:
+    """``U`` of a cap trace before running it, accumulated per conversation
+    (its turns in order), with the oracle's store rules
+    (``oracle.unique_bytes`` over ``_store_steps``) at ``oracle.block_bytes``:
+
+    - Full / Window groups store every complete block a request computes:
+      distinct prompt-prefix blocks (the trace's shared history) plus each
+      request's generated complete blocks.
+    - Checkpoint groups store a block only where a step ends exactly on its
+      boundary. A request resumes at its local hit (``semantics.resolve``
+      over the blocks the trace stored so far: vLLM's own prefix cache,
+      assumed to keep everything), its prefill step ends follow
+      :func:`prefill_step_ends` (junction: the hit of the non-Checkpoint
+      groups alone), and every boundary its decode crosses is a step end.
+
+    For sizing only; the floor is checked on the measured ``U``. Checkpoint
+    bytes assume a request runs alone. Concurrent requests share the step
+    budget and GPU cache evictions move resume points back, which moves step
+    ends as well as adding them, so this is not a bound. On the recorded
+    traces the estimate was below measured (Qwen3.5-4B: 0.97 at 8 x 6, 0.81
+    at 256 x 12 with 32 workers, where the Full group is exact); an
+    over-estimate means fewer conversations and the measured floor fails the
+    run closed (not official). Spec values this does not model:
+    :func:`unmodeled_spec`."""
+
+    def __init__(self, spec: dict[str, Any], out_tokens: int, budget: int):
+        kinds = [(label, g, bt) for label, g, bt in oracle.group_kinds(spec) if g is not None]
         sizes = oracle.block_bytes(spec)
         self._groups = [
-            (bt, sizes[gi], set()) for gi, (label, bt) in enumerate(kinds) if label != "scratch"
+            (label, g, bt, sizes[gi], set())
+            for gi, (label, g, bt) in enumerate(kinds)
+            if label != "scratch"
         ]
+        self._ckpt = any(label == "checkpoint" for label, *_ in self._groups)
+        self._align = (spec.get("cache") or {}).get("mamba_cache_mode") == "align"
         self._out = out_tokens
+        self._budget = budget
         self._gen = 0
 
+    def _resolve(self, chains: list[list[int]], plen: int, which) -> int:
+        pairs = zip(self._groups, chains, strict=True)
+        groups = [(g, ch, seen) for (label, g, _, _, seen), ch in pairs if which(label)]
+        if not groups:
+            return 0
+        present = [[b for b, h in enumerate(ch) if h in seen] for _, ch, seen in groups]
+        return oracle.sem.resolve([g for g, _, _ in groups], present, plen)
+
     def add(self, turns: list[list[int]]) -> None:
-        for bt, size, seen in self._groups:
-            for ids in turns:
-                h = 0
-                for b in range(len(ids) // bt):
+        for ids in turns:
+            plen, end = len(ids), len(ids) + self._out - 1
+            chains = []
+            for _, _, bt, _, _ in self._groups:
+                h, ch = 0, []
+                for b in range(plen // bt):
                     h = hash((h, tuple(ids[b * bt : (b + 1) * bt])))
-                    seen.add(h)
-                self._gen += size * ((len(ids) + self._out - 1) // bt - len(ids) // bt)
+                    ch.append(h)
+                chains.append(ch)
+            if self._ckpt:
+                start = self._resolve(chains, plen, lambda _: True)
+                junction = self._resolve(chains, plen, lambda label: label != "checkpoint")
+            for (label, _, bt, size, seen), ch in zip(self._groups, chains, strict=True):
+                generated = end // bt - plen // bt
+                if label != "checkpoint":
+                    seen.update(ch)
+                    self._gen += size * generated
+                    continue
+                ends = prefill_step_ends(start, plen, bt, self._budget, self._align,
+                                         junction if junction > start else 0)  # fmt: skip
+                seen.update(ch[e // bt - 1] for e in ends if e % bt == 0)
+                self._gen += size * generated  # decode ends on every boundary it crosses
 
     @property
     def bytes(self) -> int:
-        return self._gen + sum(size * len(seen) for _, size, seen in self._groups)
+        return self._gen + sum(size * len(seen) for *_, size, seen in self._groups)
+
+
+def cap_plan_spec(arm_dir: Path, wls: list[str], committed: Path) -> Path | None:
+    """Spec dump ``--cap-convs auto`` sizes from: the baseline's own gsm8k,
+    else replay, dump of this run, else the committed dump. Never the
+    preempt stage's: it runs with a shrunk GPU pool, so its ``gpu_kv_bytes``
+    would size the trace far below the floor. An official run always has
+    gsm8k before cap; only a non-official run (e.g. ``--workloads cap``)
+    reaches the committed fallback, and the floor reads GPU KV from the cap
+    stage's own dump either way."""
+    for w in ("gsm8k", "replay"):
+        if w in wls and (f := arm_dir / w / "probe" / "spec.json").exists():
+            return f
+    return committed if committed.is_file() else None
+
+
+def unmodeled_spec(spec: dict[str, Any]) -> list[str]:
+    """Spec values ``UniqueEstimate`` / :func:`prefill_step_ends` do not model
+    (sub-block hash hits, Eagle's dropped last hit block, prefill checkpoint
+    blocks) on a model with a Checkpoint group; Full / Window counting does
+    not depend on them. Non-empty: the plan is recorded as ``unmodeled`` and
+    the run is not official."""
+    if not any(label == "checkpoint" for label, *_ in oracle.group_kinds(spec)):
+        return []
+    kc = spec.get("kv_cache_config") or {}
+    out = []
+    hbs = kc.get("hash_block_size")
+    for g in kc.get("groups", []):
+        s = g.get("spec", {})
+        if hbs is not None and hbs != s.get("block_size"):
+            out.append(f"group {g.get('id')}: hash_block_size {hbs} != block_size {s.get('block_size')}")  # fmt: skip
+        if g.get("is_eagle_group") or int(s.get("num_speculative_blocks") or 0):
+            out.append(f"group {g.get('id')}: Eagle / speculative blocks")
+        if int(s.get("num_prefill_checkpoint_blocks") or 0):
+            out.append(f"group {g.get('id')}: num_prefill_checkpoint_blocks {s['num_prefill_checkpoint_blocks']}")  # fmt: skip
+    return out
 
 
 def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
@@ -2766,14 +2879,14 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
     budget = args.max_model_len - args.replay_out_tokens - 8
     lines = Path(args.replay_file).read_text().splitlines()[args.replay_skip :]
     need = CAP_FLOOR_MARGIN * MIN_CAPACITY_GPU_KV * gpu_kv_bytes(spec) / CAPACITY_FRACTION
-    est = UniqueEstimate(spec, args.replay_out_tokens)
+    est = UniqueEstimate(spec, args.replay_out_tokens, args.max_num_batched_tokens)
     used = 0
     for line in lines:
         used += 1
         est.add(workloads.conv_turns(tok, json.loads(line), budget, args.cap_turns))
         if used >= CAP_MIN_CONVS and est.bytes >= need:
             break
-    return {
+    plan = {
         "cap_convs": used,
         "mode": "auto",
         "estimated_unique_bytes": est.bytes,
@@ -2781,6 +2894,9 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
         "enough": est.bytes >= need,
         "available_convs": len(lines),
     }
+    if unmodeled := unmodeled_spec(spec):
+        plan["unmodeled"] = unmodeled  # g5_problems: not official
+    return plan
 
 
 class PoolTooSmall(RuntimeError):
@@ -2795,7 +2911,9 @@ def estimate_unique(args, spec: dict[str, Any], wl: str) -> dict[str, Any]:
     """``UniqueEstimate`` of an uncapped workload before any stage. Replay
     (``ignore_eos``): prompts + exactly ``--replay-out-tokens`` per request.
     gsm8k: prompts only, a lower bound (completions stop on data)."""
-    est = UniqueEstimate(spec, args.replay_out_tokens if wl == "replay" else 1)
+    est = UniqueEstimate(
+        spec, args.replay_out_tokens if wl == "replay" else 1, args.max_num_batched_tokens
+    )
     if wl == "replay":
         for turns in workloads.build_turns(
             Path(args.replay_file),
@@ -2839,6 +2957,8 @@ def g5_problems(v: dict[str, Any], floor: dict[str, Any], plan: dict[str, Any] |
     if not floor["pass"]:
         why = " (whole replay file used)" if (plan or {}).get("enough") is False else ""
         out.append(f"capacity below {MIN_CAPACITY_GPU_KV:g}x GPU KV{why}")
+    if (plan or {}).get("unmodeled"):
+        out.append(f"cap plan sized from an unmodeled spec: {'; '.join(plan['unmodeled'])}")
     for label, g in v.items():
         if label in _REFERENCE or label.startswith("selftest-"):
             continue
@@ -3386,17 +3506,12 @@ def main(argv: list[str] | None = None) -> int:
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
                 continue
             if kind == "baseline":
-                spec_file = next(
-                    (
-                        run_dir / label / w / "probe" / "spec.json"
-                        for w in wls
-                        if (run_dir / label / w / "probe" / "spec.json").exists()
-                    ),
-                    None,
-                )
+                spec_file = cap_plan_spec(run_dir / label, wls, committed)
                 args.cap_plan = plan_cap_convs(
                     args, json.loads(spec_file.read_text()) if spec_file else None
                 )
+                if spec_file:
+                    args.cap_plan["spec"] = str(spec_file)
                 print(f"[cap] plan {args.cap_plan}", flush=True)
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
                 continue
