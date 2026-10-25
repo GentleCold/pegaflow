@@ -3,7 +3,19 @@
   "block_size": 528,
   "cache_dtype": "auto",
   "enable_prefix_caching": true,
-  "mamba_cache_mode": "align"
+  "mamba_cache_mode": "align",
+  "prefix_cache_retention_interval": 528
+ },
+ "compilation": {
+  "backend": "inductor",
+  "cudagraph_mode": "FULL_AND_PIECEWISE",
+  "inductor_compile_config": {
+   "benchmark_combo_kernel": false,
+   "combo_kernels": true,
+   "deterministic": true,
+   "enable_auto_functionalized_v2": false
+  },
+  "mode": 3
  },
  "dtype": "bfloat16",
  "hf": {
@@ -301,6 +313,7 @@
   "kv_cache_layout": "LBNHC",
   "kv_tp_replicas": 1,
   "num_blocks": 481,
+  "prefix_cache_retention_interval": 528,
   "prefix_cacheable_group_ids": [
    0,
    1,
@@ -386,13 +399,15 @@
  },
  "max_model_len": 8192,
  "model": "/root/kexi/models/Qwen3.5-4B",
+ "model_runner": "V2",
  "parallel": {
   "dcp": 1,
   "pp": 1,
   "tp": 1
  },
  "probe": {
-  "digest_skipped_groups": {}
+  "digest_skipped_groups": {},
+  "schema": 3
  },
  "vllm_version": "0.32.0"
 }

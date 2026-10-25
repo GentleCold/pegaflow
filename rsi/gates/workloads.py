@@ -91,12 +91,25 @@ async def run_gsm8k(
     concurrency: int,
     max_tokens: int = 384,
     xargs: dict[str, Any] | None = None,
+    logprobs: bool = False,
+    prewarm: bool = False,
+    free_run: bool = False,
 ) -> dict[str, Any]:
-    """``xargs`` go to ``vllm_xargs`` (``SamplingParams.extra_args``), e.g. probe tags."""
+    """``xargs`` go to ``vllm_xargs`` (``SamplingParams.extra_args``), e.g. probe tags.
+
+    ``logprobs``: also return ``tokens`` (per request: sampled-token logprobs,
+    cached prompt tokens, prompt tokens; the server needs
+    ``--enable-prompt-tokens-details`` for the cached count).
+    ``prewarm``: send each prompt once with ``max_tokens=1`` right before its
+    real request, so vLLM's prefix cache holds the whole prompt and the real
+    request starts computing at its last full prompt block (the split control).
+    ``free_run``: no stop strings and ``ignore_eos``, so every request decodes
+    exactly ``max_tokens`` (the preempt workload: KV grows by a known amount)."""
     import aiohttp
 
     sem = asyncio.Semaphore(concurrency)
     outputs: list[str] = [""] * len(prompts)
+    tokens: list[dict[str, Any] | None] = [None] * len(prompts)
 
     async def one(session: aiohttp.ClientSession, i: int) -> None:
         body = {
@@ -106,11 +119,35 @@ async def run_gsm8k(
             "temperature": 0,
             "stop": ["Question:", "\n\n\n"],
         }
+        if free_run:
+            body |= {"stop": [], "ignore_eos": True}
         if xargs:
             body["vllm_xargs"] = xargs
-        async with sem, session.post(f"{url}/v1/completions", json=body) as r:
-            r.raise_for_status()
-            outputs[i] = (await r.json())["choices"][0]["text"]
+        if logprobs:
+            body["logprobs"] = 1
+        async with sem:
+            if prewarm:
+                warm = body | {"max_tokens": 1}
+                warm.pop("logprobs", None)
+                if xargs:
+                    # Its own pass label: the oracle and verdicts never score it.
+                    warm["vllm_xargs"] = xargs | {"rsi_pass": f"{xargs.get('rsi_pass')}_prewarm"}
+                async with session.post(f"{url}/v1/completions", json=warm) as r:
+                    r.raise_for_status()
+                    await r.read()
+            async with session.post(f"{url}/v1/completions", json=body) as r:
+                r.raise_for_status()
+                res = await r.json()
+        choice = res["choices"][0]
+        outputs[i] = choice["text"]
+        if logprobs:
+            usage = res.get("usage") or {}
+            details = usage.get("prompt_tokens_details") or {}
+            tokens[i] = {
+                "logprobs": (choice.get("logprobs") or {}).get("token_logprobs"),
+                "cached": details.get("cached_tokens"),
+                "prompt_tokens": usage.get("prompt_tokens"),
+            }
 
     t0 = time.monotonic()
     timeout = aiohttp.ClientTimeout(total=None, sock_read=600)
@@ -123,7 +160,44 @@ async def run_gsm8k(
         "accuracy": correct / len(prompts) if prompts else 0.0,
         "seconds": time.monotonic() - t0,
         "outputs": outputs,
+        **({"tokens": tokens} if logprobs else {}),
     }
+
+
+# ------------------------------------------------------------------ warmup
+
+WARMUP_PASS = "_warmup"
+WARMUP_TOKENS = 512
+WARMUP_SEED = 20261024
+
+
+def warmup_prompt() -> list[int]:
+    """Fixed pseudo-random token ids (the same for every run and model):
+    shares no prefix block with any workload prompt (asserted on the probe
+    trace, ``oracle.warmup_problems``)."""
+    import random
+
+    rng = random.Random(WARMUP_SEED)
+    return [rng.randrange(1000, 30000) for _ in range(WARMUP_TOKENS)]
+
+
+async def run_warmup(url: str, model: str) -> dict[str, Any]:
+    """One untimed request before a stage's first pass: CUDA graph / JIT /
+    allocator first-use costs land here, not in the cold pass. Tagged
+    ``rsi_pass=_warmup``, which no verdict or oracle segment scores."""
+    body = {
+        "model": model,
+        "prompt": warmup_prompt(),
+        "max_tokens": 16,
+        "temperature": 0,
+        "ignore_eos": True,
+        "vllm_xargs": {"rsi_pass": WARMUP_PASS},
+    }
+    t0 = time.monotonic()
+    async with session() as s, s.post(f"{url}/v1/completions", json=body) as r:
+        r.raise_for_status()
+        await r.read()
+    return {"seconds": time.monotonic() - t0}
 
 
 # -------------------------------------------------------- multi-turn replay
@@ -152,20 +226,27 @@ def build_turns(
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     convs = []
     for line in convs_file.read_text().splitlines()[skip : skip + n_convs]:
-        msgs = json.loads(line)
-        turns: list[list[int]] = []
-        for k, m in enumerate(msgs):
-            if m["role"] != "user":
-                continue
-            ids = tok.apply_chat_template(msgs[: k + 1], add_generation_prompt=True, tokenize=True)
-            if hasattr(ids, "input_ids"):
-                ids = ids["input_ids"]
-            if len(ids) > budget or len(turns) >= max_turns:
-                break
-            turns.append(list(ids))
+        turns = conv_turns(tok, json.loads(line), budget, max_turns)
         if turns:
             convs.append(turns)
     return convs
+
+
+def conv_turns(
+    tok: Any, msgs: list[dict[str, str]], budget: int, max_turns: int
+) -> list[list[int]]:
+    """Token-id prompts of one conversation (``build_turns``)."""
+    turns: list[list[int]] = []
+    for k, m in enumerate(msgs):
+        if m["role"] != "user":
+            continue
+        ids = tok.apply_chat_template(msgs[: k + 1], add_generation_prompt=True, tokenize=True)
+        if hasattr(ids, "input_ids"):
+            ids = ids["input_ids"]
+        if len(ids) > budget or len(turns) >= max_turns:
+            break
+        turns.append(list(ids))
+    return turns
 
 
 def _pct(xs: list[float], q: float) -> float:
@@ -182,18 +263,21 @@ async def run_replay(
     concurrency: int,
     out_tokens: int,
     xargs: list[dict[str, Any]] | None = None,
+    order: list[int] | None = None,
 ) -> dict[str, Any]:
-    """``xargs[c]`` go to ``vllm_xargs`` of every turn of conversation ``c``."""
+    """``xargs[c]`` go to ``vllm_xargs`` of every turn of conversation ``c``,
+    plus ``rsi_conv`` / ``rsi_turn`` (position, for cross-arm matching).
+    ``order``: conversation start order (default 0..n-1)."""
     import aiohttp
 
     queue: asyncio.Queue[int] = asyncio.Queue()
-    for c in range(len(convs)):
+    for c in order if order is not None else range(len(convs)):
         queue.put_nowait(c)
     ttft: list[float] = []
     e2e: list[float] = []
     prompt_tokens = 0
 
-    async def turn(session: aiohttp.ClientSession, c: int, ids: list[int]) -> None:
+    async def turn(session: aiohttp.ClientSession, c: int, k: int, ids: list[int]) -> None:
         nonlocal prompt_tokens
         body = {
             "model": model,
@@ -203,8 +287,8 @@ async def run_replay(
             "ignore_eos": True,
             "stream": True,
         }
-        if xargs and xargs[c]:
-            body["vllm_xargs"] = xargs[c]
+        if xargs is not None:
+            body["vllm_xargs"] = xargs[c] | {"rsi_conv": c, "rsi_turn": k}
         t0 = time.monotonic()
         first = None
         async with session.post(f"{url}/v1/completions", json=body) as r:
@@ -219,8 +303,8 @@ async def run_replay(
     async def worker(session: aiohttp.ClientSession) -> None:
         while not queue.empty():
             c = queue.get_nowait()
-            for ids in convs[c]:
-                await turn(session, c, ids)
+            for k, ids in enumerate(convs[c]):
+                await turn(session, c, k, ids)
 
     t0 = time.monotonic()
     timeout = aiohttp.ClientTimeout(total=None, sock_read=900)

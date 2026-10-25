@@ -60,8 +60,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    The connector under test must read `PEGAFLOW_PORT` and tolerate an empty
    `kv_connector_extra_config`; vLLM is started with
    `kv_load_failure_policy=recompute`.
-5. **Optimize**: if hit efficiency E, capacity efficiency E_C (G5) or perf is
-   below target, form a hypothesis from metrics (fallbacks per group, unused
+5. **Optimize**: hit-rate levels (E_ext, E_C) are reported, not gated (user,
+   2026-10-24; GATES.md "Hit rate"). Write a "hit-rate judgment" in
+   ITERATIONS.md for every accepted run: measured hit rate vs H* / H*_C and
+   the reference arms (H_lru, old, native), every gap explained, and whether
+   it is close enough. If it is not, or perf is below target, form a hypothesis from metrics (fallbacks per group, unused
    loads, write amplification, stranded bytes per group, save/load time), change
    the lowest layer that fixes it, rerun. One hypothesis per iteration, record
    result even if negative. Hypothesis checklist (extend it when you find more):
@@ -72,13 +75,15 @@ connector is a black-box baseline (run it, read its numbers, not its code).
      so evict a prefix's groups together and prefer evicting the tail;
    - scan resistance: one-pass sweeps must not flush reused prefixes;
    - save cost: no synchronous wait on the model step.
-   The server is in scope when the evidence points there (eviction, admission,
-   pools, query): keep it Kind-aware and model-agnostic (no model names, no
-   per-model branches), run `cargo test`, re-run the `old` arm to show no
-   regression. Server code goes on its own branch `feat/rsi-server-<topic>` as
-   a separate PR (never merge it into a model branch yourself); an independent
-   review agent reviews it and the iteration continues on that server build;
-   the user reviews server PRs in the final acceptance pass (do not wait). Connector code
+   Do not block a model on hit-rate level alone; correctness checks stay hard.
+   Do not chase the highest hit rate: no eviction policy is globally optimal,
+   so H*_C is a ceiling, not a target.
+   The server is out of scope (user, 2026-10-24): gates run on the base
+   pegaflow-server built from `feat/semantics-rsi`, and agents do not change
+   or tune it. When the evidence points at the server (eviction, admission,
+   pools, allocator, query), attribute the gap with numbers, add it to
+   PROGRESS.md "Server limitations" and go on; a gap the server causes is
+   explained, not fixed, and never blocks a model. Connector code
    stays model-agnostic too: per-model differences live only in
    `connector_v2/models/<model>.toml` (see PROGRESS.md "PR policy").
    Policy complexity rules (keep policy growing with Kinds, not with models):
@@ -97,10 +102,14 @@ connector is a black-box baseline (run it, read its numbers, not its code).
      (semantics, human-reviewed) or a server change (separate PR) instead.
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
-   gate integrity (nothing relaxed), copying from the old connector, regressions
-   on earlier models, and the policy complexity rules above (grep `policy.py`
-   for model / spec class names, count knobs and lines, unused knobs). Fix or
-   justify every finding in ITERATIONS.md.
+   gate integrity (nothing relaxed), the hit-rate judgment (numbers against
+   `summary.hit_report`, gaps explained), copying from the old connector, regressions
+   on earlier models, the policy complexity rules above (grep `policy.py`
+   for model / spec class names, count knobs and lines, unused knobs), and
+   that the connector does not touch the probe (no instrument or run-artifact
+   access: `RsiProbe`, `RsiWorkerExt`, `rsi_poison`, `sys.modules`, digests,
+   outputs; GATES.md "Boundary"). It reads every `summary.scan` hit (flagged
+   and allowlisted). Fix or justify every finding in ITERATIONS.md.
 7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers:
    the hit-rate table (local / external / total hit, oracle H*, E_ext; at
    capacity H*_C, H_lru, E_C) next to the G4 perf table, for the arm under
@@ -109,6 +118,10 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 
 ## 3. Lessons (append)
 
+- A tree for `--under-test-path` must hold no `.pyc` (the snapshot check
+  rejects it, fail-closed): extract with `git archive <rev> | tar -x` or sync
+  with `tar --exclude=__pycache__ --exclude='*.pyc'`, never import from it
+  before the run.
 - vLLM 0.32 + flashinfer-python 0.7.0.post1: remove stale `flashinfer-cubin`
   (version check aborts startup; no 0.7 cubin on PyPI).
 - A cuda-13 server build aborts in preflight when the unversioned
@@ -233,3 +246,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   the gate's `--under-test-path <tree>/python` instead. Before trusting a
   run, check `/proc/<vllm pid>/environ` or the connector's `from=` line in
   the arm's vllm.log.
+- PR CI must pass (user, 2026-10-24). Before reporting a branch done, run
+  `./scripts/check.sh` (fmt, typos, clippy, cargo check) on the remote and
+  the default Python unit gate. CI runs `cz check` on every commit of the PR,
+  merge commits included: name a merge `Merge branch '<src>' into <dst>`
+  (git's default) or use a commitizen type (`chore(rsi): merge ...`), never
+  `merge(...)`. Locally: `typos` and `cz` install from PyPI into a temp venv.

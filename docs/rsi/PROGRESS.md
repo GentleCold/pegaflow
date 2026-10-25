@@ -27,7 +27,7 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
 | adapter (per KVCacheSpec type) | Python | onboarding agent |
 | policy (what to save/load/prefetch) | Python | onboarding agent (main RSI surface) |
 | semantics (`pegaflow-semantics`: needed/resolve/saveable/key/seal_plan) | Rust, PyO3 | agent proposes, review agent + human audit |
-| server (storage only) | Rust | onboarding agent may propose a change when a gate shows a server limit (e.g. group-incoherent eviction); must stay model-agnostic (Kind-aware, never model-name-aware), keep `cargo test` green and the `old` arm unregressed; always its own PR, human review required (see "PR policy") |
+| server (storage only) | Rust | not changed by agents (user, 2026-10-24): gates run on the base server; a server limit is attributed and listed in "Server limitations" below for a human to decide |
 | gates (`docs/rsi/GATES.md`, `rsi/gates/`) | — | human only; agents may add checks, never relax |
 
 ## PR policy (user, 2026-10-23)
@@ -40,24 +40,68 @@ https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
   accepted run) is one branch `feat/rsi-<model>` and one PR, stacked on the
   previous one. #473 is the observation PR for the foundation (semantics,
   gates, connector core) + Qwen3-4B.
-- Server changes (`pegaflow-core`, `pegaflow-server`, proto) are always a
-  separate branch `feat/rsi-server-<topic>` and a separate PR, human-reviewed;
-  agents never merge them. The model PR that needs one states the dependency
-  and runs its gates against that server build; the model is "accepted
-  pending server review" until a human approves the server PR.
+- Server stays at the base version (user, 2026-10-24: "server还是保持原始版本，
+  把server的局限问题汇报给人就行，gate不要被server受限，命中率不用过度追求最高，
+  因为淘汰策略不一定是全局最优的"). Every gate run uses the pegaflow-server
+  built from `feat/semantics-rsi`. Agents do not write or tune server code;
+  they attribute a server-caused gap and list it under "Server limitations".
+  A model is never blocked or held "pending server" because of one. The
+  earlier server work (H1-H5, PRs GentleCold/pegaflow#3 and #4) is parked as
+  a proposal for the human; nothing depends on it.
 - Gate changes (`rsi/gates/**`, GATES.md) stay human-owned: agent-written gate
   code lands on its own branch (e.g. `feat/rsi-g5`) and is reviewed before it
   is used to accept anything.
 - Review flow (user, 2026-10-23: "这些评审都不要等我"): nothing blocks on the
   user. Every review (iteration, gate branch, server branch) is done by an
   independent review agent; the orchestrator merges gate branches and moves on
-  once that review passes. Server changes still go on their own branch/PR, but
-  the model's iteration continues on that server build. The user does one
-  acceptance pass after all four models are supported, covering the gate PRs,
-  server PRs and model PRs together.
+  once that review passes. The user does one acceptance pass after all four
+  models are supported, covering the gate PRs, model PRs and the "Server
+  limitations" list (with the parked server proposals) together.
 - Every progress report and ITERATIONS entry includes the hit-rate table
   (local / external / total hit, oracle H*, E_ext, and at capacity H*_C, H_lru,
   E_C), not only the perf numbers.
+
+### Server limitations (report to the human, do not fix)
+
+Measured on Qwen3-4B G5 (single Full group); details and numbers in
+`feat/rsi-server-reclaim:docs/rsi/server/reclaim-eviction.md` and
+`feat/rsi-server-evict-tail:docs/rsi/server/evict-tail.md`. Current plan
+(r3, C(0.5) = 11536 blocks) at C/U 0.5: base server E_C 0.664-0.684,
+H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
++0.10 at 0.25 and +0.06 at 0.75; H5 costs 0.01-0.08 E_C at 0.25.
+
+- Reclaim drops a fixed `RECLAIM_BATCH_SIZE = 512` blocks per round. On a
+  small pool one round frees about half of the cache (1019-block slice: 502
+  resident after cap_cold). Proposal H1: `clamp(resident / 64, 1, 512)`.
+- Pinned-region fragmentation: a layer-first save call takes one region per
+  layer, freed only when the call's last block is evicted, so dead bytes
+  stay pinned. Large on the older 32-conv plan (C = 5873 blocks: residency
+  after cap_cold 5473 v2 / 4750 old, E_C 0.1-0.25 before H3), small on r3
+  (see the E_C line above). Proposal H3: one region per saved block.
+- H3's many small copies cost warm TTFT with per-range `cuMemcpyAsync`.
+  Proposal H4: one `cuMemcpyBatchAsync` per transfer.
+- Eviction is plain LRU per (hash, group) key. On r3 most of the gap to
+  tail-first is fully evicted ranges (0.28 -> 0.23 of ext*_C), not
+  stranding (1.7% v2 / 2.5% old). Heads aging out mostly hits `old`, which
+  queries from its local hit and never refreshes them; v2 queries from
+  block 0. Proposal H5: opt-in tail-first eviction in the retained class.
+- Not group-coherent: a resume point needs every group, but each group key
+  is evicted on its own (matters for hybrid models; not measured yet).
+
+### Gate changes
+
+- 2026-10-24, user (human gate owner): "命中率那块，不要设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多".
+  Hit-rate levels are reported, not gated: G3 `E_ext >= 0.95` and
+  `oracle_hit_rate >= 0.5`, G5 `E_C >= 0.9`, the G2 "> 0.9 of oracle" item
+  and the no-`H`/`E_C`-regression clauses. Every number is still computed
+  (`reported` per verdict, `summary.hit_report`). Correctness and run
+  validity stay hard and unchanged. The onboarding agent writes a hit-rate
+  judgment in ITERATIONS.md; the review agent checks it (GATES.md "Hit
+  rate"). Branch `fix/rsi-gate-old-plugin`.
+- 2026-10-24: the `old` reference arm runs with `VLLM_PLUGINS=pegaflow` (vLLM
+  0.32 looks MultiConnector children up by registered name to rebuild stats;
+  P4 MF1 got HTTP 500 on every old-arm request). Every other arm keeps `""`.
+  Branch `fix/rsi-gate-old-plugin` 3fe119c.
 
 ## Isolation (no reference to existing implementation)
 
@@ -96,8 +140,8 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 pending (G5 r3 official) |
-| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2) |
+| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
+| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge |
 | P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed (the order3 p4 output divergence is closed as vLLM batch non-invariance), Qwen3-4B + DSV2 non-regression; review of it0+it1 pending; gate runs wait for `feat/rsi-gate-hybrid` and the retention-528 gate.json |
 | P6 | onboard gemma-4-E4B-it | todo |
 
@@ -672,6 +716,189 @@ names, magic constants that only exist in the old code).
     `cd8acc0c` at 6545352; on P4's base (55e4ff1) `a25ea150` / `bdda8997`
     before and after the P5 changes.
 
+- G5 implemented on `feat/rsi-g5` (gate agent): `oracle.py` capacity
+  simulation (`U`, clairvoyant `H*_C`, group-oblivious `H_lru`, per-group
+  stored / evicted / stranded diagnostics), `run_gate` workload `cap` (fresh
+  PegaFlow `--pool-size C`, `C = 0.5 x U` from the baseline replay cold pass,
+  passes `cap_cold`, `cap_warm`, `cap_warm2..N`), verdicts `G2.digest_self.cap`
+  and `G5.replay_warm` (`E_C >= 0.9`) required for the connector under test,
+  `cap` now part of the official profile, `native` reference arm
+  (OffloadingConnector + RsiProbe, record only). G3 numbers re-derived
+  identically on all p0-final / p3-it1 probe dirs. Slice
+  `2026-10-23-qwen3-4b-g5-slice` (8 x 6, U 4.48 GiB, C 2.24 GiB): E_C
+  connector_v2 0.40, native 0.20, old 0.0 (0 server hits); oracle_C hit rate
+  0.903, LRU 0.827, local 0.79. Server limit found: reclaim drops 512 blocks
+  per round, so a small pool keeps only ~0.5 C resident (GATES.md G5).
+
+- G5 review (APPROVE-WITH-FIXES) applied on `feat/rsi-g5`: pool size must be
+  proven for PegaFlow arms (M1); server `pegaflow_load_bytes_total` must
+  cover every external-hit block, connector-side caches are a violation
+  (M2); `E_C` subtracts the baseline's local hit for the same
+  pass/conversation/turn, per-arm local kept as a diagnostic (S1); a
+  reference arm's crash is recorded, not fatal (S2); `old` and `native` are
+  `required: false` throughout (S3). User capacity concern (slice C 2.24 GiB
+  = 0.22x GPU KV): cap is now its own 64 x 12 trace, baseline runs it first
+  (U + reference locals), fractions 0.25/0.5/0.75 per arm (0.5 gated, rest
+  a curve), official only if C(0.5) >= 2x GPU KV. Freeze policy: warm passes
+  start rotated by j/4; a run whose under-test freeze/H*_C >= 0.9 is not
+  official. G3 re-derived identically on all 45 recorded probe dirs.
+
+- G5 pre-fix reference `2026-10-23-qwen3-4b-g5-official` (rev 369b253,
+  32 x 12, U 25.81 GiB, C 12.91 GiB = 1.24x GPU KV): `warm_timed` E_C
+  connector_v2 0.216, old 0.124, native 0.558; H*_C 0.79-0.84, H_lru
+  0.52-0.56. Both PegaFlow arms are below H_lru, consistent with the server
+  reclaim-batch / prefix-oblivious LRU limit (GATES.md G5). Not comparable to
+  post-fix runs (different trace, per-arm local, no rotation).
+
+- `lmcache` reference arm (LMCacheConnectorV1, local CPU = pool / C bytes
+  exactly, chunk 256) wired on `feat/rsi-g5`, lmcache 0.5.6 in the overlay
+  `~/kexi/overlays/lmcache` (shared venv untouched). lmcache: not comparable
+  on vLLM 0.32 (wrong KV): smoke `2026-10-23-qwen3-4b-g5-lmcache-smoke` gsm8k
+  warm accuracy 0, external digests 64/64 (gsm8k) and 468/468 (replay)
+  mismatched, not poison and not another key's bytes; the in-tree adapter
+  fails to import (GATES.md G5). Left out of the official run.
+- `G2.digest_self.cap` fail for `old` / `native` on the fix slice was a gate
+  artifact: cap sampled every 4th conversation and their few external loads
+  (old: none; native: 6 requests in convs 2/5/6/7) fell outside it, so
+  `judged > 0` failed with 0 mismatches (connector_v2: 2 sampled). Cap now
+  digests every conversation and an empty sample passes flagged `vacuous`.
+  Under the old rule the pre-fix official run had all three passing (old
+  541/541, native 8567/8585 + 18 uncertain, v2 1375/1375 matched).
+
+- G5 re-review (APPROVE-WITH-FIXES on 20e6b58..6510116) applied:
+  `G2.digest_self.cap` accepted wrong loads (undigested timed passes made
+  the reference non-exhaustive; the reviewer's 79/158 corruption passed):
+  cap now digests every request of every pass and requires every loaded
+  block judged (only preempted-episode uncertainty, <= 1%, flagged);
+  vacuous passes only for reference arms. `ext` subtracts
+  `max(ref, own local)` (slice: connector_v2 / old E_C 0.0775 -> 0 with 0
+  server load bytes). Block / GPU KV bytes count `tp / kv_tp_replicas`
+  copies (PegaFlow saves one MLA copy at TP2: 5,799,278,592 B = 11,653 x
+  497,664) and GPU KV = Σ KV tensor sizes. `--cap-convs auto` (Qwen3-4B 64,
+  est. C/GPU-KV 2.44; DeepSeek-V2-Lite TP2 76, 2.22; a fixed 64 x 12 gives
+  it ~1.87). Re-scored offline: pre-fix official E_C unchanged (v2 0.216,
+  old 0.124, native 0.558) but its `G2.digest_self.cap` now fails for
+  native (18 external + 1 local unjudged, all from undigested requests):
+  old-sampling records cannot pass the exhaustive rule; a rerun is needed.
+  G3 `summarize` identical on all 153 recorded probe dirs.
+
+- Gate teardown (d646ac3, backport df01403 on fix/rsi-teardown-backport):
+  pegaflow-server with a 160 GB pinned pool took > 30 s to exit after
+  SIGKILL and `proc.wait(timeout=30)` aborted it2d's official run; the gate
+  now waits on the whole process group (120 s after SIGTERM, 300 s after
+  SIGKILL) and logs the exit time.
+- `split_invariant` (P4 finding): vLLM 0.32 MLA prefill attends to the cached
+  context separately (`_compute_prefill_context` + `merge_attn_states` at
+  `num_computed_tokens`), so on DeepSeek-V2-Lite the computed KV and greedy
+  outputs depend on where a hit ends; an honest connector failed
+  `G2.gsm8k_outputs` (warm 60/128) and `computed_exact` with every loaded
+  block byte-exact. New gate.json field (default true), established by a
+  plain-arm split control (`split_ref` vs `split`, each prompt pre-warmed);
+  with false, `computed_exact` judges only same-split copies and
+  `G2.gsm8k_outputs` is bounded by the control's rate + 0.02. Controls
+  measured (full gsm8k 1319, pre-warm took on 1319/1319):
+  Qwen3-4B FLASH_ATTN 0 differ / 0 logprob differ (split-invariant);
+  DeepSeek-V2-Lite TP2 TRITON_MLA 647 differ (0.4905; first 128: 0.4688),
+  1319/1319 logprobs differ (split-variant). Re-judged offline with
+  `split_invariant=false` + that control: P4 self-test honest passes every
+  G2 check (ext 1084/1084, warm 60/128 = 0.469 <= 0.489), liar / bitflip /
+  offbyone still fail both digest checks (2168 / 256 / 828 ext mismatched);
+  P4 old slice: old loaded blocks 10390/10390 matched, computed_exact
+  27526/27526 on same-split copies (coverage 0.70 vs baseline),
+  `G2.gsm8k_outputs` 642/1319 = 0.487 <= 0.511. Qwen3-4B: every verdict
+  unchanged on the 24 recorded runs (5580 verdict leaves) apart from the
+  new `G2.split_control`, which old records lack. DeepSeek-V2-Lite's
+  gate.json must set `"split_invariant": false` (P4's file).
+- G5 official r3 (2026-10-23, .44 GPU5): gate e9f3f33, connector_v2 at
+  8a05b7c (`--under-test-path`, tree verified blob-for-blob afterwards),
+  official, uncontaminated (max timed p99 ratio 3.2x vs the 10x limit).
+  Qwen3-4B connector_v2 passes G0-G4. It fails G5: E_C(0.5) is 0.684 vs
+  0.9, with hit 0.842 vs H*_C 0.929, about LRU level (H_lru 0.857). At
+  C/U 0.25 / 0.75, E_C is 0.084 / 0.669. Tables are in
+  `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)".
+- G5 re-review 2 (accept-with-fixes on 4797a05..e9f3f33) applied in
+  91b6a8e..940def4; resolution table in `reviews/G5-gate-rereview2.md`.
+  Split-variant G2 is now exact: warm outputs == plain `split` (aligned
+  prompts reported only), cold == baseline cold, warm computed KV judged
+  against the baseline's `split` pass with coverage >= 0.9 per pass (DSV2
+  honest self-test warm coverage 0 -> 1.0; liar/bitflip/offbyone fail;
+  P4 old and it1 slices pass G2). Provenance: overlay with only `pegaflow`
+  for `--under-test-path`, `G0.provenance` on module files, verified tree
+  revs (blob-for-blob vs GitHub) and binary sha256 in `summary.provenance`.
+  Teardown failures abort the run; SIGTERM/SIGHUP tear stages down;
+  `--pool-size` 64gb with an early U check; untimed `_warmup` request per
+  stage; contaminated timed passes (p99 > 10x baseline) make a run
+  non-official; `G2.digest_groups` fails a transferred group without
+  digests (hybrid / Mamba models fail G2 until Mamba state is digested).
+
+### 2026-10-24
+
+- G5 re-review 3 (M4-M7, S7-S9, N5) applied in c7f7520..b3d43b4. The
+  resolution table is in `reviews/G5-gate-rereview3.md`.
+  - Every new run passes `G0.spec` again (M4).
+  - The arm under test imports a verified snapshot of the rev's blobs.
+    Symlinks, untracked files, extra `.so` and pyc all reject the tree.
+    Trees for `--under-test-path` must be pyc-free (`git archive`).
+  - Unverified gate and venv trees make a run non-official.
+  - The arm runs in a private mount namespace that hides the other arms,
+    with SYS_ADMIN and SYS_PTRACE dropped. This is deterrence, not a
+    boundary (uid 0).
+  - A static scan of the snapshot flags instrument access.
+  - `VLLM_PLUGINS=""` for every vLLM.
+  - Gate fixes and run hygiene:
+    - The connector module's import path is checked.
+    - The aligned-prompt exemption is exact.
+    - Contamination is two-sided.
+    - `G4.warmup_seconds` is reported.
+    - Stage ports are leased (`PortRace`, never retried).
+    - CUDA toolchain preflight.
+    - `--replay-skip` for held-out slices (never official).
+- GPU3 run on 7d477c5 (02:07:41Z-02:14:40Z, gsm8k 64, 16gb pool):
+  - G0.spec and G0.provenance pass.
+  - connector_v2 at 8a05b7c served inside the isolation: accuracy equal to
+    baseline, G3 E 1.0.
+  - The namespaced groups were torn down.
+  - The server log shows the full 16 GiB pool and 36 CUDA IPC layers
+    registered, with no errors.
+- The Qwen3-4B re-judge (39cd826 vs b3d43b4, 49 records) left the G3
+  numbers unchanged (147/147) and overall passes unchanged. The only flag
+  change is M4's `G0.spec` fix.
+
+### 2026-10-25
+
+- Hybrid gate review (`reviews/hybrid-gate.md`, ACCEPT-WITH-FIXES at
+  8789dde) fixes on feat/rsi-gate-hybrid; resolution in the review file's
+  response section:
+  - M1: start states digested in `handle_preemptions`, before the Mamba
+    precopy and any sync load; new `selftest:sync` arm.
+  - M2: negative arms judged per group (`G2.caught_per_group`), real
+    offbyone state sabotage, sabotage counts.
+  - S1: records judged by the gate rev they ran under (`na: record
+    predates`). S2: `G2.gsm8k` gated on `alone_ref` without batch
+    invariance, honest arm included. S3: `preempt` official on
+    state-group models. S4: flag parser spellings, compile config in the
+    spec dump. S5: per-arm compile cache. S6: tests (282).
+  - S5 follow-ups: fresh per-arm caches re-timed vLLM's FLA autotune
+    kernels per arm (Qwen3.5 baseline != plain), fixed by seeding each arm
+    with the baseline's Triton autotune picks (3d6b8e6); Qwen3-4B gsm8k
+    now compiles with deterministic inductor too (2404394).
+  - Self-test `qwen3.5-4b-selftest-3d6b8e6` passed (every negative caught
+    in every group); Qwen3-4B slice `qwen3-4b-gate-hybrid-slice-2404394`
+    baseline passes `G2.batch_control` and `G0.vllm_args`.
+  - Re-review (363441c) R1-R3 fixed: `G0.spec` judges spec fields the
+    record's probe did not write as `na_fields` (re-judge of
+    `qwen3-4b-p4-it5-nonreg` no longer flips); preempted blocks vLLM zeroes
+    or COW-copies into this step are dropped (`preempt_dropped`), an
+    all-zero digest is never a reference, the spec dump records
+    `model_runner` (V2) and `probe.schema`; `G2.caught_per_group` needs bad
+    >= sabotaged per group. N2: seeding refuses non-tile autotune entries.
+  - FOLLOW-UP (DSV2 branch, R4, not this branch): when DeepSeek-V2-Lite
+    adopts this gate after P4 acceptance, in the same commit: gate.json
+    `gsm8k_vllm_args` with deterministic inductor; regenerate the committed
+    `spec.json` (retention, `compilation`, `model_runner`, `probe.schema`);
+    one plain+baseline gsm8k slice. Until then DSV2 records are re-judged
+    with ce645d7.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
@@ -708,6 +935,28 @@ Each entry: what was added, why, which vectors cover it.
   replay for now. R2EGym (`~/kexi/datasets/r2egym-256.jsonl`, 32 x 12 official)
   is the G4/G3 replay workload until agentx is provided; results only claim
   this workload.
+- For final acceptance (user's final pass; agent review counts as acceptance
+  until then, GATES.md stays DRAFT): the `split_invariant=false` rule replaces
+  cross-split `computed_exact` and exact outputs-vs-baseline-cold on
+  split-variant models (MLA prefill, e.g. DeepSeek-V2-Lite). Instead: warm
+  outputs == plain `split` exactly (aligned prompts reported only), cold ==
+  baseline cold, `computed_exact` only against same-split copies with
+  per-pass coverage >= 0.9; the flag is checked by `G2.split_control` in
+  every run. Needs the user's confirmation.
+- For final acceptance, next to the split rule: the untimed warmup request
+  (dc70805, `passes._warmup`) is a measurement change in the lenient
+  direction. It warms every arm equally, but the connector's one-time
+  save-path cost (first save, gRPC setup) now lands outside
+  `G4.replay_cold` and `G4.gsm8k_cold`. It is reported per arm vs baseline
+  as `G4.warmup_seconds` (not gated). Needs the user's confirmation.
+- For final acceptance: add rsi/gates tests to CI. PR CI runs
+  `python/tests` only (`ci.yml`), so the 303 gate tests
+  (`rsi/gates/test_oracle_capacity.py`, `test_probe_steps.py`) are a manual
+  gate today: whoever changes `rsi/gates` runs them (GATES.md
+  "Implementation"). They need the built `pegaflow.semantics`, and
+  `test_probe_steps.py` needs vllm + torch (CPU), so the CI job needs the
+  native build. Workflows are not edited by agents; needs the user's
+  decision.
 - Capacity-blind gates (raised 2026-10-23, user asked how the loop would
   find "manage SWA and full blocks separately" for DeepSeek-V4.1-Flash):
   every gate runs with an unlimited pool (`G3.no_eviction`), and write
