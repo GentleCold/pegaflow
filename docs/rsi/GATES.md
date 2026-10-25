@@ -861,16 +861,19 @@ the last accepted run record by hand until `--accepted` exists.
   times both sides under the gsm8k config (as on Qwen3-4B, where gsm8k
   runs `VLLM_BATCH_INVARIANT=1`); `G4.replay_*` runs the default config.
   `G0.vllm_args` requires each gsm8k flag as the last occurrence on every
-  gsm8k stage. Qwen3-4B and DeepSeek-V2-Lite set no `gsm8k_vllm_args`:
-  their plain and connector compiles currently in the cache made the same
-  choices (the artifacts differ only in hash-bearing files and an
-  autotune timing field), which is why their controls pass. Their
-  gate.json stays as is: their accepted runs were timed under the current
-  config. A recompile can choose differently. That fails loud on
-  `G2.plain_equals_baseline` and cannot pass a wrong load (connector arms
-  share one compile), so it costs a rerun, not correctness. The fix when
-  it happens is the same one line: gate.json `gsm8k_vllm_args` with
-  deterministic inductor.
+  gsm8k stage. Before S5, Qwen3-4B and DeepSeek-V2-Lite set no
+  `gsm8k_vllm_args`: their plain and connector compiles in the global
+  cache happened to make the same choices. With per-arm caches every arm
+  compiles fresh, so that luck is gone: `qwen3-4b-gate-hybrid-slice-3d6b8e6`
+  (default compile) had plain, baseline and connector_v2 pick different
+  reduction configs and give three different gsm8k output sets
+  (`G2.plain_equals_baseline` 35 differ, connector_v2
+  `digest_vs_baseline` all mismatched), while `G2.batch_control` and
+  `G0.vllm_args` passed. Qwen3-4B's gate.json now sets the same
+  `gsm8k_vllm_args` (and its committed `compilation` block the
+  deterministic config). Its accepted records ran under the old gate.json
+  and stay judged by it (S1). DeepSeek-V2-Lite needs the same line when
+  its branch takes this gate.
 - G3 (`oracle.py`): replays `requests.jsonl` with unlimited capacity. A block
   ending at token e is stored at the first step whose `progress` reaches e
   (checkpoint groups: only a step ending exactly on e) and is visible to

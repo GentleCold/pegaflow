@@ -10,8 +10,9 @@
   "backend": "inductor",
   "cudagraph_mode": "FULL_AND_PIECEWISE",
   "inductor_compile_config": {
-   "benchmark_combo_kernel": true,
+   "benchmark_combo_kernel": false,
    "combo_kernels": true,
+   "deterministic": true,
    "enable_auto_functionalized_v2": false
   },
   "mode": 3
