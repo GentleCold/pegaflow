@@ -607,9 +607,11 @@ def stage_pycache(stage: Path) -> Path:
 # S5: one vLLM cache root (torch compile artifacts, the Inductor and Triton
 # caches vLLM keeps next to them) per arm: <run>/.compile-cache/<label>, made
 # fresh before the arm's first stage and bound rw into that arm only. No arm
-# loads an artifact another arm (or an earlier run) wrote.
+# loads an artifact another arm (or an earlier run) wrote, except a copy of
+# the baseline's Triton autotune picks (``seed_autotune``).
 COMPILE_CACHE_DIR = ".compile-cache"
 _FRESH_CACHES: set[str] = set()
+AUTOTUNE_SOURCE = "baseline"
 
 
 def compile_cache(stage: Path) -> Path:
@@ -617,13 +619,42 @@ def compile_cache(stage: Path) -> Path:
     return stage.parents[1] / COMPILE_CACHE_DIR / stage.parent.name
 
 
+def seed_autotune(root: Path) -> int:
+    """Copy the baseline's Triton autotune results into a fresh arm root.
+
+    ``@triton.autotune`` kernels outside Inductor (vLLM's FLA ops for GDN)
+    pick a tile config by timing a fixed list on first use, and the picks
+    change the numbers (``chunk_fwd_kernel_o`` BK/BV is a reduction split);
+    Inductor's ``deterministic`` does not reach them. Fresh per-arm caches
+    re-time them per arm, so arms ran different kernels
+    (``qwen3.5-4b-selftest-fbcc3fd``). Triton keys each result by kernel,
+    compiler, env and the config list, and loads it instead of timing
+    (``TRITON_CACHE_AUTOTUNING``), so every arm runs the baseline's picks.
+    It is a copy: an arm can change only its own. Returns the file count."""
+    src = root.parent / AUTOTUNE_SOURCE / "triton"
+    if root.name == AUTOTUNE_SOURCE or not src.is_dir():
+        return 0
+    n = 0
+    for f in sorted(src.glob("*/*.autotune.json")):
+        dst = root / "triton" / f.parent.name / f.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(f, dst)
+        n += 1
+    return n
+
+
 def fresh_compile_cache(stage: Path) -> Path:
-    """The arm's cache root, emptied the first time this process uses it."""
+    """The arm's cache root, emptied (then seeded with the baseline's
+    autotune picks) the first time this process uses it."""
     d = compile_cache(stage)
     if str(d.resolve()) not in _FRESH_CACHES:
         if d.exists():
             shutil.rmtree(d)
         _FRESH_CACHES.add(str(d.resolve()))
+        d.mkdir(parents=True, exist_ok=True)
+        n = seed_autotune(d)
+        if n:
+            print(f"[cache] {d.name}: {n} Triton autotune picks from {AUTOTUNE_SOURCE}", flush=True)  # fmt: skip
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -928,6 +959,7 @@ def vllm_server(
     env["TRITON_CACHE_DIR"] = str(cache_root / "triton")
     env["TORCHINDUCTOR_CACHE_DIR"] = str(cache_root / "inductor")
     env["FLASHINFER_WORKSPACE_BASE"] = str(cache_root / "flashinfer")
+    env["TRITON_CACHE_AUTOTUNING"] = "1"  # load the seeded picks (vLLM's default too)
     backend: list[str] = []
     if gate.get("attention_backend"):
         backend = ["--attention-backend", gate["attention_backend"]]

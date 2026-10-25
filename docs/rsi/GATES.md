@@ -809,6 +809,26 @@ the last accepted run record by hand until `--accepted` exists.
   own arm's numbers, which the baseline comparisons judge. Each arm
   compiles once per config (gsm8k and the others differ), a few minutes per
   arm.
+- Triton autotune picks (`seed_autotune`). Kernels with
+  `@triton.autotune` outside Inductor (vLLM's FLA ops for GDN:
+  `chunk_fwd_kernel_o`, `chunk_gated_delta_rule_fwd_kernel_h`,
+  `solve_tril`, `cumsum`, ...) pick a tile config by timing a fixed list
+  on first use, and the pick changes the numbers (BK/BV split a
+  reduction). Inductor's `deterministic` does not reach them. Fresh
+  per-arm caches re-timed them per arm, so in
+  `qwen3.5-4b-selftest-fbcc3fd` every arm ran different picks and
+  baseline differed from plain and honest in 14/64 alone_ref completions
+  (plain == honest: 0). Each fresh arm root therefore gets a copy of the
+  baseline's `*.autotune.json` (Triton keys each by kernel, compiler,
+  cache-invalidating env and the config list, and loads it instead of
+  timing under `TRITON_CACHE_AUTOTUNING=1`, which vLLM sets by default and
+  the gate sets explicitly). Only the picks are copied, never a compiled
+  kernel or graph, and it is a copy: an arm can change only its own. Probe
+  (GPU5, `~/kexi/tmp/rsi-gate-hybrid-test/swap`, first-token logprobs of
+  4 gsm8k prompts): the baseline's full cache gives `-0.389455 -1.307971
+  -0.90808 -0.769167`, plain's `-0.385402 -1.285329 -0.907576
+  -0.780117`, and fresh compiles of the plain and the connector config
+  with only the baseline's picks both give the baseline's numbers.
 - Compile determinism (`gsm8k_vllm_args`). vLLM 0.32 compiles the model
   once per config hash (`<cache root>/torch_compile_cache/<hash>`; before
   S5 the global `~/.cache/vllm`, reused by later runs). `VllmConfig.compute_hash` appends

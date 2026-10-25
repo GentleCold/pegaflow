@@ -2624,3 +2624,23 @@ def test_each_arm_gets_its_own_compile_cache(tmp_path, monkeypatch):
         root = Path(e["VLLM_CACHE_ROOT"])
         for k in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE"):
             assert Path(e[k]).is_relative_to(root), k
+        assert e["TRITON_CACHE_AUTOTUNING"] == "1"
+
+
+def test_arms_run_the_baselines_triton_autotune_picks(tmp_path):
+    """A fresh arm root gets a copy of the baseline's ``*.autotune.json``
+    (FLA kernels outside Inductor pick tiles by timing, and the picks change
+    the numbers) and nothing else of the baseline's cache."""
+    caches = tmp_path / ".compile-cache"
+    base = caches / "baseline" / "triton"
+    (base / "H1").mkdir(parents=True)
+    (base / "H1" / "chunk_fwd_kernel_o.autotune.json").write_text('{"pick": 1}')
+    (base / "H1" / "chunk_fwd_kernel_o.cubin").write_text("kernel")
+    (caches / "baseline" / "torch_compile_cache").mkdir()
+    arm = caches / "selftest-honest"
+    arm.mkdir()
+    assert run_gate.seed_autotune(arm) == 1
+    assert (arm / "triton/H1/chunk_fwd_kernel_o.autotune.json").read_text() == '{"pick": 1}'
+    assert sorted(p.name for p in arm.rglob("*") if p.is_file()) == ["chunk_fwd_kernel_o.autotune.json"]  # fmt: skip
+    assert run_gate.seed_autotune(caches / "baseline") == 0  # the source itself
+    assert run_gate.seed_autotune(tmp_path / "x" / "plain") == 0  # no baseline yet
