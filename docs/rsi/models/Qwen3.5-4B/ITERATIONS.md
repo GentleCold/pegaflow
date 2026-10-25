@@ -808,3 +808,182 @@ local to external.
 
 H2 verdict: prediction met. Replay cold p50 is +1.6% on this slice, and the
 official-size run decides it.
+
+## it2 official (c5d3f04): `2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`
+
+Arms: plain, baseline, old, native and v2. Workloads: full gsm8k, replay
+32 x 12, cap on all 256 conversations at C/U 0.25 / 0.5 / 0.75, and preempt.
+GPU5, base server 056eb4b. `official: true`, with no `not_official_because`.
+- Capacity floor: U 167.96 GB, C(0.5) 83.98 GB = 2.52x GPU KV (floor 2x).
+  Each cap stage sizes its pool to C. The run's `--pool-size` was the
+  default 64gb, which only applies to the uncapped workloads (all of them
+  show 0 evictions).
+- Gate and under-test rev: c5d3f04.
+
+### Correctness (hard): v2 passes every verdict
+
+- G0: `G0.spec` has 0 diffs; provenance is the overlay.
+- G2: `G2.digest_groups` covers [0, 1, 2, 3]. Digests, local + external:
+  - gsm8k: 13460 + 45/45 (vs baseline: also 13460 + 45/45);
+  - replay: 456 + 540/540, with 21 local uncertain;
+  - preempt: 311 + 106/106;
+  - cap: 15240 + 59627/59627.
+  
+  0 mismatches anywhere. `G2.gsm8k` alone_ref delta is 0.0 pp (0.7188).
+  Accuracy cold / warm is 0.7908 / 0.7877 (baseline 0.7877).
+- G3: E_ext is 1.0 for gsm8k and replay. `G3.no_eviction` is 0 in every
+  pass.
+- G5 validity: `pool_ok` and `loads_ok` hold at every fraction. Excess is
+  0. Unmatched requests: 0.
+
+old passes every verdict. native fails `G0.spec` (its CPU layout is LBNHC),
+`G2.digest_vs_baseline.gsm8k` and gsm8k cold +2.6%. It is a reference arm.
+
+### G4 (hard)
+
+v2 vs baseline. old and native are listed for reference.
+
+| metric | v2 | baseline | v2 vs baseline | old | native |
+|---|---|---|---|---|---|
+| gsm8k cold s | 95.00 | 94.68 | +0.34% (pass, 2% slack) | 91.67 | 97.10 |
+| gsm8k warm s | 94.55 | 94.88 | -0.35% (pass) | 92.32 | 95.94 |
+| replay cold TTFT p50 s | 0.512 | 1.204 | -57% (pass) | 0.505 | 1.046 |
+| replay cold req/s | 8.19 | 3.61 | 2.27x (pass) | 8.06 | 7.79 |
+| replay warm TTFT p50 s (warm2/warm3) | 0.300/0.295 | 1.112/1.119 | -73% (pass) | 0.359/0.349 | 0.175/0.171 |
+| replay warm req/s (warm2/warm3) | 14.61/14.66 | 3.73/3.73 | 3.9x (pass) | 14.07/14.07 | 13.15/13.16 |
+
+H2's prediction holds at the official size. gsm8k is within 0.4% of
+baseline. Replay cold, which the 8 x 6 slice put at +1.6%, is less than half
+of baseline: with 32 conversations, vLLM's GPU cache no longer holds the
+earlier turns and the store serves them. Cap save stats (0.5) are 28 save
+steps out of 499, `flush_ms` 0 and `failed` 0.
+
+### Hit rates, unlimited pool (G3)
+
+Columns are local / ext / total, as shares of prompt tokens, then H* and
+E_ext.
+
+| pass | v2 | old | native | H* | E_ext v2 |
+|---|---|---|---|---|---|
+| gsm8k warm | 0.920 / 0.006 / 0.9255 | 0 / 0.9255 / 0.9255 | 0.925 / 0.001 / 0.9255 | 0.9255 | 1.0 |
+| replay cold | 0.232 / 0.571 / 0.803 | 0 / 0.801 / 0.801 | 0.230 / 0.573 / 0.803 | 0.803 | 1.0 (old 0.998) |
+| replay warm (x3) | 0.778 / 0.169 / 0.946 | 0 / 0.946 / 0.946 | 0.778 / 0.169 / 0.946 | 0.946 | 1.0 |
+| preempt warm | 0.667 / 0.261 / 0.928 | 0 / 0.928 / 0.928 | 0.870 / 0.058 / 0.928 | 0.928 | 1.0 |
+
+v2 reaches H* on every pass. lmcache: pending.
+
+### Hit rates at capacity (G5)
+
+The numbers are the timed warm passes (warm2 + warm3, 3716 requests,
+17.48M prompt tokens). In every simulation the reference local hit is the
+baseline's, 0.248 of the prompt. The unlimited H* is 0.946. H_lru and
+H_freeze are simulated on v2's trace; on the old and native traces they
+are within 0.002, except native's H_lru at 0.75, which is 0.862.
+
+| C/U | H*_C | H_lru | H_freeze | hit v2 / old / native | E_C v2 / old / native |
+|---|---|---|---|---|---|
+| 0.25 | 0.690 | 0.794 | 0.451 | 0.794 / 0.794 / 0.794 | 1.183 / 1.235 / 1.175 |
+| 0.5 (gated C) | 0.878 | 0.792 | 0.669 | 0.794 / 0.794 / 0.788 | 0.828 / 0.867 / 0.815 |
+| 0.75 | 0.946 | 0.906 | 0.885 | 0.907 / 0.906 / 0.946 | 0.880 / 0.943 / 0.928 |
+
+At every fraction v2's hit equals H_lru within 0.002 and equals old's hit
+within 0.001.
+- The E_C gap to old (0.04-0.06) is accounting, not hit. ext counts
+  `min(a, o) - max(ref, own)`, so v2's own GPU-local hits above the
+  baseline reference earn nothing: 403k / 428k / 778k tokens at 0.25 /
+  0.5 / 0.75. old reports a local hit of 0, so it loses nothing. Adding v2's
+  over-reference tokens back gives 1.235 / 0.867 / 0.944, old's
+  E_C within 0.001. This term is by design (GATES.md: a higher own
+  local hit "is vLLM's cache, not the store's"). It does mean that E_C
+  across arms is comparable only at equal own-local hits.
+- The hit is 0.794 at both 0.25 and 0.5. That is the within-pass reuse:
+  turn k+1 reuses turn k, and the cold pass is also 0.794. The warm passes
+  replay the 256 conversations in the same order, which is a cyclic scan
+  larger than C, so an LRU store keeps none of the earlier pass. The
+  server's eviction is plain LRU per key (see PROGRESS "Server
+  limitations"). At 0.75 the earlier pass partly survives: 0.906.
+- Group-coherence loss at the official cap size is negligible: `hit stats`
+  shows `missing=1,2,3` in 4 of 7441 lookups at 0.25 (4 of 7443 at 0.5,
+  2 of 7433 at 0.75), 2640 lost tokens.
+
+### G5 at C/U 0.25: E_C > 1 is an oracle modelling gap for Checkpoint groups
+
+Finding for the gate owner. It is offline: `rsi/gates/oracle.py` at
+c5d3f04 was imported on the run's probe traces, and the gate code was not
+edited. The scripts are `~/kexi/tmp/p5-g5-attr/attr.py` and `attr2.py`,
+outputs `out*-*.txt`.
+
+**Not the accounting.**
+- H*_C, H_lru and H_freeze come from the same `simulate` with the same
+  reference local hit and the same `min(..., max(unlimited, local))` cap.
+- The measured hit (0.7939) matches H_lru (0.7937) for every arm.
+- C is `f x` the measured U, so the Checkpoint estimate (1734 vs 2348
+  blocks) plays no part.
+
+The anomaly is H*_C < H_lru, entirely inside the oracle.
+
+**Cause.** Belady's next-use sets are built only at each request's
+unlimited resume point P: `_external_keys(kinds, r, unlimited[i], ...)` =
+`semantics.needed(g, P)`.
+- For a Full group, `needed(q)` is a subset of `needed(P)` for q < P, so
+  every fallback block already has a use at that request.
+- For a Checkpoint group, `needed(q)` is the checkpoint at q, which is not
+  in `needed(P)`. A checkpoint at an earlier boundary is "used" only by a
+  later request whose own P lands there, for example the same conversation
+  turn in the next pass. Belady therefore sees its next use far away, and it
+  declines to admit it or evicts it first (0.25: 3368 not admitted against
+  2562 stored per GDN group).
+- When Belady cannot keep a request's P-checkpoint, `resolve` falls back to
+  a boundary whose checkpoint it has also dropped. LRU keeps everything
+  recent and resumes there.
+
+Full-only models (Qwen3-4B, DSV2) cannot show this, which is why it first
+appears on the hybrid model.
+
+**Numbers (v2 trace, timed passes):**
+
+| C/U | requests with H_lru > H*_C | tokens (share of prompt) | of them below the unlimited P | blocks LRU loads there (ckpt / full) |
+|---|---|---|---|---|
+| 0.25 | 995 | 2.69M (0.154) | 995 | 2985 / 5585 |
+| 0.5 | 239 | 0.52M (0.030) | 239 | 717 / 1406 |
+| 0.75 | 0 | 0 | 0 | 0 |
+
+(Belady > LRU elsewhere: 871 requests / 0.88M tokens at 0.25, 1995 / 2.03M
+at 0.5, 651 / 0.69M at 0.75.)
+
+**Counterfactual bar** (`attr2.py`, no knowledge of LRU). A Belady whose
+use set for request i is the union of `needed(q)` over every block end
+q <= P, so every fallback resume point counts as a use. It is above H_lru
+on every request at every fraction (`lru > bar` on 0 requests):
+
+| C/U | H*_C (gate) | fallback-aware bar | H_lru | E_C v2 / old / native vs that bar |
+|---|---|---|---|---|
+| 0.25 | 0.690 | 0.841-0.843 | 0.794 | 0.881 / 0.920 / 0.874 |
+| 0.5 | 0.878 | 0.889-0.891 | 0.792 | 0.813 / 0.852 / 0.799 |
+| 0.75 | 0.946 | 0.941-0.946 | 0.906 | 0.886 / 0.949 / 0.928 |
+
+At 0.75 the fallback-aware variant is 0.005 below the gate's H*_C on two
+traces. Spreading uses over every fallback point dilutes the greedy
+choice, so neither variant dominates.
+
+Suggestion for the gate owner (not implemented): either make the Belady
+use set fallback-aware for Kinds whose `needed(q)` is not a subset of
+`needed(P)`, or report H*_C as the max of both variants. Either way E_C
+would be at most 1 here: about 0.87-0.92 at 0.25 and 0.80-0.85 at 0.5. The
+oracle docstring already says it is "a strong reference, not a proven
+optimum". This measures how far it falls short for Checkpoint groups.
+
+### Hit-rate judgment: close enough
+
+- Unlimited: v2 = H* on every pass (E_ext 1.0), the same as old and native.
+- Capacity: v2's hit = H_lru (within 0.002) and = old (within 0.001) at
+  0.25 / 0.5 / 0.75. The E_C differences to old are the own-local
+  accounting term (within 0.001).
+- The gap to the oracle at 0.5 (0.794 vs H*_C 0.878, or 0.889 with the
+  fallback-aware bar) is LRU on a cyclic trace. That is the base server's
+  eviction policy, shared by every PegaFlow arm; native, with vLLM's own
+  CPU cache, is 0.788.
+- The 0.25 point is not a v2 result above the oracle: it is the oracle
+  modelling gap above.
+- Group-coherence loss is 4 lookups out of 7441.
+- lmcache: pending.

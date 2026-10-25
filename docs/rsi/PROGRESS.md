@@ -94,6 +94,10 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   of ~17 MB) exceeds the whole pool (~100 blocks): 176-265 evictions and
   3.3-5.0 GB reclaimed per pass against ~3.5 GB saved, 21-30 blocks resident
   at pass end. Needs re-measuring at the official cap size.
+  Re-measured at the official cap size (P5 it2 official c5d3f04, C(0.5)
+  = 2.52x GPU KV): `missing=1,2,3` in 4 of 7441 lookups at 0.25, 4 of
+  7443 at 0.5, 2 of 7433 at 0.75 (2640 / 2640 / 1584 lost tokens):
+  negligible at the floor.
 
 ### Gate changes
 
@@ -149,7 +153,7 @@ names, magic constants that only exist in the old code).
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"). Hit-rate judgment on the base server: close enough. G5 hit at C/U 0.5 is v2 0.838-0.843 before P4 it7 (r3, P4 it6 cap, P4 MF5) and 0.859 on it7 (P4 M1b official), vs old 0.820-0.840, native 0.861-0.862, H_lru 0.857-0.858; the gap from H_lru to H*_C is the base server's (server proposals H1-H5 parked, see "Server limitations"). P4 regression record: `models/Qwen3-4B/ITERATIONS.md` "P4 regression runs on this model" |
 | P4 | onboard DeepSeek-V2-Lite-Chat | accept: it7 a59a254 on `feat/rsi-deepseek-v2-lite` (TP2, MLA). ACCEPTED 2026-10-25: final review ACCEPT-WITH-FIXES, M1, M2 and S1-S5 applied, re-review ACCEPT (`reviews/P4-final.md`, 4164173). Open for the user's final pass: DSV2 G5 at C/U 0.25 is 0.07 below old on the same server, cause unknown (connector side by elimination; below the 2x GPU-KV floor); lmcache numbers go into the P4 tables when `feat/rsi-gate-lmcache` merges; the gate owner should revisit the preempted-uncertain bound (DSV2 v2 at 0.85% of 1%). Official on it7: DSV2 `2026-10-25-dsv2-lite-p4-it7-off-a59a254` and Qwen3-4B `2026-10-25-qwen3-4b-p4-it7-off-a59a254`, where v2 passes every verdict (Qwen `G2.digest_self.cap` 0.45%). Hit judgment: close enough. Tables: "P4 acceptance tables" below. lmcache: pending (arm not comparable yet) |
-| P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed (the order3 p4 output divergence is closed as vLLM batch non-invariance), Qwen3-4B + DSV2 non-regression; it1 accepted; it2 in progress on the hybrid gate (slices, see 2026-10-25) |
+| P5 | onboard Qwen3.5-4B | it2 official `2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04` (`feat/rsi-qwen3.5-4b` c5d3f04, hybrid gate, base server): official, v2 passes every verdict; awaiting independent review. it1 accepted (core checkpoint saves from offers, ordering check, Qwen3-4B + DSV2 non-regression); it2 = H1 pinned async checkpoint saves + H2 lookup skip. G4: gsm8k cold/warm +0.34%/-0.35%, replay cold TTFT p50 0.512 vs 1.204 s, warm 0.300 vs 1.112 s. Hits: v2 = H* on every unlimited pass (E_ext 1.0); G5 hit v2/old/native 0.794/0.794/0.794 (0.25), 0.794/0.794/0.788 (0.5), 0.907/0.906/0.946 (0.75), v2 = H_lru within 0.002; E_C 0.5 v2/old/native 0.828/0.867/0.815 (gap to old = own-local accounting). E_C > 1 at 0.25 is an oracle gap for Checkpoint groups (finding for the gate owner, 2026-10-25). Judgment: close enough. lmcache: pending. Record: `models/Qwen3.5-4B/ITERATIONS.md` "it2 official" |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ### P4 acceptance tables (it7 a59a254, gate ce645d7, base server d1970ead)
@@ -1075,6 +1079,28 @@ local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
   req/s -1.3%. gsm8k prefix queries 6046 -> 23. Hits unchanged (replay
   warm 0.936 = H*). Merged `feat/semantics-rsi` 9a02fb5 (cap sizing) as
   be0622f. Next: official run on GPU5 (gsm8k, replay, cap, preempt).
+- P5 it2 official (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`, c5d3f04,
+  GPU5, base server, all 256 cap conversations, C(0.5) 2.52x GPU KV):
+  official, and v2 passes every verdict. 0 digest mismatches in 4 groups
+  (cap 59627/59627 external). G4: gsm8k +0.34% / -0.35%, replay cold TTFT
+  p50 0.512 vs 1.204 s, warm 0.300 vs 1.112 s. Hits: v2 = H* unlimited;
+  at capacity v2 = H_lru = old (within 0.002). E_C at 0.5 is v2 0.828,
+  old 0.867, native 0.815. The v2-old gap is v2's own local hits above
+  the baseline reference, which earn nothing by design; adding them back
+  gives old's E_C. Judgment: close enough. Next: independent review.
+- For the gate owner (P5 finding, gate code not edited): G5 E_C > 1 at
+  C/U 0.25 on Qwen3.5-4B (H*_C 0.690 < H_lru 0.794, every arm) is the
+  oracle, not the accounting. Belady's use sets are `needed(P)` at each
+  request's unlimited P only. For a Checkpoint group, `needed(q < P)` is a
+  different checkpoint, so fallback checkpoints look unused, and Belady
+  refuses or evicts them (3368 not admitted vs 2562 stored per GDN group).
+  LRU resumes there: 995 requests, 2.69M tokens (0.154 of prompt) at
+  0.25, 239 / 0.52M at 0.5, 0 at 0.75. A Belady with uses at every block
+  end <= P gives 0.841-0.843 / 0.889-0.891 / 0.941-0.946, above H_lru on
+  every request, and E_C v2 / old / native 0.881 / 0.920 / 0.874 at 0.25.
+  Suggest a fallback-aware use set for Kinds whose `needed` is not
+  prefix-closed (or the max of both variants). Full-only models are
+  unaffected. Details: `models/Qwen3.5-4B/ITERATIONS.md` "it2 official".
 - P4 final-review fixes (`reviews/P4-final.md`, ACCEPT-WITH-FIXES).
   Changes are in connector_v2's scheduler, its unit test and the docs; no
   semantics or server change.
