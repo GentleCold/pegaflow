@@ -5,6 +5,7 @@ docs/rsi/GATES.md ("Tests"). The isolation tests run only on Linux as root.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -581,6 +582,24 @@ def test_capacity_floor_fails_closed_and_g5_problems():
     assert run_gate.g5_problems({"X": flat}, high, None) == ["G5 trace does not separate freeze from H*_C"]  # fmt: skip
     assert run_gate.g5_problems({"X": {}}, high, None)  # freeze not evaluated: not official
     assert run_gate.g5_problems({"X": sep}, low, {"enough": False}) == ["capacity below 2x GPU KV (whole replay file used)"]  # fmt: skip
+    assert run_gate.g5_problems({"X": sep}, high, {"unmodeled": ["x"]}) == ["cap plan sized from an unmodeled spec: x"]  # fmt: skip
+
+
+def test_unmodeled_spec_only_flags_checkpoint_models():
+    """The Checkpoint step-end model assumes ``hash_block_size ==
+    block_size``, no Eagle, no prefill checkpoint blocks; Full-only specs
+    are counted exactly whatever those values are."""
+    ckpt = _spec(FULL, CKPT) | {"cache": {"mamba_cache_mode": "align"}}
+    assert run_gate.unmodeled_spec(ckpt) == []
+    committed = run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json"
+    assert run_gate.unmodeled_spec(json.loads(committed.read_text())) == []
+    sub = {**ckpt, "kv_cache_config": {**ckpt["kv_cache_config"], "hash_block_size": BT // 2}}
+    assert len(run_gate.unmodeled_spec(sub)) == 2  # both groups
+    full = _spec(FULL)
+    assert run_gate.unmodeled_spec({**full, "kv_cache_config": {**full["kv_cache_config"], "hash_block_size": 1}}) == []  # fmt: skip
+    pcb = json.loads(json.dumps(ckpt))
+    pcb["kv_cache_config"]["groups"][1]["spec"]["num_prefill_checkpoint_blocks"] = 1
+    assert run_gate.unmodeled_spec(pcb) == ["group 1: num_prefill_checkpoint_blocks 1"]
 
 
 def test_reference_locals_unmatched_path():
@@ -599,10 +618,80 @@ def test_reference_locals_unmatched_path():
 def test_unique_estimate_counts_shared_prefix_once():
     spec = _spec(FULL)
     # vLLM computes prompt + out - 1 tokens: out = BT + 1 completes one block.
-    est = run_gate.UniqueEstimate(spec, out_tokens=BT + 1)
+    est = run_gate.UniqueEstimate(spec, out_tokens=BT + 1, budget=4 * BT)
     a = list(range(3 * BT))
     est.add([a[: 2 * BT], a])  # turn 2 extends turn 1: 3 distinct blocks + 2 generated
     assert est.bytes == (3 + 2) * PAGE * LAYERS
+
+
+@pytest.mark.parametrize(
+    "start,plen,budget,align,junction,ends",
+    [
+        pytest.param(0, 1722, 2048, True, 0, [1584, 1722], id="stop-at-last-cacheable"),
+        pytest.param(0, 1796, 2048, True, 1056, [1056, 1584, 1796], id="stop-at-junction"),
+        pytest.param(1584, 5314, 2048, True, 0, [3168, 4752, 5280, 5314], id="chunks-end-aligned"),
+        pytest.param(0, 1722, 2048, False, 0, [1722], id="no-align-one-chunk"),
+        pytest.param(0, 5000, 2048, False, 0, [2048, 4096, 5000], id="no-align-budget"),
+    ],
+)  # fmt: skip
+def test_prefill_step_ends_follow_the_align_split(start, plen, budget, align, junction, ends):
+    assert run_gate.prefill_step_ends(start, plen, 528, budget, align, junction) == ends
+
+
+def test_unique_estimate_counts_only_saved_checkpoints():
+    """Checkpoint groups store a block only where a step ends on its boundary
+    (the oracle's rule): a 4-block prompt prefilled in one chunk stores the
+    last cacheable checkpoint only; full attention stores all 4."""
+    spec = _spec(FULL, CKPT) | {"cache": {"mamba_cache_mode": "align"}}
+    est = run_gate.UniqueEstimate(spec, out_tokens=1, budget=8 * BT)
+    est.add([list(range(4 * BT + 1))])
+    assert est.bytes == (4 + 1) * PAGE * LAYERS
+    # The next turn resumes at that checkpoint: one more chunk, one more state.
+    est.add([list(range(6 * BT + 1))])
+    assert est.bytes == (6 + 2) * PAGE * LAYERS
+
+
+def test_cap_only_run_sizes_from_the_committed_spec(tmp_path):
+    """``--workloads cap`` has no earlier baseline stage: auto must size from
+    the committed dump, not fall back to ``CAP_MIN_CONVS``."""
+    committed = tmp_path / "spec.json"
+    arm = tmp_path / "baseline"
+    assert run_gate.cap_plan_spec(arm, ["cap"], committed) is None
+    committed.write_text("{}")
+    assert run_gate.cap_plan_spec(arm, ["cap"], committed) == committed
+    # The preempt stage's dump has a shrunk GPU pool: never size from it.
+    (arm / "preempt" / "probe").mkdir(parents=True)
+    (arm / "preempt" / "probe" / "spec.json").write_text("{}")
+    assert run_gate.cap_plan_spec(arm, ["preempt", "cap"], committed) == committed
+    for w in ("replay", "gsm8k"):
+        (arm / w / "probe").mkdir(parents=True)
+        (arm / w / "probe" / "spec.json").write_text("{}")
+    wls = ["preempt", "replay", "gsm8k", "cap"]
+    assert run_gate.cap_plan_spec(arm, wls, committed) == arm / "gsm8k/probe/spec.json"
+    assert run_gate.cap_plan_spec(arm, ["preempt", "replay", "cap"], committed) == arm / "replay/probe/spec.json"  # fmt: skip
+
+
+S1_CAP = Path(__file__).parent / "testdata/qwen3.5-4b-s1-cap-cold.json"
+
+
+def test_unique_estimate_matches_the_measured_hybrid_trace():
+    """Qwen3.5-4B's committed spec on the s1 cap trace (8 x 6, out 64,
+    measured on the baseline arm): within 5% of the measured ``U``, and not
+    above it (an under-estimate only adds conversations). The estimate
+    before the Checkpoint rule was 4.47 GB, 1.28x the measured 3.49 GB."""
+    spec = json.loads((run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json").read_text())
+    data = json.loads(S1_CAP.read_text())
+    a = data["args"]
+    est = run_gate.UniqueEstimate(spec, a["replay_out_tokens"], a["max_num_batched_tokens"])
+    convs: dict[int, list] = {}
+    for conv, turn, plen, keys in sorted(data["requests"]):
+        # Same keys = same prefix: one token value per key keeps the chain.
+        ids = [t for k in keys for t in [int(k, 16)] * 528]
+        convs.setdefault(conv, []).append(ids + [-1 - turn] * (plen - len(ids)))
+    for c in sorted(convs):
+        est.add(convs[c])
+    measured = data["measured_unique_bytes"]
+    assert 0.95 * measured <= est.bytes <= measured, est.bytes / measured
 
 
 @pytest.mark.parametrize(
