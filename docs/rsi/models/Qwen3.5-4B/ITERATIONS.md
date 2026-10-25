@@ -880,6 +880,10 @@ v2 reaches H* on every pass. lmcache: pending.
 
 ### Hit rates at capacity (G5)
 
+This table is as judged at c5d3f04, with plain Belady as H*_C. The gate
+since 1f00e5a has a fallback-aware oracle; the re-scored table is in
+"Re-score with the fallback-aware oracle" below.
+
 The numbers are the timed warm passes (warm2 + warm3, 3716 requests,
 17.48M prompt tokens). In every simulation the reference local hit is the
 baseline's, 0.248 of the prompt. The unlimited H* is 0.946. H_lru and
@@ -981,18 +985,47 @@ would be at most 1 here: about 0.87-0.92 at 0.25 and 0.80-0.85 at 0.5. The
 oracle docstring already says it is "a strong reference, not a proven
 optimum". This measures how far it falls short for Checkpoint groups.
 
+### Re-score with the fallback-aware oracle (gate 1f00e5a, merged as 1002b80)
+
+`feat/semantics-rsi` 1f00e5a takes H*_C as the best of `belady`,
+`belady_fallback` (uses at every fallback resume point; only for Kinds
+whose `needed` is not prefix-closed) and `lru`. This is the suggestion
+above. Offline re-score of the official record: every cap stage's
+`capacity` is recomputed from its probe with the merged `oracle.py`, and the
+verdicts with the merged `run_gate.py`
+(`~/kexi/tmp/p5-g5-attr/rescore_cap.py`, output `rescore-1002b80.txt`).
+No verdict flips for any arm (v2, old and baseline pass; native fails as
+before, on `G0.spec`, `G2.digest_vs_baseline.gsm8k` and
+`G4.gsm8k_cold.seconds`), and `g5_problems` stays empty.
+Only H*_C and E_C move; hit, H_lru and H_freeze are the same simulations.
+
+| C/U | H*_C old -> new (winner) | H_lru | hit v2 / old / native | E_C v2 / old / native | H_lru / H*_C |
+|---|---|---|---|---|---|
+| 0.25 | 0.690 -> 0.841 (belady_fallback) | 0.794 | 0.794 / 0.794 / 0.794 | 0.881 / 0.920 / 0.874 | 0.920 |
+| 0.5 (gated C) | 0.878 -> 0.889 (belady_fallback) | 0.792 | 0.794 / 0.794 / 0.788 | 0.813 / 0.852 / 0.799 | 0.848 |
+| 0.75 | 0.946 -> 0.946 (belady) | 0.906 | 0.907 / 0.906 / 0.946 | 0.880 / 0.943 / 0.928 | 0.944 |
+
+H*_C and H_lru / H*_C are on v2's trace; old's and native's H*_C are within
+0.002. E_C is now at most 1 at every fraction, and v2's E_C is within
+0.01 of H_lru / H*_C at 0.25 and 0.5. The v2-old E_C gap
+(0.039 / 0.040 / 0.063) is the same own-local term as before: the
+over-reference tokens are unchanged and only the denominator moved, so
+adding them back gives 0.920 / 0.851 / 0.944, old's E_C within 0.002
+(old's own H*_C differs by up to 0.001).
+
 ### Hit-rate judgment: close enough
 
 - Unlimited: v2 = H* on every pass (E_ext 1.0), the same as old and native.
 - Capacity: v2's hit = H_lru (within 0.002) and = old (within 0.001) at
   0.25 / 0.5 / 0.75. The E_C differences to old are the own-local
-  accounting term (within 0.001).
-- The gap to the oracle at 0.5 (0.794 vs H*_C 0.878, or 0.889 with the
-  fallback-aware bar) is LRU on a cyclic trace. That is the base server's
-  eviction policy, shared by every PegaFlow arm; native, with vLLM's own
-  CPU cache, is 0.788.
-- The 0.25 point is not a v2 result above the oracle: it is the oracle
-  modelling gap above.
+  accounting term (within 0.002).
+- Fallback-aware oracle (gate 1f00e5a): E_C v2 is 0.881 / 0.813 / 0.880.
+  The gap to H*_C at 0.5 (0.794 vs 0.889) is LRU on a cyclic trace. That
+  is the base server's eviction policy, shared by every PegaFlow arm;
+  native, with vLLM's own CPU cache, is 0.788. Server proposals are parked
+  (PROGRESS "Server limitations").
+- The E_C > 1 at 0.25 under the c5d3f04 gate was the oracle modelling gap
+  above, and the merged oracle closes it (0.881).
 - Group-coherence loss is 4 lookups out of 7441.
 - lmcache: pending.
 
