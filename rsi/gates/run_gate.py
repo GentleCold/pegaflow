@@ -2546,6 +2546,8 @@ def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> 
         "hit_rate": w["hit_rate"],
         "oracle_hit_rate": w["oracle_hit_rate"],
         "oracle_c_hit_rate": w["oracle_c_hit_rate"],
+        # Which candidate store set H*_C (oracle.summarize_capacity); reported.
+        "oracle_c_policy": w.get("oracle_c_policy"),
         "lru_hit_rate": w["lru_hit_rate"],
         "freeze_hit_rate": w["freeze_hit_rate"],
         "lru_vs_oracle_c": w["lru_vs_oracle_c"],
@@ -2997,6 +2999,7 @@ def verdicts(
                         "capacity_bytes",
                         "efficiency_c",
                         "oracle_c_hit_rate",
+                        "oracle_c_policy",
                         "lru_hit_rate",
                         "freeze_vs_oracle_c",
                         "lru_vs_oracle_c",
@@ -3026,8 +3029,9 @@ def verdicts(
 _HIT_KEYS = {
     "G3.gsm8k_warm": ("hit_rate", "local_hit_rate", "external_hit_rate", "oracle_hit_rate", "efficiency"),
     "G3.replay_warm": ("hit_rate", "local_hit_rate", "external_hit_rate", "oracle_hit_rate", "efficiency"),
-    "G5.replay_warm": ("hit_rate", "oracle_hit_rate", "oracle_c_hit_rate", "lru_hit_rate",
-                       "freeze_hit_rate", "efficiency_c", "lru_vs_oracle_c", "freeze_vs_oracle_c"),
+    "G5.replay_warm": ("hit_rate", "oracle_hit_rate", "oracle_c_hit_rate", "oracle_c_policy",
+                       "lru_hit_rate", "freeze_hit_rate", "efficiency_c", "lru_vs_oracle_c",
+                       "freeze_vs_oracle_c"),
 }  # fmt: skip
 
 

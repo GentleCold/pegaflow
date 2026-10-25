@@ -137,7 +137,12 @@ so such stranded bytes are possible today.
   in the future goes first; next use = the next request (by first schedule)
   whose unlimited-oracle resolved prefix covers the item; an item never used
   again is not stored. Hits are `semantics.resolve` over present blocks, as in
-  G3. This is a strong reference, not a proven optimum; `E_C > 1` is allowed.
+  G3. For Kinds whose `needed` is not prefix-closed (Checkpoint, Window) a
+  second, fallback-aware Belady also counts every earlier resume point as a
+  use, and `H*_C` is the best of the candidate stores (Belady, that variant,
+  LRU), so it is never below `H_lru` (since 2026-10-26; full-only models
+  unchanged). This is a strong reference, not a proven optimum; `E_C > 1` is
+  allowed.
 - References `H_lru` (group-oblivious LRU, everything stored) and `H_freeze`
   (store until full, never evict): reported only, to show how far naive
   policies are from the bar.
@@ -1273,6 +1278,40 @@ the last accepted run record by hand until `--accepted` exists.
       furthest is not stored. Greedy under variable item sizes and blind to
       partial-prefix coherence: a strong reference, not a proven optimum
       (`E_C > 1` is allowed).
+    - Fallback-aware candidate (since 2026-10-26). The use sets above are
+      complete only when every group's `needed` is prefix-closed:
+      `needed(q) ⊆ needed(P)` for every resume point `q < P`, as for Full.
+      A Checkpoint's `needed(q)` is the state at `q`, which `needed(P)` does
+      not contain, so the plain Belady saw every earlier checkpoint as
+      unused, refused or evicted it, and lost the fallback resume point a
+      smaller store needs. LRU kept it and resumed there. On Qwen3.5-4B
+      (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) that put `H*_C` 0.690
+      below `H_lru` 0.794 at `C/U` 0.25 (`E_C` > 1), and below LRU on 239
+      requests at 0.5 (P5-it2 review). `oracle.prefix_closed` checks the
+      property from `semantics.needed` (so from the Kind, never the model
+      name) over the trace's resume points. Where it fails,
+      `belady_fallback` runs too: the same Belady, but a request uses the
+      union of `needed(q)` over every resume point `q` in `(ref, P]`
+      (`resolve`'s step, the lcm of the block sizes). Where it holds, that
+      union is `needed(P)`, so the variant would equal the plain Belady and
+      is not run.
+    - `H*_C` = per segment, the candidate store with the largest `Σ ext*_C`
+      among `belady`, `belady_fallback` (if run) and `lru`, ties in that
+      order. Each candidate is one store of `C` bytes over the whole trace,
+      so the bar is a hit rate some real store reaches, and it is never
+      below `H_lru`. Exact optimality (variable item sizes, all-groups
+      coherence) is not tractable, and neither variant dominates: spreading
+      uses over every fallback point dilutes the greedy choice (P5-it2: the
+      fallback variant is up to 0.005 below the plain one at 0.75). Recorded
+      per segment: `oracle_c_policy` (the winner) and `oracle_c_candidates`
+      (tokens, `ext*_C` tokens and `lru_above_requests` per candidate);
+      `oracle_c_policies` per stage; `diagnostics.oracle_c` stays the plain
+      Belady, with `diagnostics.oracle_c_fallback` next to it.
+      `efficiency_c_own_local` uses the same candidates at the own local
+      hit. Full-only models (Qwen3-4B, DeepSeek-V2-Lite) run the same two
+      stores as before and the plain Belady wins every segment, so their
+      records re-score byte-identical. `E_C` stays reported, not gated;
+      nothing else changes.
     - `H_lru`: group-oblivious LRU, every item stored, a re-store of a
       resident item does not refresh it, a hit refreshes the blocks loaded.
     - `H_freeze`: items stored in arrival order until the next one does not

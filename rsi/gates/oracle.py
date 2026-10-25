@@ -38,6 +38,7 @@ import argparse
 import bisect
 import heapq
 import json
+import math
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -280,6 +281,7 @@ def unique_bytes(
 
 
 _NEVER = 1 << 62  # next-use position of an item no later request needs
+POLICIES = ("belady", "belady_fallback", "lru", "freeze")
 
 
 def _chain(r: dict[str, Any], bt: int, b: int) -> str:
@@ -308,6 +310,74 @@ def _external_keys(
     does not already hold, without duplicates."""
     have = set(_needed_keys(kinds, r, local))
     return [x for x in dict.fromkeys(_needed_keys(kinds, r, p)) if x not in have]
+
+
+def _step(kinds: list[tuple[str, Any, int]]) -> int:
+    """Token step of the resume points ``resolve`` probes: lcm of the
+    non-scratch block sizes."""
+    return math.lcm(*(bt for label, _, bt in kinds if label != "scratch"))
+
+
+def _fallback_keys(
+    kinds: list[tuple[str, Any, int]], r: dict[str, Any], p: int, local: int
+) -> list[tuple[int, str]]:
+    """Blocks request ``r`` loads to resume at *some* point ``q`` in
+    ``(local, p]`` (``resolve``'s step): the union of ``needed(q)`` over those
+    points, minus what ``needed`` at ``local`` holds. Equal to
+    :func:`_external_keys` at ``p`` for groups whose ``needed`` is
+    prefix-closed (Full); adds every earlier checkpoint for Checkpoint groups.
+
+    Relies on ``needed(q)``'s ends being non-decreasing in ``q`` (every Kind),
+    so the blocks new at ``q`` are ``[max(lo, seen), hi)``.
+    """
+    if p <= local:
+        return []
+    have = set(_needed_keys(kinds, r, local))
+    step = _step(kinds)
+    points = list(range((local // step + 1) * step, p + 1, step))
+    if not points or points[-1] != p:
+        points.append(p)
+    out = []
+    for gi, (label, g, bt) in enumerate(kinds):
+        if label == "scratch":
+            continue
+        seen = prev_lo = 0
+        for q in points:
+            lo, hi = sem.needed(g, q)
+            if lo < prev_lo:
+                raise ValueError(f"oracle: needed() of group {gi} moves back at {q} tokens")
+            prev_lo = lo
+            for b in range(max(lo, seen), hi):
+                if (gi, key := _chain(r, bt, b)) not in have:
+                    out.append((gi, key))
+            seen = max(seen, hi)
+    return list(dict.fromkeys(out))
+
+
+def prefix_closed(spec: dict[str, Any], reqs: list[dict[str, Any]]) -> bool:
+    """Whether every group's ``needed(q)`` is a subset of ``needed(p)`` for
+    all resume points ``q < p`` up to the longest prompt of the trace (from
+    ``semantics.needed``, so from the Kind: true for Full, false for
+    Checkpoint and for Window once ``p`` exceeds the window). Only then does
+    the use set at the unlimited resume point already cover every fallback
+    resume point a smaller store may give."""
+    kinds = _active(spec)
+    if not kinds:
+        return True
+    step = _step(kinds)
+    top = max((r["prompt_len"] for r in reqs), default=0)
+    for label, g, _ in kinds:
+        if label == "scratch":
+            continue
+        lo_min = hi_max = None  # hull of the non-empty earlier ranges
+        for p in range(step, top + 1, step):
+            lo, hi = sem.needed(g, p)
+            if lo_min is not None and (lo > lo_min or hi < hi_max):
+                return False
+            if lo < hi:
+                lo_min = lo if lo_min is None else min(lo_min, lo)
+                hi_max = hi if hi_max is None else max(hi_max, hi)
+    return True
 
 
 def _resolve(
@@ -343,7 +413,7 @@ def simulate(
     Same store events and visibility as :func:`replay`, same ``resolve``
     scoring; only residency differs.
 
-    - ``policy="belady"`` (``H*_C``): an item's next use is the next request
+    - ``policy="belady"``: an item's next use is the next request
       (by first schedule) whose unlimited-oracle resolved prefix needs it
       (``semantics.needed`` at that request's unlimited ``P``). An arriving
       item with no next use is not stored; otherwise items with the furthest
@@ -351,6 +421,13 @@ def simulate(
       it is itself the furthest. Clairvoyant and Kind-aware through the use
       sets, but greedy under variable item sizes and blind to coherence of
       partial prefixes: a strong reference, not a proven optimum.
+    - ``policy="belady_fallback"``: the same, but a request uses every block
+      it needs to resume at *any* point ``q <= P`` (:func:`_fallback_keys`),
+      so a store too small for ``needed(P)`` still keeps a fallback resume
+      point. Identical to ``belady`` when every group's ``needed`` is
+      prefix-closed (:func:`prefix_closed`: Full), different for Checkpoint
+      (the checkpoint at ``q < P`` is not in ``needed(P)``) and Window.
+      ``H*_C`` is the best of these and LRU (:func:`summarize_capacity`).
     - ``policy="lru"`` (``H_lru``): group-oblivious LRU, every item stored, a
       re-store of a resident item does not refresh it (as the server's
       ``insert`` on an existing key), a hit refreshes the blocks loaded.
@@ -364,7 +441,7 @@ def simulate(
     resident then plus that request's recorded local hit (e.g. a checkpoint
     whose full-attention prefix was evicted).
     """
-    if policy not in ("belady", "lru", "freeze"):
+    if policy not in POLICIES:
         raise ValueError(f"unknown policy {policy!r}")
     kinds = _active(spec)
     if not kinds:
@@ -376,13 +453,15 @@ def simulate(
         unlimited = replay(spec, reqs)
     if local is None:
         local = [r["local_hit"] or 0 for r in reqs]
+    use_keys = _fallback_keys if policy == "belady_fallback" else _external_keys
+    clairvoyant = policy in ("belady", "belady_fallback")
 
     # Use positions per item (positions in schedule order, increasing).
     uses: dict[tuple[int, str], list[int]] = {}
-    for t, i in enumerate(order):
-        r = reqs[i]
-        for item in _external_keys(kinds, r, unlimited[i], local[i]):
-            uses.setdefault(item, []).append(t)
+    if clairvoyant:
+        for t, i in enumerate(order):
+            for item in use_keys(kinds, reqs[i], unlimited[i], local[i]):
+                uses.setdefault(item, []).append(t)
 
     def next_use(item: tuple[int, str], t: int) -> int:
         u = uses.get(item)
@@ -405,7 +484,7 @@ def simulate(
     passes: dict[str, Any] = {}
     # resident: item -> next use (belady) or insertion counter (lru, ordered).
     resident: dict[tuple[int, str], int] | OrderedDict[tuple[int, str], int]
-    resident = {} if policy == "belady" else OrderedDict()
+    resident = {} if clairvoyant else OrderedDict()
     heap: list[tuple[int, int, str]] = []  # (-next_use, group, key), lazy
     used = 0
 
@@ -497,8 +576,8 @@ def simulate(
             for item in _external_keys(kinds, r, hits[i], lo):
                 if item in resident:
                     resident.move_to_end(item)
-        elif policy == "belady":
-            for item in _external_keys(kinds, r, unlimited[i], lo):
+        elif clairvoyant:
+            for item in use_keys(kinds, r, unlimited[i], lo):
                 if item in resident:
                     nu = next_use(item, t + 1)
                     resident[item] = nu
@@ -535,6 +614,14 @@ def external_load_bytes(
     return total
 
 
+def oracle_c_policies(spec: dict[str, Any], reqs: list[dict[str, Any]]) -> tuple[str, ...]:
+    """Candidate stores for ``H*_C``. ``belady_fallback`` only where some
+    group's ``needed`` is not prefix-closed: elsewhere it is ``belady``."""
+    if prefix_closed(spec, reqs):
+        return ("belady", "lru")
+    return ("belady", "belady_fallback", "lru")
+
+
 def summarize_capacity(
     spec: dict[str, Any],
     reqs: list[dict[str, Any]],
@@ -548,8 +635,18 @@ def summarize_capacity(
     reference local hit (``ref_local[i]``: the baseline arm's local hit for
     the same workload position; the arm's own local hit where ``None`` or
     when ``ref_local`` is not given, counted as ``unmatched``), ``o`` =
-    unlimited oracle, ``oc`` / ``lr`` / ``fz`` = Belady / LRU / freeze at
+    unlimited oracle, ``oc`` = ``H*_C`` / ``lr`` / ``fz`` = LRU / freeze at
     capacity (all simulated with ``ref`` as the local hit).
+
+    ``H*_C`` per segment is the best of the candidate stores
+    (:func:`oracle_c_policies`): ``belady`` and ``lru``, plus
+    ``belady_fallback`` when some group's ``needed`` is not prefix-closed.
+    Each candidate is one store run over the whole trace, so the segment's
+    bar is a hit some store of ``C`` bytes reaches; the segment picks the one
+    with the largest ``Σ ext*_C`` (``oracle_c_policy``, ties in candidate
+    order; every candidate's tokens in ``oracle_c_candidates``). Exact
+    optimality (variable item sizes, all-groups coherence) is not tractable,
+    so this is a lower bound on the optimum that is never below ``H_lru``.
 
     - ``ext = max(0, min(a, o) - max(ref, own))`` (capped by the unlimited
       oracle, so a connector cannot score above what an unlimited store could
@@ -558,7 +655,7 @@ def summarize_capacity(
     - ``ext*_C = max(0, oc - ref)``; ``efficiency_c`` (``E_C``) = Σext / Σext*_C
     - ``lru_vs_oracle_c`` / ``freeze_vs_oracle_c`` = Σmax(0, lr|fz - ref) / Σext*_C
     - ``efficiency_c_own_local``: the same ratio with the arm's own local hit
-      for both ext and ext*_C (diagnostic only).
+      for both ext and ext*_C (the same candidates, own local; diagnostic only).
     - ``*_hit_rate`` = tokens / prompt tokens; ``excess`` as in G3 (unlimited).
     """
     unlimited = replay(spec, reqs)
@@ -571,21 +668,28 @@ def summarize_capacity(
                 matched[i] = False
             else:
                 ref[i] = x
-    belady, bdiag = simulate(spec, reqs, capacity, "belady", unlimited, ref)
-    lru, ldiag = simulate(spec, reqs, capacity, "lru", unlimited, ref)
+    policies = oracle_c_policies(spec, reqs)
+    runs = {k: simulate(spec, reqs, capacity, k, unlimited, ref) for k in policies}
+    lru, ldiag = runs["lru"]
     freeze, _ = simulate(spec, reqs, capacity, "freeze", unlimited, ref)
-    belady_own = (
-        belady if ref == own else simulate(spec, reqs, capacity, "belady", unlimited, own)[0]
+    runs_own = (
+        {k: h for k, (h, _) in runs.items()}
+        if ref == own
+        else {k: simulate(spec, reqs, capacity, k, unlimited, own)[0] for k in policies}
     )
     kinds = group_kinds(spec)
     block = max((bt for _, g, bt in kinds if g is not None), default=0)
+    diagnostics = {"oracle_c": runs["belady"][1], "lru": ldiag}
+    if "belady_fallback" in runs:
+        diagnostics["oracle_c_fallback"] = runs["belady_fallback"][1]
     out: dict[str, Any] = {
         "capacity_bytes": capacity,
         "kinds": [label for label, _, _ in kinds],
-        "diagnostics": {"oracle_c": bdiag, "lru": ldiag},
+        "oracle_c_policies": list(policies),
+        "diagnostics": diagnostics,
     }
-    names = ("prompt", "actual", "local", "ref", "o", "oc", "lr", "fz", "ext", "ext_c",
-             "ext_lru", "ext_fz", "ext_own", "ext_c_own", "excess", "unmatched")  # fmt: skip
+    names = ("prompt", "actual", "local", "ref", "o", "lr", "fz", "ext", "ext_lru",
+             "ext_fz", "ext_own", "excess", "unmatched")  # fmt: skip
     for name, labels in (segments or {"all": None}).items():
         part = [i for i, r in enumerate(reqs) if labels is None or r.get("pass") in labels]
         t = dict.fromkeys(names, 0)
@@ -598,18 +702,26 @@ def summarize_capacity(
             t["local"] += lo
             t["ref"] += rl
             t["o"] += o
-            t["oc"] += belady[i]
             t["lr"] += lru[i]
             t["fz"] += freeze[i]
             t["ext"] += max(0, min(a, o) - max(rl, lo))
-            t["ext_c"] += max(0, belady[i] - rl)
             t["ext_lru"] += max(0, lru[i] - rl)
             t["ext_fz"] += max(0, freeze[i] - rl)
             t["ext_own"] += max(0, min(a, o) - lo)
-            t["ext_c_own"] += max(0, belady_own[i] - lo)
             t["excess"] += max(0, a - max(o, lo))
             t["unmatched"] += not matched[i]
-        p, ec = t["prompt"], t["ext_c"]
+        cand = {
+            k: {
+                "tokens": sum(h[i] for i in part),
+                "ext_tokens": sum(max(0, h[i] - ref[i]) for i in part),
+                "lru_above_requests": sum(lru[i] > h[i] for i in part),
+            }
+            for k, (h, _) in runs.items()
+        }
+        best = max(policies, key=lambda k: cand[k]["ext_tokens"])  # first of equals
+        oc, ec = cand[best]["tokens"], cand[best]["ext_tokens"]
+        ec_own = max(sum(max(0, h[i] - own[i]) for i in part) for h in runs_own.values())
+        p = t["prompt"]
         out[name] = {
             "requests": len(part),
             "unmatched_requests": t["unmatched"],
@@ -620,8 +732,10 @@ def summarize_capacity(
             "hit_rate": t["actual"] / p if p else 0.0,
             "oracle_tokens": t["o"],
             "oracle_hit_rate": t["o"] / p if p else 0.0,
-            "oracle_c_tokens": t["oc"],
-            "oracle_c_hit_rate": t["oc"] / p if p else 0.0,
+            "oracle_c_tokens": oc,
+            "oracle_c_hit_rate": oc / p if p else 0.0,
+            "oracle_c_policy": best,
+            "oracle_c_candidates": cand,
             "lru_tokens": t["lr"],
             "lru_hit_rate": t["lr"] / p if p else 0.0,
             "freeze_hit_rate": t["fz"] / p if p else 0.0,
@@ -632,7 +746,7 @@ def summarize_capacity(
             "efficiency_c": t["ext"] / ec if ec else None,
             "lru_vs_oracle_c": t["ext_lru"] / ec if ec else None,
             "freeze_vs_oracle_c": t["ext_fz"] / ec if ec else None,
-            "efficiency_c_own_local": t["ext_own"] / t["ext_c_own"] if t["ext_c_own"] else None,
+            "efficiency_c_own_local": t["ext_own"] / ec_own if ec_own else None,
             "excess_tokens": t["excess"],
             "excess_limit": block * len(part),
         }

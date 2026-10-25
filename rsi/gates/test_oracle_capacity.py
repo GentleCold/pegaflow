@@ -152,6 +152,89 @@ def test_lru_strands_checkpoints_belady_keeps_coherent_prefixes():
     assert _by_pass(reqs, lru, "b") < _by_pass(reqs, belady, "b")
 
 
+def _fallback_trace() -> list[dict]:
+    """One document, three requests (Qwen3.5 P5 it2 shape, minimized).
+    r0 (3 blocks) stores full 0-2 and checkpoints 1, 2 (its steps end at 8
+    and 12, not 4). r1 (1 block) stores checkpoint 0. r2 (3 blocks) resumes
+    at 12 with an unlimited store: full 0-2 + checkpoint 2, four blocks."""
+    return [
+        _req("d", 3, 1, "a") | {"progress": [[1, 2 * BT], [2, 3 * BT], [3, 3 * BT + 1]]},
+        _req("d", 1, 6, "a"),
+        _req("d", 3, 10, "a"),
+    ]
+
+
+SWA = _group(1, "SlidingWindowSpec", ["SlidingWindowSpec", "AttentionSpec", "KVCacheSpec"])
+SWA["spec"]["sliding_window"] = BT + 1  # Window{BT}: the last block before p
+
+
+@pytest.mark.parametrize(
+    "spec,reqs,items,policy,oc",
+    [
+        # 3 blocks of room, r2 needs 4 at P. needed(P) holds no earlier
+        # checkpoint, so old Belady sees checkpoint 0 unused and drops it
+        # (r2: 0). LRU keeps it and resumes at 4. The fallback-aware use set
+        # (every checkpoint <= P) keeps full 0-1 + checkpoint 1: 8, the
+        # optimum for 3 blocks.
+        (_spec(FULL, CKPT), _fallback_trace(), 3, "belady_fallback", 2 * BT),
+        # Qwen3.5 shape: 3 GDN groups + full; 5 blocks of room = full 0-1 +
+        # three checkpoints 1 (P = 12 needs 6).
+        (QWEN35_SPEC, _fallback_trace(), 5, "belady_fallback", 2 * BT),
+        # Full only: needed is prefix-closed, so the candidates are old
+        # Belady and LRU and Belady wins (the old H*_C exactly).
+        (CYCLIC[0], CYCLIC[1], 8, "belady", None),
+    ],
+    ids=["checkpoint-fallback", "qwen3.5-fallback", "full-only-cyclic"],
+)
+def test_oracle_c_is_never_below_lru(spec, reqs, items, policy, oc):
+    """H*_C = the best of the candidate stores, each one simulated over the
+    whole trace: never below H_lru on a segment, and identical to the old
+    Belady where every group's ``needed`` is prefix-closed (Full)."""
+    cap = items * PAGE * LAYERS
+    out = oracle.summarize_capacity(spec, reqs, cap)
+    w = out["all"]
+    assert w["ext_oracle_c_tokens"] >= w["ext_lru_tokens"], w
+    assert w["oracle_c_policy"] == policy
+    belady, bdiag = oracle.simulate(spec, reqs, cap, "belady")
+    assert out["diagnostics"]["oracle_c"] == bdiag
+    if policy == "belady":
+        assert out["oracle_c_policies"] == ["belady", "lru"]
+        assert "oracle_c_fallback" not in out["diagnostics"]
+        assert w["oracle_c_tokens"] == sum(belady) > w["lru_tokens"]
+    else:
+        assert sum(belady) < w["lru_tokens"] < w["oracle_c_tokens"] == oc
+        assert w["oracle_c_candidates"]["belady"]["lru_above_requests"] == 1
+        assert w["oracle_c_candidates"][policy]["lru_above_requests"] == 0
+        assert w["oracle_c_tokens"] <= sum(oracle.replay(spec, reqs))
+
+
+@pytest.mark.parametrize(
+    "spec,plen_blocks,closed",
+    [
+        (_spec(FULL), 6, True),
+        (_spec(FULL, CKPT), 6, False),
+        (_spec(FULL, SWA), 1, True),  # prompts within the window: like Full
+        (_spec(FULL, SWA), 6, False),  # the window slides past block 0
+        (QWEN35_SPEC, 6, False),
+    ],
+    ids=["full", "full+checkpoint", "window-short", "window-long", "qwen3.5"],
+)
+def test_fallback_use_set_differs_only_where_needed_is_not_prefix_closed(spec, plen_blocks, closed):
+    """``prefix_closed`` (from ``semantics.needed``, i.e. the Kind) decides
+    whether ``belady_fallback`` runs; where it holds, the fallback use set is
+    the old one, so a full-only bar cannot move."""
+    reqs = [_req("p", plen_blocks, 1, "a")]
+    assert oracle.prefix_closed(spec, reqs) is closed
+    assert ("belady_fallback" not in oracle.oracle_c_policies(spec, reqs)) is closed
+    kinds = oracle._active(spec)
+    p = plen_blocks * BT
+    for lo in (0, BT):
+        old = set(oracle._external_keys(kinds, reqs[0], p, lo))
+        new = set(oracle._fallback_keys(kinds, reqs[0], p, lo))
+        assert old <= new
+        assert (old == new) is closed
+
+
 def test_summarize_capacity_caps_ext_by_unlimited_oracle():
     """A connector claiming more than the unlimited store could serve gets no
     E_C credit for it, and is counted as excess."""
