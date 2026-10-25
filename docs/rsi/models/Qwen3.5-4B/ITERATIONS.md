@@ -589,3 +589,109 @@ No. The tools stay outside the repo, as P4's did.
   `p5_check.py`. Whether they belong in the gate is the gate owner's call.
 - The tools stay until Qwen3.5-4B passes G2 on the hybrid gate, and are
   then deleted.
+
+## it2 (2026-10-25): hybrid gate slices, pinned saves
+
+Branch `feat/rsi-qwen3.5-4b`. Merged `feat/semantics-rsi` (f8eac30,
+hybrid gate) as 6f4aff1 and `feat/rsi-deepseek-v2-lite` (563a693, P4
+accepted) as 554ad9d. Base server `pegaflow-semantics-rsi` 056eb4b. GPU5
+only. Every slice runs with `--under-test-path <git-archive tree>/python`
+and is checked against vllm.log `from=`.
+
+Merge notes for the reviewer:
+- P4 put `storage_tp` into the layout namespace, so the Qwen3-4B test
+  vector `QWEN3_NAMESPACE_V1` moved from cf6b5725 / cd8acc0c to a25ea150 /
+  bdda8997 (stub / native). The P4 review covered this. The new values are
+  what 563a693 computes on its own.
+- `plan_saves(..., kv_usage=, offers=)`: P4's one GroupSave per
+  (storage group, request) applies to the checkpoint groups and the full
+  group alike.
+
+### Slice s1 (25fcccb): correctness passes, G4 cold and G5 cap fail
+
+Run `2026-10-25-qwen3.5-4b-p5-it2-s1-25fcccb`: arms plain, baseline, old,
+native, v2; gsm8k 128, replay 8 x 6, cap 8 x 6 at 0.25/0.5/0.75, preempt.
+Not official (slice, capacity floor 0.05x GPU KV).
+
+Correctness of v2, all pass:
+- digests: gsm8k 80/80 external, 1515 local, computed 5/5; replay 39/39;
+  preempt 106/106 external (18 preempted requests, 56 resumed-episode
+  loads); `G2.digest_groups` [0, 1, 2, 3];
+- accuracy: `alone_ref` 0.7188 = baseline;
+- G3 `E_ext` 1.0 on gsm8k, replay and preempt, no evictions.
+
+G4 (v2 / old / native / baseline):
+
+| metric | v2 | old | native | baseline |
+|---|---|---|---|---|
+| warm TTFT p50 (warm2/warm3) | 0.138/0.116 | 0.167/0.167 | 0.121/0.123 | 0.210/0.207 |
+| warm req/s | 6.87/6.86 | 6.70/6.70 | 6.47/6.49 | 5.40/5.40 |
+| cold TTFT p50 | 0.278 (+27.5%) | 0.346 | 0.224 | 0.218 |
+| cold req/s | 4.805 (-6.2%) | 4.801 | 5.084 | 5.124 |
+| gsm8k cold s (128 q) | 12.166 (+2.7%) | 10.719 | 12.132 | 11.844 |
+
+Hits, unlimited pool (local / ext / total; H* is the unlimited oracle):
+
+| pass | v2 | old | native | H* | E_ext v2 |
+|---|---|---|---|---|---|
+| replay warm | 0.678 / 0.257 / 0.936 | 0 / 0.936 / 0.936 | 0.678 / 0.257 / 0.936 | 0.936 | 1.0 |
+| gsm8k warm | 0.818 / 0.109 / 0.926 | 0 / 0.926 / 0.926 | 0.919 / 0.007 / 0.926 | 0.926 | 1.0 |
+| preempt warm | 0.667 / 0.261 / 0.928 | 0 / 0.928 / 0.928 | 0.870 / 0.058 / 0.928 | 0.928 | 1.0 |
+
+lmcache: pending (`feat/rsi-gate-lmcache` is not merged).
+
+G4 cold cost attribution: checkpoint layouts saved synchronously. Over the
+replay cold window the `save stats` show 34 save steps, `flush_ms`
+1517.7 of 33.5 s, `wait_ms` 1254 (waiting for the forward), `rpc_ms`
+261, `max_job_ms` 109. Every chunk that ends on a 528 boundary blocks the
+step until its 24 GDN pages and attention block have been copied. That
+accounts for the cold TTFT and req/s gap. H1 below targets it.
+
+`hit stats` never reached vllm.log. The API server force-kills EngineCore
+at teardown, so `Scheduler.shutdown` never runs. bc9c38a logs the counters
+when the last live request finishes and at most every 30 s.
+
+### Slice s2cap (d2a484d): the 0-byte cap is a sub-floor pool
+
+Cap only, baseline + v2, 8 x 6, f = 0.5: C = 1.63 GiB = 0.05x GPU KV
+(33.29 GB). The gate's floor is 2x, so this run supports no G5
+conclusion. What it shows:
+- v2 loaded 0 bytes. `hit stats` `missing=1,2,3` 4 of 160 lookups (lost
+  4224 tokens): the full group backed a resume point and every GDN group
+  had been evicted.
+- per pass the server evicted 176-265 blocks of ~17 MB (3.3-5.0 GB
+  reclaimed) against ~3.5 GB saved, leaving 21-30 resident blocks. One
+  reclaim round is `RECLAIM_BATCH_SIZE = 512` blocks, more than the whole
+  pool (~100 blocks), and eviction is per (hash, group) key. Both are listed
+  under PROGRESS "Server limitations" and marked sub-floor.
+- H*_C 0.870, H_lru 0.734, H_freeze 0.846, v2 hit 0.720 (= baseline
+  local).
+
+Official sizing (gate `plan_cap_convs`, reported to the orchestrator, fix
+assigned to the gate owner): `--cap-convs auto` picks 203 of 256
+conversations at estimated U 147.1 GB (need 146.5). At 8 x 6 the estimate
+is 4.47 GB against 3.49 GB measured (0.78), so the measured floor likely
+misses at 203. The official run waits for the sizing branch.
+
+### H1 (5667cd7): pin saved blocks instead of saving synchronously
+
+Change (model-agnostic; it applies to every layout that saved
+synchronously before):
+- The scheduler pins each planned save's blocks in vLLM's `BlockPool`
+  (`touch`, one reference per block) when it builds the plan, and unpins
+  them (`free_blocks`) once every worker reports that step's saves done.
+  The report is `PegaWorkerMetadata.saved_through`, aggregated as the min
+  over ranks.
+- A pinned block stays out of the free queue, so vLLM can neither hand it
+  out again nor zero or COW-copy into it before `handle_preemptions`
+  runs. That covers the V2 runner's zeroing order as well as reuse.
+- These layouts drop the preemption flush and the finish hold, and are
+  not batched, so pins stay short. `has_pending_push_work` keeps the
+  engine stepping until the pins are released. If no block pool was
+  bound, saves are disabled (fail closed).
+- Unit tests: `test_pinned_saves_hold_blocks_until_every_worker_saved`,
+  `test_pinned_saves_fail_closed_without_a_pool`,
+  `test_pinned_worker_reports_saved_through`.
+
+Prediction: cold replay TTFT p50 and req/s within 2% of baseline, `save
+stats` `flush_ms` ~0. Correctness unchanged: digests, preempt, alone_ref.

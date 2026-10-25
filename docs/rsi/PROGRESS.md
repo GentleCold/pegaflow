@@ -86,7 +86,14 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   queries from its local hit and never refreshes them; v2 queries from
   block 0. Proposal H5: opt-in tail-first eviction in the retained class.
 - Not group-coherent: a resume point needs every group, but each group key
-  is evicted on its own (matters for hybrid models; not measured yet).
+  is evicted on its own. Seen on Qwen3.5-4B, but only on a sub-floor pool
+  (P5 it2 s2cap d2a484d, C = 1.63 GiB = 0.05x GPU KV, so no G5 conclusion):
+  `hit stats` `missing=1,2,3` in 4 of 160 lookups, meaning the full group
+  backed a resume point and all three GDN groups were evicted; 0 bytes
+  loaded. On that pool one reclaim round (`RECLAIM_BATCH_SIZE` 512 blocks
+  of ~17 MB) exceeds the whole pool (~100 blocks): 176-265 evictions and
+  3.3-5.0 GB reclaimed per pass against ~3.5 GB saved, 21-30 blocks resident
+  at pass end. Needs re-measuring at the official cap size.
 
 ### Gate changes
 
