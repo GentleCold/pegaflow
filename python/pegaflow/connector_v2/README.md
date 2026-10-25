@@ -29,10 +29,13 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   group and uses the server's prefix query, which can prefetch. The other
   groups use membership queries (local only for now). A model without a full
   group is `Unsupported`.
-  - Group 0 is queried first. Its contiguous hit, floored to the resume
-    step, bounds every hit: if that bound (or, before any query, the
-    prompt's own bound) is not past vLLM's local hit, no other group is
-    queried. vLLM re-queries a waiting request every scheduling pass.
+  - vLLM re-queries a waiting request every scheduling pass, so queries
+    that cannot beat vLLM's local hit are skipped. The bound is
+    `semantics.resolve` with every unqueried group's blocks counted as
+    present, checked before any query and again after group 0. If it is
+    not past the local hit, the remaining groups are not queried and
+    create no lease (group 0's lease is released). A full-only layout
+    skips only when no full block lies past the local hit.
   - `semantics.resolve` gives the longest legal `p`. `policy.accept` may lower it.
   - Only the blocks in `semantics.needed(g, p)` that are past vLLM's local hit get loaded.
   - Leases that cover none of those blocks are released immediately. Unwanted

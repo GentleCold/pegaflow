@@ -899,30 +899,61 @@ def test_miss_attribution_names_the_missing_group(sem):
 
 @BOTH
 @pytest.mark.parametrize(
-    ("num_computed", "full_ans", "queried", "released", "stats"),
+    ("specs", "num_computed", "full_ans", "queried", "released", "stats"),
     [
-        # 13 tokens: the largest resume point is 12 = the local hit, no query.
-        pytest.param(12, Ready(3, b"F"), [], [], {}, id="local-hit-is-max"),
-        # Group 0 backs only 8 = the local hit: stop before the checkpoint group.
-        pytest.param(8, Ready(2, b"F"), [0], [b"F"], {}, id="full-bound-at-local-hit"),
-        # Group 0 backs 12 > 8: the checkpoint group is queried as before (its
-        # state at 4 does not help, so 12 is attributed to it as a miss).
+        # Full only (Qwen3-4B / DSV2 shape), 13 tokens: the prompt's last
+        # loadable block ends at 12 = the local hit, so nothing is queried.
         pytest.param(
+            (StubFullSpec(),), 12, Ready(3, b"F"), [], [], {}, id="full-only-local-hit-is-max"
+        ),
+        # Full only, one block past the local hit: queried as before; with a
+        # single group nothing else is skipped.
+        pytest.param(
+            (StubFullSpec(),), 8, Ready(2, b"F"), [0], [b"F"], {}, id="full-only-one-block-past"
+        ),
+        # Hybrid, same block size: group 0 backs only 8 = the local hit, so
+        # the checkpoint group is not queried (no lease is created for it).
+        pytest.param(
+            (StubCheckpointSpec(), StubFullSpec()),
+            8,
+            Ready(2, b"F"),
+            [0],
+            [b"F"],
+            {},
+            id="hybrid-full-bound-at-local-hit",
+        ),
+        # Hybrid, group 0 backs 12 > 8: the checkpoint group is queried as
+        # before (its state at 4 does not help, so 12 is counted as its miss).
+        pytest.param(
+            (StubCheckpointSpec(), StubFullSpec()),
             8,
             Ready(3, b"F"),
             [0, 1],
             [b"F", b"C"],
             {"missing=1": 1, "lost_tokens": 4},
-            id="full-bound-past-local-hit",
+            id="hybrid-full-bound-past-local-hit",
+        ),
+        # Hybrid, checkpoint block 2 x the full block: the resume step is 8,
+        # the next one (16) lies past the 13-token prompt. The full group
+        # alone could reach 12, but no legal resume point beats 8: no query.
+        pytest.param(
+            (StubCheckpointSpec(block_size=2 * BT), StubFullSpec()),
+            8,
+            Ready(3, b"F"),
+            [],
+            [],
+            {},
+            id="hybrid-next-resume-step-past-prompt",
         ),
     ],
 )
 def test_lookup_skips_queries_that_cannot_beat_the_local_hit(
-    sem, num_computed, full_ans, queried, released, stats
+    sem, specs, num_computed, full_ans, queried, released, stats
 ):
-    """vLLM re-queries every waiting request each scheduling pass: no group
-    is queried once no resume point past vLLM's local hit is possible."""
-    layout = _layout(sem, StubCheckpointSpec(), StubFullSpec())
+    """vLLM re-queries every waiting request each scheduling pass: groups
+    are not queried once no resume point past vLLM's local hit is possible
+    (``semantics.resolve`` over what the unqueried groups could hold)."""
+    layout = _layout(sem, *specs)
     sched, rpc = _sched(sem, {0: full_ans, 1: Ready(1, b"C", [0])}, layout=layout)
     assert sched.get_num_new_matched_tokens(_req(), num_computed) == (0, False)
     assert (rpc.queried, rpc.released) == (queried, released)

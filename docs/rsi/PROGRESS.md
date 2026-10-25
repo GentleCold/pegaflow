@@ -1063,10 +1063,13 @@ local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
   saves: 6046 prefix queries for 2703 lookups, each pass 4 group queries
   + lease releases for a hit that cannot beat vLLM's local 1056 tokens.
 - P5 it2 hypothesis H2 (next): skip lookups that cannot beat vLLM's
-  local hit (no query when `(num_tokens - 1) // step * step <=
-  num_computed`; query group 0 first and stop if its contiguous bound
-  is not past the local hit). Measure: gsm8k cold/warm s, replay cold
-  TTFT p50 vs baseline; correctness unchanged.
+  local hit. The bound is `semantics.resolve` over optimistic answers
+  (unqueried groups count as fully present), checked before any query
+  and after group 0. Full-only layouts skip only when no full block lies
+  past the local hit. A skipped group creates no lease. No policy knob.
+  Measure: gsm8k cold/warm s, replay cold TTFT p50 vs baseline (read
+  replay cold p50 on the official-size run; the slice is noisy).
+  Correctness unchanged.
 - P4 final-review fixes (`reviews/P4-final.md`, ACCEPT-WITH-FIXES).
   Changes are in connector_v2's scheduler, its unit test and the docs; no
   semantics or server change.

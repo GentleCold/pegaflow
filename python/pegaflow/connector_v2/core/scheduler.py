@@ -248,33 +248,49 @@ class Scheduler:
         return n, not hit.sync
 
     def _lookup(self, request: Any, num_computed: int) -> _Lookup:
-        """Query the server, storage group 0 first. Every hit is bounded by
-        group 0's contiguous prefix (it is a full group), floored to the
-        resume step: once that bound is not past vLLM's local hit, no group
-        can extend it, so the remaining groups are not queried (vLLM
-        re-queries every waiting request on every scheduling pass)."""
+        """Query the server, storage group 0 first.
+
+        vLLM re-queries every waiting request on every scheduling pass, so
+        queries that cannot beat vLLM's local hit are skipped. The bound is
+        ``semantics.resolve`` over optimistic answers (every block of a group
+        not yet queried present): before any query, then after group 0. If
+        it is not past ``num_computed``, no answer from the remaining groups
+        can make a hit. For a full-only layout that is "no full block past
+        the local hit"; with a checkpoint group it is the next resume step.
+        A skipped group creates no lease; group 0's lease is released.
+        """
         layout = self._layout
-        step = layout.step
+        groups = [g.sem for g in layout.groups]
         # resolve keeps the last token for vLLM, so blocks past it are never needed.
         limit_tokens = max(request.num_tokens - 1, 0)
+        hashes = [
+            layout.group_hashes(g, request.block_hashes)[: limit_tokens // g.sem.block_tokens]
+            for g in layout.groups
+        ]
+        everything = [frozenset(range(len(h))) for h in hashes]
+
+        def cannot_beat_local(known: list[frozenset[int]]) -> bool:
+            try:
+                bound = self._sem.resolve(
+                    groups, known + everything[len(known) :], request.num_tokens
+                )
+            except Exception:
+                return False  # only a shortcut: query as usual, _plan_hit reports it
+            return bound <= num_computed
+
         none = tuple(frozenset() for _ in layout.groups)
-        g0 = layout.groups[0]
-        bt0 = g0.sem.block_tokens
-        hashes0 = layout.group_hashes(g0, request.block_hashes)[: limit_tokens // bt0]
-        if len(hashes0) * bt0 // step * step <= num_computed:
-            return _Lookup([], none, False)  # no legal resume point past the local hit
+        if cannot_beat_local([]):
+            return _Lookup([], none, False)
         leases: list[_Lease] = []
         present: list[frozenset[int]] = []
         loading = False
         try:
             for sid, g in enumerate(layout.groups):
-                hashes = hashes0 if sid == 0 else layout.group_hashes(g, request.block_hashes)
-                hashes = hashes[: limit_tokens // g.sem.block_tokens]
-                if not hashes or g.sem.kind == "scratch":
+                if not hashes[sid] or g.sem.kind == "scratch":
                     present.append(frozenset())
                     continue
                 ans = self._rpc.query_prefetch(
-                    self._instance_id, hashes, request.request_id, False, sid
+                    self._instance_id, hashes[sid], request.request_id, False, sid
                 )
                 if not hasattr(ans, "num_hit_blocks"):  # QueryLoading
                     loading = True
@@ -286,13 +302,9 @@ class Scheduler:
                 elif positions:
                     raise RuntimeError(f"group {sid}: {len(positions)} hits without a lease")
                 present.append(frozenset(positions))
-                if sid == 0:  # (a loading group 0 has `continue`d above)
-                    contiguous = 0
-                    while contiguous in present[0]:
-                        contiguous += 1
-                    if contiguous * bt0 // step * step <= num_computed:
-                        self._release(leases)
-                        return _Lookup([], (present[0], *none[1:]), False)
+                if sid == 0 and len(layout.groups) > 1 and cannot_beat_local(present):
+                    self._release(leases)
+                    return _Lookup([], (present[0], *none[1:]), False)
         except BaseException:
             self._release(leases)
             raise

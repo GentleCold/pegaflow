@@ -744,16 +744,33 @@ blocks). It has another cause:
 
 ### H2 (next): skip lookups that cannot beat vLLM's local hit
 
-Change (model-agnostic, `Scheduler._lookup`):
-- no query at all when `(num_tokens - 1) // step * step <= num_computed`
-  (no legal resume point lies past vLLM's local hit);
-- query storage group 0 (full, prefix query) first. Its contiguous hit
-  bounds every resume point, so if that bound, floored to `step`, is not
-  past the local hit, release its lease and skip the other groups.
+Change (model-agnostic, `Scheduler._lookup`, no policy knob). The bound is
+`semantics.resolve` run over optimistic answers, where every block of a
+group not yet queried counts as present. So it follows each Kind's own
+resume rule, with no model names and no extra rule:
+- before any query: if the bound is not past `num_computed`, nothing is
+  queried. For a full-only layout (Qwen3-4B, DSV2) that means "the prompt
+  has no loadable full block past the local hit". There the result was
+  already 0, so the only change is one query and one lease fewer. With a
+  checkpoint group the bound is the next resume step past the local hit
+  (528 on Qwen3.5);
+- after storage group 0 (full, prefix query): the same check with group
+  0's real answer. If it fails, group 0's lease is released and the other
+  groups are never queried, so they create no lease;
+- if `resolve` raises inside the shortcut, the lookup queries as before
+  and `_plan_hit` reports the error.
 
-Lookups are still counted in `hit stats`. A skipped group cannot be
-`missing`: the counter only attributes resume points past the local hit.
+Hit and save bookkeeping is unchanged. `_plan_hit` still runs, so the
+lookup is counted in `hit stats`. A skipped group cannot be `missing`,
+because the counter only attributes resume points past the local hit.
+`_hits`, `request_finished` and save planning are untouched.
 
-Prediction: gsm8k cold / warm within 2% of baseline, and replay cold TTFT
-p50 closer to baseline (cold passes query group 0 only). Hits and
-correctness unchanged.
+Unit test `test_lookup_skips_queries_that_cannot_beat_the_local_hit`,
+stub and native: full-only with no block past the local hit and with one
+block past it; hybrid at and past group 0's bound; and a hybrid layout
+whose next resume step lies past the prompt.
+
+Prediction: gsm8k cold / warm within 2% of baseline, replay cold TTFT p50
+closer to baseline. Hits and correctness unchanged. Replay cold p50 is
+judged on the official-size run: the 8 x 6 slice is noisy (P4 saw
+baseline swing 0.171-0.192).
