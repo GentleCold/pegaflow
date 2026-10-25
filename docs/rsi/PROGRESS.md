@@ -849,6 +849,16 @@ names, magic constants that only exist in the old code).
     `spec.json` (retention, `compilation`, `model_runner`, `probe.schema`);
     one plain+baseline gsm8k slice. Until then DSV2 records are re-judged
     with ce645d7.
+- Cap sizing (feat/rsi-gate-cap-sizing): `UniqueEstimate` counted every
+  block boundary of every Checkpoint group, but the oracle stores a
+  Checkpoint block only at step ends on its boundary; Qwen3.5-4B's auto
+  plan (203 conversations, est. 147.05 GB) would have measured below the
+  floor. It now applies the oracle's rules per Kind with vLLM 0.32's
+  align-mode step ends (`prefill_step_ends`). s1 8 x 6: 3.39 GB est vs
+  3.49 GB measured (was 4.47 GB). Official plans: Qwen3-4B 64 and
+  DeepSeek-V2-Lite 76 unchanged (same bytes); Qwen3.5-4B all 256
+  conversations est. 136.33 GB, above the floor (133.15 GB) but under the
+  1.1 margin (146.47 GB). Floor and margin unchanged.
 
 ## Semantics changelog
 
@@ -894,7 +904,7 @@ Each entry: what was added, why, which vectors cover it.
   `G4.replay_cold` and `G4.gsm8k_cold`. It is reported per arm vs baseline
   as `G4.warmup_seconds` (not gated). Needs the user's confirmation.
 - For final acceptance: add rsi/gates tests to CI. PR CI runs
-  `python/tests` only (`ci.yml`), so the 303 gate tests
+  `python/tests` only (`ci.yml`), so the 310 gate tests
   (`rsi/gates/test_oracle_capacity.py`, `test_probe_steps.py`) are a manual
   gate today: whoever changes `rsi/gates` runs them (GATES.md
   "Implementation"). They need the built `pegaflow.semantics`, and
