@@ -210,7 +210,7 @@ class Scheduler:
         self._drop_hit(req_id)
 
         try:
-            lookup = self._lookup(request)
+            lookup = self._lookup(request, num_computed)
         except Exception:
             logger.warning("[PegaKVConnectorV2] query failed req=%s", req_id, exc_info=True)
             self._loading_since.pop(req_id, None)
@@ -247,16 +247,28 @@ class Scheduler:
         self._hits[req_id] = hit
         return n, not hit.sync
 
-    def _lookup(self, request: Any) -> _Lookup:
+    def _lookup(self, request: Any, num_computed: int) -> _Lookup:
+        """Query the server, storage group 0 first. Every hit is bounded by
+        group 0's contiguous prefix (it is a full group), floored to the
+        resume step: once that bound is not past vLLM's local hit, no group
+        can extend it, so the remaining groups are not queried (vLLM
+        re-queries every waiting request on every scheduling pass)."""
         layout = self._layout
+        step = layout.step
         # resolve keeps the last token for vLLM, so blocks past it are never needed.
         limit_tokens = max(request.num_tokens - 1, 0)
+        none = tuple(frozenset() for _ in layout.groups)
+        g0 = layout.groups[0]
+        bt0 = g0.sem.block_tokens
+        hashes0 = layout.group_hashes(g0, request.block_hashes)[: limit_tokens // bt0]
+        if len(hashes0) * bt0 // step * step <= num_computed:
+            return _Lookup([], none, False)  # no legal resume point past the local hit
         leases: list[_Lease] = []
         present: list[frozenset[int]] = []
         loading = False
         try:
             for sid, g in enumerate(layout.groups):
-                hashes = layout.group_hashes(g, request.block_hashes)
+                hashes = hashes0 if sid == 0 else layout.group_hashes(g, request.block_hashes)
                 hashes = hashes[: limit_tokens // g.sem.block_tokens]
                 if not hashes or g.sem.kind == "scratch":
                     present.append(frozenset())
@@ -274,6 +286,13 @@ class Scheduler:
                 elif positions:
                     raise RuntimeError(f"group {sid}: {len(positions)} hits without a lease")
                 present.append(frozenset(positions))
+                if sid == 0:  # (a loading group 0 has `continue`d above)
+                    contiguous = 0
+                    while contiguous in present[0]:
+                        contiguous += 1
+                    if contiguous * bt0 // step * step <= num_computed:
+                        self._release(leases)
+                        return _Lookup([], (present[0], *none[1:]), False)
         except BaseException:
             self._release(leases)
             raise

@@ -1056,6 +1056,17 @@ local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
   asynchronously (no flush in `wait_for_save`, no preemption flush, no
   finish hold). Layouts that save async today are unchanged. Measure: v2
   replay cold TTFT p50 / req/s vs baseline, `save stats` flush_ms.
+- P5 it2 s3 (5667cd7 = H1, not official): correctness all pass (digests
+  in 4 groups, preempt 106/106 ext, alone_ref delta 0, no eviction).
+  `flush_ms` 0; replay cold req/s -1.7% (pass), TTFT p50 +3.8% (fail;
+  s1 +27.5%). gsm8k +5.3% cold/warm (fail) with 1 save step, so not from
+  saves: 6046 prefix queries for 2703 lookups, each pass 4 group queries
+  + lease releases for a hit that cannot beat vLLM's local 1056 tokens.
+- P5 it2 hypothesis H2 (next): skip lookups that cannot beat vLLM's
+  local hit (no query when `(num_tokens - 1) // step * step <=
+  num_computed`; query group 0 first and stop if its contiguous bound
+  is not past the local hit). Measure: gsm8k cold/warm s, replay cold
+  TTFT p50 vs baseline; correctness unchanged.
 - P4 final-review fixes (`reviews/P4-final.md`, ACCEPT-WITH-FIXES).
   Changes are in connector_v2's scheduler, its unit test and the docs; no
   semantics or server change.

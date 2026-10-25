@@ -695,3 +695,65 @@ synchronously before):
 
 Prediction: cold replay TTFT p50 and req/s within 2% of baseline, `save
 stats` `flush_ms` ~0. Correctness unchanged: digests, preempt, alone_ref.
+
+### Slice s3 (5667cd7): H1 result
+
+Run `2026-10-25-qwen3.5-4b-p5-it2-s3-5667cd7`: arms plain, baseline, v2;
+full gsm8k, replay 8 x 6, preempt, cap 8 x 6 at f = 0.5. Not official
+(slice, capacity floor 0.05x GPU KV). vllm.log logs `saves=async-pinned`.
+
+Correctness of v2, all pass: `G2.digest_groups` [0, 1, 2, 3]; gsm8k
+digests 13455 local + 50/50 external, also vs baseline; replay 127 local
++ 39/39 external; preempt 311 local + 106/106 external; `G2.gsm8k`
+alone_ref delta 0.0 pp (0.7188); G3 E_ext 1.0 (gsm8k, replay);
+`G3.no_eviction` 0 in every pass. Accuracy cold / warm 0.7839 / 0.7892
+(baseline 0.7824, plain 0.7892).
+
+G4 (v2 vs baseline):
+
+| metric | s1 (sync saves) | s3 (H1) |
+|---|---|---|
+| replay cold TTFT p50 | +27.5% | 0.2250 vs 0.2167, +3.8% (fail) |
+| replay cold req/s | -6.2% | 5.050 vs 5.137, -1.7% (pass) |
+| replay warm TTFT p50 (warm2/warm3) | 0.138/0.116 vs 0.210/0.207 | 0.140/0.139 vs 0.207/0.209 |
+| replay warm req/s | 6.87/6.86 vs 5.40/5.40 | 6.86/6.87 vs 5.41/5.41 |
+| gsm8k cold / warm s (1319 q) | (128 q: +2.7%) | 99.37 / 99.59 vs 94.41 / 94.60, +5.3% (fail) |
+
+Hits, unlimited pool (local / ext / total = H*): replay warm 0.678 /
+0.257 / 0.936, preempt warm 0.667 / 0.261 / 0.928, gsm8k warm 0.919 /
+0.006 / 0.926. Same as s1. old and native were not run in s3; their s1
+values stand. lmcache: pending.
+
+Replay cold `save stats`: 34 save steps, `flush_ms` 0, saver-thread
+`wait_ms` 1508 and `rpc_ms` 229. Those are off the step thread. H1 holds:
+the save cost is off the step, and req/s is within 2%. TTFT p50 is still
++3.8%.
+
+The gsm8k cost is not from saves. Over the pass there is 1 save step (40
+blocks). It has another cause:
+- plain takes 64.3 s and baseline (probe connector only) 94.4 s. vLLM's
+  connector path costs ~47% on this model before v2 adds anything.
+- the scheduler counted 2703 lookups, but the server logged 6046 prefix
+  queries (vLLM re-queries a waiting request every scheduling pass). Every
+  one returned 2 hit blocks (the 8-shot prefix, 2 x 528).
+- each pass runs `query_prefetch` for all 4 groups, and then releases
+  every lease: vLLM's local hit (1056 tokens) already equals the largest
+  resume point the prompt allows, `(num_tokens - 1) // 528 * 528`. That
+  is ~8 gRPC calls per pass on the scheduler thread, ~48k per gsm8k pass,
+  for a hit that can never beat vLLM's own.
+
+### H2 (next): skip lookups that cannot beat vLLM's local hit
+
+Change (model-agnostic, `Scheduler._lookup`):
+- no query at all when `(num_tokens - 1) // step * step <= num_computed`
+  (no legal resume point lies past vLLM's local hit);
+- query storage group 0 (full, prefix query) first. Its contiguous hit
+  bounds every resume point, so if that bound, floored to `step`, is not
+  past the local hit, release its lease and skip the other groups.
+
+Lookups are still counted in `hit stats`. A skipped group cannot be
+`missing`: the counter only attributes resume points past the local hit.
+
+Prediction: gsm8k cold / warm within 2% of baseline, and replay cold TTFT
+p50 closer to baseline (cold passes query group 0 only). Hits and
+correctness unchanged.

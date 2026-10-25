@@ -291,11 +291,13 @@ class FakeRpc:
     def __init__(self, answers=None):
         self.answers = answers or {}
         self.released: list[bytes] = []
+        self.queried: list[int] = []  # group_id of every query_prefetch call
         self.loads: list[list] = []
         self.load_ok: dict[bytes, bool] = {}
         self.registered: dict | None = None
 
     def query_prefetch(self, instance_id, hashes, req_id, wait_for_full_prefix, group_id):
+        self.queried.append(group_id)
         ans = self.answers[group_id]
         if isinstance(ans, Exception):
             raise ans
@@ -893,6 +895,38 @@ def test_miss_attribution_names_the_missing_group(sem):
     sched.request_finished("r")
     sched.get_num_new_matched_tokens(_req(), 0)
     assert sched.hit_stats == {"lookups": 3, "missing=1": 2, "lost_tokens": 16}
+
+
+@BOTH
+@pytest.mark.parametrize(
+    ("num_computed", "full_ans", "queried", "released", "stats"),
+    [
+        # 13 tokens: the largest resume point is 12 = the local hit, no query.
+        pytest.param(12, Ready(3, b"F"), [], [], {}, id="local-hit-is-max"),
+        # Group 0 backs only 8 = the local hit: stop before the checkpoint group.
+        pytest.param(8, Ready(2, b"F"), [0], [b"F"], {}, id="full-bound-at-local-hit"),
+        # Group 0 backs 12 > 8: the checkpoint group is queried as before (its
+        # state at 4 does not help, so 12 is attributed to it as a miss).
+        pytest.param(
+            8,
+            Ready(3, b"F"),
+            [0, 1],
+            [b"F", b"C"],
+            {"missing=1": 1, "lost_tokens": 4},
+            id="full-bound-past-local-hit",
+        ),
+    ],
+)
+def test_lookup_skips_queries_that_cannot_beat_the_local_hit(
+    sem, num_computed, full_ans, queried, released, stats
+):
+    """vLLM re-queries every waiting request each scheduling pass: no group
+    is queried once no resume point past vLLM's local hit is possible."""
+    layout = _layout(sem, StubCheckpointSpec(), StubFullSpec())
+    sched, rpc = _sched(sem, {0: full_ans, 1: Ready(1, b"C", [0])}, layout=layout)
+    assert sched.get_num_new_matched_tokens(_req(), num_computed) == (0, False)
+    assert (rpc.queried, rpc.released) == (queried, released)
+    assert sched.hit_stats == {"lookups": 1, **stats}
 
 
 def test_hit_stats_logged_when_idle_and_on_cadence():
