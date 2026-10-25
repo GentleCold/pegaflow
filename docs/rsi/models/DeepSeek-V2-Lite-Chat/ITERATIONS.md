@@ -2265,7 +2265,7 @@ The recorded rerun the final review asked for (M1), on the accepted tree
   only. lmcache not run.
 
 Verdicts: v2 passes every verdict (`pass: true`). `G2.digest_self.cap`
-passes: 2219 preempted-uncertain of 488,983 loaded blocks (0.45%), 0
+passes: 2219 preempted-uncertain of 489,905 loaded blocks (0.45%), 0
 mismatched (271616 ext and 213851 local matched). old passes every
 verdict. native fails G0.spec (by construction), its usual
 `G2.digest_vs_baseline.gsm8k` (layout) and G4 gsm8k (+6.4%).
