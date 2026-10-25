@@ -158,7 +158,7 @@ names, magic constants that only exist in the old code).
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"). Hit-rate judgment on the base server: close enough. G5 hit at C/U 0.5 is v2 0.838-0.843 before P4 it7 (r3, P4 it6 cap, P4 MF5) and 0.859 on it7 (P4 M1b official), vs old 0.820-0.840, native 0.861-0.862, H_lru 0.857-0.858; the gap from H_lru to H*_C is the base server's (server proposals H1-H5 parked, see "Server limitations"). P4 regression record: `models/Qwen3-4B/ITERATIONS.md` "P4 regression runs on this model" |
 | P4 | onboard DeepSeek-V2-Lite-Chat | accept: it7 a59a254 on `feat/rsi-deepseek-v2-lite` (TP2, MLA). ACCEPTED 2026-10-25: final review ACCEPT-WITH-FIXES, M1, M2 and S1-S5 applied, re-review ACCEPT (`reviews/P4-final.md`, 4164173). Open for the user's final pass: DSV2 G5 at C/U 0.25 is 0.07 below old on the same server, cause unknown (connector side by elimination; below the 2x GPU-KV floor); lmcache numbers go into the P4 tables when `feat/rsi-gate-lmcache` merges; the gate owner should revisit the preempted-uncertain bound (DSV2 v2 at 0.85% of 1%). Official on it7: DSV2 `2026-10-25-dsv2-lite-p4-it7-off-a59a254` and Qwen3-4B `2026-10-25-qwen3-4b-p4-it7-off-a59a254`, where v2 passes every verdict (Qwen `G2.digest_self.cap` 0.45%). Hit judgment: close enough. Tables: "P4 acceptance tables" below. lmcache: pending (arm not comparable yet); under the lmcache gate's resume stage (a4523f3) its it6 / it7 records fail `G2.resume_reference` (every arm): needs an official rerun with the resume stage |
-| P5 | onboard Qwen3.5-4B | it2 official `2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04` (`feat/rsi-qwen3.5-4b` c5d3f04, hybrid gate, base server): official, v2 passes every verdict; awaiting independent review. it1 accepted (core checkpoint saves from offers, ordering check, Qwen3-4B + DSV2 non-regression); it2 = H1 pinned async checkpoint saves + H2 lookup skip. G4: gsm8k cold/warm +0.34%/-0.35%, replay cold TTFT p50 0.512 vs 1.204 s, warm 0.300 vs 1.112 s. Hits: v2 = H* on every unlimited pass (E_ext 1.0); G5 hit v2/old/native 0.794/0.794/0.794 (0.25), 0.794/0.794/0.788 (0.5), 0.907/0.906/0.946 (0.75), v2 = H_lru within 0.002; E_C 0.5 v2/old/native 0.828/0.867/0.815 (gap to old = own-local accounting). E_C > 1 at 0.25 is an oracle gap for Checkpoint groups (finding for the gate owner, 2026-10-25). Judgment: close enough. lmcache: pending. Record: `models/Qwen3.5-4B/ITERATIONS.md` "it2 official" |
+| P5 | onboard Qwen3.5-4B | it2 official `2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04` (`feat/rsi-qwen3.5-4b` c5d3f04, hybrid gate, base server): official, v2 passes every verdict. Review ACCEPT-WITH-FIXES (`reviews/P5-it2.md`, no must-fix): S2 (lmcache gate merged, offline re-judge unchanged), S3 and nits applied 2026-10-26; S1 Qwen3-4B / DSV2 regression slices (H2 skips server LRU refreshes) prepared below, waiting for GPUs; fold into `feat/semantics-rsi` after they pass. it1 accepted (core checkpoint saves from offers, ordering check, Qwen3-4B + DSV2 non-regression); it2 = H1 pinned async checkpoint saves + H2 lookup skip. G4: gsm8k cold/warm +0.34%/-0.35%, replay cold TTFT p50 0.512 vs 1.204 s, warm 0.300 vs 1.112 s. Hits: v2 = H* on every unlimited pass (E_ext 1.0); G5 hit v2/old/native 0.794/0.794/0.794 (0.25), 0.794/0.794/0.788 (0.5), 0.907/0.906/0.946 (0.75), v2 = H_lru within 0.002; E_C 0.5 v2/old/native 0.828/0.867/0.815 (gap to old = own-local accounting). E_C > 1 at 0.25 is an oracle gap for Checkpoint groups (finding for the gate owner, 2026-10-25). Judgment: close enough. lmcache: pending. Record: `models/Qwen3.5-4B/ITERATIONS.md` "it2 official" |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ### P4 acceptance tables (it7 a59a254, gate ce645d7, base server d1970ead)
@@ -1179,6 +1179,49 @@ local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
     self-test needs `G2.resume_reference` on split-variant models (DSV2
     self-test with the resume stage: GPU, pending). S6: the resume replay
     chains every episode of a preempted warm request.
+
+### 2026-10-26
+
+- P5 it2 review fixes (`reviews/P5-it2.md`, ACCEPT-WITH-FIXES):
+  - S2: merged `feat/semantics-rsi` a4523f3 (lmcache gate) as 7247751.
+    Offline re-judge of `2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04` with
+    the merged gate: no verdict and no field changes for any arm,
+    `g5_problems` empty, no `G2.resume_reference` (split-invariant).
+  - S3: dead `Worker.sync_saves` deleted. Nits: own > ref wording and
+    the `ref_cnt` / spec-decode caveat (ITERATIONS, README).
+  - S1: H2's ITERATIONS text corrected. A skipped prefix query also skips
+    the server's LRU refresh (`ReadCache::get_prefix_blocks` ->
+    `refresh_recency`), so eviction order at capacity can move on
+    full-only models. Regression slices, not launched (waiting for free
+    GPUs), one at a time, at this branch's head:
+    - export (Mac; gate tree and under-test tree are both the head, the
+      native extension is unchanged since c5d3f04 and is copied from the
+      base build):
+
+      ```
+      WT=/Users/a1234/workspace/pegaflow/.worktrees/rsi-qwen35
+      REV=$(git -C $WT rev-parse --short=7 HEAD); FULL=$(git -C $WT rev-parse HEAD)
+      for d in gate ut; do git -C $WT archive --format=tar HEAD | ssh -o ConnectTimeout=20 -i ~/.ssh/pegaflow_h200_kexi -p 2222 -l kexi@root@10.1.0.44 jumpcg.ppio.cloud "mkdir ~/kexi/p5-$d-$REV && tar xf - -C ~/kexi/p5-$d-$REV && echo $FULL > ~/kexi/p5-$d-$REV/.rsi-rev && cp ~/kexi/pegaflow-semantics-rsi/python/pegaflow/pegaflow.cpython-312-x86_64-linux-gnu.so ~/kexi/p5-$d-$REV/python/pegaflow/"; done
+      ```
+
+    - Qwen3-4B, TP1, GPU5 (remote; set `REV` there to the same short
+      sha):
+
+      ```
+      cd ~/kexi/p5-gate-$REV && CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python/.venv/bin:~/kexi/cuda13/bin:$PATH LD_LIBRARY_PATH=~/kexi/cuda13-lib setsid nohup ~/kexi/pegaflow/python/.venv/bin/python -m rsi.gates.run_gate --model /root/kexi/models/Qwen3-4B --tag qwen3-4b-p5-s1-$REV --arms plain,baseline,old,pegaflow.connector_v2:PegaKVConnectorV2 --workloads gsm8k,cap --tp 1 --gpu 5 --max-model-len 8192 --max-num-batched-tokens 2048 --max-num-seqs 256 --gpu-mem 0.8 --pool-size 64gb --concurrency 32 --cap-convs auto --cap-turns 12 --cap-fractions 0.25,0.5,0.75 --pegaflow-server ~/kexi/pegaflow-semantics-rsi/target/release/pegaflow-server --under-test-path ~/kexi/p5-ut-$REV/python --runs-root ~/kexi/rsi-runs > ~/kexi/rsi-runs/qwen3-4b-p5-s1-$REV.log 2>&1 < /dev/null &
+      ```
+
+    - DSV2, TP2, GPU4,5 (after the Qwen run; same command with
+      `--model /root/kexi/models/DeepSeek-V2-Lite-Chat --tag
+      dsv2-lite-p5-s1-$REV --tp 2 --gpu 4,5` and log
+      `dsv2-lite-p5-s1-$REV.log`). The merged gate adds the resume stage
+      for DSV2 (split-variant).
+    - Not official by design (no replay). The other args match the
+      accepted it7 runs (`2026-10-25-*-p4-it7-off-a59a254`), so cap auto
+      gives the same 64 / 76 conversations. Compare v2's G4 gsm8k, G5
+      hit and E_C per fraction, and v2 - old in the same run, with the
+      "P4 acceptance tables". Pass = every v2 verdict that runs passes and
+      no hit or E_C drop beyond old's run-to-run noise.
 
 ## Semantics changelog
 

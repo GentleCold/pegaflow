@@ -750,8 +750,14 @@ group not yet queried counts as present. So it follows each Kind's own
 resume rule, with no model names and no extra rule:
 - before any query: if the bound is not past `num_computed`, nothing is
   queried. For a full-only layout (Qwen3-4B, DSV2) that means "the prompt
-  has no loadable full block past the local hit". There the result was
-  already 0, so the only change is one query and one lease fewer. With a
+  has no loadable full block past the local hit". There the hit result
+  was already 0. The query is not side-effect free, though: a server prefix
+  query refreshes the LRU recency of every block it hits
+  (`pegaflow-core` `ReadCache::get_prefix_blocks` -> `refresh_recency`).
+  Before H2, vLLM's per-pass re-queries of a waiting request refreshed the
+  blocks vLLM already held locally; after H2 they do not, so server
+  eviction order at capacity can move on full-only models too (review
+  P5-it2 S1; a Qwen3-4B / DSV2 regression slice measures it). With a
   checkpoint group the bound is the next resume step past the local hit
   (528 on Qwen3.5);
 - after storage group 0 (full, prefix query): the same check with group
@@ -889,9 +895,11 @@ are within 0.002, except native's H_lru at 0.75, which is 0.862.
 At every fraction v2's hit equals H_lru within 0.002 and equals old's hit
 within 0.001.
 - The E_C gap to old (0.04-0.06) is accounting, not hit. ext counts
-  `min(a, o) - max(ref, own)`, so v2's own GPU-local hits above the
-  baseline reference earn nothing: 403k / 428k / 778k tokens at 0.25 /
-  0.5 / 0.75. old reports a local hit of 0, so it loses nothing. Adding v2's
+  `min(a, o) - max(ref, own)` per request, so on requests where v2's own
+  GPU-local hit is above the baseline reference (own > ref) the excess
+  earns nothing: 403k / 428k / 778k tokens at 0.25 / 0.5 / 0.75. In
+  aggregate v2's own local rate (0.182) is below the reference (0.248).
+  old reports a local hit of 0, so it loses nothing. Adding v2's
   over-reference tokens back gives 1.235 / 0.867 / 0.944, old's
   E_C within 0.001. This term is by design (GATES.md: a higher own
   local hit "is vLLM's cache, not the store's"). It does mean that E_C
@@ -987,3 +995,33 @@ optimum". This measures how far it falls short for Checkpoint groups.
   modelling gap above.
 - Group-coherence loss is 4 lookups out of 7441.
 - lmcache: pending.
+
+### Review P5-it2 (ACCEPT-WITH-FIXES, `docs/rsi/reviews/P5-it2.md`)
+
+- S1: the H2 text above is corrected: skipping a query also skips its
+  server-side LRU refresh, so H2 is not a pure no-op on full-only layouts.
+  The regression slices (Qwen3-4B and DSV2, gsm8k + official-size cap at
+  this branch's head) are prepared in PROGRESS and wait for free GPUs.
+- S2: merged `feat/semantics-rsi` a4523f3 (lmcache gate) as 7247751.
+  Offline re-judge of the official record with the merged gate
+  (`~/kexi/tmp/p5-g5-attr/rejudge.py`, every stage's `digest_self`
+  recomputed with the new digest_compare, verdicts with the new
+  run_gate): every verdict of every arm is unchanged, with no changed
+  field, and `g5_problems` stays empty. No `G2.resume_reference` is added,
+  since Qwen3.5-4B is split-invariant (`resume_stage_needed` is false).
+  One artefact of re-judging from another tree: the record's probe files
+  live in the run's gate tree (`~/kexi/p5-gate-c5d3f04`), so `G0.provenance`
+  flags them "not under the gate tree". With `REPO` aliased to the run's
+  tree (`REJUDGE_REPO`) the flag is gone; it is a path check, not a
+  record change.
+- S3: `Worker.sync_saves` deleted (dead since H1: a pinned layout without a
+  block pool disables saves, it never falls back to sync saves). The unit
+  test keeps only the `may_zero_or_copy_blocks` classification that
+  `_pin_saves` uses.
+- Nit, spec decode: pinned blocks raise vLLM's `ref_cnt`. vLLM 0.32's
+  `is_block_writable` (`ref_cnt == 1`) is used only for speculative Mamba
+  blocks, and spec decode is out of scope here. Before enabling spec
+  decode on a checkpoint layout, check that a pinned save cannot make a
+  speculative block look unwritable (README "Saves" says the same).
+- `PegaWorkerMetadata` keeps its name (a rename touches the vLLM-facing
+  metadata class and buys only log clarity).

@@ -98,7 +98,10 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     while it is read. Such layouts need no flush and no finish hold, and
     their saves are not batched (pins stay short). `has_pending_push_work`
     keeps vLLM stepping until the pins are released. Without a bound block
-    pool these layouts save nothing (fail closed);
+    pool these layouts save nothing (fail closed). A pin raises the block's
+    `ref_cnt`; vLLM 0.32 reads `ref_cnt == 1` (`is_block_writable`) only for
+    speculative Mamba blocks, so check this before enabling spec decode on a
+    checkpoint layout;
   - a save that fails, raises, or whose saver thread died still releases its
     blocks (a failed save is a future miss). A save RPC that hangs blocks
     `flush` and held requests for good (logged every 10 s): the client has
