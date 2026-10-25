@@ -15,7 +15,7 @@ Arms:
   old                      reference connector (pegaflow.connector:PegaKVConnector), black box
   native                   reference: vLLM's OffloadingConnector (CPU offload), record only
   lmcache                  reference: LMCacheConnectorV1, local CPU backend only, record only
-  selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k only
+  selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k and preempt only
   <module>:<Class>         connector under test
 
 Every arm/workload pair gets fresh servers. Passes: ``cold``, then before each
@@ -65,7 +65,10 @@ from rsi.gates import digest_compare, oracle, provenance, workloads
 REPO = Path(__file__).resolve().parents[2]
 OLD = "pegaflow.connector:PegaKVConnector"
 SELFTEST = "rsi.gates.selftest.connector:SelftestConnector"
-NEGATIVE_SELFTESTS = ("liar", "bitflip", "offbyone")
+# ``sync`` needs a state (align-mode Mamba) group: it corrupts only those.
+NEGATIVE_SELFTESTS = ("liar", "bitflip", "offbyone", "sync")
+# Where a self-test arm's worker reports the sabotage it applied (stage dir).
+SABOTAGE_DIR = "selftest"
 
 # Official profile: thresholds and workload sizes (GATES.md is the source).
 OFFICIAL = {
@@ -127,6 +130,30 @@ SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 # same-split references for warm computed blocks.
 SPLIT_PASSES = ("split_ref", "split")
 MIN_PREWARMED = 0.9  # share of split requests whose hit reaches the last full block
+# Batch control (gsm8k, plain arm): ``alone`` repeats the first
+# BATCH_CONTROL_N prompts of ``split`` (same pre-warm, so the same split) one
+# request at a time. Completions and logprobs equal to the batched ``split``
+# ones establish gate.json ``batch_invariant``; any divergence refutes it.
+BATCH_PASS = "alone"
+BATCH_CONTROL_N = 64
+# Without batch invariance a batched pass's outputs depend on its batches
+# (load timing), so the output controls compare passes of one composition:
+# ``alone_ref`` (the same BATCH_CONTROL_N prompts, one at a time, no
+# pre-warm) on the plain and the baseline arm. ``G2.plain_equals_baseline``
+# compares the two; ``G2.split_control`` compares plain ``alone`` with it.
+ALONE_REF = "alone_ref"
+_ALONE = (BATCH_PASS, ALONE_REF)
+# Preempt workload (optional, ``--workloads ...,preempt``): the first
+# PREEMPT_N gsm8k prompts, each decoding exactly PREEMPT_OUT tokens, cold then
+# warm (reset + poison), on a GPU KV pool of ``preempt_gpu_blocks`` blocks
+# (PREEMPT_REQS requests of PREEMPT_SPAN tokens): requests outgrow the pool
+# and vLLM preempts and resumes them, so the digests (every request, every
+# preempted episode) judge loads after a preemption. G2.preempt.
+PREEMPT = "preempt"
+PREEMPT_N = 32
+PREEMPT_OUT = 640
+PREEMPT_SPAN = 2048
+PREEMPT_REQS = 4
 MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
 
 
@@ -577,6 +604,103 @@ def stage_pycache(stage: Path) -> Path:
     return stage.parents[1] / STAGE_PYCACHE_DIR / stage.parent.name / stage.name
 
 
+# S5: one vLLM cache root (torch compile artifacts, the Inductor and Triton
+# caches vLLM keeps next to them) per arm: <run>/.compile-cache/<label>, made
+# fresh before the arm's first stage and bound rw into that arm only. No arm
+# loads an artifact another arm (or an earlier run) wrote, except a copy of
+# the baseline's Triton autotune picks (``seed_autotune``).
+COMPILE_CACHE_DIR = ".compile-cache"
+_FRESH_CACHES: set[str] = set()
+AUTOTUNE_SOURCE = "baseline"
+
+
+def compile_cache(stage: Path) -> Path:
+    """``<run>/<label>/<wl>`` -> ``<run>/.compile-cache/<label>``."""
+    return stage.parents[1] / COMPILE_CACHE_DIR / stage.parent.name
+
+
+# N2: what a seeded Triton autotune entry may hold: a tile config. Triton's
+# format also carries ``pre_hook`` and ``ir_override`` (a path to IR Triton
+# compiles instead of the kernel); both must be null.
+_TILE_FIELDS = {"kwargs", "num_warps", "num_ctas", "num_stages", "maxnreg"}
+_NULL_FIELDS = {"pre_hook", "ir_override"}
+
+
+def autotune_file_problem(data: Any) -> str | None:
+    """None if every ``configs_timings`` entry is a plain tile config (int
+    kwargs, warps, ctas, stages, maxnreg) with numeric timings."""
+
+    def scalar(v: Any) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    entries = data.get("configs_timings") if isinstance(data, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return "no configs_timings list"
+    for i, e in enumerate(entries):
+        if not (isinstance(e, list) and len(e) == 2 and isinstance(e[0], dict)):
+            return f"entry {i} is not [config, timings]"
+        cfg, timings = e
+        extra = set(cfg) - _TILE_FIELDS - _NULL_FIELDS
+        if extra:
+            return f"entry {i} has fields {sorted(extra)}"
+        if any(cfg.get(k) is not None for k in _NULL_FIELDS):
+            return f"entry {i} sets {sorted(k for k in _NULL_FIELDS if cfg.get(k) is not None)}"
+        kw = cfg.get("kwargs", {})
+        if not isinstance(kw, dict) or not all(
+            isinstance(k, str) and scalar(v) for k, v in kw.items()
+        ):
+            return f"entry {i} kwargs are not integer tile sizes"
+        if not all(cfg.get(k) is None or scalar(cfg[k]) for k in _TILE_FIELDS - {"kwargs"}):
+            return f"entry {i} has a non-integer launch field"
+        ts = timings if isinstance(timings, list) else [timings]
+        if not all(isinstance(t, int | float) and not isinstance(t, bool) for t in ts):
+            return f"entry {i} timings are not numbers"
+    return None
+
+
+def seed_autotune(root: Path) -> int:
+    """Copy the baseline's Triton autotune results into a fresh arm root.
+
+    ``@triton.autotune`` kernels outside Inductor (vLLM's FLA ops for GDN)
+    pick a tile config by timing a fixed list on first use, and the picks
+    change the numbers (``chunk_fwd_kernel_o`` BK/BV is a reduction split);
+    Inductor's ``deterministic`` does not reach them. Fresh per-arm caches
+    re-time them per arm, so arms ran different kernels
+    (``qwen3.5-4b-selftest-fbcc3fd``). Triton keys each result by kernel,
+    compiler, env and the config list, and loads it instead of timing
+    (``TRITON_CACHE_AUTOTUNING``), so every arm runs the baseline's picks.
+    It is a copy: an arm can change only its own. Returns the file count."""
+    src = root.parent / AUTOTUNE_SOURCE / "triton"
+    if root.name == AUTOTUNE_SOURCE or not src.is_dir():
+        return 0
+    n = 0
+    for f in sorted(src.glob("*/*.autotune.json")):
+        bad = autotune_file_problem(json.loads(f.read_text()))
+        if bad:
+            raise ValueError(f"refusing to seed {f}: {bad}")
+        dst = root / "triton" / f.parent.name / f.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(f, dst)
+        n += 1
+    return n
+
+
+def fresh_compile_cache(stage: Path) -> Path:
+    """The arm's cache root, emptied (then seeded with the baseline's
+    autotune picks) the first time this process uses it."""
+    d = compile_cache(stage)
+    if str(d.resolve()) not in _FRESH_CACHES:
+        if d.exists():
+            shutil.rmtree(d)
+        _FRESH_CACHES.add(str(d.resolve()))
+        d.mkdir(parents=True, exist_ok=True)
+        n = seed_autotune(d)
+        if n:
+            print(f"[cache] {d.name}: {n} Triton autotune picks from {AUTOTUNE_SOURCE}", flush=True)  # fmt: skip
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 # M9: everything the gate judges from that the gate itself writes (pass
 # outputs and tokens, result.json, stage-error.json) lives here, never in a
 # dir an arm gets: <run>/.gate/<label>/<workload>. The runs root is under the
@@ -641,7 +765,7 @@ def isolation(args, stage: Path) -> dict[str, Any]:
     return {
         "helper": str(ISOLATE),
         "hide": str(Path(args.runs_root).resolve()),
-        "rw": [str(stage), str(stage_pycache(stage))],
+        "rw": [str(stage), str(stage_pycache(stage)), str(compile_cache(stage))],
         "ro": [str(Path(args.under_test_overlay).resolve())] if args.under_test_path else [],
     }
 
@@ -813,7 +937,10 @@ def kv_transfer_config(
     else:
         if kind == "selftest":
             module, cls = SELFTEST.split(":")
-            extra = {"mode": arm.split(":", 1)[1]}
+            extra = {
+                "mode": arm.split(":", 1)[1],
+                "report_dir": str(probe_dir.parent / SABOTAGE_DIR),
+            }
         else:
             module, cls = (OLD if kind == "old" else arm).split(":")
             extra = {}
@@ -843,7 +970,12 @@ def vllm_server(
     pf_port,
     log,
     cpu_bytes: int = 0,
+    num_gpu_blocks: int = 0,
+    gsm8k: bool = False,
 ):
+    """``num_gpu_blocks``: the stage's own GPU KV pool (preempt), else
+    ``--num-gpu-blocks``. ``gsm8k``: the stage also gets gate.json's
+    ``gsm8k_vllm_args`` (the cross-arm exact comparisons run there)."""
     lease = PortLease(1, block=VLLM_PORT_BLOCK, log=log)
     (port,) = lease.ports
     env = os.environ.copy()
@@ -860,6 +992,16 @@ def vllm_server(
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONPATH"] = ":".join(x for x in (str(REPO), env.get("PYTHONPATH")) if x)
     env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
+    # S5: every compiled-code cache the stage loads lives in its arm's root:
+    # torch compile + Inductor (vLLM puts them under VLLM_CACHE_ROOT), Triton
+    # (kernels JIT-compiled before vLLM's compile sets it, e.g. GDN's FLA
+    # ops) and FlashInfer's JIT ops.
+    cache_root = fresh_compile_cache(log.parent)
+    env["VLLM_CACHE_ROOT"] = str(cache_root)
+    env["TRITON_CACHE_DIR"] = str(cache_root / "triton")
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(cache_root / "inductor")
+    env["FLASHINFER_WORKSPACE_BASE"] = str(cache_root / "flashinfer")
+    env["TRITON_CACHE_AUTOTUNING"] = "1"  # load the seeded picks (vLLM's default too)
     backend: list[str] = []
     if gate.get("attention_backend"):
         backend = ["--attention-backend", gate["attention_backend"]]
@@ -902,7 +1044,9 @@ def vllm_server(
         "--max-num-batched-tokens",
         str(args.max_num_batched_tokens),
         "--max-num-seqs",
-        str(args.max_num_seqs),
+        # A small pool (preempt) holds at most one Mamba block per decoding
+        # sequence: vLLM refuses max_num_seqs above the block count.
+        str(min(args.max_num_seqs, num_gpu_blocks) if num_gpu_blocks else args.max_num_seqs),
         "--enable-prefix-caching",
         "--gpu-memory-utilization",
         str(args.gpu_mem),
@@ -914,6 +1058,7 @@ def vllm_server(
         "rsi.gates.rsi_probe.RsiWorkerExt",
         *backend,
         *gate.get("vllm_args", []),
+        *(gate.get("gsm8k_vllm_args", []) if gsm8k else []),
         *args.vllm_arg,
     ]
     if arm_kind(arm) == "plain":
@@ -922,11 +1067,12 @@ def vllm_server(
     cfg = kv_transfer_config(arm, probe_dir, "tagged", cpu_bytes)
     if cfg is not None:
         cmd += ["--kv-transfer-config", json.dumps(cfg)]
-    if args.num_gpu_blocks:
-        cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks)]
+    if num_gpu_blocks or args.num_gpu_blocks:
+        cmd += ["--num-gpu-blocks-override", str(num_gpu_blocks or args.num_gpu_blocks)]
+    vllm_cmd = cmd  # before the isolation prefix: summary.json records it per stage
     cmd = isolated(args, arm, log, cmd)
     url = f"http://127.0.0.1:{port}"
-    return url, launched(cmd, env, log, f"{url}/health", 900, lease)
+    return url, launched(cmd, env, log, f"{url}/health", 900, lease), vllm_cmd
 
 
 def reset_prefix_cache(url: str) -> None:
@@ -947,6 +1093,32 @@ def reset_and_poison(url: str) -> dict[str, Any]:
     if not results or not all(isinstance(x, dict) and x.get("bytes") for x in results):
         raise RuntimeError(f"rsi_poison did not cover the KV cache: {results}")
     return {"poisoned": results}
+
+
+def has_state_group(spec: dict[str, Any]) -> bool:
+    """A spec dump with a Mamba (state) group."""
+    groups = spec.get("kv_cache_config", {}).get("groups", [])
+    return any("MambaSpec" in g.get("spec", {}).get("mro", []) for g in groups)
+
+
+def preempt_gpu_blocks(spec: dict[str, Any], max_model_len: int) -> int:
+    """GPU KV blocks of the preempt stage: room for PREEMPT_REQS requests of
+    PREEMPT_SPAN tokens, and at least what vLLM needs to admit one request of
+    ``max_model_len`` (plus its null block). Full / window groups take a block
+    per ``block_size`` tokens; an align-mode Mamba group 2 (+ speculative)."""
+
+    def per_request(tokens: int) -> int:
+        n = 0
+        for g in spec["kv_cache_config"]["groups"]:
+            s = g["spec"]
+            if "MambaSpec" in s.get("mro", []):
+                n += 2 + int(s.get("num_speculative_blocks") or 0)
+            else:
+                w = s.get("sliding_window")
+                n += -(-min(tokens, w + s["block_size"] if w else tokens) // s["block_size"])
+        return n
+
+    return max(PREEMPT_REQS * per_request(PREEMPT_SPAN), per_request(max_model_len) + 1)
 
 
 def cap_names(repeats: int) -> list[str]:
@@ -1030,12 +1202,13 @@ def run_arm_workload(
     if probe.exists():
         shutil.rmtree(probe)
     gdir = gate_dir(out)
-    for d in (gdir, stage_pycache(out)):  # fresh per stage (M9, M10)
+    for d in (gdir, stage_pycache(out), out / SABOTAGE_DIR):  # fresh per stage (M9, M10)
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
     kind = arm_kind(arm)
     gsm = workload == "gsm8k"
+    pre = workload == PREEMPT
     cap = workload.startswith("cap")
     if cap and capacity <= 0 and kind != "baseline":
         raise ValueError("cap workload needs a capacity")
@@ -1057,7 +1230,7 @@ def run_arm_workload(
                 args, out / "pegaflow.log", str(capacity) if cap else args.pool_size, arm
             )
             stack.enter_context(cm)
-        url, cm = vllm_server(
+        url, cm, result["vllm_cmd"] = vllm_server(
             args,
             gate,
             arm,
@@ -1066,6 +1239,8 @@ def run_arm_workload(
             pf_port,
             out / "vllm.log",
             store_bytes if kind in _OFFLOAD else 0,
+            args.preempt_blocks if pre else 0,
+            gsm8k=gsm,
         )
         stack.enter_context(cm)
         if kind == "lmcache":
@@ -1080,10 +1255,21 @@ def run_arm_workload(
             limit = SELFTEST_LIMIT if kind == "selftest" else args.gsm8k_limit
             prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, limit)
             names = ["cold", "warm"]
+            batch_inv = bool(gate.get("batch_invariant"))
             if kind == "plain":
-                names += list(SPLIT_PASSES)  # the split control
-            elif kind == "baseline" and not split_inv:
-                names.append("split")  # same-split references for warm computed KV
+                names += [*SPLIT_PASSES, BATCH_PASS]  # the split and batch controls
+                names += [] if batch_inv else [ALONE_REF]
+            elif kind == "baseline":
+                names += [] if split_inv else ["split"]  # same-split references
+                names += [] if batch_inv else [ALONE_REF]
+            elif not batch_inv:
+                # One request at a time, warm (after reset + poison): the
+                # batch composition every arm shares, where G2.gsm8k gates.
+                names += [ALONE_REF]
+        elif pre:
+            prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, PREEMPT_N)
+            names = ["cold", "warm"]
+            result["gpu_blocks"] = args.preempt_blocks
         else:
             convs = workloads.build_turns(
                 Path(args.replay_file),
@@ -1114,19 +1300,26 @@ def run_arm_workload(
             pf_before = (
                 asyncio.run(workloads.scrape(pf_metrics, ("pegaflow",))) if pf_metrics else {}
             )
-            if gsm:
+            if gsm or pre:
                 # Digest every request: under batch invariance every copy is a
                 # reference, so nothing a connector loads goes unjudged.
                 xargs = {"rsi_pass": name, "rsi_digest": "full"}
+                alone = name in _ALONE
                 res = asyncio.run(
                     workloads.run_gsm8k(
                         url,
                         "m",
-                        prompts,
-                        args.concurrency,
+                        prompts[:BATCH_CONTROL_N] if alone else prompts,
+                        1 if alone else args.concurrency,
                         xargs=xargs,
-                        logprobs=kind == "plain" and name in SPLIT_PASSES,
-                        prewarm=name == "split",
+                        # Logprobs only where they are compared (plain and
+                        # baseline controls): a negative self-test arm's
+                        # corrupted state gives non-finite logprobs, which
+                        # vLLM cannot serialize (HTTP 400).
+                        logprobs=(alone and kind in ("plain", "baseline"))
+                        or (kind == "plain" and name in SPLIT_PASSES),
+                        prewarm=name in (BATCH_PASS, "split"),
+                        **({"max_tokens": PREEMPT_OUT, "free_run": True} if pre else {}),
                     )
                 )
                 (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
@@ -1206,8 +1399,22 @@ def run_arm_workload(
         [json.loads(x) for x in errs.read_text().splitlines()] if errs.exists() else []
     )
     result["digest_self"] = digest_compare.compare(probe, probe, invariant, split_inv)
+    if kind == "selftest":
+        result["sabotage"] = sabotage_counts(out / SABOTAGE_DIR)
     (gdir / "result.json").write_text(json.dumps(result, indent=1))
     return result
+
+
+def sabotage_counts(d: Path) -> dict[str, int]:
+    """Group -> loads the self-test connector corrupted (its worker's
+    ``sabotage-*.jsonl``; ``{}``: none, e.g. honest)."""
+    out: dict[str, int] = {}
+    for f in sorted(d.glob("sabotage-*.jsonl")) if d.is_dir() else ():
+        for line in f.read_text().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                out[str(rec["group"])] = out.get(str(rec["group"]), 0) + int(rec["n"])
+    return out
 
 
 def summary_line(res: dict[str, Any]) -> str:
@@ -1260,6 +1467,45 @@ def spec_diff(a: Any, b: Any, path: str = "") -> list[str]:
     return [] if a == b else [f"{path}: {a!r} != {b!r}"]
 
 
+# R1: spec dump fields added after the first committed dumps, with the probe
+# schema that first wrote them (``rsi_probe.SPEC_SCHEMA``). A dump at an older
+# schema lacks them because its gate rev did not know them: not judged.
+SPEC_FIELDS: dict[tuple[str, ...], int] = {
+    ("cache", "prefix_cache_retention_interval"): 1,  # e620462
+    ("kv_cache_config", "prefix_cache_retention_interval"): 1,  # e620462
+    ("compilation",): 2,  # 9204863
+    ("model_runner",): 3,
+}
+_MISSING = object()
+
+
+def dump_schema(dump: dict[str, Any]) -> int:
+    """The probe schema a spec dump was written under: recorded since schema
+    3 (``probe.schema``; ``probe`` itself is not compared); before that, the newest ``SPEC_FIELDS`` entry present (fields were only
+    ever added, so a dump holding a schema-2 field knew every schema-1 one)."""
+    recorded = dump.get("probe", {}).get("schema")
+    if isinstance(recorded, int):
+        return recorded
+    return max((v for p, v in SPEC_FIELDS.items() if _get(dump, p) is not _MISSING), default=0)
+
+
+def _get(d: Any, path: tuple[str, ...]) -> Any:
+    for k in path:
+        if not isinstance(d, dict) or k not in d:
+            return _MISSING
+        d = d[k]
+    return d
+
+
+def _pop(d: dict[str, Any], path: tuple[str, ...]) -> bool:
+    """Remove ``path`` from ``d``; True if it was there."""
+    for k in path[:-1]:
+        d = d.get(k)
+        if not isinstance(d, dict):
+            return False
+    return d.pop(path[-1], _MISSING) is not _MISSING
+
+
 def g0(run_dir: Path, label: str, committed: Path) -> dict[str, Any]:
     """Arm layout == baseline layout (gsm8k), baseline layout == committed dump."""
     base = run_dir / "baseline" / "gsm8k" / "probe"
@@ -1270,17 +1516,96 @@ def g0(run_dir: Path, label: str, committed: Path) -> dict[str, Any]:
         _strip(json.loads((base / "spec.json").read_text())),
         _strip(json.loads((mine / "spec.json").read_text())),
     ) + spec_diff(_worker_layout(base), _worker_layout(mine), ".worker")
+    na: list[str] = []
     if committed.exists():
-        diffs += [
-            "committed" + d
-            for d in spec_diff(
-                _strip(json.loads(committed.read_text())),
-                _strip(json.loads((base / "spec.json").read_text())),
-            )
-        ]
+        raw = json.loads((base / "spec.json").read_text())
+        schema = dump_schema(raw)
+        want, got = _strip(json.loads(committed.read_text())), _strip(raw)
+        for path, since in SPEC_FIELDS.items():
+            # S1/R1: a field the record's probe did not write yet is not
+            # judged; one it wrote is judged in full (missing or different
+            # fails).
+            if since > schema and _get(got, path) is _MISSING and _pop(want, path):
+                na.append(".".join(path))
+        diffs += ["committed" + d for d in spec_diff(want, got)]
     else:
         diffs.append(f"committed spec dump {committed} missing")
-    return {"pass": not diffs, "diffs": diffs[:20], "num_diffs": len(diffs)}
+    out: dict[str, Any] = {"pass": not diffs, "diffs": diffs[:20], "num_diffs": len(diffs)}
+    if na:
+        out["na_fields"] = na
+        out["na"] = "record predates these spec fields"
+    return out
+
+
+# vLLM 0.32 short aliases of flags a gate.json may set.
+_FLAG_ALIASES = {"-cc": "--compilation-config"}
+
+
+def _flag_values(argv: list[str], names: tuple[str, ...] = ()) -> list[tuple[str, str | None]]:
+    """``(--flag, value)`` pairs of a CLI argument list as vLLM's
+    ``FlexibleArgumentParser`` reads it: ``--flag value``, ``--flag=value``
+    and bare ``--flag``, with ``_`` in the name (before any ``.``) read as
+    ``-``, and a short alias (``-cc``) as its long flag. A dotted
+    ``--flag.key value`` is merged into one ``--flag <json>`` that vLLM
+    appends after every other argument, replacing the plain one, so it is
+    listed last with its own spelling as the value (never a gate value). A
+    prefix of one of ``names`` (argparse abbreviation) counts as that name
+    (fail-closed: an ambiguous one counts as each)."""
+    out, dotted = [], []
+    for i, a in enumerate(argv):
+        key, eq, val = a.partition("=")
+        head, dot, _ = key.partition(".")
+        if head in _FLAG_ALIASES:
+            name = _FLAG_ALIASES[head]
+        elif head.startswith("--") and len(head) > 2:
+            name = "--" + head[2:].replace("_", "-")
+        else:
+            continue
+        if eq:
+            value: str | None = val
+        else:
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            value = None if nxt is None or nxt.startswith("--") else nxt
+        hits = [name] if name in names else [n for n in names if n.startswith(name)] or [name]
+        for n in hits:
+            if dot:
+                dotted.append((n, f"{a} {value}"))
+            else:
+                out.append((n, value))
+    return out + dotted
+
+
+def gate_args_verdict(
+    results: dict[str, dict[str, Any]], gate: dict[str, Any] | None
+) -> dict[str, Any]:
+    """G0.vllm_args: every stage's vLLM ran with gate.json's ``vllm_args``
+    in force, and every gsm8k stage also with ``gsm8k_vllm_args`` (the last
+    occurrence of each flag carries the gate's value, so a later
+    ``--vllm-arg`` cannot silently override it)."""
+    gate = gate or {}
+    every = _flag_values(list(gate.get("vllm_args", [])))
+    gsm = _flag_values(list(gate.get("gsm8k_vllm_args", [])))
+    names = tuple(f for f, _ in every + gsm)
+    bad: dict[str, list[str]] = {}
+    for label, per in results.items():
+        for wl, r in per.items():
+            if "error" in r:
+                continue
+            cmd = r.get("vllm_cmd")
+            if cmd is None:
+                bad[f"{label}/{wl}"] = ["vllm command not recorded"]
+                continue
+            want = every + (gsm if wl == "gsm8k" else [])
+            got = dict(_flag_values(cmd, names))  # last occurrence wins, as in argparse
+            miss = [f"{f} {v}" for f, v in want if f not in got or got[f] != v]
+            if miss:
+                bad[f"{label}/{wl}"] = miss
+    return {
+        "pass": not bad,
+        "vllm_args": gate.get("vllm_args", []),
+        "gsm8k_vllm_args": gate.get("gsm8k_vllm_args", []),
+        "bad": bad,
+    }
 
 
 def expected_pegaflow(args, kind: str) -> Path | None:
@@ -1378,15 +1703,19 @@ def _hit_alignment(run_dir: Path) -> int:
     return 16
 
 
-def split_control(run_dir: Path) -> dict[str, Any] | None:
+def split_control(run_dir: Path, batch_invariant: bool = True) -> dict[str, Any] | None:
     """The plain arm's split control: ``split`` (each prompt pre-warmed into
     vLLM's prefix cache, so the request starts at its last full prompt block)
     vs ``split_ref`` (same prompts, hits end at the shared few-shot prefix).
+    Without batch invariance the batched pair differs by batch composition
+    alone, so the pair is ``alone`` vs ``alone_ref`` (one request at a time)
+    and its basis is the baseline's ``alone_ref`` instead of plain cold.
     Per request: completion differs, sampled-token logprobs differ, and the
     pre-warm took (``split`` cached the whole prompt up to its last full
     block: ``cached >= (prompt_tokens - 1) // align * align``)."""
-    ref, got = _outputs(run_dir, "plain", "split_ref"), _outputs(run_dir, "plain", "split")
-    rt, gt = _tokens(run_dir, "plain", "split_ref"), _tokens(run_dir, "plain", "split")
+    rn, gn = ("split_ref", "split") if batch_invariant else (ALONE_REF, BATCH_PASS)
+    ref, got = _outputs(run_dir, "plain", rn), _outputs(run_dir, "plain", gn)
+    rt, gt = _tokens(run_dir, "plain", rn), _tokens(run_dir, "plain", gn)
     if not ref or not got or rt is None or gt is None or len(ref) != len(got):
         return None
     differ = [a != b for a, b in zip(ref, got, strict=True)]
@@ -1406,16 +1735,68 @@ def split_control(run_dir: Path) -> dict[str, Any] | None:
     # split differs from a connector's warm request on exactly these prompts.
     # A missing token record is not aligned: it is never exempted (S7).
     aligned = [b is not None and bool(b.get("prompt_tokens")) and b["prompt_tokens"] % al == 0 for b in gt]  # fmt: skip
-    cold = _outputs(run_dir, "plain", "cold")
+    basis = _outputs(run_dir, *(("plain", "cold") if batch_invariant else ("baseline", ALONE_REF)))
+    # Requests whose two passes started at the same point: the pair compares
+    # no split there (reported; e.g. a last full block at the shared prefix).
+    same = sum(
+        a is not None and b is not None and a.get("cached") == b.get("cached")
+        for a, b in zip(rt, gt, strict=True)
+    )
+    batched = None
+    if not batch_invariant:
+        # The batched pair, reported only: its differences mix split and
+        # batch composition.
+        br, bg = _outputs(run_dir, "plain", "split_ref"), _outputs(run_dir, "plain", "split")
+        bt_r, bt_g = _tokens(run_dir, "plain", "split_ref"), _tokens(run_dir, "plain", "split")
+        if br and bg and bt_r is not None and bt_g is not None and len(br) == len(bg):
+            batched = {
+                "n": len(br),
+                "differ": sum(a != b for a, b in zip(br, bg, strict=True)),
+                "logprob_differ": sum(
+                    a is None or b is None or a.get("logprobs") != b.get("logprobs")
+                    for a, b in zip(bt_r, bt_g, strict=True)
+                ),
+            }
     return {
         "n": len(ref),
+        "pair": [rn, gn],
+        **({"batched": batched} if not batch_invariant else {}),
         "differ": differ,
         "logprob_differ": lp,
         "prewarmed": sum(warmed),
-        "ref_equals_cold": cold is not None and cold == ref,
-        "split_outputs": got,
-        "aligned": aligned,
+        "same_start": same,
+        "ref_equals_cold": basis is not None and basis == ref,
+        "split_outputs": _outputs(run_dir, "plain", "split") if not batch_invariant else got,
+        "aligned": aligned
+        if batch_invariant
+        else [
+            b is not None and bool(b.get("prompt_tokens")) and b["prompt_tokens"] % al == 0
+            for b in (_tokens(run_dir, "plain", "split") or [])
+        ],
     }
+
+
+def _plain_equals_baseline(
+    run_dir: Path, ref_cold: list[str] | None, batch_invariant: bool
+) -> dict[str, Any]:
+    """The probe changes nothing: plain cold == baseline cold under batch
+    invariance; otherwise the one-at-a-time ``alone_ref`` passes (same batch
+    composition) must agree in every completion and sampled-token logprob,
+    and the batched cold differ count is reported."""
+    cold_differ = _differ(ref_cold, _outputs(run_dir, "plain", "cold"))
+    if batch_invariant:
+        return {"pass": cold_differ == 0, "differ": cold_differ}
+    a, b = _outputs(run_dir, "baseline", ALONE_REF), _outputs(run_dir, "plain", ALONE_REF)
+    at, bt = _tokens(run_dir, "baseline", ALONE_REF), _tokens(run_dir, "plain", ALONE_REF)
+    out: dict[str, Any] = {"pair": ALONE_REF, "cold_differ": cold_differ}
+    if not a or a is None or b is None or at is None or bt is None or len(a) != len(b):
+        return {"pass": False, "reason": f"{ALONE_REF} passes missing"} | out
+    out["differ"] = _differ(a, b)
+    out["logprob_differ"] = sum(
+        x is None or y is None or x.get("logprobs") != y.get("logprobs")
+        for x, y in zip(at, bt, strict=True)
+    )
+    return {"pass": out["differ"] == 0 and out["logprob_differ"] == 0, "n": len(a)} | out
 
 
 def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str, Any]:
@@ -1428,6 +1809,11 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
     n = ctrl["n"]
     differ, lp = sum(ctrl["differ"]), sum(ctrl["logprob_differ"])
     measured = differ == 0 and lp == 0
+    # N2: pairs that started at the same point compare no split. When nearly
+    # all do, an invariant measurement says nothing: it is flagged
+    # ``vacuous`` (the verdict is unchanged: ``true``, the strict claim,
+    # judges computed blocks across splits and can only fail a right load).
+    vacuous = n > 0 and measured and ctrl.get("same_start", 0) >= MIN_PREWARMED * n
     ok = measured == claim and ctrl["prewarmed"] >= MIN_PREWARMED * n
     # split_ref is the cold pass repeated: if it differs from plain cold the
     # control's basis is not the baseline the arms are compared to.
@@ -1442,16 +1828,79 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
         "logprob_differ": lp,
         "prewarmed": ctrl["prewarmed"],
         "ref_equals_cold": ctrl["ref_equals_cold"],
+        **{k: ctrl[k] for k in ("pair", "same_start", "batched") if k in ctrl},
     }
+    if vacuous:
+        out["measured_invariant"] = None
+        out["vacuous"] = (
+            f"{ctrl['same_start']}/{n} pairs started at the same point: no split compared"
+        )
     if measured != claim:
         out["reason"] = (
             f"gate.json split_invariant={claim} but the control measured "
             f"{'no' if measured else 'a'} divergence"
         )
     elif not ctrl["ref_equals_cold"]:
-        out["reason"] = "split_ref differs from plain cold: the control has no stable basis"
+        out["reason"] = "the reference pass differs from its basis: the control has no stable basis"
     elif not ok:
         out["reason"] = "pre-warm did not take: the control is vacuous"
+    return out
+
+
+def batch_control(run_dir: Path) -> dict[str, Any] | None:
+    """The plain arm's batch control: ``alone`` (the first prompts of
+    ``split``, one at a time, same pre-warm) vs the batched ``split`` ones.
+    Per request: completion differs, sampled-token logprobs differ, and the
+    pre-warm took in ``alone`` (``split``'s is ``split_control``'s)."""
+    ref, got = _outputs(run_dir, "plain", "split"), _outputs(run_dir, "plain", BATCH_PASS)
+    rt, gt = _tokens(run_dir, "plain", "split"), _tokens(run_dir, "plain", BATCH_PASS)
+    if not ref or not got or rt is None or gt is None or len(got) > len(ref) or len(gt) != len(got):  # fmt: skip
+        return None
+    al = _hit_alignment(run_dir)
+    warmed = [
+        b is not None
+        and b.get("prompt_tokens") is not None
+        and (b.get("cached") or 0) >= (b["prompt_tokens"] - 1) // al * al
+        for b in gt
+    ]
+    return {
+        "n": len(got),
+        "differ": [a != b for a, b in zip(ref, got, strict=False)],
+        "logprob_differ": [
+            a is None or b is None or a.get("logprobs") != b.get("logprobs")
+            for a, b in zip(rt, gt, strict=False)
+        ],
+        "prewarmed": sum(warmed),
+    }
+
+
+def _batch_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str, Any]:
+    """gate.json's ``batch_invariant`` must be what the control measures:
+    true needs identical completions and logprobs alone and batched, false
+    needs some divergence. The pre-warm must have taken for nearly every
+    ``alone`` request, else the two passes ran at different splits."""
+    if ctrl is None:
+        return {"pass": False, "reason": "not evaluated (plain arm split/alone passes missing)"}
+    n = ctrl["n"]
+    differ, lp = sum(ctrl["differ"]), sum(ctrl["logprob_differ"])
+    measured = differ == 0 and lp == 0
+    warm_ok = ctrl["prewarmed"] >= MIN_PREWARMED * n
+    out = {
+        "pass": n > 0 and measured == claim and warm_ok,
+        "batch_invariant": claim,
+        "measured_invariant": measured,
+        "n": n,
+        "differ": differ,
+        "logprob_differ": lp,
+        "prewarmed": ctrl["prewarmed"],
+    }
+    if measured != claim:
+        out["reason"] = (
+            f"gate.json batch_invariant={claim} but the control measured "
+            f"{'no' if measured else 'a'} divergence"
+        )
+    elif not out["pass"]:
+        out["reason"] = "pre-warm did not take or nothing compared: the control is vacuous"
     return out
 
 
@@ -1483,7 +1932,11 @@ def _outputs_verdict(
     out: dict[str, Any] = {"invariant": invariant, "split_invariant": split_inv}
     out |= {f"{p}_differ": d for p, d in diffs.items()}
     if not invariant:
-        return {"pass": True} | out
+        # No same-batch-composition reference exists for a warm pass (its
+        # batches depend on load timing), so completions are reported only;
+        # G2.gsm8k (accuracy) and the byte-exact digest checks gate.
+        out["warm_differ_vs_split"], out["warm_differ_vs_split_aligned"] = split_diffs
+        return {"pass": True, "gated": False} | out
     if split_inv:
         return {"pass": all(d == 0 for d in diffs.values())} | out
     out["warm_differ_vs_split"], out["warm_differ_vs_split_aligned"] = split_diffs
@@ -1548,11 +2001,15 @@ def _digest_verdict(
     judged = d["external_matched"] + d["external_mismatched"]
     seen = d["external_compared"] + d["external_uncertain"] + d["external_unreferenced"]
     vacuous = vacuous_ok and seen == 0
+    # A state an episode started from (local or loaded) that the probe could
+    # not digest is a load nobody judged.
+    start_skipped = sum(n for k, n in d.get("state_skipped", {}).items() if k.startswith("start"))
     ok = (
         d["local_mismatched"] == 0
         and d["external_mismatched"] == 0
         and d["local_unreferenced"] == 0
         and d["external_unreferenced"] == 0
+        and start_skipped == 0
     )
     if min_judged is not None and not vacuous:
         ok = ok and judged > 0 and judged >= min_judged * seen
@@ -1578,9 +2035,32 @@ def _digest_verdict(
         **cov,
         **({"vacuous": "no external block in the digested sample"} if vacuous else {}),
         **({"preempted_uncertain": preempted} if preempted else {}),
+        **({"state_skipped": d["state_skipped"]} if d.get("state_skipped") else {}),
         **{k: d[k] for k in keys},
         "first_bad": next((g["first_bad"] for g in d["groups"].values() if g["first_bad"]), None),
     }
+
+
+def _preempt_verdict(r: dict[str, Any] | None, min_judged: float | None) -> dict[str, Any]:
+    """G2.preempt (when the ``preempt`` workload ran): the stage's digests
+    are exhaustive (every request and every preempted episode digested), so
+    every loaded block is judged; vLLM must have preempted some request and
+    some block loaded by a resumed episode must have been compared."""
+    if r is None or "error" in r:
+        return {"pass": False, "reason": "not evaluated"}
+    d = r.get("digest_self")
+    v = _digest_verdict(d, min_judged, exhaustive=True)
+    if d is None:
+        return v
+    after = d.get("after_preemption", {})
+    v["preempted_requests"] = d.get("preempted_requests", 0)
+    v["after_preemption"] = after
+    v["gpu_blocks"] = r.get("gpu_blocks")
+    resumed_loads = after.get("local_compared", 0) + after.get("external_compared", 0)
+    if not v["preempted_requests"] or not resumed_loads:
+        v["pass"] = False
+        v.setdefault("reason", "no preemption, or no load after one was compared: vacuous")
+    return v
 
 
 def digest_groups(probe: Path) -> dict[str, Any]:
@@ -1830,6 +2310,139 @@ def _perf_verdicts(
     return g
 
 
+def _predates(v: dict[str, Any], predates: bool) -> dict[str, Any]:
+    """S1: a record is judged by the gate rev it ran under. A check added
+    after a record was made (its inputs are absent from the gate-written
+    record) is ``na`` for it, never a retroactive failure."""
+    if not predates:
+        return v
+    return {"pass": True, "na": "record predates this check", "would_be": v.get("pass")}
+
+
+def _records_cmd(results: dict[str, dict[str, Any]]) -> bool:
+    """Some stage of the record has its vLLM command (``vllm_cmd``)."""
+    return any("vllm_cmd" in r for per in results.values() for r in per.values())
+
+
+def _ran_without(results: dict[str, dict[str, Any]], label: str, name: str) -> bool:
+    """``label``'s gsm8k stage ran, recorded its passes, and has no ``name``
+    pass: a record from before the gate ran that pass."""
+    r = results.get(label, {}).get("gsm8k", {})
+    return "error" not in r and bool(r.get("passes")) and name not in r["passes"]
+
+
+def gsm8k_accuracy_verdict(
+    gsm: dict[str, Any] | None, base_gsm: dict[str, Any] | None, batch_inv: bool
+) -> dict[str, Any]:
+    """G2.gsm8k: accuracy within ``ACC_TOL`` of the baseline at the same
+    batch composition. Batch invariant: cold and warm vs baseline cold.
+    Otherwise batched accuracy moves with load timing (no reference shares
+    a warm pass's batches), so the gated pass is ``alone_ref`` (one request
+    at a time, after reset + poison: loads at the same split as the
+    baseline's) vs baseline ``alone_ref``; cold / warm deltas vs baseline
+    cold are reported (``batched_delta_pp``)."""
+
+    def acc(r: dict[str, Any] | None, name: str) -> float | None:
+        return (r or {}).get("passes", {}).get(name, {}).get("accuracy")
+
+    basis = "cold" if batch_inv else ALONE_REF
+    ref = acc(base_gsm, basis)
+    gated = ("cold", "warm") if batch_inv else (ALONE_REF,)
+    accs = {p: acc(gsm, p) for p in gated}
+    ok = ref is not None and all(a is not None and abs(a - ref) <= ACC_TOL for a in accs.values())
+    out: dict[str, Any] = {
+        "pass": ok,
+        "basis": f"baseline {basis}",
+        "baseline": ref,
+        **{
+            f"{p}_delta_pp": (a - ref) * 100
+            for p, a in accs.items()
+            if a is not None and ref is not None
+        },  # fmt: skip
+    }
+    if not batch_inv:
+        cold = acc(base_gsm, "cold")
+        out["batched_delta_pp"] = {
+            p: (a - cold) * 100 if a is not None and cold is not None else None
+            for p in ("cold", "warm")
+            for a in (acc(gsm, p),)
+        }
+    if not ok:
+        out["reason"] = (
+            f"accuracy differs from baseline {basis} by more than {ACC_TOL} (or missing)"
+        )
+    return out
+
+
+def _loads(
+    d: dict[str, Any] | None,
+    gid: int,
+    kinds: tuple[str, ...],
+    tags: tuple[str, ...] = ("local", "external"),
+) -> int | None:
+    """Loaded blocks of group ``gid`` with ``tags`` counted under ``kinds``;
+    None = not evaluated."""
+    if d is None:
+        return None
+    x = d.get("groups", {}).get(str(gid), {})
+    return sum(x.get(f"{t}_{k}", 0) for t in tags for k in kinds)
+
+
+def _bad_loads(d: dict[str, Any] | None, gid: int) -> int | None:
+    """Loaded blocks of group ``gid`` that equal no reference (mismatched
+    or unreferenced, local and external); None = not evaluated."""
+    return _loads(d, gid, ("mismatched", "unreferenced"))
+
+
+def _caught(bad: int | None, uncertain: int | None, n: int | None) -> bool:
+    """R3: one digest check catches a group when its bad loads cover every
+    sabotaged load it could judge (``n - uncertain``), at least one; ``n``
+    None = the record predates the count (one bad load suffices)."""
+    if not bad:
+        return False
+    return n is None or (n > 0 and bad >= n - (uncertain or 0))
+
+
+def caught_per_group(
+    d_self: dict[str, Any] | None,
+    d_base: dict[str, Any] | None,
+    targets: list[int],
+    sabotage: dict[str, int] | None,
+    d_preempt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """M2/R3: a negative self-test arm is caught only if every group it
+    corrupts (``targets``), each judged on its own, has in both gsm8k
+    digest checks at least as many loads equal to no reference as the
+    connector sabotaged there, less the external loads that check left
+    uncertain
+    (``sabotage``: group -> count; 0 fails; None = the record predates the
+    count, then one bad load suffices). Preempt counts are reported."""
+    groups: dict[str, Any] = {}
+    for gid in targets:
+        n = None if sabotage is None else sabotage.get(str(gid), 0)
+        row = {
+            "digest_self_bad": _bad_loads(d_self, gid),
+            "vs_baseline_bad": _bad_loads(d_base, gid),
+            # Sabotage hits connector (external) loads only.
+            "digest_self_uncertain": _loads(d_self, gid, ("uncertain",), ("external",)),
+            "vs_baseline_uncertain": _loads(d_base, gid, ("uncertain",), ("external",)),
+            "sabotaged": n,
+            **({"preempt_bad": _bad_loads(d_preempt, gid)} if d_preempt is not None else {}),
+        }
+        row["caught"] = _caught(
+            row["digest_self_bad"], row["digest_self_uncertain"], n
+        ) and _caught(row["vs_baseline_bad"], row["vs_baseline_uncertain"], n)
+        groups[str(gid)] = row
+    out: dict[str, Any] = {"pass": bool(groups) and all(r["caught"] for r in groups.values())}
+    out["groups"] = groups
+    if sabotage is None:
+        out["sabotage_na"] = "record predates the sabotage count"
+    if not out["pass"]:
+        missed = [k for k, r in groups.items() if not r["caught"]]
+        out["reason"] = f"groups {missed}: fewer bad loads than sabotaged (less uncertain) in a digest check, or not sabotaged" if groups else "no transferred group"  # fmt: skip
+    return out
+
+
 def verdicts(
     results: dict[str, dict[str, Any]],
     run_dir: Path,
@@ -1842,21 +2455,22 @@ def verdicts(
     v: dict[str, Any] = {}
     connectors = connectors or {}
     split_inv = bool((gate or {}).get("split_invariant", True))
-    ctrl = split_control(run_dir)
+    batch_inv = bool((gate or {}).get("batch_invariant"))
+    ctrl = split_control(run_dir, batch_inv)
     base = results.get("baseline", {})
     ref_cold = _outputs(run_dir, "baseline", "cold")
-    ref_acc = base.get("gsm8k", {}).get("passes", {}).get("cold", {}).get("accuracy")
     base_probe = run_dir / "baseline" / "gsm8k" / "probe"
+    state_ids = digest_compare.state_groups(base_probe)
+    state_model = bool(state_ids) or (
+        committed.is_file() and has_state_group(json.loads(committed.read_text()))
+    )
     invariant = base.get("gsm8k", {}).get("invariant", False)
 
     # Controls: the probe changes nothing (plain == baseline), poisoning and
     # the local reset change nothing (baseline warm == cold), local hits are
     # byte-identical to their computed copies.
     v["baseline"] = {
-        "G2.plain_equals_baseline": {
-            "pass": _differ(ref_cold, _outputs(run_dir, "plain", "cold")) == 0,
-            "differ": _differ(ref_cold, _outputs(run_dir, "plain", "cold")),
-        },
+        "G2.plain_equals_baseline": _plain_equals_baseline(run_dir, ref_cold, batch_inv),
         # Output equality needs batch invariance; gate.json declares when a
         # model cannot have it, and then only accuracy and digests count.
         "G2.warm_equals_cold": {
@@ -1866,6 +2480,8 @@ def verdicts(
         },
         "G2.digest_self.gsm8k": _digest_verdict(base.get("gsm8k", {}).get("digest_self"), None),
         "G2.digest_groups": digest_groups(base_probe),
+        # gate.json's vllm_args (e.g. mamba_cache_mode, retention) on every arm.
+        "G0.vllm_args": _predates(gate_args_verdict(results, gate), not _records_cmd(results)),
         **(
             {"G0.provenance": g0_provenance(run_dir, "baseline", pegaflow_dirs.get("baseline"))}
             if pegaflow_dirs is not None
@@ -1873,11 +2489,17 @@ def verdicts(
         ),
         # gate.json's split_invariant is established here, not declared.
         "G2.split_control": _split_control_verdict(ctrl, split_inv),
+        # Likewise batch_invariant (it decides whether outputs are compared).
+        "G2.batch_control": _predates(
+            _batch_control_verdict(batch_control(run_dir), batch_inv),
+            _ran_without(results, "plain", BATCH_PASS),
+        ),
         "G2.digest_self.cap": _digest_verdict(
             base.get("cap", {}).get("digest_self"), None, exhaustive=True
         )
         if "cap" in base
         else {"pass": True, "na": "no cap workload"},
+        **({"G2.preempt": _preempt_verdict(base[PREEMPT], None)} if PREEMPT in base else {}),
     }
     base_errors = {wl: r["error"] for wl, r in base.items() if "error" in r}
     if base_errors:
@@ -1915,31 +2537,54 @@ def verdicts(
         diffs = {p: _differ(ref_cold, _outputs(run_dir, label, p)) for p in ("cold", "warm")}
         split_diffs = split_differ(ctrl, _outputs(run_dir, label, "warm"))
         g["G2.gsm8k_outputs"] = _outputs_verdict(diffs, invariant, split_inv, split_diffs)
+        if PREEMPT in per_all:
+            g["G2.preempt"] = _preempt_verdict(per_all[PREEMPT], MIN_JUDGED_GSM8K)
+        g["G2.gsm8k"] = gsm8k_accuracy_verdict(gsm, base.get("gsm8k"), batch_inv)
+        g["G2.gsm8k"]["alone_ref_differ"] = (
+            _differ(_outputs(run_dir, "baseline", ALONE_REF), _outputs(run_dir, label, ALONE_REF))
+            if not batch_inv
+            else None
+        )
         if kind == "selftest":
-            # Negative arms must be caught by both digest checks (a single
-            # flipped byte need not change a greedy output, so outputs are
-            # only reported); the honest arm must pass every G2 check.
-            digests = ("G2.digest_self.gsm8k", "G2.digest_vs_baseline.gsm8k")
-            if label == "selftest-honest":
-                g["pass"] = all(
-                    g[k]["pass"] for k in (*digests, "G2.gsm8k_outputs", "G2.digest_groups")
+            mode = label.removeprefix("selftest-")
+            if mode == "honest" and state_model and "G2.preempt" not in g:
+                g["G2.preempt"] = {
+                    "pass": False,
+                    "reason": f"the {PREEMPT} workload is required on models with a state group",
+                }
+            # G0 must hold for every self-test arm: a negative arm is caught
+            # by its loads, not by a layout difference.
+            g0_keys = tuple(k for k in ("G0.spec", "G0.provenance") if k in g)
+            if mode == "honest":
+                need = (
+                    *g0_keys,
+                    "G2.digest_self.gsm8k",
+                    "G2.digest_vs_baseline.gsm8k",
+                    "G2.gsm8k_outputs",
+                    "G2.gsm8k",
+                    "G2.digest_groups",
+                    *(("G2.preempt",) if "G2.preempt" in g else ()),
                 )
+                g["pass"] = all(g[k]["pass"] for k in need)
                 g["expect"] = "pass every G2 check"
             else:
-                g["pass"] = not any(g[k]["pass"] for k in digests)
-                g["expect"] = "fail both G2 digest checks"
+                # Caught in every group it corrupts, by both digest checks,
+                # each group judged on its own (a single flipped byte need
+                # not change a greedy output: outputs are reported only).
+                targets = g["G2.digest_groups"].get("groups", [])
+                if mode == "sync":
+                    targets = [x for x in targets if x in state_ids]
+                g["G2.caught_per_group"] = caught_per_group(
+                    gsm and gsm.get("digest_self"),
+                    vs_base,
+                    targets,
+                    gsm.get("sabotage") if gsm else None,
+                    per_all.get(PREEMPT, {}).get("digest_self"),
+                )
+                g["pass"] = all(g[k]["pass"] for k in g0_keys) and g["G2.caught_per_group"]["pass"]
+                g["expect"] = "G0 passes; every corrupted group fails both G2 digest checks"
             v[label] = g
             continue
-        accs = {p: gsm["passes"][p]["accuracy"] for p in ("cold", "warm")} if gsm else {}
-        g["G2.gsm8k"] = {
-            "pass": ref_acc is not None
-            and len(accs) == 2
-            and all(abs(a - ref_acc) <= ACC_TOL for a in accs.values()),
-            "baseline": ref_acc,
-            **{
-                f"{p}_delta_pp": (a - ref_acc) * 100 for p, a in accs.items() if ref_acc is not None
-            },
-        }
         rep = per_wl.get("replay")
         # Replay shares prefixes with untagged conversations, so many loads stay
         # uncertain; only require that some were judged and none mismatched.
@@ -2261,8 +2906,12 @@ def official_problems(
     for need in ("plain", "baseline", "under_test"):
         if need not in kinds:
             out.append(f"arm {need} missing")
-    if set(wls) != set(WORKLOADS):
+    if set(wls) - {PREEMPT} != set(WORKLOADS):
         out.append(f"workloads {wls} != {','.join(WORKLOADS)}")
+    if PREEMPT not in wls and committed.is_file() and has_state_group(json.loads(committed.read_text())):  # fmt: skip
+        # S3: gsm8k loads one state key per group; preempt judges resumed
+        # episodes' state loads, which no other official stage exhausts.
+        out.append(f"workload {PREEMPT} missing (required on models with a Mamba state group)")
     if args.num_gpu_blocks or args.vllm_arg:
         out.append("--num-gpu-blocks / --vllm-arg override")
     for a in arms:
@@ -2372,6 +3021,12 @@ def install_stop_handlers() -> None:
     atexit.register(stop_live)
 
 
+def uses_server(args) -> bool:
+    """Some arm of the run starts a pegaflow-server (``old``, under test)."""
+    arms = [a for a in str(getattr(args, "arms", "")).split(",") if a]
+    return any(arm_kind(a) in ("old", "under_test") for a in arms)
+
+
 def record_provenance(args, run_dir: Path) -> dict[str, Any]:
     """Revs (verified against ``provenance.REMOTE``) and hashes of what the
     run measured: the gate tree, the venv's ``pegaflow`` (reference arms, the
@@ -2401,6 +3056,9 @@ def record_provenance(args, run_dir: Path) -> dict[str, Any]:
             )
         server = Path(args.pegaflow_server).resolve()
         rev_file = server.parents[2] / ".rsi-rev"
+        if not uses_server(args):
+            out["pegaflow_server"] = {"used": False, "path": str(server)}
+            return out
         out["pegaflow_server"] = {
             "path": str(server),
             "sha256": provenance.sha256(server) if server.is_file() else None,
@@ -2436,7 +3094,8 @@ class ProvenanceWatch:
         if getattr(args, "under_test_path", ""):
             self.roots["under_test"] = (Path(args.under_test_overlay).resolve(), ("pegaflow",), False)  # fmt: skip
         server = Path(args.pegaflow_server).resolve()
-        self.roots["pegaflow_server"] = (server.parent, (server.name,), False)
+        if uses_server(args):
+            self.roots["pegaflow_server"] = (server.parent, (server.name,), False)
         self.base = {r: provenance.fingerprint(*v) for r, v in self.roots.items()}
         self.checks: list[dict[str, Any]] = []
 
@@ -2646,6 +3305,13 @@ def main(argv: list[str] | None = None) -> int:
     model_dir = REPO / "docs" / "rsi" / "models" / Path(args.model).name
     gate_file, committed = model_dir / "gate.json", model_dir / "spec.json"
     gate = json.loads(gate_file.read_text()) if gate_file.exists() else {}
+    args.preempt_blocks = 0
+    if PREEMPT in args.workloads.split(","):
+        if not committed.exists():
+            ap.error(f"the {PREEMPT} workload sizes its GPU pool from {committed} (missing)")
+        args.preempt_blocks = preempt_gpu_blocks(
+            json.loads(committed.read_text()), args.max_model_len
+        )
     run_dir = Path(args.runs_root) / f"{date.today().isoformat()}-{args.tag}"
     run_dir.mkdir(parents=True, exist_ok=True)
     gate_pyc = (run_dir / PYCACHE_DIR).resolve()
@@ -2675,7 +3341,7 @@ def main(argv: list[str] | None = None) -> int:
     cuda_bad = cuda_problems(cuda)
     print(f"[gate] cuda env {json.dumps(cuda)} problems {cuda_bad}", flush=True)
     pool_checks: list[dict[str, Any]] = []
-    uncapped = [w for w in wls if w != "cap"]
+    uncapped = [w for w in wls if w not in ("cap", PREEMPT)]
     if any(arm_kind(a) in _STORES for a in arms) and uncapped:
         if committed.exists():
             spec = json.loads(committed.read_text())
@@ -2694,7 +3360,14 @@ def main(argv: list[str] | None = None) -> int:
         kind = arm_kind(arm)
         label = arm_label(arm)
         for wl in wls:
-            if wl != "gsm8k" and kind in ("plain", "selftest"):
+            if kind == "plain" and wl != "gsm8k":
+                continue
+            if kind == "selftest" and wl not in ("gsm8k", PREEMPT):
+                continue
+            if arm == "selftest:sync" and wl == PREEMPT:
+                # vLLM 0.32's scheduler dies on synchronous Mamba loads in the
+                # small preempt pool (allocate_slots: "Cannot get 1 free
+                # blocks"); the arm is judged by the gsm8k digests.
                 continue
             if wl != "cap":
                 if kind in _STORES and wl not in measured_u:

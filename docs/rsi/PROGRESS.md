@@ -815,6 +815,41 @@ names, magic constants that only exist in the old code).
   numbers unchanged (147/147) and overall passes unchanged. The only flag
   change is M4's `G0.spec` fix.
 
+### 2026-10-25
+
+- Hybrid gate review (`reviews/hybrid-gate.md`, ACCEPT-WITH-FIXES at
+  8789dde) fixes on feat/rsi-gate-hybrid; resolution in the review file's
+  response section:
+  - M1: start states digested in `handle_preemptions`, before the Mamba
+    precopy and any sync load; new `selftest:sync` arm.
+  - M2: negative arms judged per group (`G2.caught_per_group`), real
+    offbyone state sabotage, sabotage counts.
+  - S1: records judged by the gate rev they ran under (`na: record
+    predates`). S2: `G2.gsm8k` gated on `alone_ref` without batch
+    invariance, honest arm included. S3: `preempt` official on
+    state-group models. S4: flag parser spellings, compile config in the
+    spec dump. S5: per-arm compile cache. S6: tests (282).
+  - S5 follow-ups: fresh per-arm caches re-timed vLLM's FLA autotune
+    kernels per arm (Qwen3.5 baseline != plain), fixed by seeding each arm
+    with the baseline's Triton autotune picks (3d6b8e6); Qwen3-4B gsm8k
+    now compiles with deterministic inductor too (2404394).
+  - Self-test `qwen3.5-4b-selftest-3d6b8e6` passed (every negative caught
+    in every group); Qwen3-4B slice `qwen3-4b-gate-hybrid-slice-2404394`
+    baseline passes `G2.batch_control` and `G0.vllm_args`.
+  - Re-review (363441c) R1-R3 fixed: `G0.spec` judges spec fields the
+    record's probe did not write as `na_fields` (re-judge of
+    `qwen3-4b-p4-it5-nonreg` no longer flips); preempted blocks vLLM zeroes
+    or COW-copies into this step are dropped (`preempt_dropped`), an
+    all-zero digest is never a reference, the spec dump records
+    `model_runner` (V2) and `probe.schema`; `G2.caught_per_group` needs bad
+    >= sabotaged per group. N2: seeding refuses non-tile autotune entries.
+  - FOLLOW-UP (DSV2 branch, R4, not this branch): when DeepSeek-V2-Lite
+    adopts this gate after P4 acceptance, in the same commit: gate.json
+    `gsm8k_vllm_args` with deterministic inductor; regenerate the committed
+    `spec.json` (retention, `compilation`, `model_runner`, `probe.schema`);
+    one plain+baseline gsm8k slice. Until then DSV2 records are re-judged
+    with ce645d7.
+
 ## Semantics changelog
 
 Each entry: what was added, why, which vectors cover it.
@@ -858,6 +893,14 @@ Each entry: what was added, why, which vectors cover it.
   save-path cost (first save, gRPC setup) now lands outside
   `G4.replay_cold` and `G4.gsm8k_cold`. It is reported per arm vs baseline
   as `G4.warmup_seconds` (not gated). Needs the user's confirmation.
+- For final acceptance: add rsi/gates tests to CI. PR CI runs
+  `python/tests` only (`ci.yml`), so the 303 gate tests
+  (`rsi/gates/test_oracle_capacity.py`, `test_probe_steps.py`) are a manual
+  gate today: whoever changes `rsi/gates` runs them (GATES.md
+  "Implementation"). They need the built `pegaflow.semantics`, and
+  `test_probe_steps.py` needs vllm + torch (CPU), so the CI job needs the
+  native build. Workflows are not edited by agents; needs the user's
+  decision.
 - Capacity-blind gates (raised 2026-10-23, user asked how the loop would
   find "manage SWA and full blocks separately" for DeepSeek-V4.1-Flash):
   every gate runs with an unlimited pool (`G3.no_eviction`), and write
