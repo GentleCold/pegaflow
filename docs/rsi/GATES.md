@@ -241,7 +241,7 @@ cd .. && PYTHONPATH=. python/.venv/bin/python -m pytest -q -p no:cacheprovider r
 ```
 
 The full suite is the gate's test run, signal and teardown tests (real
-subprocesses) included: 282 tests in about 52 s on the 4090 host. Nothing is
+subprocesses) included: 303 tests in about 52 s on the 4090 host. Nothing is
 deselected. PR CI does not run them (it runs `python/tests` only); they are
 a manual gate for every change under `rsi/gates` until CI does (PROGRESS,
 user acceptance item). The isolation tests (`isolate.py`) need Linux and root and skip
@@ -610,13 +610,22 @@ the last accepted run record by hand until `--accepted` exists.
     for requests that step computes, boundary above the episode start) are
     digested in `wait_for_save`, after the forward wrote them. Each
     episode's start state (block `start / block_size - 1`: the local hit or
-    what a connector loaded) is digested in `handle_preemptions`, which
-    vLLM 0.32 calls every step before `_update_states`, `preprocess_mamba`
-    (whose align precopy copies exactly that block into the running state
-    the forward reads) and a synchronous `start_load_kv`. So the digest is
-    of the bytes the forward computes from: a load landing after the
-    precopy (sync, or an async one reported done before its copy landed)
-    is `mismatched`. `requests.jsonl` `states` lists `[episode, covered,
+    what a connector loaded) is digested in `handle_preemptions`. vLLM
+    0.32's V2 model runner (what runs: `Using V2 Model Runner` in every
+    `vllm.log`, spec.json `model_runner`, pinned by `G0.spec`) calls it
+    every step from `kv_connector.pre_forward`, after `update_requests`
+    (zeroes new blocks, applies COW copies) and `preprocess_state` (the
+    align precopy, which reads that block into a later one: src
+    `(start-1)//bs`, dst `cdiv(start+sched, bs)-1`), and before a
+    synchronous `start_load_kv` and the forward. So the digest is of the
+    bytes the forward computes from: a sync load lands after it and is
+    `mismatched`. The preempted-episode digest runs there too, so a freed
+    block vLLM reallocated and overwrote earlier in the step (in
+    `new_block_ids_to_zero`, or a `kv_cache_block_copies` destination) is
+    dropped, recorded in `requests.jsonl` `preempt_dropped`, and counts as
+    an undigested computation; an all-zero computed digest is never a
+    reference (`ref_zero_copies`, `computed_zero`), since a load that
+    wrote nothing into a zeroed block would match it. `requests.jsonl` `states` lists `[episode, covered,
     group, what]`; `what` other than `offer` / `start` is a skip
     (`not_offered`: a step ended on a boundary vLLM offered neither in
     that step nor in the next one, e.g. past the prompt; `start_*`: a
@@ -656,14 +665,21 @@ the last accepted run record by hand until `--accepted` exists.
   parser reads every spelling vLLM accepts (`--flag=value`, `_` for `-`,
   abbreviations, `-cc`, dotted keys).
 - Record vs gate rev (S1): a run record is judged by the gate rev it ran
-  under. When an offline re-judge with a later rev meets a check whose
-  inputs the record lacks because the gate did not produce them yet, the
-  check is `{"pass": true, "na": "record predates this check"}` (with
-  `would_be`), never a retroactive fail: `G0.vllm_args` (no stage has a
-  `vllm_cmd`), `G2.batch_control` (plain gsm8k ran without an `alone`
-  pass), the committed `compilation` block in `G0.spec` (dump without one)
-  and the self-test sabotage count. A record that has them is judged in
-  full.
+  under (`provenance.gate.rev`; re-judge with that tree when it matters).
+  When an offline re-judge with a later rev meets a check whose inputs the
+  record lacks because the gate did not produce them yet, the check is
+  `{"pass": true, "na": "record predates this check"}` (with `would_be`),
+  never a retroactive fail: `G0.vllm_args` (no stage has a `vllm_cmd`),
+  `G2.batch_control` (plain gsm8k ran without an `alone` pass) and the
+  self-test sabotage count. `G0.spec` (R1) skips, as `na_fields`, the
+  committed spec fields the record's probe did not write yet
+  (`run_gate.SPEC_FIELDS`: retention since e620462, `compilation` since
+  9204863, `model_runner` since schema 3). The record's schema is its
+  `probe.schema`, else the newest of those fields present (fields were only
+  ever added). A field its schema knew that is missing, or any field
+  present with another value, still fails. A record that has them is
+  judged in full. Adding a dump field: bump `rsi_probe.SPEC_SCHEMA` and add
+  it to `SPEC_FIELDS`.
 - G2 controls (baseline arm): `plain_equals_baseline` (gsm8k cold completions
   identical: the probe changes nothing), `warm_equals_cold` (under invariance:
   reset + poison change nothing), `digest_self.gsm8k` (no local mismatch).
@@ -823,7 +839,11 @@ the last accepted run record by hand until `--accepted` exists.
   cache-invalidating env and the config list, and loads it instead of
   timing under `TRITON_CACHE_AUTOTUNING=1`, which vLLM sets by default and
   the gate sets explicitly). Only the picks are copied, never a compiled
-  kernel or graph, and it is a copy: an arm can change only its own. Probe
+  kernel or graph, and it is a copy: an arm can change only its own.
+  Triton's file format can also name IR to compile instead of the kernel
+  (`ir_override`) or a `pre_hook`; seeding refuses any file whose entries
+  hold anything but integer tile configs and numeric timings
+  (`autotune_file_problem`). Probe
   (GPU5, `~/kexi/tmp/rsi-gate-hybrid-test/swap`, first-token logprobs of
   4 gsm8k prompts): the baseline's full cache gives `-0.389455 -1.307971
   -0.90808 -0.769167`, plain's `-0.385402 -1.285329 -0.907576
@@ -1071,8 +1091,11 @@ the last accepted run record by hand until `--accepted` exists.
   (`<stage>/selftest/sabotage-*.jsonl`, `result.sabotage`). A negative arm
   passes (is caught) only if G0 passes and `G2.caught_per_group` passes:
   every group it corrupts (all transferred groups; `sync`: the state
-  groups), each judged on its own, has a load that equals no reference
-  (mismatched or unreferenced) in both `G2.digest_self.gsm8k` and
-  `G2.digest_vs_baseline.gsm8k`, and a nonzero sabotage count there.
+  groups), each judged on its own, has in both `G2.digest_self.gsm8k` and
+  `G2.digest_vs_baseline.gsm8k` at least as many loads equal to no
+  reference (mismatched or unreferenced) as the connector sabotaged there,
+  less the external loads that check left uncertain, and a nonzero
+  sabotage count (R3: a gate that catches only some sabotaged loads fails
+  its self-test).
   Preempt per-group counts are reported. Output deltas are reported only
   (one flipped byte need not change a greedy completion).

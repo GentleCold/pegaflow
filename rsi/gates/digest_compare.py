@@ -25,6 +25,11 @@ in REF. A local or external block is
   are preempted episodes of digested requests (no untagged computation);
 - ``unreferenced`` when REF never computed the key.
 
+An all-zero computed copy is never a reference (``ref_zero_copies``): vLLM
+zeroes freshly allocated attention blocks, so it would match a load that
+wrote nothing. A preempted block the probe dropped because vLLM overwrote it
+first (``preempt_dropped``) counts as an undigested computation.
+
 For state groups (``spec.json`` ``probe.state_groups``) a state at length e
 is computed only by an episode with a step ending exactly on e, so those
 episodes are its computations; every one of them is digested in its step,
@@ -105,6 +110,14 @@ def _episode_views(r: dict[str, Any]) -> list[tuple[int, int, list[int]]]:
     return out
 
 
+ZERO_DIGEST = "0" * 32  # rsi_probe's exact digest of an all-zero page
+
+
+def is_zero(exact: tuple[str, ...]) -> bool:
+    """Every layer of the block is all zero bytes."""
+    return bool(exact) and all(d == ZERO_DIGEST for d in exact)
+
+
 def state_groups(probe_dir: Path) -> set[int]:
     """Groups the probe digests per step (Mamba align state), from spec.json."""
     f = probe_dir / "spec.json"
@@ -158,8 +171,15 @@ class Reference:
         self.split_copies: dict[tuple[Key, Split], dict[tuple[str, ...], list[Any]]] = defaultdict(
             dict
         )
+        # R2: an all-zero digest is never a reference. vLLM zeroes freshly
+        # allocated attention blocks, so a zero copy (a block overwritten
+        # before it was digested) would match a load that wrote nothing.
+        self.zero_copies = 0
         for key, tag, exact, l1, _, split, _ep in records(probe_dir):
             if tag == "computed":
+                if is_zero(exact):
+                    self.zero_copies += 1
+                    continue
                 self.copies[key].setdefault(exact, [0, l1])[0] += 1
                 self.split_copies[(key, split)].setdefault(exact, [0, l1])[0] += 1
         # (kind, prefix key) -> number of (request, episode) that computed it.
@@ -180,6 +200,9 @@ class Reference:
             ranges = computed_ranges(r)
             views = _episode_views(r) if r["episodes"] else []
             done = set(r.get("preempt_digested", []))
+            # Blocks of a digested preempted episode the probe dropped (vLLM
+            # overwrote them first): those computations stay undigested.
+            dropped = {(d[0], d[2]) for d in r.get("preempt_dropped", [])}
             for k, (start, end) in enumerate(ranges):
                 ends = set(views[k][2]) if k < len(views) else set()
                 for e in range((start // kt + 1) * kt, end + 1, kt):
@@ -189,7 +212,11 @@ class Reference:
                         self.computers[(kind, key)] += 1
                         if r.get("digest") is None:
                             self.untagged[(kind, key)] += 1
-                        elif k + 1 < len(ranges) and kind == "block" and k not in done:
+                        elif (
+                            k + 1 < len(ranges)
+                            and kind == "block"
+                            and (k not in done or (k, e) in dropped)
+                        ):
                             self.preempted[(kind, key)] += 1
 
     def kind(self, key: Key) -> tuple[str, str]:
@@ -216,6 +243,7 @@ def _group() -> dict[str, Any]:
         "computed_exact": 0,
         "computed_unmatched_split": 0,
         "computed_unreferenced": 0,
+        "computed_zero": 0,
         "max_rel_l1": 0.0,
         "first_bad": None,
     }
@@ -260,6 +288,10 @@ def compare(
         copies = ref.copies.get(key, {})
         if tag == "computed":
             bp = by_pass[str(pass_of.get(rid))]
+            if is_zero(exact):
+                # Not a reference (so ``own`` does not apply) and not judged.
+                g["computed_zero"] += 1
+                continue
             if ref.occurrences(key) - own <= 0:
                 if not own:
                     g["computed_unreferenced"] += 1
@@ -320,6 +352,7 @@ def compare(
         Counter(s[3] for r in reqs for s in r.get("states", []) if s[3] not in ("offer", "start"))
     )
     total["max_rel_l1"] = max((g["max_rel_l1"] for g in groups.values()), default=0.0)
+    total["ref_zero_copies"] = ref.zero_copies  # computed all-zero blocks, not references
     total["after_preemption"] = dict(after)
     total["preempted_requests"] = sum(len(r["episodes"]) > 1 for r in reqs)
     total["invariant"] = invariant

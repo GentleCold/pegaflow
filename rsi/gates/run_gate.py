@@ -619,6 +619,45 @@ def compile_cache(stage: Path) -> Path:
     return stage.parents[1] / COMPILE_CACHE_DIR / stage.parent.name
 
 
+# N2: what a seeded Triton autotune entry may hold: a tile config. Triton's
+# format also carries ``pre_hook`` and ``ir_override`` (a path to IR Triton
+# compiles instead of the kernel); both must be null.
+_TILE_FIELDS = {"kwargs", "num_warps", "num_ctas", "num_stages", "maxnreg"}
+_NULL_FIELDS = {"pre_hook", "ir_override"}
+
+
+def autotune_file_problem(data: Any) -> str | None:
+    """None if every ``configs_timings`` entry is a plain tile config (int
+    kwargs, warps, ctas, stages, maxnreg) with numeric timings."""
+
+    def scalar(v: Any) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    entries = data.get("configs_timings") if isinstance(data, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return "no configs_timings list"
+    for i, e in enumerate(entries):
+        if not (isinstance(e, list) and len(e) == 2 and isinstance(e[0], dict)):
+            return f"entry {i} is not [config, timings]"
+        cfg, timings = e
+        extra = set(cfg) - _TILE_FIELDS - _NULL_FIELDS
+        if extra:
+            return f"entry {i} has fields {sorted(extra)}"
+        if any(cfg.get(k) is not None for k in _NULL_FIELDS):
+            return f"entry {i} sets {sorted(k for k in _NULL_FIELDS if cfg.get(k) is not None)}"
+        kw = cfg.get("kwargs", {})
+        if not isinstance(kw, dict) or not all(
+            isinstance(k, str) and scalar(v) for k, v in kw.items()
+        ):
+            return f"entry {i} kwargs are not integer tile sizes"
+        if not all(cfg.get(k) is None or scalar(cfg[k]) for k in _TILE_FIELDS - {"kwargs"}):
+            return f"entry {i} has a non-integer launch field"
+        ts = timings if isinstance(timings, list) else [timings]
+        if not all(isinstance(t, int | float) and not isinstance(t, bool) for t in ts):
+            return f"entry {i} timings are not numbers"
+    return None
+
+
 def seed_autotune(root: Path) -> int:
     """Copy the baseline's Triton autotune results into a fresh arm root.
 
@@ -636,6 +675,9 @@ def seed_autotune(root: Path) -> int:
         return 0
     n = 0
     for f in sorted(src.glob("*/*.autotune.json")):
+        bad = autotune_file_problem(json.loads(f.read_text()))
+        if bad:
+            raise ValueError(f"refusing to seed {f}: {bad}")
         dst = root / "triton" / f.parent.name / f.name
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(f, dst)
@@ -1425,6 +1467,45 @@ def spec_diff(a: Any, b: Any, path: str = "") -> list[str]:
     return [] if a == b else [f"{path}: {a!r} != {b!r}"]
 
 
+# R1: spec dump fields added after the first committed dumps, with the probe
+# schema that first wrote them (``rsi_probe.SPEC_SCHEMA``). A dump at an older
+# schema lacks them because its gate rev did not know them: not judged.
+SPEC_FIELDS: dict[tuple[str, ...], int] = {
+    ("cache", "prefix_cache_retention_interval"): 1,  # e620462
+    ("kv_cache_config", "prefix_cache_retention_interval"): 1,  # e620462
+    ("compilation",): 2,  # 9204863
+    ("model_runner",): 3,
+}
+_MISSING = object()
+
+
+def dump_schema(dump: dict[str, Any]) -> int:
+    """The probe schema a spec dump was written under: recorded since schema
+    3 (``probe.schema``; ``probe`` itself is not compared); before that, the newest ``SPEC_FIELDS`` entry present (fields were only
+    ever added, so a dump holding a schema-2 field knew every schema-1 one)."""
+    recorded = dump.get("probe", {}).get("schema")
+    if isinstance(recorded, int):
+        return recorded
+    return max((v for p, v in SPEC_FIELDS.items() if _get(dump, p) is not _MISSING), default=0)
+
+
+def _get(d: Any, path: tuple[str, ...]) -> Any:
+    for k in path:
+        if not isinstance(d, dict) or k not in d:
+            return _MISSING
+        d = d[k]
+    return d
+
+
+def _pop(d: dict[str, Any], path: tuple[str, ...]) -> bool:
+    """Remove ``path`` from ``d``; True if it was there."""
+    for k in path[:-1]:
+        d = d.get(k)
+        if not isinstance(d, dict):
+            return False
+    return d.pop(path[-1], _MISSING) is not _MISSING
+
+
 def g0(run_dir: Path, label: str, committed: Path) -> dict[str, Any]:
     """Arm layout == baseline layout (gsm8k), baseline layout == committed dump."""
     base = run_dir / "baseline" / "gsm8k" / "probe"
@@ -1435,16 +1516,25 @@ def g0(run_dir: Path, label: str, committed: Path) -> dict[str, Any]:
         _strip(json.loads((base / "spec.json").read_text())),
         _strip(json.loads((mine / "spec.json").read_text())),
     ) + spec_diff(_worker_layout(base), _worker_layout(mine), ".worker")
+    na: list[str] = []
     if committed.exists():
-        want = _strip(json.loads(committed.read_text()))
-        got = _strip(json.loads((base / "spec.json").read_text()))
-        if "compilation" not in got:
-            # S1: a record from before the probe dumped compile settings.
-            want.pop("compilation", None)
+        raw = json.loads((base / "spec.json").read_text())
+        schema = dump_schema(raw)
+        want, got = _strip(json.loads(committed.read_text())), _strip(raw)
+        for path, since in SPEC_FIELDS.items():
+            # S1/R1: a field the record's probe did not write yet is not
+            # judged; one it wrote is judged in full (missing or different
+            # fails).
+            if since > schema and _get(got, path) is _MISSING and _pop(want, path):
+                na.append(".".join(path))
         diffs += ["committed" + d for d in spec_diff(want, got)]
     else:
         diffs.append(f"committed spec dump {committed} missing")
-    return {"pass": not diffs, "diffs": diffs[:20], "num_diffs": len(diffs)}
+    out: dict[str, Any] = {"pass": not diffs, "diffs": diffs[:20], "num_diffs": len(diffs)}
+    if na:
+        out["na_fields"] = na
+        out["na"] = "record predates these spec fields"
+    return out
 
 
 # vLLM 0.32 short aliases of flags a gate.json may set.
@@ -2284,13 +2374,33 @@ def gsm8k_accuracy_verdict(
     return out
 
 
-def _bad_loads(d: dict[str, Any] | None, gid: int) -> int | None:
-    """Loaded blocks of group ``gid`` that equal no reference (mismatched
-    or unreferenced, local and external); None = not evaluated."""
+def _loads(
+    d: dict[str, Any] | None,
+    gid: int,
+    kinds: tuple[str, ...],
+    tags: tuple[str, ...] = ("local", "external"),
+) -> int | None:
+    """Loaded blocks of group ``gid`` with ``tags`` counted under ``kinds``;
+    None = not evaluated."""
     if d is None:
         return None
     x = d.get("groups", {}).get(str(gid), {})
-    return sum(x.get(f"{t}_{k}", 0) for t in ("local", "external") for k in ("mismatched", "unreferenced"))  # fmt: skip
+    return sum(x.get(f"{t}_{k}", 0) for t in tags for k in kinds)
+
+
+def _bad_loads(d: dict[str, Any] | None, gid: int) -> int | None:
+    """Loaded blocks of group ``gid`` that equal no reference (mismatched
+    or unreferenced, local and external); None = not evaluated."""
+    return _loads(d, gid, ("mismatched", "unreferenced"))
+
+
+def _caught(bad: int | None, uncertain: int | None, n: int | None) -> bool:
+    """R3: one digest check catches a group when its bad loads cover every
+    sabotaged load it could judge (``n - uncertain``), at least one; ``n``
+    None = the record predates the count (one bad load suffices)."""
+    if not bad:
+        return False
+    return n is None or (n > 0 and bad >= n - (uncertain or 0))
 
 
 def caught_per_group(
@@ -2300,21 +2410,28 @@ def caught_per_group(
     sabotage: dict[str, int] | None,
     d_preempt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """M2: a negative self-test arm is caught only if every group it
-    corrupts (``targets``) has a load that equals no reference in both
-    gsm8k digest checks, each group judged on its own, and the connector
-    reports a sabotage in that group (``sabotage``: group -> count; None =
-    the record predates the count). Preempt counts are reported."""
+    """M2/R3: a negative self-test arm is caught only if every group it
+    corrupts (``targets``), each judged on its own, has in both gsm8k
+    digest checks at least as many loads equal to no reference as the
+    connector sabotaged there, less the external loads that check left
+    uncertain
+    (``sabotage``: group -> count; 0 fails; None = the record predates the
+    count, then one bad load suffices). Preempt counts are reported."""
     groups: dict[str, Any] = {}
     for gid in targets:
         n = None if sabotage is None else sabotage.get(str(gid), 0)
         row = {
             "digest_self_bad": _bad_loads(d_self, gid),
             "vs_baseline_bad": _bad_loads(d_base, gid),
+            # Sabotage hits connector (external) loads only.
+            "digest_self_uncertain": _loads(d_self, gid, ("uncertain",), ("external",)),
+            "vs_baseline_uncertain": _loads(d_base, gid, ("uncertain",), ("external",)),
             "sabotaged": n,
             **({"preempt_bad": _bad_loads(d_preempt, gid)} if d_preempt is not None else {}),
         }
-        row["caught"] = bool(row["digest_self_bad"]) and bool(row["vs_baseline_bad"]) and n != 0
+        row["caught"] = _caught(
+            row["digest_self_bad"], row["digest_self_uncertain"], n
+        ) and _caught(row["vs_baseline_bad"], row["vs_baseline_uncertain"], n)
         groups[str(gid)] = row
     out: dict[str, Any] = {"pass": bool(groups) and all(r["caught"] for r in groups.values())}
     out["groups"] = groups
@@ -2322,7 +2439,7 @@ def caught_per_group(
         out["sabotage_na"] = "record predates the sabotage count"
     if not out["pass"]:
         missed = [k for k, r in groups.items() if not r["caught"]]
-        out["reason"] = f"groups {missed} not caught by both digest checks (or not sabotaged)" if groups else "no transferred group"  # fmt: skip
+        out["reason"] = f"groups {missed}: fewer bad loads than sabotaged (less uncertain) in a digest check, or not sabotaged" if groups else "no transferred group"  # fmt: skip
     return out
 
 

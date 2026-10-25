@@ -399,13 +399,15 @@
  },
  "max_model_len": 8192,
  "model": "/root/kexi/models/Qwen3.5-4B",
+ "model_runner": "V2",
  "parallel": {
   "dcp": 1,
   "pp": 1,
   "tp": 1
  },
  "probe": {
-  "digest_skipped_groups": {}
+  "digest_skipped_groups": {},
+  "schema": 3
  },
  "vllm_version": "0.32.0"
 }

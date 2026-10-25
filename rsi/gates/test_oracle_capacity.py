@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rsi.gates import oracle, run_gate
+from rsi.gates import digest_compare, oracle, run_gate
 
 BT = 4  # tokens per block, every group
 PAGE = 500  # bytes per layer page
@@ -1771,6 +1771,53 @@ def _state_probe(tmp_path, warm_byte: str, preempt: bool):
     return probe
 
 
+def _zero_probe(tmp_path, cold_byte: str, dropped: bool):
+    """Key ``p:1`` (2 blocks) computed by ``a`` in a preempted episode 0
+    (digested at preemption, bytes ``cold_byte``) and loaded by ``b``
+    (external, bytes of an all-zero page, i.e. a load that wrote nothing
+    into a zeroed block). ``dropped``: the probe dropped a's block because
+    vLLM zeroed it before the digest."""
+    z = digest_compare.ZERO_DIGEST
+    a = _req("p", 2, 1, "cold") | {"req_id": "a", "digest": "full"}
+    a["episodes"], a["progress"] = [[1, 0, 0], [5, 0, 0]], [[1, 2 * BT + 1], [5, 2 * BT + 1]]
+    a["computed"], a["preempt_digested"] = 2 * BT + 1, [0]
+    if dropped:
+        a["preempt_dropped"] = [[0, 0, 2 * BT, "zeroed"]]
+    b = _req("p", 2, 10, "warm") | {"req_id": "b", "digest": "full"}
+    b["episodes"], b["progress"] = [[10, 0, 2 * BT]], [[10, 2 * BT + 1]]
+
+    def rec(rid, byte, **kw):
+        blk = {"key": "p:1", "covered": 2 * BT, "exact": [byte], "l1": [0.0]}
+        return {"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": [blk]} | kw  # fmt: skip
+
+    digests = [rec("b", z), rec("a", "F")]  # a's last episode, digested at finish
+    if not dropped:
+        digests.append(rec("a", cold_byte, episode=0))
+    return _probe(tmp_path, [a, b], digests)
+
+
+@pytest.mark.parametrize(
+    "cold_byte,dropped,matched,mismatched,uncertain",
+    [
+        ("F", False, 0, 1, 0),  # a real copy: the no-op load is caught
+        (digest_compare.ZERO_DIGEST, False, 0, 0, 1),  # zero copy is no reference
+        ("F", True, 0, 0, 1),  # dropped: an undigested computation
+    ],
+    ids=["real-copy", "zero-copy", "dropped"],
+)
+def test_zero_digest_is_never_a_reference(tmp_path, cold_byte, dropped, matched, mismatched, uncertain):  # fmt: skip
+    """R2: vLLM zeroes new attention blocks, so a preempted block digested
+    after vLLM zeroed it would make a load that wrote nothing ``matched``.
+    An all-zero computed copy is never a reference, and a block the probe
+    dropped counts as an undigested computation (``uncertain``, not
+    ``mismatched``: the reference is not exhaustive)."""
+    probe = _zero_probe(tmp_path, cold_byte, dropped)
+    d = digest_compare.compare(probe, probe, invariant=False)
+    g = d["groups"]["0"]
+    assert (g["external_matched"], g["external_mismatched"], g["external_uncertain"]) == (matched, mismatched, uncertain)  # fmt: skip
+    assert d["ref_zero_copies"] == (cold_byte == digest_compare.ZERO_DIGEST)
+
+
 @pytest.mark.parametrize(
     "warm_byte,preempt,matched,mismatched",
     [("S", False, 1, 0), ("X", False, 0, 1), ("S", True, 1, 0), ("X", True, 0, 1)],
@@ -2358,12 +2405,109 @@ def test_g0_spec_pins_the_compile_config(tmp_path, edit, ok):
     if edit == "drop-deterministic":
         spec["compilation"]["inductor_compile_config"].pop("deterministic")
     elif edit == "no-compilation-block":
-        spec.pop("compilation")
+        # A schema-1 dump (before 9204863): retention, no compile/runner/schema.
+        for k in ("compilation", "model_runner"):
+            spec.pop(k)
+        spec["probe"].pop("schema")
     for label in ("baseline", "arm"):
         probe = tmp_path / label / "gsm8k" / "probe"
         probe.mkdir(parents=True)
         (probe / "spec.json").write_text(json.dumps(spec))
     assert run_gate.g0(tmp_path, "arm", committed)["pass"] is ok
+
+
+def _schema0(spec: dict) -> dict:
+    """The committed spec as a probe before e620462 wrote it: no retention,
+    compilation, runner or schema fields."""
+    import copy
+
+    s = copy.deepcopy(spec)
+    for path in (*run_gate.SPEC_FIELDS, ("probe", "schema")):
+        run_gate._pop(s, path)
+    return s
+
+
+@pytest.mark.parametrize(
+    "model,edit,ok,na",
+    [
+        ("Qwen3-4B", "schema0", True, 4),  # qwen3-4b-p4-it5-nonreg's dump shape
+        ("Qwen3-4B", "schema0-retention-differs", False, 2),  # a field it had, differing
+        ("Qwen3-4B", "schema0-layout-differs", False, 4),
+        ("Qwen3-4B", "schema2-retention-missing", False, 1),  # its rev knew retention
+        ("Qwen3-4B", "current", True, 0),
+        ("Qwen3-4B", "current-runner-missing", False, 0),
+        ("Qwen3-4B", "current-runner-differs", False, 0),
+        ("Qwen3.5-4B", "schema0", True, 4),
+    ],
+    ids=[
+        "older-record",
+        "older-record-field-differs",
+        "older-record-layout-differs",
+        "known-field-missing",
+        "current",
+        "current-field-missing",
+        "current-field-differs",
+        "older-hybrid-record",
+    ],  # fmt: skip
+)
+def test_g0_spec_fields_unknown_to_the_record_are_na(tmp_path, model, edit, ok, na):
+    """R1: a spec field missing from a recorded dump is ``na`` only when the
+    record's probe schema did not know it (recorded, else the newest known
+    field present); a known field missing, or any field present with another
+    value, fails."""
+    import json
+
+    committed = run_gate.REPO / f"docs/rsi/models/{model}/spec.json"
+    spec = json.loads(committed.read_text())
+    if edit.startswith("schema0"):
+        spec = _schema0(spec)
+        if edit == "schema0-retention-differs":
+            spec["cache"]["prefix_cache_retention_interval"] = 64
+            spec["kv_cache_config"]["prefix_cache_retention_interval"] = 64
+        elif edit == "schema0-layout-differs":
+            spec["kv_cache_config"]["kv_cache_layout"] = "LBHNC"
+    elif edit == "schema2-retention-missing":
+        spec = _schema0(spec)
+        spec["compilation"] = json.loads(committed.read_text())["compilation"]
+    elif edit == "current-runner-missing":
+        spec.pop("model_runner")
+    elif edit == "current-runner-differs":
+        spec["model_runner"] = "V1"
+    for label in ("baseline", "arm"):
+        probe = tmp_path / label / "gsm8k" / "probe"
+        probe.mkdir(parents=True)
+        (probe / "spec.json").write_text(json.dumps(spec))
+    v = run_gate.g0(tmp_path, "arm", committed)
+    assert v["pass"] is ok, v
+    assert len(v.get("na_fields", [])) == na, v
+
+
+def test_seeded_autotune_holds_only_tile_configs(tmp_path):
+    """N2: Triton's autotune format can name IR to compile instead of the
+    kernel (``ir_override``) or a ``pre_hook``; a seeded file must hold
+    plain tile configs only, else seeding refuses."""
+    import json
+
+    good = {"key": [1], "configs_timings": [[{"kwargs": {"BK": 32}, "num_warps": 4, "num_ctas": 1, "num_stages": 2, "maxnreg": None, "pre_hook": None, "ir_override": None}, [0.1, 0.2, 0.3]]]}  # fmt: skip
+    assert run_gate.autotune_file_problem(good) is None
+    cfg = good["configs_timings"][0][0]
+    for bad in (
+        {"ir_override": "/tmp/k.ttgir"},
+        {"pre_hook": "f"},
+        {"extra": 1},
+        {"kwargs": {"BK": "32"}},
+        {"num_warps": "4"},
+    ):
+        assert run_gate.autotune_file_problem({"configs_timings": [[cfg | bad, [0.1]]]}), bad
+    assert run_gate.autotune_file_problem({"configs_timings": []})
+    caches = tmp_path / ".compile-cache"
+    src = caches / "baseline" / "triton" / "H1"
+    src.mkdir(parents=True)
+    bad_file = good | {"configs_timings": [[cfg | {"ir_override": "/x.ttir"}, [0.1]]]}
+    (src / "k.autotune.json").write_text(json.dumps(bad_file))
+    (caches / "plain").mkdir()
+    with pytest.raises(ValueError, match="ir_override"):
+        run_gate.seed_autotune(caches / "plain")
 
 
 def _groups(**per: dict) -> dict:
@@ -2396,13 +2540,32 @@ _ALL4 = {"0": _BAD, "1": _BAD, "2": _BAD, "3": _BAD}
         ),  # claims no state sabotage
         (
             _groups(**{"0": {"local_unreferenced": 2}}),
-            _groups(**{"0": {"external_unreferenced": 1}}),
+            _groups(**{"0": {"external_unreferenced": 2}}),
             [0],
             {"0": 2},
             True,
         ),  # liar  # fmt: skip
         (_groups(**{"0": _BAD}), _groups(**{"0": _BAD}), [0], None, True),  # record predates counts
         (_groups(), _groups(), [], {}, False),
+        # R3: 3 bad of 4 sabotaged in one check: a sabotaged load got through
+        (_groups(**{"0": _BAD}), _groups(**{"0": _BAD}), [0], {"0": 4}, False),
+        # ... unless that check could not judge it (external uncertain)
+        (
+            _groups(**{"0": _BAD | {"external_uncertain": 1}}),
+            _groups(**{"0": _BAD | {"external_uncertain": 1}}),
+            [0],
+            {"0": 4},
+            True,
+        ),  # fmt: skip
+        # a local uncertain is no sabotaged load: it does not excuse one
+        (
+            _groups(**{"0": _BAD | {"local_uncertain": 1}}),
+            _groups(**{"0": _BAD | {"local_uncertain": 1}}),
+            [0],
+            {"0": 4},
+            False,
+        ),  # fmt: skip
+        (_groups(**{"0": _BAD}), _groups(**{"0": _BAD}), [0], {"0": 3}, True),
     ],
     ids=[
         "all-groups",
@@ -2412,12 +2575,17 @@ _ALL4 = {"0": _BAD, "1": _BAD, "2": _BAD, "3": _BAD}
         "unreferenced",
         "predates",
         "nothing",
+        "fewer-bad-than-sabotaged",
+        "uncertain-excused",
+        "local-uncertain-not-excused",
+        "bad-equals-sabotaged",
     ],  # fmt: skip
 )
 def test_negative_arm_caught_in_every_group(d_self, d_base, targets, sabotage, ok):
-    """M2: a negative self-test arm counts as caught only if each group it
-    corrupts, judged on its own, has a load equal to no reference in both
-    gsm8k digest checks, and the connector reports a sabotage there."""
+    """M2/R3: a negative self-test arm counts as caught only if each group it
+    corrupts, judged on its own, has in both gsm8k digest checks at least as
+    many loads equal to no reference as the connector sabotaged there (less
+    the external loads that check left uncertain), and a sabotage at all."""
     v = run_gate.caught_per_group(d_self, d_base, targets, sabotage)
     assert v["pass"] is ok, v
     assert set(v["groups"]) == {str(t) for t in targets}
@@ -2631,16 +2799,19 @@ def test_arms_run_the_baselines_triton_autotune_picks(tmp_path):
     """A fresh arm root gets a copy of the baseline's ``*.autotune.json``
     (FLA kernels outside Inductor pick tiles by timing, and the picks change
     the numbers) and nothing else of the baseline's cache."""
+    import json
+
     caches = tmp_path / ".compile-cache"
     base = caches / "baseline" / "triton"
     (base / "H1").mkdir(parents=True)
-    (base / "H1" / "chunk_fwd_kernel_o.autotune.json").write_text('{"pick": 1}')
+    pick = json.dumps({"key": [1], "configs_timings": [[{"kwargs": {"BK": 32}, "num_warps": 4, "num_stages": 2}, [0.1]]]})  # fmt: skip
+    (base / "H1" / "chunk_fwd_kernel_o.autotune.json").write_text(pick)
     (base / "H1" / "chunk_fwd_kernel_o.cubin").write_text("kernel")
     (caches / "baseline" / "torch_compile_cache").mkdir()
     arm = caches / "selftest-honest"
     arm.mkdir()
     assert run_gate.seed_autotune(arm) == 1
-    assert (arm / "triton/H1/chunk_fwd_kernel_o.autotune.json").read_text() == '{"pick": 1}'
+    assert (arm / "triton/H1/chunk_fwd_kernel_o.autotune.json").read_text() == pick
     assert sorted(p.name for p in arm.rglob("*") if p.is_file()) == ["chunk_fwd_kernel_o.autotune.json"]  # fmt: skip
     assert run_gate.seed_autotune(caches / "baseline") == 0  # the source itself
     assert run_gate.seed_autotune(tmp_path / "x" / "plain") == 0  # no baseline yet

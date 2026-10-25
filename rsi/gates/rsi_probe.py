@@ -28,10 +28,11 @@ test (MultiConnector) or alone (baseline) and records:
   that forward, before any later step can reuse the block). Loaded states:
   the episode's start state, block ``start / block_size - 1`` of the
   episode's first step (the local hit or what a connector loaded), digested
-  in ``handle_preemptions``: before ``preprocess_mamba`` copies that block
-  into the running state the forward reads, and before a sync
-  ``start_load_kv`` (a load landing there is too late for the forward and
-  shows up as a mismatch). These records carry ``episode`` (index into the request's
+  in ``handle_preemptions``. On vLLM 0.32's V2 runner that is after the
+  align precopy (which only reads the start block into a later one) and
+  before a sync ``start_load_kv`` and the forward, so it digests the bytes
+  the forward computes from (a sync load landing after it is too late for
+  the forward and shows up as a mismatch). These records carry ``episode`` (index into the request's
   episodes), so a state computed in a preempted episode is tagged by that
   episode. Outside align mode Mamba groups are skipped (running state).
 
@@ -201,6 +202,30 @@ def _compilation_summary(vllm_config: Any) -> dict[str, Any]:
     }
 
 
+# Spec dump schema (``probe.schema``); bump when a field is added, and add it
+# to ``run_gate.SPEC_FIELDS`` so older records are not judged on it.
+SPEC_SCHEMA = 3
+
+
+def _model_runner(vllm_config: Any) -> str:
+    """vLLM's model runner: V2 calls ``handle_preemptions`` after zeroing,
+    COW copies and the Mamba precopy, V1 before them."""
+    return "V2" if getattr(vllm_config, "use_v2_model_runner", False) else "V1"
+
+
+def _clobbered_blocks(scheduler_output: Any) -> dict[int, str]:
+    """Block ids vLLM overwrites this step before the forward: freshly
+    allocated blocks it zeroes (``new_block_ids_to_zero``) and COW copy
+    destinations (``kv_cache_block_copies``). On the V2 runner both happen
+    before ``handle_preemptions``, so a freed preempted block reallocated in
+    the same step no longer holds the preempted episode's bytes."""
+    out = {int(b): "zeroed" for b in getattr(scheduler_output, "new_block_ids_to_zero", None) or ()}
+    for c in getattr(scheduler_output, "kv_cache_block_copies", None) or ():
+        dst = c.dst_block_id if hasattr(c, "dst_block_id") else c[1]  # KVCacheBlockCopy
+        out[int(dst)] = "cow"
+    return out
+
+
 def prefix_keys(tokens: list[int], covered: list[int]) -> list[str]:
     """Hex prefix hash for each coverage length in ``covered`` (ascending)."""
     out: list[str] = []
@@ -275,8 +300,8 @@ class _StateJob:
 class ProbeMetadata(KVConnectorMetadata):
     jobs: list[_DigestJob] = field(default_factory=list)
     states: list[_StateJob] = field(default_factory=list)
-    # Episode start states, digested as the forward reads them (before the
-    # Mamba precopy and any sync load of this step).
+    # Episode start states, digested as the forward reads them (V2: after
+    # the Mamba precopy, which only reads them, before any sync load).
     start_states: list[_StateJob] = field(default_factory=list)
     # Requests preempted this step: digested before this step's forward can
     # reuse their freed blocks.
@@ -296,6 +321,8 @@ class _Live:
     blocks: list[list[int]] = field(default_factory=list)
     computed: int = 0
     preempt_digested: list[int] = field(default_factory=list)  # episodes
+    # Preempted blocks not digested: [episode, group, covered, "zeroed" | "cow"]
+    preempt_dropped: list[list[Any]] = field(default_factory=list)
 
 
 class RsiProbe(KVConnectorBase_V1, SupportsHMA):
@@ -434,7 +461,10 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             # Effective compile settings (G0.spec pins them): an arm whose
             # compile differs from the baseline's computes other numbers.
             "compilation": _compilation_summary(vllm_config),
+            # Decides the worker step order the probe's digests rely on.
+            "model_runner": _model_runner(vllm_config),
             "probe": {
+                "schema": SPEC_SCHEMA,
                 "digest_skipped_groups": {str(k): v for k, v in self._skip_groups.items()},
                 "state_groups": sorted(self._state_groups),
             },
@@ -555,10 +585,11 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         starts: list[_StateJob] = []
         # First: a request preempted (and possibly resumed) this step is
         # digested from the block table of its previous episode.
+        clobbered = _clobbered_blocks(scheduler_output)
         preempted = [
             job
             for rid in sorted(getattr(scheduler_output, "preempted_req_ids", None) or ())
-            if (job := self._preempt_job(rid)) is not None
+            if (job := self._preempt_job(rid, clobbered)) is not None
         ]
         for req in scheduler_output.scheduled_new_reqs:
             self._episode(req.req_id, req.num_computed_tokens)
@@ -603,10 +634,13 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 table.extend(new)
         live.computed = before + sched.get(rid, 0)
 
-    def _preempt_job(self, rid: str) -> _DigestJob | None:
+    def _preempt_job(self, rid: str, clobbered: dict[int, str] | None = None) -> _DigestJob | None:
         """The bytes a preempted episode leaves (its fully computed blocks),
         tagged by that episode; without it its computations stay undigested
-        and its loads unjudged."""
+        and its loads unjudged. ``clobbered`` (block id -> ``zeroed`` |
+        ``cow``): freed blocks vLLM reallocated this step and overwrites
+        before ``handle_preemptions`` on the V2 runner; they are dropped (no
+        reference from them) and recorded in ``preempt_dropped``."""
         live = self._live.get(rid)
         if live is None or not live.episodes or live.request is None:
             return None
@@ -617,6 +651,12 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         tokens = list(live.request.all_token_ids)
         computed = min(live.computed, len(tokens))
         per_group = self._entries(tokens, computed, live.episodes[-1][2], digest, live.blocks)
+        if clobbered:
+            for gid, blocks in enumerate(per_group):
+                for b in blocks:
+                    if b[1] in clobbered:
+                        live.preempt_dropped.append([ep, gid, b[3], clobbered[b[1]]])
+                per_group[gid] = [b for b in blocks if b[1] not in clobbered]
         live.preempt_digested.append(ep)
         live.blocks, live.computed = [], 0
         return _DigestJob(rid, per_group, episode=ep) if any(per_group) else None
@@ -760,6 +800,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                     "progress": live.progress,
                     **({"states": live.states} if self._state_groups else {}),
                     "preempt_digested": live.preempt_digested,
+                    "preempt_dropped": live.preempt_dropped,
                     "finish_step": self._step,
                     "digest": digest,
                     "key_tokens": kt,
@@ -918,10 +959,16 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         return
 
     def handle_preemptions(self, kv_connector_metadata) -> None:
-        # Called every step before ``_update_states``, the Mamba precopy and
-        # ``start_load_kv``: the freed blocks still hold the preempted
-        # episode's bytes, and a start-state block holds what the precopy is
-        # about to hand the forward.
+        # vLLM 0.32's V2 runner (what runs; ``spec.json`` ``model_runner``)
+        # calls this from ``kv_connector.pre_forward``, after
+        # ``update_requests`` (zeroes new blocks, applies COW copies) and the
+        # Mamba align precopy, and before a sync ``start_load_kv`` and the
+        # forward. Freed preempted blocks still hold their episode's bytes
+        # except the ones reallocated and overwritten this step, which
+        # ``build_connector_meta`` already dropped (``preempt_dropped``). A
+        # start-state block holds what the forward computes from: the
+        # precopy only reads it (its destination is a later block), and a
+        # sync load lands after this digest.
         meta = kv_connector_metadata
         if not isinstance(meta, ProbeMetadata):
             return

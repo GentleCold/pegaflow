@@ -77,7 +77,7 @@ _BLOCKS = ([10, 11, 12, 13], [20, 21, 22, 23])
 )
 def test_start_state_is_queued_for_before_the_forward(start, blocks, n_tokens, what):
     """M1: the start state (block ``start / bt - 1``) goes to ``start_states``,
-    which the worker digests in ``handle_preemptions`` (before the precopy),
+    which the worker digests in ``handle_preemptions`` (before a sync load),
     never to ``states`` (``wait_for_save``); a start state that cannot be
     digested is recorded as a ``start_*`` skip."""
     p = _probe()
@@ -139,10 +139,44 @@ def test_preempted_episode_digests_its_computed_full_blocks():
     assert live.blocks == [[30, 31, 32], [40, 41, 42]]
 
 
+@pytest.mark.parametrize(
+    "zero,copies,dropped",
+    [
+        ((), (), []),
+        ((21, 99), (), [[0, FULL, 2 * BT, "zeroed"]]),
+        ((), (SimpleNamespace(src_block_id=5, dst_block_id=22),), [[0, FULL, 3 * BT, "cow"]]),
+    ],
+    ids=["untouched", "zeroed", "cow-destination"],
+)
+def test_preempted_blocks_overwritten_this_step_are_dropped(zero, copies, dropped):
+    """R2: the V2 runner zeroes new blocks and applies COW copies before
+    ``handle_preemptions``, so a freed preempted block reallocated this step
+    no longer holds its episode's bytes: it is not digested (no reference)
+    and is recorded in ``preempt_dropped``."""
+    p = _probe()
+    _admit(p, "a", 30, local=0, start=0, sched=3 * BT, blocks=([10, 11, 12], [20, 21, 22]))
+    out = _out({}, preempted=["a"])
+    out.new_block_ids_to_zero, out.kv_cache_block_copies = list(zero), list(copies)
+    (job,) = p.build_connector_meta(out).preempted
+    kept = {20: BT, 21: 2 * BT, 22: 3 * BT}
+    for d in dropped:
+        kept = {b: c for b, c in kept.items() if c != d[2]}
+    assert [(b[1], b[3]) for b in job.blocks[FULL]] == sorted(kept.items())
+    assert p._live["a"].preempt_dropped == dropped
+
+
+def test_spec_dump_records_the_runner_and_schema():
+    """R2: the runner decides the worker step order the digests rely on."""
+    assert rsi_probe._model_runner(SimpleNamespace(use_v2_model_runner=True)) == "V2"
+    assert rsi_probe._model_runner(SimpleNamespace(use_v2_model_runner=False)) == "V1"
+    assert rsi_probe.SPEC_SCHEMA == 3
+
+
 def test_worker_digests_start_states_before_the_forward(monkeypatch):
-    """M1: start states are digested in ``handle_preemptions`` (vLLM calls it
-    before ``_update_states``, the align precopy and ``start_load_kv``),
-    offers in ``wait_for_save`` (after the forward wrote them)."""
+    """M1: start states are digested in ``handle_preemptions`` (V2 runner:
+    after the align precopy, which only reads them, before a sync
+    ``start_load_kv`` and the forward), offers in ``wait_for_save`` (after
+    the forward wrote them)."""
     p = object.__new__(rsi_probe.RsiProbe)
     p._groups = [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=BT))]
     calls: list[tuple[str, str, int | None]] = []
