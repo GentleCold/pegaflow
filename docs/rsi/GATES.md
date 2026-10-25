@@ -137,7 +137,12 @@ so such stranded bytes are possible today.
   in the future goes first; next use = the next request (by first schedule)
   whose unlimited-oracle resolved prefix covers the item; an item never used
   again is not stored. Hits are `semantics.resolve` over present blocks, as in
-  G3. This is a strong reference, not a proven optimum; `E_C > 1` is allowed.
+  G3. For Kinds whose `needed` is not prefix-closed (Checkpoint, Window) a
+  second, fallback-aware Belady also counts every earlier resume point as a
+  use, and `H*_C` is the best of the candidate stores (Belady, that variant,
+  LRU), so it is never below `H_lru` in `Σ ext*_C` (since 2026-10-26;
+  full-only models unchanged). This is a strong reference, not a proven optimum; `E_C > 1` is
+  allowed.
 - References `H_lru` (group-oblivious LRU, everything stored) and `H_freeze`
   (store until full, never evict): reported only, to show how far naive
   policies are from the bar.
@@ -404,7 +409,7 @@ cd .. && PYTHONPATH=. python/.venv/bin/python -m pytest -q -p no:cacheprovider r
 ```
 
 The full suite is the gate's test run, signal and teardown tests (real
-subprocesses) included: 311 tests in about 52 s on the 4090 host. Nothing is
+subprocesses) included: 363 tests in about 52 s on the 4090 host. Nothing is
 deselected. PR CI does not run them (it runs `python/tests` only); they are
 a manual gate for every change under `rsi/gates` until CI does (PROGRESS,
 user acceptance item). The isolation tests (`isolate.py`) need Linux and root and skip
@@ -1273,6 +1278,53 @@ the last accepted run record by hand until `--accepted` exists.
       furthest is not stored. Greedy under variable item sizes and blind to
       partial-prefix coherence: a strong reference, not a proven optimum
       (`E_C > 1` is allowed).
+    - Fallback-aware candidate (since 2026-10-26). The use sets above are
+      complete only when every group's `needed` is prefix-closed:
+      `needed(q) ⊆ needed(P)` for every resume point `q < P`, as for Full.
+      A Checkpoint's `needed(q)` is the state at `q`, which `needed(P)` does
+      not contain, so the plain Belady saw every earlier checkpoint as
+      unused, refused or evicted it, and lost the fallback resume point a
+      smaller store needs. LRU kept it and resumed there. On Qwen3.5-4B
+      (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) that put `H*_C` 0.690
+      below `H_lru` 0.794 at `C/U` 0.25 (`E_C` > 1), and below LRU on 239
+      requests at 0.5 (P5-it2 review). `oracle.prefix_closed` checks the
+      property from `semantics.needed` (so from the Kind, never the model
+      name) over the trace's resume points. Where it fails,
+      `belady_fallback` runs too: the same Belady, but a request uses the
+      union of `needed(q)` over every resume point `q` in `(ref, P]`
+      (`resolve`'s step, the lcm of the block sizes). Where it holds, that
+      union is `needed(P)`, so the variant would equal the plain Belady and
+      is not run.
+    - `H*_C` = per segment, the candidate store with the largest `Σ ext*_C`
+      among `belady`, `belady_fallback` (if run) and `lru`, ties in that
+      order. Each candidate is one store of `C` bytes over the whole trace,
+      so the bar is a hit rate some real store reaches, and it is never
+      below `H_lru` in `Σ ext*_C` (the selection key; the hit rates could
+      in principle rank differently, and agreed on every segment of the
+      re-scored runs). Exact optimality (variable item sizes, all-groups
+      coherence) is not tractable, and neither variant dominates: spreading
+      uses over every fallback point dilutes the greedy choice (P5-it2: the
+      fallback variant is up to 0.005 below the plain one at 0.75). Recorded
+      per segment: `oracle_c_policy` (the winner) and `oracle_c_candidates`
+      (tokens, `ext*_C` tokens and `lru_above_requests` per candidate);
+      `oracle_c_policies` per stage; `diagnostics.oracle_c` stays the plain
+      Belady, with `diagnostics.oracle_c_fallback` next to it. The
+      verdict's `oracle_c_groups` / `oracle_c_passes` are the diagnostics of
+      the `warm_timed` winner, and when that is not the plain Belady, the
+      plain Belady's are reported too, as `belady_groups` /
+      `belady_passes`. `efficiency_c_own_local` uses the same candidates at
+      the own local hit. Full-only models (Qwen3-4B, DeepSeek-V2-Lite) run
+      the same two stores as before and the plain Belady wins every
+      segment, so their records re-score identical in every shared field
+      (the record only gains `oracle_c_policies`, `oracle_c_policy` and
+      `oracle_c_candidates`). `E_C` stays reported, not gated. One indirect
+      effect: `freeze_vs_oracle_c` feeds `g5_problems` (officiality:
+      `FREEZE_SEPARATION`), and a higher bar lowers it, so for a
+      non-prefix-closed model a trace that did not separate freeze from
+      `H*_C` before can now be official. That is the right direction, since
+      the bar is a reachable store and the separation is real. No current
+      run flips: Qwen3.5-4B 0.5 goes from 0.667 to 0.655 (v2), and full-only
+      runs are unchanged.
     - `H_lru`: group-oblivious LRU, every item stored, a re-store of a
       resident item does not refresh it, a hit refreshes the blocks loaded.
     - `H_freeze`: items stored in arrival order until the next one does not
@@ -1287,7 +1339,7 @@ the last accepted run record by hand until `--accepted` exists.
     `Σ ext*_C = 0`: fails). Reported: `lru_vs_oracle_c` and
     `freeze_vs_oracle_c` (`Σ max(0, H - ref) / Σ ext*_C`),
     `efficiency_c_own_local` (the same `E_C` with the arm's own local hit in
-    place of `ref` for `ext`, `ext*_C` and the Belady run; diagnostic only),
+    place of `ref` for `ext`, `ext*_C` and the candidate runs; diagnostic only),
     `efficiency_c_cold` / `freeze_vs_oracle_c_cold` (`cap_cold`: within-pass
     multi-turn reuse after vLLM evicted the earlier turn; diagnostic only).
     `unmatched_requests` = requests without a `ref` (no position tag, or the
@@ -1308,7 +1360,9 @@ the last accepted run record by hand until `--accepted` exists.
     counter deltas, per-pass server I/O (`saved_bytes`, `loaded_bytes`,
     `external_hit_bytes`) and end-of-pass resident / used bytes, per-group
     stored / not-admitted / evicted counts and bytes and per-pass resident /
-    stranded bytes for `H*_C` and `H_lru`.
+    stranded bytes for `H_lru` and for the store that set `H*_C` on
+    `warm_timed` (`oracle_c_policy`; plus the plain Belady's as `belady_*`
+    when another candidate won).
   - `G2.digest_self.cap` (cap probe dir against itself, every request
     digested): 0 mismatched and 0 unreferenced (local and external), and
     exhaustive: every loaded block judged. The only allowance is a block
