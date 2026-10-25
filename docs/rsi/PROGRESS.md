@@ -1215,7 +1215,11 @@ local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
       `--model /root/kexi/models/DeepSeek-V2-Lite-Chat --tag
       dsv2-lite-p5-s1-$REV --tp 2 --gpu 4,5` and log
       `dsv2-lite-p5-s1-$REV.log`). The merged gate adds the resume stage
-      for DSV2 (split-variant).
+      for DSV2 (split-variant), and DSV2's gate.json now has
+      `gsm8k_vllm_args` (merged from `feat/rsi-deepseek-v2-lite` fac8e82
+      as 46814fc). So the DSV2 reference is its own official rerun on the
+      merged gate (connector tree from its branch) once it lands, and it7
+      only for G5 hit / E_C.
     - Not official by design (no replay). The other args match the
       accepted it7 runs (`2026-10-25-*-p4-it7-off-a59a254`), so cap auto
       gives the same 64 / 76 conversations. Compare v2's G4 gsm8k, G5
