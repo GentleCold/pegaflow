@@ -968,11 +968,14 @@ the last accepted run record by hand until `--accepted` exists.
     0.32's align-mode split (`prefill_step_ends`: non-final chunks end on a
     block boundary, stops at the last cacheable boundary and at the
     shared-prefix junction, `--max-num-batched-tokens` per step), and decode
-    stores every boundary it crosses. A request running alone is assumed, so
-    shared step budgets (more step ends) make the measured `U` a little
-    higher: Qwen3.5-4B s1 8 x 6 estimates 3.39 GB vs 3.49 GB measured (0.97;
-    the Full-only rule gave 4.47 GB, 1.28x), an error toward more
-    conversations. If the whole file is
+    stores every boundary it crosses. A request running alone is assumed;
+    concurrent requests share the step budget, which only adds step ends,
+    so the Checkpoint part is a lower bound and the error is toward more
+    conversations. Qwen3.5-4B: s1 8 x 6 estimates 3.39 GB vs 3.49 GB
+    measured (0.97; the Full-only rule gave 4.47 GB, 1.28x); the official
+    256 x 12 (32 workers) estimates 136.33 GB vs 167.96 GB measured (0.81,
+    full-attention group exact; run `qwen3.5-4b-cap-sizing-baseline-4f3cb97`).
+    If the whole file is
     not enough every conversation is used and the measured floor fails the
     run closed (`capacity below 2x GPU KV (whole replay file used)`).
     Every replay request carries `vllm_xargs.rsi_conv` / `rsi_turn`; the probe

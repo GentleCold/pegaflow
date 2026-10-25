@@ -858,7 +858,13 @@ names, magic constants that only exist in the old code).
   3.49 GB measured (was 4.47 GB). Official plans: Qwen3-4B 64 and
   DeepSeek-V2-Lite 76 unchanged (same bytes); Qwen3.5-4B all 256
   conversations est. 136.33 GB, above the floor (133.15 GB) but under the
-  1.1 margin (146.47 GB). Floor and margin unchanged. A cap-only run
+  1.1 margin (146.47 GB). Floor and margin unchanged. Baseline-only cap
+  run on GPU6 at that size (`qwen3.5-4b-cap-sizing-baseline-4f3cb97`, not
+  official by design): measured U 167.96 GB = 5.05x GPU KV, C(0.5) 2.52x,
+  floor passes. Full-attention blocks exact (2717); Checkpoint 2348 per
+  GDN group measured vs 1734 estimated: 32 concurrent workers split
+  prefills into more step ends than one request alone (est/meas 0.81).
+  A cap-only run
   (`--workloads cap`) had no earlier baseline spec dump and fell back to
   64 conversations; auto now sizes from the committed dump there.
 

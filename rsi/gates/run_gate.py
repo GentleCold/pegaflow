@@ -2766,9 +2766,11 @@ class UniqueEstimate:
       groups alone), and every boundary its decode crosses is a step end.
 
     For sizing only; the floor is checked on the measured ``U``. Checkpoint
-    bytes are a slight under-estimate: shared step budgets and GPU cache
-    evictions only add step ends, which raises the measured ``U`` and so
-    errs on the safe side (more conversations)."""
+    bytes are a lower bound: concurrent requests share the step budget (and
+    GPU cache evictions move resume points back), which only adds step ends
+    and raises the measured ``U``, so the error is toward more conversations
+    (Qwen3.5-4B: 0.97 of measured at 8 x 6, 0.81 at 256 x 12 with 32
+    workers, where the Full group is exact)."""
 
     def __init__(self, spec: dict[str, Any], out_tokens: int, budget: int):
         kinds = [(label, g, bt) for label, g, bt in oracle.group_kinds(spec) if g is not None]
