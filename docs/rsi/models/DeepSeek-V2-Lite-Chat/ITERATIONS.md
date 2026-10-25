@@ -2397,3 +2397,38 @@ Plan (GPU): S5 self-test with the resume stage (plain, baseline, honest,
 liar, bitflip, offbyone on gsm8k, TP2), then M2 official (plain, baseline,
 old, native, lmcache, v2; gsm8k, replay, cap, preempt; preempt is R2: the
 S6 episode chain for preempted warm requests on a GPU).
+
+### S5: self-test with the resume stage (`2026-10-25-dsv2-lite-p4-selftest-fac8e82`, GPU 0,1, TP2, gate fac8e82, run_gate pgid 3639242)
+
+Arms plain, baseline, selftest:{honest,liar,bitflip,offbyone}; workloads
+gsm8k (128 questions) and preempt; not official by design. Each self-test
+arm got its own `resume-selftest-<mode>` baseline replay.
+
+| arm | G0.spec (committed at fac8e82 / regenerated) | resume_reference | digest_self.gsm8k ext / local mismatched | vs_baseline ext / local mismatched; computed exact | outputs | accuracy cold / warm | preempt | caught_per_group (group 0) |
+|---|---|---|---|---|---|---|---|---|
+| baseline | - | - | 0 / 0; 6434 / 6434 exact | - | plain == baseline 0 differ, warm == cold 0 | 0.7031 / 0.7031 | pass | - |
+| honest | fail (4 schema-3 fields) / pass | pass: 128 planned, 84 waves, 0 missing / start_differs | 0 / 0 (1084 ext matched) | 0 / 0; 4274 / 4274, coverage 1.0 | pass (0 differ from the replay; 60 differ from cold, = split control 60 / 128) | 0.7031 / 0.7109 | pass (45 preempted, 604 ext matched) | - |
+| liar | fail / pass | pass (67 waves) | fail | 2168 / 34544 | fail | 0.0078 / 0 | fail | caught: 36712 / 36712 bad, 2230 sabotaged |
+| bitflip | fail / pass | pass (16 waves) | 256 / 254 | 256 / 254 | fail | 0.7031 / 0 | fail (128 ext) | caught: 510 / 510, 256 sabotaged |
+| offbyone | fail / pass | pass (85 waves) | 828 / 17272 | 828 / 17272 | fail | 0.7031 / 0.1016 | fail (464 ext) | caught: 18100 / 18100, 254 sabotaged |
+
+- The run's `pass` is false on every self-test arm only through `G0.spec`:
+  the committed spec.json at fac8e82 predates probe schema 3
+  (`cache.prefix_cache_retention_interval`, `compilation`,
+  `kv_cache_config.prefix_cache_retention_interval`, `model_runner`).
+  The spec.json is now regenerated from this run's
+  `baseline/gsm8k/probe/spec.json` (without `modules` and
+  `probe.state_groups`, which `_strip` ignores, as in the other committed
+  dumps). `run_gate.g0` against it: pass, 0 diffs, for all four arms.
+  The other diffs vs the old dump are volatile (`num_blocks` 6222 -> 6226,
+  `layer_stride`, `size`). `compilation.inductor_compile_config.deterministic`
+  is true: R4's `gsm8k_vllm_args` took effect (`G0.vllm_args` passes).
+- With G0.spec passing, honest passes every required check including
+  `G2.resume_reference`, and each negative fails both digest checks in its
+  group: the gate sees on DSV2 under the resume stage. Signatures equal the
+  2026-10-23 self-test (liar 2168 / bitflip 256 / offbyone 828 external
+  mismatched; accuracies identical).
+- R2 is not covered here: `episodes_planned` is 0 for every arm. The resume
+  stage replays the gsm8k warm pass, and no gsm8k warm request was
+  preempted; the `preempt` workload is its own stage and is judged by
+  `G2.preempt`, not replayed.

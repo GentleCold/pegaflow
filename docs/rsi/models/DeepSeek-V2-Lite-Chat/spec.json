@@ -3,7 +3,19 @@
   "block_size": 16,
   "cache_dtype": "auto",
   "enable_prefix_caching": true,
-  "mamba_cache_mode": "none"
+  "mamba_cache_mode": "none",
+  "prefix_cache_retention_interval": 0
+ },
+ "compilation": {
+  "backend": "inductor",
+  "cudagraph_mode": "FULL_AND_PIECEWISE",
+  "inductor_compile_config": {
+   "benchmark_combo_kernel": false,
+   "combo_kernels": true,
+   "deterministic": true,
+   "enable_auto_functionalized_v2": false
+  },
+  "mode": 3
  },
  "dtype": "bfloat16",
  "hf": {
@@ -103,7 +115,8 @@
   "hash_block_size": 16,
   "kv_cache_layout": "LBNHC",
   "kv_tp_replicas": 2,
-  "num_blocks": 6222,
+  "num_blocks": 6226,
+  "prefix_cache_retention_interval": 0,
   "prefix_cacheable_group_ids": [
    0
   ],
@@ -111,7 +124,7 @@
    {
     "block_stride": 18432,
     "host_resident": false,
-    "layer_stride": 114683904,
+    "layer_stride": 114757632,
     "layers": [
      "model.layers.0.self_attn.attn",
      "model.layers.1.self_attn.attn",
@@ -142,7 +155,7 @@
      "model.layers.26.self_attn.attn"
     ],
     "offset": 0,
-    "size": 3096465408
+    "size": 3098456064
    }
   ],
   "transfer_group_ids": [
@@ -151,13 +164,15 @@
  },
  "max_model_len": 8192,
  "model": "/root/kexi/models/DeepSeek-V2-Lite-Chat",
+ "model_runner": "V2",
  "parallel": {
   "dcp": 1,
   "pp": 1,
   "tp": 2
  },
  "probe": {
-  "digest_skipped_groups": {}
+  "digest_skipped_groups": {},
+  "schema": 3
  },
  "vllm_version": "0.32.0"
 }
