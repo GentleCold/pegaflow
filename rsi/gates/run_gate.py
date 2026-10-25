@@ -2823,6 +2823,9 @@ def verdicts(
                     "G2.gsm8k",
                     "G2.digest_groups",
                     *(("G2.preempt",) if "G2.preempt" in g else ()),
+                    # Split-variant: warm computed KV and outputs are judged
+                    # against the replay at the arm's resume points (S5).
+                    *(("G2.resume_reference",) if not split_inv else ()),
                 )
                 g["pass"] = all(g[k]["pass"] for k in need)
                 g["expect"] = "pass every G2 check"
