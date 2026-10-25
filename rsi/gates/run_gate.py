@@ -162,6 +162,8 @@ MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
 # same-split, same-context reference, and the arm's warm completions have a
 # same-split reference (``resume_differ``).
 RESUME_PASS = "resume"
+# A later episode of a request the arm's vLLM preempted (S6, ``resume_plan``).
+RESUME_EP_PASS = f"{RESUME_PASS}_ep"
 RESUME_PREFIX = "resume-"
 
 
@@ -1217,18 +1219,36 @@ def match_locals(reqs: list[dict[str, Any]], ref: dict[str, int] | None) -> list
     return out
 
 
+def resume_stage_needed(gate: dict[str, Any], arms: list[str]) -> bool:
+    """Split-variant models only: every arm's gsm8k warm pass gets a baseline
+    replay at its resume points (needs the baseline arm)."""
+    return not gate.get("split_invariant", True) and "baseline" in arms
+
+
 def resume_plan(reqs: list[dict[str, Any]], n: int) -> dict[str, Any]:
     """An arm's gsm8k warm pass as the baseline's ``resume`` stage replays it.
 
-    Per warm request (prompt index ``conv``), from its last schedule episode
-    ``[step, local, start]``: the arm resumed computing at ``start`` with
+    Per warm request (prompt index ``conv``), from its first schedule episode
+    ``[step, local, start]``: the arm started computing at ``start`` with
     ``[0, local)`` from vLLM's prefix cache (filled by its earlier warm
     requests) and ``[local, start)`` loaded by the connector. The replay
     pre-warms ``[0, start)`` (only when ``start > local``: the local part
     comes from the replay's own earlier requests, as in the arm), in waves of
-    the arm's schedule order (same ``step`` = same wave). ``problems``: warm
-    requests without a usable prompt index (the plan then fails closed)."""
+    the arm's schedule order (same ``step`` = same wave). Wave rows:
+    ``[prompt, pre-warm R, start, prompt_len]``.
+
+    A request vLLM preempted has later episodes ``k`` (S6): ``chains[prompt]``
+    lists ``[k, R_k, start_k, tokens_k]`` (``tokens_k``: the request's length
+    when episode ``k`` was scheduled, ``episode_tokens``; ``R_k`` the
+    pre-warm point, by the same rule). The replay runs each right after the
+    previous one finishes, as a request of the first ``tokens_k`` tokens of
+    the replay's own sequence so far, so its context is the replay's
+    previous episode (vLLM's local hit, as in the arm when the preempted
+    request's blocks were still cached). ``problems``: warm
+    requests without a usable prompt index or episode lengths (the plan then
+    fails closed)."""
     rows, problems, seen = [], [], set()
+    chains: dict[str, list[list[int]]] = {}
     for r in reqs:
         if r.get("pass") != "warm" or not r.get("episodes"):
             continue
@@ -1237,8 +1257,21 @@ def resume_plan(reqs: list[dict[str, Any]], n: int) -> dict[str, Any]:
             problems.append(f"warm request {r.get('req_id')}: prompt index {i!r}")
             continue
         seen.add(i)
-        step, local, start = r["episodes"][-1]
+        eps = r["episodes"]
+        step, local, start = eps[0]
         rows.append((step, i, start, local or 0, r.get("prompt_len")))
+        if len(eps) > 1:
+            raw = r.get("episode_tokens")
+            toks = raw if isinstance(raw, list) else []
+            plen = r.get("prompt_len") or 0
+            if len(toks) != len(eps) or any(not isinstance(t, int) or t < plen for t in toks[1:]):
+                problems.append(f"warm request {r.get('req_id')}: episode lengths {raw!r}")
+                continue
+            chains[str(i)] = [
+                [k, s if s > (lk or 0) else 0, s, toks[k]]
+                for k in range(1, len(eps))
+                for _, lk, s in (eps[k],)
+            ]
     waves: list[list[list[int]]] = []
     last = None
     for step, i, start, local, plen in sorted(rows):
@@ -1248,27 +1281,43 @@ def resume_plan(reqs: list[dict[str, Any]], n: int) -> dict[str, Any]:
         waves[-1].append([i, start if start > local else 0, start, plen])
     if len(seen) != n:
         problems.append(f"{len(seen)} of {n} prompts have a warm request")
-    return {"waves": waves, "problems": problems}
+    return {"waves": waves, "chains": chains, "problems": problems}
 
 
 def resume_check(plan: dict[str, Any], reqs: list[dict[str, Any]]) -> dict[str, Any]:
     """Did the replay resume where the arm did? Per planned prompt: the
-    replayed ``resume`` request's prompt length and last-episode start vs the
-    arm's (a differing start leaves that request's computed blocks without a
-    same-split reference: unjudged, never matched)."""
+    replayed ``resume`` request's prompt length and first-episode start vs
+    the arm's (a differing start leaves that request's computed blocks
+    without a same-split reference: unjudged, never matched). Per planned
+    later episode (``chains``, S6): the ``resume_ep`` request of that
+    episode (``turn``), its prompt length vs the arm's episode length and its
+    start vs the arm's episode start (``episode_*``, ``[prompt, episode]``)."""
     got = {
         r["conv"]: r for r in reqs if r.get("pass") == RESUME_PASS and r.get("episodes")
+    }  # fmt: skip
+    got_ep = {
+        (r["conv"], r.get("turn")): r
+        for r in reqs
+        if r.get("pass") == RESUME_EP_PASS and r.get("episodes")
     }  # fmt: skip
     planned = [x for w in plan["waves"] for x in w]
     missing = [i for i, *_ in planned if i not in got]
     plen = [i for i, _, _, p in planned if i in got and got[i].get("prompt_len") != p]
-    start = [i for i, _, s, _ in planned if i in got and got[i]["episodes"][-1][2] != s]
+    start = [i for i, _, s, _ in planned if i in got and got[i]["episodes"][0][2] != s]
+    eps = [(int(i), k, s, n) for i, rows in plan.get("chains", {}).items() for k, _, s, n in rows]
+    ep_missing = [[i, k] for i, k, _, _ in eps if (i, k) not in got_ep]
+    ep_plen = [[i, k] for i, k, _, n in eps if (i, k) in got_ep and got_ep[(i, k)].get("prompt_len") != n]  # fmt: skip
+    ep_start = [[i, k] for i, k, s, _ in eps if (i, k) in got_ep and got_ep[(i, k)]["episodes"][0][2] != s]  # fmt: skip
     return {
         "planned": len(planned),
         "waves": len(plan["waves"]),
         "missing": missing,
         "prompt_len_differs": plen,
         "start_differs": start,
+        "episodes_planned": len(eps),
+        "episode_missing": ep_missing,
+        "episode_prompt_len_differs": ep_plen,
+        "episode_start_differs": ep_start,
         "plan_problems": plan["problems"],
     }
 
@@ -1439,6 +1488,7 @@ def run_arm_workload(
                         [[(i, r) for i, r, *_ in w] for w in plan["waves"]],
                         args.concurrency,
                         xargs={"rsi_pass": name, "rsi_digest": "full"},
+                        chains=plan["chains"],
                     )
                 )
                 (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
@@ -2054,6 +2104,8 @@ def resume_differ(
         return None, None
     plen = {i: p for w in plan["waves"] for i, _, _, p in w}
     unreplayed = set(check["missing"]) | set(check["start_differs"]) | set(check["prompt_len_differs"])  # fmt: skip
+    for k in ("episode_missing", "episode_start_differs", "episode_prompt_len_differs"):
+        unreplayed |= {i for i, _ in check.get(k, [])}  # a later episode replayed elsewhere (S6)
     checked = exempt = 0
     for i, out in enumerate(got):
         p = plen.get(i)
@@ -2077,8 +2129,18 @@ def _resume_verdict(r: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "pass": d["pass"] and not c.get("plan_problems"),
         "digest_self": d["pass"],
-        **{k: c.get(k) for k in ("planned", "waves", "plan_problems")},
-        **{k: len(c.get(k) or []) for k in ("missing", "start_differs", "prompt_len_differs")},
+        **{k: c.get(k) for k in ("planned", "waves", "episodes_planned", "plan_problems")},
+        **{
+            k: len(c.get(k) or [])
+            for k in (
+                "missing",
+                "start_differs",
+                "prompt_len_differs",
+                "episode_missing",
+                "episode_start_differs",
+                "episode_prompt_len_differs",
+            )
+        },
     }
 
 
@@ -3688,7 +3750,7 @@ def main(argv: list[str] | None = None) -> int:
     measured_u: dict[str, dict[str, Any]] = {}
     # Split-variant: every arm's gsm8k warm pass gets a baseline replay at its
     # resume points (needs the baseline arm, which always runs first).
-    needs_resume = not gate.get("split_invariant", True) and "baseline" in arms
+    needs_resume = resume_stage_needed(gate, arms)
 
     for arm in arms:
         kind = arm_kind(arm)
