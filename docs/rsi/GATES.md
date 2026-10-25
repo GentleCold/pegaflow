@@ -173,10 +173,18 @@ so such stranded bytes are possible today.
   | Qwen3-4B | source build of LMCache PR #4467 head `e05c2ea` | 256 | comparable, except the `cap075` curve point (wrong loads) | below |
   | Qwen3-4B | PR #4467 `e05c2ea` | 16 (secondary) | not comparable: claimed hits never loaded | below |
   | DeepSeek-V2-Lite-Chat (TP2, MLA) | PR #4467 `e05c2ea` | 256 | not comparable: crashes | below |
-  | DeepSeek-V2-Lite-Chat | 0.5.6 | 256 | digests pass with the resume reference; see below | below |
+  | DeepSeek-V2-Lite-Chat | 0.5.6 | 256 | not comparable yet: every judged byte right, one request's warm blocks lack a reference (S7) | below |
 
   The gate pins an unmerged upstream PR (#4467) for the lmcache arm on
   Qwen3-4B: an open item for the user's final acceptance.
+
+  `native` on Qwen3-4B (`2026-10-24-qwen3-4b-lmcache-ref-1afec5a`):
+  `G2.digest_self.cap` fails at `C/U = 0.5` on the preempted-uncertain
+  bound only. 0 mismatched; all 5140 unjudged loaded blocks are keys whose
+  only undigested computations are preempted episodes (every request is
+  digested), 1.04% of loaded blocks vs `MAX_PREEMPTED_UNCERTAIN` 1%
+  (0.25: 0.24%, 0.75: 0.79%, both pass). That is the bound working as
+  written, not wrong KV; its G5 numbers are reported with that flag.
 
 - Qwen3-4B, PR #4467, chunk 256: `2026-10-24-qwen3-4b-lmcache-ref-1afec5a`
   (`--arms baseline,native,lmcache`, official flags, cap plan 64 convs as
@@ -246,7 +254,26 @@ so such stranded bytes are possible today.
     (-1.56 pp, `ACC_TOL` 1 pp). The baseline's own replay at lmcache's
     resume points scores 0.672 too, with the same completions. That is the
     cost of resuming at chunk ends on a split-variant model, not of the
-    bytes. The full-size run decides the model's status (below).
+    bytes.
+  - Full size (`2026-10-24-dsv2-lite-lmcache-ref-b05e507`, gate `b05e507`,
+    0.5.6, official flags, cap plan 76 convs = the official run's,
+    U 13730052096 B): `G2.resume_reference` 1319/1319 resumed where lmcache
+    did (1104 waves). `G2.gsm8k` passes: cold 0.6725 = baseline, warm
+    0.6717 (-0.08 pp), and the replay also scores 0.6717. `G2.gsm8k_outputs`
+    passes (0 non-aligned differ from the replay). `G2.digest_self` passes
+    for gsm8k, replay and every cap fraction (0 mismatched).
+    `G2.digest_vs_baseline.gsm8k` fails, with local 358496/358496 and
+    external 152/152 matched and computed 55026/55026 exact: 14 warm
+    computed blocks of one non-aligned request (prompt 1077, 1284 tokens)
+    have no same-context copy (S7 needs 0). lmcache resumed it at 1280
+    from local 1088 plus 12 loaded blocks, whose bytes equal baseline cold
+    copies (computed from 1088 in a prefill over the whole 1284-token
+    prompt). The replay's prewarm recomputed them from 1088 in a prefill
+    that ends at 1280, which gives other bytes on this build, so the
+    resumed request's context fingerprint differs. The reference is
+    incomplete for that request; nothing judged is wrong. The fix would be
+    a prewarm that reproduces the prefill the loaded blocks came from.
+    That is not done here, so the model stays "not comparable yet".
     `native` passes the same checks in the official run
     (`2026-10-24-dsv2-lite-p4-it6-off-a1e7fd2`) and under `b05e507`'s key.
 
