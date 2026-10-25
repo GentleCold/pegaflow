@@ -349,7 +349,7 @@ Tests and CI:
 ## Response (author, 2026-10-25)
 
 Run evidence for every item is the self-test and Qwen3-4B slice listed at
-the end (tags filled in when the runs finish).
+the end.
 
 | item | resolution |
 |---|---|
@@ -358,9 +358,9 @@ the end (tags filled in when the runs finish).
 | S1 | GATES.md "Record vs gate rev": a record is judged by the rev it ran under. `G0.vllm_args` (no `vllm_cmd` anywhere), `G2.batch_control` (plain gsm8k without an `alone` pass), the committed `compilation` block (dump without one) and the sabotage count are `na: record predates this check` with `would_be`. Unit: `test_new_baseline_checks_are_na_for_older_records`. Qwen3-4B gsm8k slice (plain, baseline, connector_v2) on GPU5 below. DSV2 is on its own branch; it gets the same slice when that branch takes this gate. |
 | S2 | Not widened. `G2.gsm8k` without batch invariance gates every arm, honest included, on `alone_ref` (64 prompts one at a time after reset + poison, now run by every arm) vs baseline `alone_ref`, ACC_TOL 0.01; batched deltas are reported (`batched_delta_pp`). Plain and baseline `alone_ref` already agree in every logprob (5bc2e25), so a correct load at the same composition gives the same accuracy and 0.01 is outside noise. The official-size spread measurement is not needed for this rule; if a correct arm's `alone_ref` ever differs, the run shows it. |
 | S3 | `preempt` is required in the official profile when the committed spec has a Mamba group, and the honest self-test fails without it there (N6). GATES.md states the coverage limit: gsm8k loads one state key per group; cap and replay coverage on Qwen3.5 come with the P5 it2 official run. |
-| S4 | `_flag_values` reads `--flag=value`, `_` for `-` (before any `.`), argparse abbreviations of the gate's flags, `-cc`, and dotted keys (appended last, as vLLM does). The probe dumps `compilation` (mode, backend, `inductor_compile_config`, `cudagraph_mode`) and both committed specs carry it (values from `EngineArgs.create_engine_config` on .44). Units: `test_gate_args_read_every_vllm_spelling`, `test_g0_spec_pins_the_compile_config`. |
+| S4 | `_flag_values` reads `--flag=value`, `_` for `-` (before any `.`), argparse abbreviations of the gate's flags, `-cc`, and dotted keys (appended last, as vLLM does). The probe dumps `compilation` (mode, backend, `inductor_compile_config`, `cudagraph_mode`) and both committed specs carry it (values from `EngineArgs.create_engine_config` on .44; Qwen3-4B's now the deterministic config, see S1 run evidence). Units: `test_gate_args_read_every_vllm_spelling`, `test_g0_spec_pins_the_compile_config`. |
 | S5 | Per-arm `VLLM_CACHE_ROOT` = `<run>/.compile-cache/<label>`, emptied before the arm's first stage; `TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR` and `FLASHINFER_WORKSPACE_BASE` inside it; bound rw only into its own isolated arm. Per arm rather than "baseline populates, ro into the arm": the connector arms share a compile hash, so a shared ro artifact would still be one artifact for both sides; per arm, a tampered artifact only changes its own arm's numbers, which the baseline comparisons judge. plain == baseline with separate caches: self-test below. Fully fresh caches were not enough: vLLM's FLA (GDN) kernels are `@triton.autotune`d outside Inductor, so each arm re-timed its own tile picks and ran different numerics (`qwen3.5-4b-selftest-fbcc3fd`: baseline vs plain/honest 14/64 alone_ref completions differ, plain == honest; now `scratch/*-fbcc3fd-autotune`). 3d6b8e6 copies only the baseline's `*.autotune.json` into each fresh arm root (`seed_autotune`; GATES.md "Triton autotune picks", with the swap probe). Units: `test_each_arm_gets_its_own_compile_cache`, `test_arms_run_the_baselines_triton_autotune_picks`. |
-| S6 | Added (table-driven): `start_*` skips fail `_digest_verdict`, `preempt_gpu_blocks` sizing (incl. committed Qwen3.5 = 40), `_plain_equals_baseline` with equal completions and one logprob off, probe step logic (`_start_states`, `_offered_states`, `_unoffered`, `_preempt_job`, `_track`) in the new `test_probe_steps.py`. 282 tests. CI: workflows not edited; PROGRESS open question "add rsi/gates tests to CI" for the user's acceptance, and GATES.md says the suite is a manual gate until then. |
+| S6 | Added (table-driven): `start_*` skips fail `_digest_verdict`, `preempt_gpu_blocks` sizing (incl. committed Qwen3.5 = 40), `_plain_equals_baseline` with equal completions and one logprob off, probe step logic (`_start_states`, `_offered_states`, `_unoffered`, `_preempt_job`, `_track`) in the new `test_probe_steps.py`. 283 tests (with the S5 autotune test). CI: workflows not edited; PROGRESS open question "add rsi/gates tests to CI" for the user's acceptance, and GATES.md says the suite is a manual gate until then. |
 | N1 | Fixed: the older global plain artifact gives -0.388626, two fresh plain compiles both -0.390268. |
 | N2 | `G2.split_control` reports `vacuous` and `measured_invariant: null` when `same_start >= 0.9 n` with no divergence; verdict unchanged (can only fail a right load). gate.json notes no longer say both claims are measured. |
 | N3 | `not_offered` is recorded only when neither the step nor the next one offered the boundary (or the request finished in between). |
@@ -368,3 +368,43 @@ the end (tags filled in when the runs finish).
 | N5 | Not changed: the venv is shared with the P4 runs; the 056eb4b..d252bfe diff is `connector_v2` only and the self-test and gate do not import it. The slice's connector_v2 arm runs from the venv's 056eb4b and is a reference point for S1, not an iteration. |
 | N6 | Enforced: honest self-test on a state-group model fails without `G2.preempt`. |
 | N7 | Self-test arms now need `G0.spec` and `G0.provenance`: honest in its `need`, negative arms must pass G0 (caught by their loads, not by a layout difference). |
+
+### Run evidence (gate rev 2404394 tree; self-test at 3d6b8e6, same gate code)
+
+Self-test `qwen3.5-4b-selftest-3d6b8e6` (GPU5,
+`~/kexi/rsi-runs/2026-10-25-qwen3.5-4b-selftest-3d6b8e6`): baseline,
+honest pass; every negative arm caught in every group it corrupts.
+
+- baseline: all checks pass; `G2.plain_equals_baseline` alone_ref 0/64
+  completions and 0/64 logprobs differ with separate per-arm caches (S5);
+  `G2.batch_control` measured non-invariant (17/64), `G2.split_control`
+  pass (vacuous, 63/64 same start), `G0.vllm_args` pass.
+- honest: pass; `G2.gsm8k` alone_ref 0.71875 vs 0.71875 (0.0 pp,
+  0 completions differ), digests matched in both checks, `G2.preempt` pass.
+
+| arm | group | digest_self bad | vs_baseline bad | preempt bad | sabotaged | caught |
+|---|---|---|---|---|---|---|
+| liar | 0, 1, 2 (GDN) | 320 each | 320 each | 87 each | 4 each | yes |
+| liar | 3 (full) | 640 | 640 | 176 | 8 | yes |
+| bitflip | 0, 1, 2 | 192 each | 192 each | 75 each | 33 each | yes |
+| bitflip | 3 | 192 | 192 | 47 | 33 | yes |
+| offbyone | 0, 1, 2 | 192 each | 192 each | 75 each | 21 each | yes |
+| offbyone | 3 | 192 | 192 | 47 | 21 | yes |
+| sync | 0, 1, 2 | 2 each | 2 each | n/a (gsm8k only) | 2 each | yes |
+
+All four negatives also fail `G2.gsm8k` (alone_ref -70.3, -71.9, -68.8,
+-1.56 pp). sync runs gsm8k only: vLLM 0.32's scheduler dies on sync Mamba
+loads in the 40-block preempt pool (`scratch/*-687c5b2-syncpreempt`).
+
+Qwen3-4B slice `qwen3-4b-gate-hybrid-slice-2404394` (GPU5, plain,
+baseline, connector_v2 from the venv's 056eb4b, gsm8k 128): baseline
+passes every check, `G2.batch_control` measured invariant (0/64
+completions, 0/64 logprobs), `G0.vllm_args` pass (deterministic
+`gsm8k_vllm_args`), `G2.plain_equals_baseline` 0 differ. connector_v2:
+`G0.spec`, `G2.digest_self`, `G2.digest_vs_baseline` (1034 external, 16055
+local matched), `G2.gsm8k_outputs` (0 cold, 0 warm differ) and `G2.gsm8k`
+pass; its replay/cap/G3-G5 checks fail only because the slice ran gsm8k.
+The first slice at 3d6b8e6 (default compile,
+`scratch/*-3d6b8e6-defaultcompile`) showed per-arm caches break Qwen3-4B's
+cross-arm comparisons without deterministic inductor (35 completions
+differ), which 2404394 fixes.

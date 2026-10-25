@@ -829,6 +829,13 @@ names, magic constants that only exist in the old code).
     invariance, honest arm included. S3: `preempt` official on
     state-group models. S4: flag parser spellings, compile config in the
     spec dump. S5: per-arm compile cache. S6: tests (282).
+  - S5 follow-ups: fresh per-arm caches re-timed vLLM's FLA autotune
+    kernels per arm (Qwen3.5 baseline != plain), fixed by seeding each arm
+    with the baseline's Triton autotune picks (3d6b8e6); Qwen3-4B gsm8k
+    now compiles with deterministic inductor too (2404394).
+  - Self-test `qwen3.5-4b-selftest-3d6b8e6` passed (every negative caught
+    in every group); Qwen3-4B slice `qwen3-4b-gate-hybrid-slice-2404394`
+    baseline passes `G2.batch_control` and `G0.vllm_args`.
 
 ## Semantics changelog
 
