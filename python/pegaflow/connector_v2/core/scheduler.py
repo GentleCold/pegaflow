@@ -559,8 +559,10 @@ class Scheduler:
         if stats["lookups"] % self.HIT_LOG_EVERY == 0:
             self.report_hit_stats()
 
-    def report_hit_stats(self) -> None:
-        if len(self.hit_stats) > 1:  # anything beyond the lookup count
+    def report_hit_stats(self, always: bool = False) -> None:
+        """Log the counters; periodic lines only once a miss was counted, the
+        shutdown line always (so a silent log means no miss, not no line)."""
+        if always or len(self.hit_stats) > 1:  # anything beyond the lookup count
             logger.info("[PegaKVConnectorV2] hit stats %s", dict(sorted(self.hit_stats.items())))
 
     def _touches_unconfirmed(self, block_ids: tuple[list[int], ...]) -> bool:
@@ -600,7 +602,7 @@ class Scheduler:
         return True
 
     def shutdown(self) -> None:
-        self.report_hit_stats()
+        self.report_hit_stats(always=True)
         for req_id in list(self._hits):
             self._drop_hit(req_id)
         # Load plans never handed to the workers still hold their leases.

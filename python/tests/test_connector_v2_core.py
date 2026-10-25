@@ -11,6 +11,7 @@ extension or server is needed. Cases marked ``native`` re-run against the real
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import random
 import sys
@@ -855,6 +856,23 @@ def test_miss_attribution_names_the_missing_group(sem):
     sched.request_finished("r")
     sched.get_num_new_matched_tokens(_req(), 0)
     assert sched.hit_stats == {"lookups": 3, "missing=1": 2, "lost_tokens": 16}
+
+
+def test_hit_stats_logged_at_shutdown_without_misses(caplog):
+    """A gate slice must tell "no miss" from "no line": shutdown always logs."""
+    sched, _ = _sched(StubSemantics, {0: Ready(0, b""), 1: Ready(0, b"")})
+    sched.get_num_new_matched_tokens(_req(), 0)
+    # Attach directly: the connector module may stop package propagation.
+    log = logging.getLogger("pegaflow.connector_v2.core.scheduler")
+    log.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=log.name):
+            sched.report_hit_stats()
+            assert "hit stats" not in caplog.text
+            sched.shutdown()
+    finally:
+        log.removeHandler(caplog.handler)
+    assert "hit stats {'lookups': 1}" in caplog.text
 
 
 def test_saves_reoffer_after_missing_block_ids():

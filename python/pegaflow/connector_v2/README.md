@@ -105,8 +105,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   longest resume point the full group backs, how often and how many tokens
   were lost, counted once per request and resume point (vLLM re-queries a
   waiting request every scheduling pass) (`missing=` with no group: the policy lowered `p`). This is the
-  group-coherence signal for server eviction. Nothing is logged while no
-  miss was counted.
+  group-coherence signal for server eviction. The periodic line is skipped
+  while no miss was counted; the shutdown line is always logged.
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first, and `LayerDecl.layout` when an

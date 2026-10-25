@@ -898,6 +898,16 @@ names, magic constants that only exist in the old code).
     `spec.json` (retention, `compilation`, `model_runner`, `probe.schema`);
     one plain+baseline gsm8k slice. Until then DSV2 records are re-judged
     with ce645d7.
+- P5 it2 started (`feat/rsi-qwen3.5-4b`, merged `feat/semantics-rsi`
+  f8eac30 = hybrid gate). Plan: (1) adapt connector_v2 to the hybrid gate
+  if a slice shows it needs it (preempt pool, start-state digests before
+  the forward, sync-load rules), `hit stats` logged unconditionally at
+  shutdown; unit gate. (2) GPU5 slices (plain, baseline, old, native, v2;
+  gsm8k + replay + cap + preempt), one hypothesis per iteration, SKILL
+  step 5 checklist (checkpoint saves only at resume boundaries, no
+  unresumable state, group-coherent resume, save cost off the step).
+  (3) Tell the orchestrator before the official run (P4 merge first).
+  Server stays at the base build (`pegaflow-semantics-rsi` 056eb4b).
 
 ## Semantics changelog
 
