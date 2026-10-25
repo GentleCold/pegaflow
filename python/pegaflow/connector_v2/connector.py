@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorTransferResults,
+    KVConnectorWorkerMetadata,
     SupportsHMA,
 )
 from vllm.logger import init_logger
@@ -71,6 +72,27 @@ _route_package_logs()
 @dataclass
 class PegaConnectorMetadata(KVConnectorMetadata):
     plan: StepPlan = field(default_factory=StepPlan)
+
+
+@dataclass
+class PegaWorkerMetadata(KVConnectorWorkerMetadata):
+    """Pinned saves: the latest plan step every worker finished saving."""
+
+    saved_through: int
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
+        assert isinstance(other, PegaWorkerMetadata)
+        return PegaWorkerMetadata(min(self.saved_through, other.saved_through))
+
+
+def _pin_saves(kv_cache_config: Any, layout: Any) -> bool:
+    """vLLM may write a block before ``handle_preemptions`` runs (zeroing,
+    copy-on-write on the V2 model runner) or free a checkpoint state block
+    right after the step that offered it: such layouts pin the blocks they
+    save until the copy is done (``Scheduler`` ``pin_saves``)."""
+    return may_zero_or_copy_blocks(kv_cache_config) or any(
+        g.sem.kind == "checkpoint" for g in layout.groups
+    )
 
 
 class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
@@ -125,6 +147,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         )
 
         self._scheduler: Scheduler | None = None
+        self._pins_bound = False
         self._worker: Worker | None = None
         profile = extra.get("model_profile") or getattr(mc, "architecture", None)
         if role == KVConnectorRole.SCHEDULER:
@@ -150,6 +173,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 self._rpc,
                 self._instance_id,
                 sync_loads=sync_loads,
+                pin_saves=_pin_saves(kv_cache_config, self._layout),
                 # Steps vLLM schedules before it processes a step's output
                 # (fallback: the largest value vLLM 0.32 uses, pp + 1).
                 confirm_steps=getattr(
@@ -168,18 +192,15 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         else:
             from pegaflow import PyLoadState
 
-            # An offered checkpoint block is only guaranteed to hold its state
-            # until the step after the offer may free or reuse it (vLLM does
-            # not keep it in the block table), so checkpoint saves finish in
-            # the offering step's wait_for_save.
-            sync_saves = may_zero_or_copy_blocks(kv_cache_config) or any(
-                g.sem.kind == "checkpoint" for g in self._layout.groups
-            )
+            # The scheduler pins what these layouts save (_pin_saves): the
+            # saves stay asynchronous, unbatched so blocks stay pinned briefly.
+            pinned = _pin_saves(kv_cache_config, self._layout)
             policy = load_policy(profile)
+            batch_steps = 1 if pinned else policy.save_batch_steps
             logger.info(
                 "[PegaKVConnectorV2] saves=%s batch_steps=%d max_kv_usage=%s",
-                "sync" if sync_saves else "async",
-                policy.save_batch_steps,
+                "async-pinned" if pinned else "async",
+                batch_steps,
                 policy.save_batch_max_kv_usage,
             )
             self._worker = Worker(
@@ -191,8 +212,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 _ipc_bytes,
                 PyLoadState,
                 _mark_compute,
-                sync_saves=sync_saves,
-                batch_steps=policy.save_batch_steps,
+                batch_steps=batch_steps,
+                pinned_saves=pinned,
             )
 
     @property
@@ -237,6 +258,9 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         block_state = scheduler_output.kv_connector_block_state
         # vLLM binds its cache manager after construction (bind_kv_cache_manager).
         kv_cache_manager = getattr(self, "_kv_cache_manager", None)
+        if kv_cache_manager is not None and not self._pins_bound:
+            self._pins_bound = True
+            self._scheduler.bind_pins(*_block_pins(kv_cache_manager.block_pool))
         self._scheduler.plan_saves(
             scheduled,
             block_state.get_block_ids if block_state is not None else lambda _: None,
@@ -249,9 +273,17 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         return PegaConnectorMetadata(self._scheduler.take_plan())
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        assert self._scheduler is not None
         # A failed sync load: KV computed on it may be reused, stop saving.
-        if self._scheduler is not None and connector_output.invalid_block_ids:
+        if connector_output.invalid_block_ids:
             self._scheduler.on_load_errors(connector_output.invalid_block_ids)
+        meta = connector_output.kv_connector_worker_meta
+        if isinstance(meta, PegaWorkerMetadata):
+            self._scheduler.on_saved_through(meta.saved_through)
+
+    def has_pending_push_work(self) -> bool:
+        # Keep the engine stepping until the workers report pinned saves done.
+        return self._scheduler is not None and self._scheduler.has_pinned_saves()
 
     def request_finished(
         self, request: Request, block_ids: list[int]
@@ -279,7 +311,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         # Blocks vLLM freed (preemption) may be reused by this step while a
         # save still reads them. Runs before any KV write of the step; on the
         # V2 model runner after block zeroing and copy-on-write, which is why
-        # layouts with those save synchronously (core.may_zero_or_copy_blocks).
+        # layouts with those pin their saved blocks instead (_pin_saves).
         assert self._worker is not None
         assert isinstance(kv_connector_metadata, PegaConnectorMetadata)
         if kv_connector_metadata.plan.flush:
@@ -312,6 +344,12 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             finished_sending=sending, finished_recving=finished, failed_recving=failed
         )
 
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        assert self._worker is not None
+        if not self._worker.pinned_saves:
+            return None
+        return PegaWorkerMetadata(self._worker.saved_through())
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         assert self._worker is not None
         return self._worker.take_invalid()
@@ -337,6 +375,19 @@ def _with_worker_ranks(par: Parallel) -> Parallel:
         pp_rank=get_pp_group().rank_in_group,
         dcp_rank=dcp_rank,
     )
+
+
+def _block_pins(pool: Any) -> tuple[Any, Any]:
+    """Pin / unpin GPU blocks by id in vLLM's ``BlockPool``: one reference
+    each, so a block vLLM frees meanwhile stays out of the free queue (never
+    reallocated, zeroed or copied into) until the unpin returns it."""
+
+    def pin(block_ids: list[int]) -> Any:
+        blocks = [pool.blocks[b] for b in block_ids]
+        pool.touch(blocks)
+        return blocks
+
+    return pin, pool.free_blocks
 
 
 def _server_device_id() -> int:

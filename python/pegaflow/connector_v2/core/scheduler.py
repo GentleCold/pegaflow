@@ -63,7 +63,11 @@ class StepPlan:
     vLLM holds for our saves (report them in ``finished_sending`` once every
     save that may read them is done), and ``flush`` asks the worker to finish
     every pending save before this step touches any KV (vLLM freed blocks a
-    pending save may still read, e.g. on preemption). ``send_saves`` asks the
+    pending save may still read, e.g. on preemption). With pinned saves
+    (``Scheduler(pin_saves=True)``) neither is used: the scheduler keeps every
+    block it plans to save allocated in vLLM's block pool until all workers
+    report the step's saves done (``step``, ``Scheduler.on_saved_through``).
+    ``send_saves`` asks the
     worker to send its held (batched) saves with this step's, without
     waiting for them: vLLM's GPU KV cache is under pressure, and finished
     requests held for batched saves keep blocks that waiting requests need.
@@ -75,6 +79,7 @@ class StepPlan:
     flush: bool = False
     send_saves: bool = False
     kv_usage_unknown: bool = False  # vLLM's KV usage was unavailable (send_saves set)
+    step: int = -1  # plan_saves call that built this plan (pinned saves report it back)
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,7 @@ class Scheduler:
         semantics: Any | None = None,
         sync_loads: bool = False,
         confirm_steps: int = 2,
+        pin_saves: bool = False,
     ):
         """``sync_loads``: vLLM can recover from a failed synchronous load of this
         layout (it maps ``invalid_block_ids`` back to requests only with one
@@ -134,7 +140,17 @@ class Scheduler:
 
         ``confirm_steps``: steps vLLM schedules before it processes a step's
         output (vLLM's ``max_concurrent_batches``). A sync load's outcome, and
-        the rewind of a failed one, is visible only that many steps later."""
+        the rewind of a failed one, is visible only that many steps later.
+
+        ``pin_saves``: blocks to save are pinned in vLLM's block pool
+        (``bind_pins``) from the step that plans them until every worker
+        reports that step's saves done (``on_saved_through``). A pinned block
+        is never handed out again, so vLLM cannot zero, copy into (COW) or
+        reuse it while the worker copies it: saves stay asynchronous without
+        preemption flushes or finish holds. For layouts where vLLM writes
+        reallocated blocks before ``handle_preemptions`` (block zeroing, COW)
+        or frees checkpoint state blocks while they are still being read.
+        Saves are disabled (fail closed) if no pool was bound."""
         self._layout = layout
         self._policy = policy
         self._rpc = rpc
@@ -149,7 +165,8 @@ class Scheduler:
         self._saving: set[str] = set()  # requests with saves since their blocks were last freed
         # vLLM frees window blocks that slide out while the request runs, which a
         # pending save may still read: such layouts flush before every step.
-        self._flush_always = any(g.sem.kind == "window" for g in layout.groups)
+        # Pinned saves cover that too: a pinned block is never reallocated.
+        self._flush_always = not pin_saves and any(g.sem.kind == "window" for g in layout.groups)
         # GPU block -> first step that may save on top of it. A sync load lands
         # before its step's forward; if it failed, that step and the ones vLLM
         # scheduled before seeing the failure computed on its bytes. The server
@@ -166,6 +183,10 @@ class Scheduler:
         # and later loads are async so no further bad block enters that cache.
         self._saves_disabled = False
         self._kv_usage_warned = False
+        self._pin_saves = pin_saves
+        self._pin: Callable[[list[int]], Any] | None = None
+        self._unpin: Callable[[Any], None] | None = None
+        self._pins: dict[int, Any] = {}  # plan step -> pin token, in step order
         self._plan = StepPlan()
         # Lookups, and per missing-group set how often (and how many tokens)
         # the full groups backed a longer hit than the one taken. Counted once
@@ -458,7 +479,7 @@ class Scheduler:
         their block table does not say which block holds which state. An
         offer is used only for the boundary this step's forward computes
         (``semantics.saveable``); the worker saves it before the next step
-        can free or reuse the block (checkpoint layouts save synchronously).
+        can free or reuse the block (checkpoint layouts pin it, ``pin_saves``).
 
         A request whose blocks include an unconfirmed sync-load block saves
         nothing yet (its range is offered again once the outcome is visible).
@@ -472,9 +493,18 @@ class Scheduler:
         self._steps += 1
         if self._unconfirmed:
             self._unconfirmed = {b: s for b, s in self._unconfirmed.items() if s > step}
-        for req_id in preempted:
-            self._plan.flush = True
-            self._saving.discard(req_id)  # the flush covers its old blocks
+        self._plan.step = step
+        if self._pin_saves:
+            if self._pin is None and not self._saves_disabled:
+                self._saves_disabled = True
+                logger.error(
+                    "[PegaKVConnectorV2] vLLM bound no block pool: saves need pinned "
+                    "blocks on this layout, saves disabled for this process"
+                )
+        else:
+            for req_id in preempted:
+                self._plan.flush = True
+                self._saving.discard(req_id)  # the flush covers its old blocks
         self._plan.flush |= self._flush_always
         if kv_usage is None:
             if not self._kv_usage_warned:
@@ -550,13 +580,37 @@ class Scheduler:
             if item in seen:
                 continue
             seen.add(item)
-            self._saving.add(item.req_id)
+            if not self._pin_saves:
+                self._saving.add(item.req_id)
             sid = sid_of[item.group]
             save = by_key.setdefault((sid, item.req_id), GroupSave(sid, [], []))
             save.block_ids.append(item.block_id)
             save.block_hashes.append(item.block_hash)
         # Stable sort: within a group, requests keep their scheduled order.
-        self._plan.saves.extend(sorted(by_key.values(), key=lambda s: s.sid))
+        saves = sorted(by_key.values(), key=lambda s: s.sid)
+        if self._pin_saves and saves:
+            assert self._pin is not None
+            self._pins[step] = self._pin([b for gs in saves for b in gs.block_ids])
+        self._plan.saves.extend(saves)
+
+    # ----------------------------------------------------------- pinned saves
+    def bind_pins(self, pin: Callable[[list[int]], Any], unpin: Callable[[Any], None]) -> None:
+        """``pin(block_ids)`` takes a reference on each GPU block (a block may
+        repeat) and returns a token; ``unpin(token)`` drops them."""
+        self._pin, self._unpin = pin, unpin
+
+    def on_saved_through(self, step: int) -> None:
+        """Every worker finished the saves of plans up to ``step``: unpin them."""
+        if not self._pins:
+            return
+        assert self._unpin is not None
+        for s in [s for s in self._pins if s <= step]:
+            self._unpin(self._pins.pop(s))
+
+    def has_pinned_saves(self) -> bool:
+        """Blocks are pinned for saves still in flight: vLLM must keep stepping
+        until the workers report them done."""
+        return bool(self._pins)
 
     def _count_miss(
         self, request: Any, num_computed: int, present: tuple[frozenset[int], ...], p: int

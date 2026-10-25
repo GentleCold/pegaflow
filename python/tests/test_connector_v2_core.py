@@ -1407,6 +1407,100 @@ def test_save_flush_before_block_reuse(specs, preempted, flush):
     assert sched.request_finished("r") is (not preempted)
 
 
+class FakePool:
+    """vLLM BlockPool references by block id: pinned blocks are never reused."""
+
+    def __init__(self):
+        self.refs: dict[int, int] = {}
+
+    def pin(self, block_ids):
+        for b in block_ids:
+            self.refs[b] = self.refs.get(b, 0) + 1
+        return list(block_ids)
+
+    def unpin(self, token):
+        for b in token:
+            self.refs[b] -= 1
+            if not self.refs[b]:
+                del self.refs[b]
+
+
+def _pinned_sched(layout, pool=None):
+    sched = Scheduler(
+        layout, Policy(), FakeRpc(), "inst", clock=Clock(), semantics=StubSemantics, pin_saves=True
+    )
+    if pool is not None:
+        sched.bind_pins(pool.pin, pool.unpin)
+    return sched
+
+
+def test_pinned_saves_hold_blocks_until_every_worker_saved():
+    """Layouts where vLLM zeroes, COW-copies or frees state blocks before a
+    pending save could run pin every saved block in vLLM's pool from the plan
+    until the workers report that step saved: no flush, no finish hold, and a
+    preempted request's blocks stay pinned (never reallocated)."""
+    pool = FakePool()
+    sched = _pinned_sched(_layout(StubSemantics, StubCheckpointSpec(), StubFullSpec()), pool)
+    sched.on_new_request(_req())
+    ids = lambda _: (CKPT_IDS, FULL_IDS)  # noqa: E731
+    sched.plan_saves([("r", 0, 4)], ids, offers={"r": [(0, 31, 4)]})
+    p0 = sched.take_plan()
+    assert (p0.step, pool.refs) == (0, {10: 1, 31: 1})
+    sched.plan_saves([("r", 4, 4)], ids, ("r",), offers={"r": [(0, 32, 8)]})
+    p1 = sched.take_plan()
+    assert (p1.step, p1.flush, pool.refs) == (1, False, {10: 1, 31: 1, 11: 1, 32: 1})
+    assert sched.request_finished("r") is False and p1.finished == []
+    sched.on_saved_through(0)
+    assert pool.refs == {11: 1, 32: 1} and sched.has_pinned_saves()
+    sched.on_saved_through(5)
+    assert pool.refs == {} and not sched.has_pinned_saves()
+
+
+def test_pinned_saves_fail_closed_without_a_pool():
+    sched = _pinned_sched(_layout(StubSemantics, StubFullSpec()))
+    sched.on_new_request(_req())
+    sched.plan_saves([("r", 0, 13)], lambda _: (FULL_IDS,))
+    assert sched.take_plan().saves == [] and not sched.has_pinned_saves()
+
+
+def test_pinned_worker_reports_saved_through():
+    """saved_through is the last plan step with every save before it done;
+    a step without saves counts as done once the earlier ones are."""
+    import threading
+
+    gates = [threading.Event(), threading.Event()]
+    marks = iter(gates)
+    rpc = FakeRpc()
+    layout = _layout(StubSemantics, StubFullSpec())
+    worker = Worker(
+        layout,
+        rpc,
+        "inst",
+        Parallel(),
+        0,
+        lambda t: b"ipc",
+        lambda: None,
+        lambda: FakeMark(next(marks)),
+        pinned_saves=True,
+    )
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    assert worker.saved_through() == -1
+    worker.save(StepPlan(saves=[GroupSave(0, [10], [b"h0"])], step=0))
+    worker.save(StepPlan(step=1))
+    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])], step=2))
+    assert worker.saved_through() == -1  # nothing copied yet: wait_for_save never blocked
+    gates[0].set()
+    with worker._cv:
+        assert worker._cv.wait_for(lambda: worker._completed >= 1, 5)
+    assert worker.saved_through() == 1
+    gates[1].set()
+    assert worker.flush(5)
+    assert worker.saved_through() == 2
+    worker.save(StepPlan(step=3))
+    assert worker.saved_through() == 3
+    worker.shutdown()
+
+
 # --------------------------------------------------------------------- layout
 @BOTH
 @pytest.mark.parametrize(

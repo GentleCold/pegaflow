@@ -82,8 +82,16 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     is before the step's forward writes any block, but vLLM's V2 model runner
     zeroes new blocks and applies copy-on-write copies before it. So layouts
     where vLLM may zero (`needs_kv_cache_zeroing`) or copy (`hash_block_size`
-    smaller than a group's `block_size`) blocks save synchronously instead:
-    `wait_for_save` returns once the step's saves are done;
+    smaller than a group's `block_size`) blocks, or that have a checkpoint
+    group, pin their saves instead: the scheduler takes one reference per
+    saved block in vLLM's `BlockPool` (`touch`) when it plans the save and
+    drops it (`free_blocks`) once every worker reports that step's saves
+    done (`PegaWorkerMetadata.saved_through`, min over ranks). A pinned block
+    is never handed out again, so vLLM cannot zero, copy into or reuse it
+    while it is read. Such layouts need no flush and no finish hold, and
+    their saves are not batched (pins stay short). `has_pending_push_work`
+    keeps vLLM stepping until the pins are released. Without a bound block
+    pool these layouts save nothing (fail closed);
   - a save that fails, raises, or whose saver thread died still releases its
     blocks (a failed save is a future miss). A save RPC that hangs blocks
     `flush` and held requests for good (logged every 10 s): the client has
@@ -97,7 +105,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   saved. A boundary vLLM did not offer (it retains only what
   `--prefix-cache-retention-interval` keeps) is not saved. An offered block
   holds its state only until vLLM frees or reuses it, so layouts with a
-  checkpoint group save synchronously in `wait_for_save`. Loads need nothing
+  checkpoint group pin it (see Saves) until the copy is done. Loads need nothing
   special: the needed block `[p - bt, p)` is always past the local hit, and
   vLLM allocates a fresh state block for an external hit.
 - **Hit stats.** The scheduler logs `hit stats` (cumulative) at most every

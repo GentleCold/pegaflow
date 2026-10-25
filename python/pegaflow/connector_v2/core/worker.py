@@ -18,12 +18,17 @@ the copy is done, so:
 
 ``flush`` runs in vLLM's ``handle_preemptions``, which vLLM's V1 model runner
 calls before it zeroes or copies (copy-on-write) any block, but the V2 runner
-calls after. Layouts where vLLM may zero or copy blocks (``sync_saves``) so
-wait for every save inside ``wait_for_save`` instead, before the next step.
+calls after. Layouts where vLLM may zero or copy blocks, or free a checkpoint
+state block right after offering it, use pinned saves instead: the scheduler
+keeps every block it plans to save allocated in vLLM's block pool until all
+workers report the step's saves done (``saved_through``), so no such block is
+reallocated meanwhile. ``sync_saves`` (wait for every save inside
+``wait_for_save``) remains for callers without a block pool.
 """
 
 from __future__ import annotations
 
+import collections
 import logging
 import queue
 import threading
@@ -120,6 +125,7 @@ class Worker:
         clock: Callable[[], float] = time.perf_counter,
         sync_saves: bool = False,
         batch_steps: int = 1,
+        pinned_saves: bool = False,
     ):
         """``sync_saves``: ``save`` returns only after the step's saves are done
         (vLLM may zero or copy blocks before ``handle_preemptions`` runs).
@@ -129,6 +135,10 @@ class Worker:
         oldest held job has seen ``batch_steps`` steps or waited
         ``SAVE_HOLD_MAX_S``, whichever comes first (<= 1 sends every step).
         ``flush`` and ``StepPlan.send_saves`` send held jobs at once.
+
+        ``pinned_saves``: the scheduler pins the blocks of each plan's saves
+        until ``saved_through`` reports that plan's step (``Scheduler``
+        ``pin_saves``), so saves need neither ``sync_saves`` nor batching.
         """
         self._layout = layout
         self._rpc = rpc
@@ -166,6 +176,11 @@ class Worker:
         self._held_steps = 0  # steps seen by the oldest held job
         self._held_since = 0.0
         self._held_bytes = 0  # estimated wire size of the held jobs' save entries
+        # Pinned saves: (job seq, plan step) of submitted jobs not known done,
+        # and the last plan step seen by ``save``.
+        self._pinned = pinned_saves
+        self._job_steps: collections.deque[tuple[int, int]] = collections.deque()
+        self._last_step = -1
         # The saver thread exited: it reads no block any more, so every hold
         # is released and later saves are dropped (future misses).
         self._saver_dead = False
@@ -374,6 +389,8 @@ class Worker:
             # saver only reads the blocks after the KV writes completed.
             ready = self._mark_compute()
             self._submitted += 1
+            if self._pinned:
+                self._job_steps.append((self._submitted, plan.step))
             size = _wire_bytes(saves)
             if self._held and self._held_bytes + size > self.SAVE_RPC_MAX_BYTES:
                 # One merged RPC must stay well under the gRPC message limit.
@@ -391,6 +408,7 @@ class Worker:
                 with self._cv:
                     self.save_stats.pressure_rpcs += 1
                 self._release_held()
+        self._last_step = max(self._last_step, plan.step)
         t1 = self._clock()
         with self._cv:
             stats = self.save_stats
@@ -407,6 +425,20 @@ class Worker:
             self.flush()
         if report:
             self.report_save_stats()
+
+    @property
+    def pinned_saves(self) -> bool:
+        return self._pinned
+
+    def saved_through(self) -> int:
+        """The latest plan step whose saves, and every earlier one's, are done
+        (failed or not: a failed save is a future miss, its blocks may go)."""
+        with self._cv:
+            completed = self._submitted if self._saver_dead else self._completed
+        steps = self._job_steps
+        while steps and steps[0][0] <= completed:
+            steps.popleft()
+        return steps[0][1] - 1 if steps else self._last_step
 
     def _release_due(self, now: float) -> bool:
         if self._sync_saves or self._batch_steps <= 1:

@@ -1032,6 +1032,23 @@ local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
   logs it when idle and every 30 s. Next: cap-only diagnostic slice
   (baseline + v2) to attribute the 0-load per group, then the save-cost
   hypothesis (checkpoint saves off the step, fenced on block reuse).
+- P5 it2 s2cap (d2a484d, cap only, sub-floor pool C = 1.63 GiB = 0.05x
+  GPU KV, no G5 conclusion): v2 loads 0 bytes; `hit stats` `missing=1,2,3`
+  4 of 160 lookups (full group present, every GDN group evicted). Official
+  `--cap-convs auto` sizing for Qwen3.5 reported to the orchestrator (est.
+  U 147 GB at 203 convs; estimate/measured 0.78 at 8 x 6 suggests the
+  measured floor misses at 203). Merged P4 (563a693) as 554ad9d.
+- P5 it2 hypothesis H1 (next): G4 cold replay pays the sync checkpoint
+  save (`flush_ms` 1518 / 33.5 s). Change: for layouts that must save
+  synchronously (block zeroing / COW / checkpoint groups), the scheduler
+  pins every block it plans to save in vLLM's block pool (`touch`) and
+  unpins it once every worker reports the save done (worker metadata,
+  min over ranks; `has_pending_push_work` keeps the engine stepping
+  meanwhile). A pinned block is never reallocated, so it is never zeroed,
+  COW-written or reused before the copy lands; the worker then saves
+  asynchronously (no flush in `wait_for_save`, no preemption flush, no
+  finish hold). Layouts that save async today are unchanged. Measure: v2
+  replay cold TTFT p50 / req/s vs baseline, `save stats` flush_ms.
 - P4 final-review fixes (`reviews/P4-final.md`, ACCEPT-WITH-FIXES).
   Changes are in connector_v2's scheduler, its unit test and the docs; no
   semantics or server change.
