@@ -623,3 +623,86 @@ The M1 hazard is the same in V2: a sync state load lands after the precopy.
 - Differential re-judge, d252bfe vs 0249697 trees, on
   `2026-10-24-qwen3-4b-p4-it5-nonreg` (result above). Two more records
   timed out (10 min per call) and are not reported.
+
+## Verification of fixes (790bddc)
+
+Scope: 363441c..790bddc (one commit). Self-test
+`2026-10-25-qwen3.5-4b-selftest-790bddc`. I re-ran the re-judge myself on
+.44, read only. Result: **MERGE**. R1, R2 and N2 are fixed. R3 is fixed
+with one non-blocking refinement (V1).
+
+- R1 (`run_gate.py:1473-1537`). A `SPEC_FIELDS` entry is `na` only when
+  two things hold: the baseline dump's schema predates the field (recorded
+  `probe.schema`, else the newest known field present), and the field is
+  absent. A field that is present is always compared. A known field that
+  is missing fails. Unit cases `older-record-field-differs`,
+  `known-field-missing` and `current-field-missing` fail as they should.
+  An arm cannot make a field go absent:
+  - `na` is computed from the baseline's dump only. The baseline is gate
+    code, and its probe dir is hidden from the isolated arm.
+  - The arm's own dump is compared to the baseline's with no `na` at all.
+  - All 6 dumps in the run carry `schema: 3`.
+- R2.
+  - Drop path. `_clobbered_blocks` collects `new_block_ids_to_zero` and the
+    COW `dst_block_id` (`KVCacheBlockCopy(src_block_id, dst_block_id)`,
+    `kv_cache_utils.py:241`). Preempted blocks with those ids are dropped
+    and recorded in `preempt_dropped`. `digest_compare` then counts their
+    computations as preempted, so they are undigested and never a
+    reference. This direction is right.
+  - Zero digests. An all-zero digest is excluded from references
+    (`digest_compare.py:180`). It is also skipped as a computed candidate
+    (`:291`). So a no-op load can never be `matched` against zeros, and in
+    this run `ref_zero_copies` and `computed_zero` are both 0.
+  - Runner. `model_runner: "V2"` is in every dump and in both committed
+    specs. `G0.spec` pins it.
+  - Gap (NIT V2). V2 also runs the Mamba precopy before
+    `handle_preemptions`. Its destination can be a just-freed preempted
+    block, and on Qwen3.5 all four groups share each KV tensor (offset 0,
+    same size). The precopy destination is not in `clobbered`. The worst
+    case is a garbage reference copy, which can fail a right load but
+    cannot pass a wrong one. I did not reproduce this.
+- R3 (`run_gate.py:2397-2440`). Each digest check needs bad ≥ sabotaged −
+  uncertain per group. Uncertain counts external loads only, and a
+  sabotage count of 0 fails. The run passes:
+  - `digest_self` and `vs_baseline` both give liar 320/4 (group 3: 640/8),
+    bitflip 192/33, offbyone 192/27 and sync 2/2;
+  - uncertain is 0 everywhere.
+
+  V1 (refinement): `bad` includes *local* bad loads, i.e. vLLM's cached
+  copies of corrupted loaded blocks. These can make up for sabotaged
+  external loads the gate missed. Example: liar has 4 external and 316
+  local bad loads per GDN group. A stricter bar would compare external bad
+  against sabotaged. It already holds exactly here: external bad =
+  sabotaged in every arm and group (liar 4/4/4/8, bitflip 33, offbyone 27,
+  sync 2/2/2/0), from my own `compare` on the run. Not blocking.
+- N2 (`run_gate.py:619-657`). `autotune_file_problem` accepts only
+  `[config, timings]` pairs. A config may hold only `kwargs` (str → int),
+  integer `num_warps`/`num_ctas`/`num_stages`/`maxnreg`, null `pre_hook`
+  and null `ir_override`; timings must be numeric. Anything else stops the
+  seed with `ValueError`. The file is validated before it is copied. Its
+  source is the baseline's cache, which the arm cannot write. In the run,
+  each of the 6 arms seeded 6 picks and none was refused.
+- Re-judge differences outside `G0.spec` are pre-existing. I ran the same
+  `rj2.py` on `2026-10-24-qwen3-4b-p4-it5-nonreg` with the d252bfe tree and
+  with the 790bddc tree:
+  - With d252bfe, the baseline fails `G2.plain_equals_baseline`,
+    `G2.warm_equals_cold` and `G2.split_control`. The connector arms fail
+    `G2.gsm8k_outputs`, `G2.digest_self.cap` and `G5.replay_warm`.
+  - The only differences with 790bddc are the `na` labels on `G0.spec`,
+    `G0.vllm_args` and `G2.batch_control`. All three are pass on both
+    trees.
+  - My 790bddc output is byte-identical to the author's `rj2-it5.out`.
+  - The author's `rj-d252bfe.out` contains "record predates this check",
+    which the d252bfe tree cannot emit (no such string in its
+    `run_gate.py`). That file was not produced by d252bfe. My own run
+    replaces it as evidence.
+- NIT V3. `computed_zero` and `ref_zero_copies` are reported but never
+  gated. Real KV is never all-zero, so `computed_zero == 0` could be
+  required on every arm.
+- Checks:
+  - `pytest rsi/gates` at 790bddc on .44 (`git archive`,
+    `CUDA_VISIBLE_DEVICES=""`): 303 passed in 52 s;
+  - `cz check --rev-range 1749353..HEAD` OK, `typos` OK, `ruff check rsi`
+    OK;
+  - self-test 790bddc: baseline and honest pass, all four negatives
+    caught, `preempt_dropped` 0.
