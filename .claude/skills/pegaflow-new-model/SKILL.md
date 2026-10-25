@@ -51,7 +51,10 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    put model knobs in `models/<model>`. Prefer policy changes over adapter changes.
 4. **Gates**: on .3 from `~/kexi/pegaflow-semantics-rsi`, run
    `python -m rsi.gates.run_gate --model ... --tag <model>-it<N> --arms plain,baseline,old,native,lmcache,<module>:<Class>`
-   with `--lmcache-overlay ~/kexi/overlays/lmcache-pr4467` (full command in
+   with the model's lmcache overlay (gate.json `lmcache_dist`: Qwen3-4B
+   `~/kexi/overlays/lmcache-pr4467`, DeepSeek-V2-Lite `~/kexi/overlays/lmcache`
+   (0.5.6; PR #4467 crashes on MLA); a new model declares the build it
+   validated in its gate.json, else the run is not official; full command in
    GATES.md "Implementation"; always include `plain`). Official runs carry
    the reference arms `native` and `lmcache` next to `old`; drop `lmcache`
    only where GATES.md G5 "lmcache status per model" says it is not
