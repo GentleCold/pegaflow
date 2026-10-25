@@ -1018,3 +1018,58 @@ Verdicts:
 | v2 (required) | fails | `G5.replay_warm` only |
 | old | fails (not required) | `G4.gsm8k_warm.seconds`, `G2.digest_self.cap`, `G5` |
 | native | fails (not required) | `G0.spec` (LBNHC vs LBHNC layout), `G2.digest_vs_baseline.gsm8k`, G4 gsm8k, `G5` |
+
+## P4 regression runs on this model (2026-10-24/25, base server d1970ead)
+
+P4 (DeepSeek-V2-Lite-Chat onboarding) changed the shared connector_v2, so
+Qwen3-4B was rerun as its regression model. The full records are in
+`../DeepSeek-V2-Lite-Chat/ITERATIONS.md`; this entry keeps Qwen3-4B's own
+history in one place. All runs: GPU 0, TP1, 64gb pool, cap 64 x 12,
+C(0.5) = 27.2 GB = 2.44x GPU KV.
+
+| run | tree | official | what it shows | DSV2 file section |
+|---|---|---|---|---|
+| MF2 `2026-10-24-qwen3-4b-p4-mf2` | d56fcb2 (save batching on) | yes | G0-G4 pass, no G4 regression vs it2d; G5 regressed (0.5: 0.777 vs 0.842 at r3) | "MF2: official Qwen3-4B non-regression" |
+| A/B `...-ab-a-d56fcb2` / `...-ab-b-706006c` | batching on / off | no (cap only) | batching off restores G5 (0.794 -> 0.837) | "Batching A/B for the G5 regression" |
+| it6 cap `...-it6-cap-b5cf567` | b5cf567 (it6: one entry per held step) | no (cap only) | G5 back at the r3 level with batching kept | "it6 (2026-10-24)" |
+| MF5 `2026-10-24-qwen3-4b-p4-it6-off-a1e7fd2` | a1e7fd2 (it6) | yes | everything passes except `G2.digest_self.cap` (1.008% preempted-uncertain, 0 mismatched) | "MF5: official Qwen3-4B regression run" |
+| it7 cap `2026-10-25-qwen3-4b-p4-m2-a59a254` | a59a254 (it7: one save entry per group and request) | no (cap only) | G5 up at every fraction, digest 0.43% | "M2", "Qwen3-4B cap regression" |
+| M1 `2026-10-25-qwen3-4b-p4-it7-off-a59a254` | a59a254 (it7) | yes | every v2 verdict passes; `G2.digest_self.cap` 0.45%, 0 mismatched | "it7", "M1b: official Qwen3-4B rerun on it7" |
+
+G5 at C/U 0.25 / 0.5 / 0.75 (warm_timed hit, E_C in brackets):
+
+| run | v2 | old | native | lmcache | H_lru | H*_C |
+|---|---|---|---|---|---|---|
+| r3 (8a05b7c) | 0.399 (0.084) / 0.842 (0.684) / 0.876 (0.669) | 0.395 (0.069) / 0.832 (0.681) / 0.876 (0.682) | 0.529 (0.287) / 0.861 (0.715) / 0.927 (0.770) | | 0.581 / 0.857 / 0.916 | 0.865 / 0.929 / 0.971 |
+| MF2 (d56fcb2) | 0.368 (0.029) / 0.777 (0.592) / 0.865 (0.673) | 0.392 (0.068) / 0.840 (0.673) / 0.879 (0.688) | not run | | 0.588 / 0.857 / 0.916 | 0.865 / 0.929 / 0.971 |
+| it6 cap (b5cf567) | 0.396 (0.080) / 0.843 (0.688) / 0.878 (0.682) | not run | not run | | 0.580 / 0.857 / 0.915 | 0.865 / 0.930 / 0.970 |
+| MF5 (a1e7fd2) | 0.392 (0.065) / 0.838 (0.667) / 0.883 (0.698) | 0.398 (0.081) / 0.820 (0.645) / 0.873 (0.674) | 0.542 (0.308) / 0.861 (0.718) / 0.927 (0.767) | pending (arm not comparable yet) | 0.581 / 0.857 / 0.915 | 0.862 / 0.929 / 0.970 |
+| it7 cap (a59a254) | 0.404 (0.099) / 0.859 (0.711) / 0.908 (0.724) | 0.400 (0.080) / 0.836 (0.675) / 0.876 (0.692) | not run | | 0.584 / 0.857 / 0.915 | 0.863 / 0.929 / 0.971 |
+| M1 (a59a254) | 0.409 (0.111) / 0.859 (0.701) / 0.908 (0.741) | 0.396 (0.071) / 0.829 (0.675) / 0.878 (0.693) | 0.533 (0.296) / 0.862 (0.715) / 0.927 (0.775) | pending (arm not comparable yet) | 0.584 / 0.858 / 0.916 | 0.863 / 0.929 / 0.970 |
+
+G3 (unlimited) is unchanged in every run: v2 at H* on gsm8k warm (0.992)
+and replay warm (0.998), E_ext 1.0, excess 0. On M1 (local / ext / total):
+gsm8k warm 0.922 / 0.070 / 0.992, replay cold 0.385 / 0.479 / 0.864, replay
+warm2 0.347 / 0.651 / 0.998. G4 vs the same-run baseline:
+
+| run | replay warm p50 | replay cold p50 | cold req/s | gsm8k cold / warm |
+|---|---|---|---|---|
+| MF5 v2 | -84.4 / -83.6% | -63.0% | +146.6% | +0.37% / -0.76% |
+| M1 v2 | -85.1 / -83.8% | -62.3% | +145.0% | +0.92% / -0.43% |
+| M1 old | -82.4 / -81.1% | -62.3% | +146.3% | +1.82% / +1.52% |
+| M1 native | -84.8 / -84.2% | -62.2% | +130.1% | +6.38% / +6.42% (fail) |
+
+Hit-rate judgment on the base server (closes P3's "pending"): close
+enough. At the gated point, 0.5, v2 on it7 is at H_lru (0.859 vs 0.858),
+above old (0.829) and 0.003 below native. Before it7, v2 was 0.838 to
+0.843, against old 0.820 to 0.840 and H_lru 0.857. The remaining gap from
+H_lru to H*_C is the base server's (PROGRESS "Server limitations"). At 0.25
+(C = 1.22x GPU KV, below the 2x floor) v2 and old are level (0.409 vs 0.396)
+and both are about 0.18 below H_lru. Native's lead there comes from a
+different store. Two P4 regressions are closed: MF2's (batching folded held
+steps into one entry per layer, fixed by it6), and the mixed-request entry
+that it7 split per request.
+
+`G2.digest_self.cap` on MF5 (1.008%) is closed by M1, the recorded rerun:
+0.45%, 0 mismatched. The share is run-to-run variance in which turns get
+preempted (old failed the same verdict on r3 at 1.10%).

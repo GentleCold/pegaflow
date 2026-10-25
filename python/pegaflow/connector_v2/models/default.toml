@@ -12,3 +12,19 @@ loading_wait_ms = 1000
 # vLLM can recover from a failed synchronous load (one KV cache group, no
 # block zeroing); otherwise every load is asynchronous.
 sync_load_tokens = 256
+
+# Save batching. Each step's saves are held and merged with later steps' into
+# one save RPC, sent once the oldest held step has seen save_batch_steps steps
+# (save_batch_steps = 1 sends every step). Fewer, larger submissions cost
+# vLLM's GPU less: the server copies from its own CUDA context, which
+# time-slices with vLLM's. Batching delays a finished request's
+# finished_sending (its blocks stay held) by up to that bound. The worker
+# also sends held saves after a fixed 1 s staleness cap (checked once per
+# step, so a hold can run about one step past it). Preemption flushes and
+# shutdown send at once.
+save_batch_steps = 32
+
+# Held saves are sent at once on steps where vLLM's GPU KV cache usage
+# (0..1, after the step's allocations) is at least this: the held finished
+# requests' blocks are then what waiting requests need. > 1 disables it.
+save_batch_max_kv_usage = 0.9

@@ -29,7 +29,9 @@ from pegaflow.connector_v2.core import (
     build_layout,
     may_zero_or_copy_blocks,
 )
+from pegaflow.connector_v2.core.layout import StorageRanks
 from pegaflow.connector_v2.core.scheduler import GroupSave, LoadPlan
+from pegaflow.connector_v2.core.worker import _wire_bytes
 from pegaflow.connector_v2.policy import Policy, SaveItem, load_policy
 
 BT = 4
@@ -119,19 +121,54 @@ def _saveable(g: _Group, before: int, after: int) -> tuple[int, int]:
     return (0, 0)
 
 
+@dataclass(frozen=True)
+class _Fragment:
+    layer: str
+    part: int
+    holders: list[int]
+
+    @property
+    def writer(self) -> int:
+        return self.holders[0]
+
+
+@dataclass(frozen=True)
+class _SealPlan:
+    plan: dict[int, list[_Fragment]]
+
+    @property
+    def groups(self) -> list[int]:
+        return sorted(self.plan)
+
+    def fragments(self, group: int) -> list[_Fragment]:
+        return self.plan[group]
+
+    def slot_of(self, rank: int, layer: str) -> tuple[int, int] | None:
+        for g, frags in self.plan.items():
+            for slot, f in enumerate(frags):
+                if f.layer == layer and rank in f.holders:
+                    return g, slot
+        return None
+
+
 def _seal_plan(ranks):
-    """Only the checks the core relies on: equal segments, every part held."""
-    layers: dict[str, tuple[list[int], int, set[int]]] = {}
-    for _, regions in ranks:
+    """The checks the core relies on (equal segments, every part held) and
+    the fragment order: layer name, then part; holders ascending."""
+    layers: dict[str, tuple[int, list[int], int, dict[int, set[int]]]] = {}
+    for rank, regions in ranks:
         for r in regions:
-            segs, count, parts = layers.setdefault(r.layer, (r.segments, r.shard.count, set()))
+            g, segs, count, parts = layers.setdefault(
+                r.layer, (r.group, r.segments, r.shard.count, {})
+            )
             if segs != r.segments or count != r.shard.count:
                 raise ValueError(f"layer {r.layer}: segment sizes differ")
-            parts.add(r.shard.index)
-    for layer, (_, count, parts) in layers.items():
-        if parts != set(range(count)):
+            parts.setdefault(r.shard.index, set()).add(rank)
+    plan: dict[int, list[_Fragment]] = {}
+    for layer, (g, _, count, parts) in sorted(layers.items()):
+        if set(parts) != set(range(count)):
             raise ValueError(f"layer {layer}: missing part")
-    return object()
+        plan.setdefault(g, []).extend(_Fragment(layer, p, sorted(parts[p])) for p in range(count))
+    return _SealPlan(plan)
 
 
 StubSemantics = types.SimpleNamespace(
@@ -790,7 +827,7 @@ def test_checkpoint_saves_from_offers(sem, steps, offers, expected):
     sched.on_new_request(_req(num_tokens=13, n_hashes=3))
     out = []
     for step, offer in zip(steps, offers, strict=True):
-        sched.plan_saves([step], lambda _: (CKPT_IDS, FULL_IDS), (), offer)
+        sched.plan_saves([step], lambda _: (CKPT_IDS, FULL_IDS), offers=offer)
         out.append([(s.sid, s.block_ids, s.block_hashes) for s in sched.take_plan().saves])
     assert out == expected
 
@@ -890,6 +927,24 @@ def test_hit_stats_logged_when_idle_and_on_cadence():
     assert lines[1:] == ["[PegaKVConnectorV2] hit stats {'lookups': 4}"]
 
 
+@BOTH
+def test_saves_keep_one_entry_per_request(sem):
+    # The server pins one region per entry: two requests saving in one step
+    # must not share an entry. Groups in sid order, requests in scheduled order.
+    sched, _ = _sched(sem, {})
+    sched.on_new_request(_req(req_id="b", num_tokens=8, n_hashes=2))
+    sched.on_new_request(_req(req_id="a"))
+    ids = {"a": (WINDOW_IDS, FULL_IDS), "b": ([40, 41, 42], [30, 31, 32])}
+    assert _step_saves(sched, [[("a", 0, 13), ("b", 0, 8)]], ids) == [
+        [
+            (0, [10, 11, 12], H[:3]),
+            (0, [30, 31], H[:2]),
+            (1, [20, 21, 22], H[:3]),
+            (1, [40, 41], H[:2]),
+        ]
+    ]
+
+
 def test_saves_reoffer_after_missing_block_ids():
     sched, _ = _sched(StubSemantics, {})
     sched.on_new_request(_req())
@@ -978,14 +1033,14 @@ class JumpClock:
         return self.now
 
 
-def _worker(sem, rpc, states, layout=None, mark=FakeMark, clock=None, sync_saves=False):
+def _worker(sem, rpc, states, layout=None, mark=FakeMark, clock=None, sync_saves=False, par=None):
     it = iter(states)
     kwargs = {"clock": clock} if clock is not None else {}
     return Worker(
         layout or _layout(sem),
         rpc,
         "inst",
-        Parallel(),
+        par or Parallel(),
         0,
         lambda t: b"ipc",
         lambda: next(it),
@@ -1138,6 +1193,154 @@ def test_async_save_holds_blocks_until_copied(outcome):
     worker.shutdown()
 
 
+class StepClock:
+    """Reads the time the test set; ``tick`` advances it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+# Steps: block id saved that step (None = a step without saves), then the
+# step's clock advance in ms. Expected: block ids per save RPC, in order.
+# The staleness cap (Worker.SAVE_HOLD_MAX_S) is 10 ms here.
+@pytest.mark.parametrize(
+    "batch_steps,steps,expected",
+    [
+        pytest.param(1, [(1, 0), (2, 0), (3, 0)], [[1], [2], [3]], id="off"),
+        pytest.param(3, [(1, 0), (2, 0), (3, 0), (4, 0)], [[1, 2, 3]], id="steps"),
+        # Steps without saves still age the held jobs (vLLM calls
+        # wait_for_save every engine step).
+        pytest.param(3, [(1, 0), (None, 0), (None, 0)], [[1]], id="idle-steps-count"),
+        # The cap: the step that finds the batch due joins it (sent at 12 ms).
+        pytest.param(100, [(1, 4), (2, 4), (3, 4), (4, 0), (5, 0)], [[1, 2, 3, 4]], id="cap"),
+        # Whichever bound comes first.
+        pytest.param(8, [(1, 6), (2, 6), (3, 0)], [[1, 2, 3]], id="cap-before-steps"),
+        pytest.param(2, [(1, 0), (2, 0), (3, 0)], [[1, 2]], id="steps-before-cap"),
+    ],
+)
+def test_save_batching(batch_steps, steps, expected, monkeypatch):
+    """Policy save_batch_steps: consecutive steps' saves go out as one save RPC,
+    released by the step bound or the staleness cap; nothing is lost. Each
+    step keeps its own layer entry in the RPC (the server pins one region per
+    entry: one entry per layer for many steps strands evicted bytes)."""
+    monkeypatch.setattr(Worker, "SAVE_HOLD_MAX_S", 10e-3)
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    clock = StepClock()
+    worker = Worker(
+        _layout(StubSemantics, StubFullSpec()),
+        rpc,
+        "inst",
+        Parallel(),
+        0,
+        lambda t: b"ipc",
+        lambda: None,
+        FakeMark,
+        clock=clock,
+        batch_steps=batch_steps,
+    )
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    for block, advance_ms in steps:
+        saves = [] if block is None else [GroupSave(0, [block], [b"h%d" % block])]
+        worker.save(StepPlan(saves=saves))
+        clock.now += advance_ms / 1e3
+    worker._jobs.put(None)  # stop the saver after what was released so far
+    worker._saver.join(5)
+    assert [[ids for _, ids, _ in c] for c in calls] == [[[b] for b in e] for e in expected]
+    assert [[h for _, _, h in c] for c in calls] == [[[b"h%d" % b] for b in e] for e in expected]
+    assert all(name == "layers.0.attn" for c in calls for name, _, _ in c)
+    assert worker.save_stats.rpcs == len(expected)
+
+
+@pytest.mark.parametrize(
+    "kv_usage,threshold,send",
+    [
+        pytest.param(0.3, 0.9, False, id="low"),
+        pytest.param(0.9, 0.9, True, id="at-threshold"),
+        pytest.param(1.0, 1.01, False, id="disabled"),
+        # vLLM did not bind its cache manager: fail loud and stop batching.
+        pytest.param(None, 0.9, True, id="unknown"),
+    ],
+)
+def test_kv_pressure_sends_held_saves(kv_usage, threshold, send, caplog):
+    """Under GPU KV pressure, held saves go out in the step's RPC instead of
+    waiting for the batch bound: finished requests held for the batch keep
+    blocks that waiting requests need. The step does not wait for them.
+    Unknown usage counts as pressure, warned once and counted in save stats."""
+    layout = _layout(StubSemantics, StubFullSpec())
+    sched, _ = _sched(
+        StubSemantics, {}, policy=Policy(save_batch_max_kv_usage=threshold), layout=layout
+    )
+    with caplog.at_level("WARNING", logger="pegaflow.connector_v2.core.scheduler"):
+        sched.plan_saves([], lambda rid: None, kv_usage=kv_usage)
+        pressured = sched.take_plan()
+        sched.plan_saves([], lambda rid: None, kv_usage=kv_usage)
+    warned = [r for r in caplog.records if "usage is unavailable" in r.getMessage()]
+    assert len(warned) == (1 if kv_usage is None else 0)
+    assert pressured.send_saves is send and pressured.flush is False
+    assert pressured.kv_usage_unknown is (kv_usage is None)
+
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    worker = _worker(StubSemantics, rpc, [], layout=layout)
+    worker._batch_steps = 32
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
+    pressured.saves = [GroupSave(0, [12], [b"h2"])]
+    worker.save(pressured)
+    assert len(worker._held) == (0 if send else 2)
+    assert worker.save_stats.pressure_rpcs == (1 if send else 0)
+    assert worker.save_stats.kv_usage_unknown_steps == (1 if kv_usage is None else 0)
+    assert worker.flush(5)
+    assert [[ids for _, ids, _ in c] for c in calls] == [[[11], [12]]]
+    worker.shutdown()
+
+
+def test_merged_save_rpc_stays_under_size_budget(monkeypatch):
+    """A merged save RPC must stay under the gRPC message limit: a step that
+    would push the held batch past SAVE_RPC_MAX_BYTES sends the batch first.
+    Nothing is lost, and the order of blocks is kept."""
+    one_step = _wire_bytes([("layers.0.attn", [1], [b"h1"])])
+    monkeypatch.setattr(Worker, "SAVE_RPC_MAX_BYTES", 2 * one_step)
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
+    worker._batch_steps = 100
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    for b in (1, 2, 3):
+        worker.save(StepPlan(saves=[GroupSave(0, [b], [b"h%d" % b])]))
+    assert worker.flush(5)
+    assert [[ids for _, ids, _ in c] for c in calls] == [[[1], [2]], [[3]]]
+    assert worker.save_stats.rpcs == 2
+    worker.shutdown()
+
+
+def test_save_batching_flush_and_finish_fence():
+    """A held job counts as submitted: a request finishing after it is held
+    until the batch is sent and copied, and flush (preemption, shutdown)
+    sends held jobs at once instead of waiting for the batch bound."""
+    calls = []
+    rpc = FakeRpc()
+    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
+    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
+    worker._batch_steps = 100  # never released by the bound in this test
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
+    worker.start(StepPlan(finished=["r"]))
+    worker.save(StepPlan())
+    assert worker.poll()[0] == set() and calls == []
+    assert worker.flush(5)
+    assert len(calls) == 1 and worker.poll()[0] == {"r"}
+    assert worker.save_stats.sent == 1
+    worker.shutdown()
+
+
 @pytest.mark.parametrize(
     "fields,sync",
     [
@@ -1170,11 +1373,15 @@ def test_layouts_that_zero_or_copy_save_synchronously(fields, sync):
     rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=SlowMark, sync_saves=sync)
+    # Save batching on (the shipped default): sync saves must ignore it.
+    worker._batch_steps = 32
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
-    # Sync: done before the next step can zero or copy a block. Async: the
-    # job still waits on the compute mark.
+    # Sync: done before the next step can zero or copy a block, in its own
+    # RPC. Async: the job is held (batched) or still waits on the mark.
     assert len(calls) == (1 if sync else 0)
+    assert worker.save_stats.rpcs == (1 if sync else 0)
+    assert len(worker._held) == (0 if sync else 1)
     worker.shutdown()
     assert len(calls) == 1
 
@@ -1427,6 +1634,13 @@ def test_full_attention_layout(sem, full_attention, spec, par, kv, shards):
     ranks = [dataclasses.replace(par, tp_rank=r) for r in range(par.tp_size)]
     decls = [full_attention.layer(spec, names[0], r) for r in ranks]
     assert [d.shard for d in decls] == [sem.Shard.heads(i, n) for i, n in shards]
+    # One storage rank per head shard; its first holder writes it.
+    first = {i: r for r, (i, _) in reversed(list(enumerate(shards)))}
+    assert layout.storage == StorageRanks(
+        shards[0][1],
+        tuple(i for i, _ in shards),
+        tuple(first[i] == r for r, (i, _) in enumerate(shards)),
+    )
     # Rank 0 registration as the server sees it: one page-sized segment per layer.
     rpc = FakeRpc()
     _worker(sem, rpc, [], layout=layout).register(
@@ -1615,9 +1829,10 @@ def test_qwen35_layout(sem, mamba, full_attention):
         assert other.namespace != layout.namespace, change
 
 
-# Qwen3-4B test layout namespaces computed by the 6545352 core (before
-# LayerDecl.layout); stub and native differ only in repr(Shard).
-QWEN3_NAMESPACE_V1 = {"stub": "cf6b5725", "native": "cd8acc0c"}
+# Qwen3-4B test layout namespaces computed by the P4 core (563a693, with
+# storage_tp, before LayerDecl.layout); stub and native differ only in
+# repr(Shard). Was cf6b5725 / cd8acc0c before storage_tp entered the namespace.
+QWEN3_NAMESPACE_V1 = {"stub": "a25ea150", "native": "bdda8997"}
 
 
 @BOTH
@@ -1649,3 +1864,129 @@ def test_qwen35_declarations_seal(sem, mamba, full_attention, tp):
                 regions.append(sem.Region(name, sid, [int(s) for s in d.segments], d.shard))
         ranks.append((r, regions))
     sem.seal_plan(ranks)
+
+
+# -------------------------------------------------- adapters/mla_attention.py
+@dataclass(frozen=True)
+class MLAAttentionSpec(FullAttentionSpec):  # registry keys on the class name
+    """Defaults = docs/rsi/models/DeepSeek-V2-Lite-Chat/spec.json (bf16 latent
+    kv_lora_rank 512 + rope 64 = 576, one head, replicated over TP)."""
+
+    num_kv_heads: int = 1
+    head_size: int = 576
+    head_size_v: int = 0
+    page_size_bytes: int = 18432
+    max_tp_shards: int | None = 1
+    cache_dtype_str: str | None = "auto"
+    alignment: int | None = None
+    model_version: str | None = None
+    cache_role: str = "sparse"
+    is_index_group_leader: bool = False
+    non_causal_multi_token_decode: bool = False
+
+
+DSV2_BLOCKS = 6222
+# vLLM 0.32 LBNHC layer view [B, H=1, N, C=576] in bf16 (probe dump, both TP2 ranks).
+DSV2_KV = FakeKV((DSV2_BLOCKS, 1, 16, 576), (9216, 576, 576, 1))
+
+
+@pytest.fixture
+def mla_attention(monkeypatch, sem):
+    from pegaflow.connector_v2.adapters import mla_attention as mod
+
+    adapter = mod.MLAAttentionAdapter(sem)
+    monkeypatch.setattr(mod, "ADAPTER", adapter)
+    return adapter
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "par",
+    [
+        pytest.param(Parallel(), id="tp1"),
+        # DeepSeek-V2-Lite as run by the gate: TP2, vLLM kv_tp_replicas=2.
+        pytest.param(Parallel(tp_size=2, kv_tp_replicas=2), id="tp2"),
+        pytest.param(Parallel(tp_size=4, kv_tp_replicas=4), id="tp4"),
+    ],
+)
+def test_mla_attention_layout(sem, mla_attention, par):
+    spec = MLAAttentionSpec()
+    names, cfg = _attn_cfg(spec, 27)
+    layout = build_layout(cfg, par, {"model": "DeepSeek-V2-Lite-Chat"}, semantics=sem)
+    assert [(g.sem.kind, g.sem.block_tokens) for g in layout.groups] == [("full", 16)]
+    ranks = [dataclasses.replace(par, tp_rank=r) for r in range(par.tp_size)]
+    # Every rank holds the same latent page: one fragment per layer after seal_plan.
+    assert {mla_attention.layer(spec, names[0], r).shard for r in ranks} == {sem.Shard.replicated()}
+    # Replicas share one storage rank: one slot per layer, only rank 0 saves.
+    n = par.tp_size
+    assert layout.storage == StorageRanks(1, (0,) * n, (True,) + (False,) * (n - 1))
+    for r in ranks:
+        rpc = FakeRpc()
+        saved = []
+        rpc.save = lambda *args, saved=saved: saved.append(args) or (True, "")
+        loaded = []
+        rpc.load = lambda *args, loaded=loaded: loaded.append(args[1]) or (True, "")
+        worker = _worker(sem, rpc, [FakeLoadState()], layout=layout, par=r)
+        worker.register(dict.fromkeys(names, DSV2_KV), dict.fromkeys(names, spec))
+        reg = rpc.registered
+        assert (reg["tp_rank"], reg["tp_size"]) == (0, 1)
+        assert set(reg["segments"]) == {1}
+        assert set(reg["bytes_per_block"]) == set(reg["kv_strides"]) == {18432}
+        assert set(reg["num_blocks"]) == {DSV2_BLOCKS}
+        assert (reg["backend"], reg["page_first"]) == ("direct", False)
+        worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
+        assert worker.flush(5)
+        assert [(a[1], len(a[-1])) for a in saved] == ([(0, 27)] if r.tp_rank == 0 else [])
+        worker.start(StepPlan(loads=[LoadPlan("q", [(b"L0", [[3]])], sync=False)]))
+        assert loaded == [0]  # every holder loads its own GPU from storage rank 0
+        worker.shutdown()
+
+
+def test_mla_seal_plan_one_writer():
+    """Replicated MLA pages seal as one fragment per layer, written by rank 0."""
+    sem = _native()
+    spec = MLAAttentionSpec()
+    from pegaflow.connector_v2.adapters import mla_attention as mod
+
+    adapter = mod.MLAAttentionAdapter(sem)
+    ranks = []
+    for r in range(2):
+        d = adapter.layer(spec, "l0", Parallel(tp_rank=r, tp_size=2, kv_tp_replicas=2))
+        ranks.append((r, [sem.Region("l0", 0, list(d.segments), d.shard)]))
+    plan = sem.seal_plan(ranks)
+    (frag,) = plan.fragments(0)
+    assert (frag.holders, frag.writer, frag.bytes) == ([0, 1], 0, 18432)
+    assert plan.is_writer(0, 0, 0) and not plan.is_writer(1, 0, 0)
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("max_tp_shards", None),
+        ("max_tp_shards", 2),
+        ("alignment", 576),
+        ("model_version", "deepseek_v4"),
+        ("cache_role", "indexer"),
+        ("is_index_group_leader", True),
+        ("cache_dtype_str", "fp8_ds_mla"),
+        ("state_content_bytes", 656),
+        ("kv_quant_mode", 1),
+        ("page_size_padded", 18944),
+        ("non_causal_multi_token_decode", True),
+        ("sliding_window", 4096),
+        ("head_size_v", 128),
+    ],
+)
+def test_mla_attention_rejects_unvalidated_specs(sem, mla_attention, field, value):
+    spec = dataclasses.replace(MLAAttentionSpec(), **{field: value})
+    _, cfg = _attn_cfg(spec, 2)
+    with pytest.raises(Unsupported):
+        build_layout(cfg, Parallel(tp_size=2, kv_tp_replicas=2), {"model": "m"}, semantics=sem)
+
+
+def test_mla_and_full_attention_never_share_a_namespace(sem, full_attention, mla_attention):
+    """Equal page sizes, different bytes: the spec class is part of the namespace."""
+    mla = MLAAttentionSpec()
+    full = FullAttentionSpec(num_kv_heads=1, head_size=288, page_size_bytes=18432)
+    assert _layout_of(sem, mla).namespace != _layout_of(sem, full).namespace

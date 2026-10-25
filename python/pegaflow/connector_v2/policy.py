@@ -48,6 +48,15 @@ class Policy:
     # Hits of at most this many tokens load before the step's forward (where the
     # layout allows it), longer ones asynchronously between steps.
     sync_load_tokens: int = 256
+    # Merge consecutive steps' saves into one save RPC: send when the oldest
+    # held step has seen save_batch_steps steps (<= 1 sends every step), when
+    # the GPU KV cache is under pressure, or after the worker's staleness cap
+    # (Worker.SAVE_HOLD_MAX_S). Preemption flushes and shutdown send at once.
+    save_batch_steps: int = 32
+    # Send held saves at once while vLLM's GPU KV cache usage (0..1, after
+    # the step's allocations) is at or above this: finished requests held
+    # for a batch keep blocks that waiting requests need. > 1 disables it.
+    save_batch_max_kv_usage: float = 0.9
 
     def accept(self, p: int, present: Sequence[frozenset[int]]) -> int:
         """Hit length to use, <= ``p``; ``present[sid]`` = blocks the server has."""

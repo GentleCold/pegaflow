@@ -1,0 +1,8 @@
+{
+ "attention_backend": null,
+ "batch_invariant": true,
+ "invariant_attention_backend": "TRITON_MLA",
+ "split_invariant": false,
+ "vllm_args": [],
+ "notes": "MLA (one latent KV head, max_tp_shards=1), one KV group, TP2. On sm89 vLLM 0.32 picks TRITON_MLA for dense MLA (FLASH_ATTN_MLA / FLASHMLA need sm90+, FLASHINFER_MLA sm100); TRITON_MLA supports batch invariance (num_kv_splits=1); the self-test confirmed warm_equals_cold and baseline computed_exact. Not split-invariant: MLA prefill attends to the cached context separately and merges at num_computed_tokens (vLLM 0.32 forward_mha), so outputs after a prefix hit depend on where the hit ends (ITERATIONS.md split evidence; the gate's plain-vLLM split control measured 647/1319 gsm8k outputs differing)."
+}

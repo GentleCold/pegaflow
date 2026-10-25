@@ -85,6 +85,7 @@ class Adapter(Protocol):
 _REGISTRY: dict[str, str] = {
     "FullAttentionSpec": "full_attention",
     "MambaSpec": "mamba",
+    "MLAAttentionSpec": "mla_attention",
 }
 
 

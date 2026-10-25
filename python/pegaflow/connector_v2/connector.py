@@ -126,6 +126,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
 
         self._scheduler: Scheduler | None = None
         self._worker: Worker | None = None
+        profile = extra.get("model_profile") or getattr(mc, "architecture", None)
         if role == KVConnectorRole.SCHEDULER:
             if getattr(self._kv_transfer_config, "kv_load_failure_policy", None) == "fail":
                 # vLLM's scheduler reads the TOP-LEVEL kv_transfer_config. Under
@@ -137,7 +138,6 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                     "policy is the top-level kv_transfer_config's. Under fail, a failed "
                     "load (e.g. an expired lease) errors the request: use recompute"
                 )
-            profile = extra.get("model_profile") or getattr(mc, "architecture", None)
             # vLLM maps a failed synchronous load (invalid_block_ids) back to
             # requests only with one KV cache group, and zeroes new blocks on
             # the compute stream, unordered against the server's copy.
@@ -158,7 +158,10 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             )
             try:
                 self._rpc.start_session_watcher(
-                    self._instance_id, self._layout.namespace, par.tp_size, par.world_size
+                    self._instance_id,
+                    self._layout.namespace,
+                    self._layout.storage.tp_size,  # the tp_size workers register with
+                    par.world_size,
                 )
             except Exception:
                 logger.warning("[PegaKVConnectorV2] session watcher failed", exc_info=True)
@@ -172,7 +175,13 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             sync_saves = may_zero_or_copy_blocks(kv_cache_config) or any(
                 g.sem.kind == "checkpoint" for g in self._layout.groups
             )
-            logger.info("[PegaKVConnectorV2] saves=%s", "sync" if sync_saves else "async")
+            policy = load_policy(profile)
+            logger.info(
+                "[PegaKVConnectorV2] saves=%s batch_steps=%d max_kv_usage=%s",
+                "sync" if sync_saves else "async",
+                policy.save_batch_steps,
+                policy.save_batch_max_kv_usage,
+            )
             self._worker = Worker(
                 self._layout,
                 self._rpc,
@@ -183,6 +192,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 PyLoadState,
                 _mark_compute,
                 sync_saves=sync_saves,
+                batch_steps=policy.save_batch_steps,
             )
 
     @property
@@ -225,12 +235,16 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens, strict=True)
         )
         block_state = scheduler_output.kv_connector_block_state
+        # vLLM binds its cache manager after construction (bind_kv_cache_manager).
+        kv_cache_manager = getattr(self, "_kv_cache_manager", None)
         self._scheduler.plan_saves(
             scheduled,
             block_state.get_block_ids if block_state is not None else lambda _: None,
             scheduler_output.preempted_req_ids or (),
+            # None (not bound): the scheduler treats it as pressure, i.e. no batching.
+            kv_usage=kv_cache_manager.usage if kv_cache_manager is not None else None,
             # Checkpoint (Mamba align) states, with their exact block ids.
-            getattr(block_state, "boundary_state_offloads", None),
+            offers=getattr(block_state, "boundary_state_offloads", None),
         )
         return PegaConnectorMetadata(self._scheduler.take_plan())
 

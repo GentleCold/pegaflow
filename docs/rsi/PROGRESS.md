@@ -140,10 +140,56 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
-| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge |
-| P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed (the order3 p4 output divergence is closed as vLLM batch non-invariance), Qwen3-4B + DSV2 non-regression; review of it0+it1 pending; gate runs wait for `feat/rsi-gate-hybrid` and the retention-528 gate.json |
+| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"). Hit-rate judgment on the base server: close enough. G5 hit at C/U 0.5 is v2 0.838-0.843 before P4 it7 (r3, P4 it6 cap, P4 MF5) and 0.859 on it7 (P4 M1b official), vs old 0.820-0.840, native 0.861-0.862, H_lru 0.857-0.858; the gap from H_lru to H*_C is the base server's (server proposals H1-H5 parked, see "Server limitations"). P4 regression record: `models/Qwen3-4B/ITERATIONS.md` "P4 regression runs on this model" |
+| P4 | onboard DeepSeek-V2-Lite-Chat | accept: it7 a59a254 on `feat/rsi-deepseek-v2-lite` (TP2, MLA). ACCEPTED 2026-10-25: final review ACCEPT-WITH-FIXES, M1, M2 and S1-S5 applied, re-review ACCEPT (`reviews/P4-final.md`, 4164173). Open for the user's final pass: DSV2 G5 at C/U 0.25 is 0.07 below old on the same server, cause unknown (connector side by elimination; below the 2x GPU-KV floor); lmcache numbers go into the P4 tables when `feat/rsi-gate-lmcache` merges; the gate owner should revisit the preempted-uncertain bound (DSV2 v2 at 0.85% of 1%). Official on it7: DSV2 `2026-10-25-dsv2-lite-p4-it7-off-a59a254` and Qwen3-4B `2026-10-25-qwen3-4b-p4-it7-off-a59a254`, where v2 passes every verdict (Qwen `G2.digest_self.cap` 0.45%). Hit judgment: close enough. Tables: "P4 acceptance tables" below. lmcache: pending (arm not comparable yet) |
+| P5 | onboard Qwen3.5-4B | it1 (`feat/rsi-qwen3.5-4b`): core checkpoint saves from offers, ordering check passed (the order3 p4 output divergence is closed as vLLM batch non-invariance), Qwen3-4B + DSV2 non-regression; it1 accepted; it2 in progress on the hybrid gate (slices, see 2026-10-25) |
 | P6 | onboard gemma-4-E4B-it | todo |
+
+### P4 acceptance tables (it7 a59a254, gate ce645d7, base server d1970ead)
+
+Both runs are official: arms plain, baseline, old, native, v2, GPU 0(,1).
+Full records are in `models/DeepSeek-V2-Lite-Chat/ITERATIONS.md` ("it7",
+M1a and M1b).
+
+G3, unlimited store (local / ext / total; H*; E_ext; excess tokens):
+
+| model / pass | v2 | old | native | lmcache | H* |
+|---|---|---|---|---|---|
+| DSV2 gsm8k warm | 0.937 / 0.056 / 0.993; E 1.0; 0 | 0.938 / 0.055 / 0.993; E 1.0; 1230 | 0.940 / 0.053 / 0.993; E 1.0; 1230 | pending (arm not comparable yet) | 0.993 |
+| DSV2 replay cold | 0.493 / 0.349 / 0.843; E 1.0 | 0.491 / 0.352 / 0.843; E 1.0 | 0.498 / 0.345 / 0.842; E 0.9998 | pending | 0.843 |
+| DSV2 replay warm2 | 0.465 / 0.533 / 0.998; E 1.0; 0 | 0.519 / 0.479 / 0.998; E 1.0; 210 | 0.461 / 0.537 / 0.998; E 1.0; 210 | pending | 0.998 |
+| Qwen3-4B gsm8k warm | 0.922 / 0.070 / 0.992; E 1.0; 0 | 0.926 / 0.067 / 0.993; E 1.0; 1170 | 0.933 / 0.060 / 0.993; E 1.0; 1170 | pending | 0.992 |
+| Qwen3-4B replay cold | 0.385 / 0.479 / 0.864; E 1.0 | 0.381 / 0.483 / 0.864; E 1.0 | 0.384 / 0.480 / 0.864; E 1.0 | pending | 0.864 |
+| Qwen3-4B replay warm2 | 0.347 / 0.651 / 0.998; E 1.0; 0 | 0.361 / 0.638 / 0.998; E 1.0; 195 | 0.378 / 0.621 / 0.998; E 1.0; 195 | pending | 0.998 |
+
+G5, cap trace, warm_timed. Each cell is hit (E_C); H_lru and H*_C are
+computed on v2's trace:
+
+| model, C/U | v2 | old | native | lmcache | H_lru | H*_C |
+|---|---|---|---|---|---|---|
+| DSV2 0.25 (1.14x GPU KV) | 0.452 (0.070) | 0.522 (0.180) | 0.579 (0.282) | pending (arm not comparable yet) | 0.671 | 0.854 |
+| DSV2 0.5 (2.27x) | 0.847 (0.620) | 0.845 (0.614) | 0.851 (0.622) | pending | 0.847 | 0.925 |
+| DSV2 0.75 | 0.899 (0.659) | 0.886 (0.616) | 0.933 (0.708) | pending | 0.918 | 0.968 |
+| Qwen3-4B 0.25 (1.22x) | 0.409 (0.111) | 0.396 (0.071) | 0.533 (0.296) | pending | 0.584 | 0.863 |
+| Qwen3-4B 0.5 (2.44x) | 0.859 (0.701) | 0.829 (0.675) | 0.862 (0.715) | pending | 0.858 | 0.929 |
+| Qwen3-4B 0.75 | 0.908 (0.741) | 0.878 (0.693) | 0.927 (0.775) | pending | 0.916 | 0.970 |
+
+G4, change vs the same-run baseline (warm = warm2 / warm3):
+
+| model / arm | replay warm p50 | warm req/s | cold p50 | cold req/s | gsm8k cold / warm |
+|---|---|---|---|---|---|
+| DSV2 v2 | -68.2 / -67.3% | +131 / +126% | -31.8% | +59.7% | +0.32 / -1.96% |
+| DSV2 old | -57.8 / -63.8% | +131 / +126% | -30.8% | +57.6% | +1.04 / -0.98% |
+| DSV2 native | -69.9 / -67.2% | +141 / +144% | -38.8% | +63.8% | +0.63 / -1.57% |
+| Qwen3-4B v2 | -85.1 / -83.8% | +288 / +277% | -62.3% | +145.0% | +0.92 / -0.43% |
+| Qwen3-4B old | -82.4 / -81.1% | +294 / +278% | -62.3% | +146.3% | +1.82 / +1.52% |
+| Qwen3-4B native | -84.8 / -84.2% | +273 / +269% | -62.2% | +130.1% | +6.38 / +6.42% (fail) |
+
+Judgment: close enough. At the gated point, 0.5, v2 is at H_lru on both
+models and level with the reference arms. The one gap is DSV2 0.25, where v2
+is 0.07 below old. Old's run-to-run noise there is 0.038 (0.512 to 0.550). C
+there is 1.14x GPU KV, below the 2x floor. The sim rules out the
+local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
 
 ## Log
 
@@ -652,6 +698,76 @@ names, magic constants that only exist in the old code).
   14.2 vs 21.9 GB/s effective H2D on replay warm2. Both copy 64 KiB
   per-layer pages.
 
+- P4 start (isolated onboarding agent, DeepSeek-V2-Lite-Chat, MLA, TP2 on
+  .44 GPU pairs 0,1 / 2,3; worktree `.worktrees/rsi-deepseek-v2-lite`, branch
+  `feat/rsi-deepseek-v2-lite` from `feat/semantics-rsi` 8af8fe4; remote dir
+  `~/kexi/pegaflow-rsi-deepseek-v2-lite`). Plan: (1) self-test at TP2
+  (plain, baseline, 4 selftest arms, 128 gsm8k) to get spec.json + gate.json;
+  (2) map MLAAttentionSpec -> (Kind, Shard, unit) from the dump and vLLM
+  0.32 source; (3) adapter for `MLAAttentionSpec` (the registry dispatches
+  by exact class name, so the full_attention adapter does not apply); (4)
+  slices, then one official run with `old`; (5) Qwen3-4B slice if shared code
+  changes. Runs import connector_v2 from the P4 remote tree (PYTHONPATH),
+  native `.so` copied from `pegaflow-semantics-rsi`, server binary reused.
+  Record: `docs/rsi/models/DeepSeek-V2-Lite-Chat/ITERATIONS.md`.
+
+- P4 it4/it5 (2026-10-24, connector-only, no semantics or server change):
+  save batching is a model-agnostic policy knob, on by default:
+  `save_batch_steps = 32`, plus `save_batch_max_kv_usage = 0.9`, which sends
+  held saves at once when vLLM's GPU KV usage is at least 90%. A fixed 1 s
+  staleness cap (`Worker.SAVE_HOLD_MAX_S`, formerly the `save_batch_ms` knob,
+  folded per review M3) and a 16 MiB merged-RPC cap are constants.
+  Sync-save layouts skip batching. Every run below is non-official.
+  - Unpressured DSV2 TP2 3x (`it5-rep-01`, replay only, 8x6): the G4
+    replay verdicts pass 3/3 (cold p50 -1.9 to +0.6% vs baseline), against
+    +5% for batching off. gsm8k G2/G3/G4 have not been evaluated with
+    batching on.
+  - Pressured DSV2 (`--num-gpu-blocks 1200`): without the KV-pressure send,
+    the batch hold cost +53% cold p50. With it, the default is level with
+    batching off, with no added preemptions.
+  - Qwen3-4B TP1 (8x6, max KV usage 31%): no regression (`it4-nonreg`,
+    `it4-qrep-b`, `it5-nonreg`). The official-regime check (32x12, KV up to
+    99.6%, vs it2d) is pending (review M2).
+  - Review `reviews/P4-dsv2-lite.md`: accept after must-fix. M1 (official
+    DSV2 run under rsi-g5's split mode, including gsm8k) and M2 wait for
+    the rsi-g5 merge.
+  - Gate issue seen: a vLLM `--port` bind race (`EADDRINUSE`) killed one
+    run_gate (`qwen3-4b-p4-it4-qrep`).
+- P4 official runs and G5 (2026-10-24, connector-only, base server
+  d1970ead; record `models/DeepSeek-V2-Lite-Chat/ITERATIONS.md`):
+  - MF1 `2026-10-24-dsv2-lite-p4-mf1` (07f5d96) and MF2
+    `2026-10-24-qwen3-4b-p4-mf2` (d56fcb2) are official and pass G0-G4.
+    MF2 is no regression vs it2d. The DSV2 old supplement
+    (`...-dsv2-lite-p4-old-supp`) has old passing everything.
+  - G5 regressed with batching (Qwen3-4B 0.5: 0.777 vs 0.842 at 8a05b7c).
+    A/B (`...-ab-a-d56fcb2` / `...-ab-b-706006c`): batching off restores
+    it.
+  - Cause: `_release_held` folded every held step into one save entry
+    per layer. The base server pins one region per entry until its last
+    block is evicted (see "Server limitations").
+  - it6 (43a3759) keeps one entry per held step. Same RPC count, DSV2
+    8 x 6 cold p50 -0.5% vs baseline.
+  - Official runs on the it6 tree a1e7fd2 (arms plain, baseline, old,
+    native, v2; lmcache pending, arm not comparable yet):
+    - MF4 DSV2 `2026-10-24-dsv2-lite-p4-it6-off-a1e7fd2` (pgid
+      3030292): v2 passes every verdict.
+    - MF5 Qwen3-4B `2026-10-24-qwen3-4b-p4-it6-off-a1e7fd2` (pgid
+      3092773): v2 passes G0, G3, G4 and every other G2. It fails
+      `G2.digest_self.cap`: 1.008% preempted-uncertain vs the 1% limit,
+      0 mismatched. Open for the coordinator and the gate owner.
+
+    | model | C/U | v2 | old | native | lmcache | H_lru | H*_C |
+    |---|---|---|---|---|---|---|---|
+    | DSV2 | 0.25 | 0.436 | 0.512 | 0.578 | pending | 0.673 | 0.851 |
+    | DSV2 | 0.5 | 0.844 | 0.845 | 0.850 | pending | 0.847 | 0.925 |
+    | DSV2 | 0.75 | 0.863 | 0.889 | 0.933 | pending | 0.919 | 0.968 |
+    | Qwen3-4B | 0.25 | 0.392 | 0.398 | 0.542 | pending | 0.581 | 0.862 |
+    | Qwen3-4B | 0.5 | 0.838 | 0.820 | 0.861 | pending | 0.857 | 0.929 |
+    | Qwen3-4B | 0.75 | 0.883 | 0.873 | 0.927 | pending | 0.915 | 0.970 |
+
+  - DSV2 still trails old by 0.076 at 0.25 and 0.026 at 0.75. The
+    per-request entry split is untested and deliberately not done.
+    Listed for the reviewer.
 - P3 it2e non-regression (fc06c9b):
   - Slice `2026-10-23-qwen3-4b-p3-it2e-slice`: all correctness and replay
     verdicts pass. gsm8k cold failed at +9.9%. A 10 s zero-throughput stall
@@ -916,6 +1032,28 @@ names, magic constants that only exist in the old code).
   logs it when idle and every 30 s. Next: cap-only diagnostic slice
   (baseline + v2) to attribute the 0-load per group, then the save-cost
   hypothesis (checkpoint saves off the step, fenced on block reuse).
+- P4 final-review fixes (`reviews/P4-final.md`, ACCEPT-WITH-FIXES).
+  Changes are in connector_v2's scheduler, its unit test and the docs; no
+  semantics or server change.
+  - M2: per-request save entries became it7 (a59a254, `plan_saves` emits
+    one GroupSave per storage group and request). The base server keeps a
+    whole pinned region alive until every block in it is evicted, so mixed
+    entries strand bytes.
+    - DSV2 A/B (`2026-10-25-dsv2-lite-p4-m2-a59a254`): resident/C went
+      from 0.78-0.90 to 0.91-0.96, and hit at 0.75 from 0.863 to 0.899.
+    - Qwen3-4B cap regression: 0.5 went from 0.838 to 0.859.
+    - The DSV2 8 x 6 cold check failed only on baseline noise; the
+      same-time control on a1e7fd2 confirmed this, and it was accepted.
+  - The DSV2 0.25 gap stays unexplained. The server-faithful sim (both
+    query modes) rules out the local-hit query, the resident deficit, lost
+    saves and the server. The gap is 0.06-0.12, against old's own noise of
+    0.038.
+  - M1: official reruns on it7, DSV2
+    `2026-10-25-dsv2-lite-p4-it7-off-a59a254` and Qwen3-4B
+    `2026-10-25-qwen3-4b-p4-it7-off-a59a254`. v2 passes every verdict on
+    both. Qwen `G2.digest_self.cap` is 0.45% (MF5 1.008%), DSV2 0.85%.
+  - S1-S5: done. The tables are in "P4 acceptance tables" above. Gate stays
+    at ce645d7 until P4 is accepted.
 
 ## Semantics changelog
 
