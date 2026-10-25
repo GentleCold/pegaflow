@@ -100,13 +100,13 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   checkpoint group save synchronously in `wait_for_save`. Loads need nothing
   special: the needed block `[p - bt, p)` is always past the local hit, and
   vLLM allocates a fresh state block for an external hit.
-- **Hit stats.** Every 500 lookups (and at shutdown) the scheduler logs
-  `hit stats`: lookups, and per set of storage groups missing at the
+- **Hit stats.** The scheduler logs `hit stats` (cumulative) at most every
+  30 s while lookups run, whenever the last live request finishes, and at
+  shutdown (vLLM may kill the engine core without calling it): lookups, and per set of storage groups missing at the
   longest resume point the full group backs, how often and how many tokens
   were lost, counted once per request and resume point (vLLM re-queries a
   waiting request every scheduling pass) (`missing=` with no group: the policy lowered `p`). This is the
-  group-coherence signal for server eviction. The periodic line is skipped
-  while no miss was counted; the shutdown line is always logged.
+  group-coherence signal for server eviction.
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first, and `LayerDecl.layout` when an

@@ -858,21 +858,36 @@ def test_miss_attribution_names_the_missing_group(sem):
     assert sched.hit_stats == {"lookups": 3, "missing=1": 2, "lost_tokens": 16}
 
 
-def test_hit_stats_logged_at_shutdown_without_misses(caplog):
-    """A gate slice must tell "no miss" from "no line": shutdown always logs."""
+def test_hit_stats_logged_when_idle_and_on_cadence():
+    """The gate force-kills the engine core (no ``shutdown``): the counters
+    must reach the log when the last request finishes and every HIT_LOG_S."""
     sched, _ = _sched(StubSemantics, {0: Ready(0, b""), 1: Ready(0, b"")})
-    sched.get_num_new_matched_tokens(_req(), 0)
-    # Attach directly: the connector module may stop package propagation.
+    lines: list[str] = []
+    # Own handler: caplog would also see propagated copies of each record.
+    handler = logging.Handler(logging.INFO)
+    handler.emit = lambda record: lines.append(record.getMessage())
     log = logging.getLogger("pegaflow.connector_v2.core.scheduler")
-    log.addHandler(caplog.handler)
+    level = log.level
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
     try:
-        with caplog.at_level(logging.INFO, logger=log.name):
-            sched.report_hit_stats()
-            assert "hit stats" not in caplog.text
-            sched.shutdown()
+        sched.get_num_new_matched_tokens(_req(), 0)
+        sched.get_num_new_matched_tokens(_req(req_id="s"), 0)
+        sched.request_finished("r")
+        assert lines == []  # "s" still live, cadence not due
+        sched._clock.now += Scheduler.HIT_LOG_S
+        sched.get_num_new_matched_tokens(_req(req_id="t"), 0)
+        assert lines == ["[PegaKVConnectorV2] hit stats {'lookups': 3}"]
+        sched.request_finished("s")
+        sched.request_finished("t")  # idle, but nothing new to report
+        sched.shutdown()
+        assert len(lines) == 1
+        sched.get_num_new_matched_tokens(_req(req_id="u"), 0)
+        sched.request_finished("u")  # idle with a new count
     finally:
-        log.removeHandler(caplog.handler)
-    assert "hit stats {'lookups': 1}" in caplog.text
+        log.removeHandler(handler)
+        log.setLevel(level)
+    assert lines[1:] == ["[PegaKVConnectorV2] hit stats {'lookups': 4}"]
 
 
 def test_saves_reoffer_after_missing_block_ids():

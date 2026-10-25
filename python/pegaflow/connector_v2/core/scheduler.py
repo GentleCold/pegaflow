@@ -109,7 +109,7 @@ def _offered_ids(g: GroupInfo, blocks: range, offers: Sequence[tuple[int, int, i
 
 
 class Scheduler:
-    HIT_LOG_EVERY = 500  # lookups between "hit stats" log lines
+    HIT_LOG_S = 30.0  # min seconds between "hit stats" lines while lookups run
 
     def __init__(
         self,
@@ -167,6 +167,8 @@ class Scheduler:
         # scheduling pass until it can be allocated.
         self.hit_stats: dict[str, int] = {}
         self._counted: dict[str, tuple[int, int]] = {}
+        self._hit_dirty = False  # counters changed since the last line
+        self._hit_logged_at = clock()
 
     # ------------------------------------------------------------------ hits
     def on_new_request(self, request: Any) -> None:
@@ -556,14 +558,18 @@ class Scheduler:
             key = "missing=" + ",".join(map(str, missing))  # "missing=" alone: policy cut
             stats[key] = stats.get(key, 0) + 1
             stats["lost_tokens"] = stats.get("lost_tokens", 0) + p_full - max(p, num_computed)
-        if stats["lookups"] % self.HIT_LOG_EVERY == 0:
+        self._hit_dirty = True
+        if self._clock() - self._hit_logged_at >= self.HIT_LOG_S:
             self.report_hit_stats()
 
-    def report_hit_stats(self, always: bool = False) -> None:
-        """Log the counters; periodic lines only once a miss was counted, the
-        shutdown line always (so a silent log means no miss, not no line)."""
-        if always or len(self.hit_stats) > 1:  # anything beyond the lookup count
-            logger.info("[PegaKVConnectorV2] hit stats %s", dict(sorted(self.hit_stats.items())))
+    def report_hit_stats(self) -> None:
+        """Log the cumulative counters. Called at most every ``HIT_LOG_S`` while
+        lookups run, when the last live request finishes, and at shutdown:
+        vLLM may kill the engine core without running ``shutdown``, so a run's
+        final counters must not depend on it."""
+        self._hit_dirty = False
+        self._hit_logged_at = self._clock()
+        logger.info("[PegaKVConnectorV2] hit stats %s", dict(sorted(self.hit_stats.items())))
 
     def _touches_unconfirmed(self, block_ids: tuple[list[int], ...]) -> bool:
         return any(
@@ -595,6 +601,8 @@ class Scheduler:
         self._saved_upto.pop(req_id, None)
         self._requests.pop(req_id, None)
         self._counted.pop(req_id, None)
+        if self._hit_dirty and not self._requests:
+            self.report_hit_stats()  # idle: the counters are final for now
         if req_id not in self._saving:
             return False
         self._saving.discard(req_id)
@@ -602,7 +610,8 @@ class Scheduler:
         return True
 
     def shutdown(self) -> None:
-        self.report_hit_stats(always=True)
+        if self._hit_dirty:
+            self.report_hit_stats()
         for req_id in list(self._hits):
             self._drop_hit(req_id)
         # Load plans never handed to the workers still hold their leases.
