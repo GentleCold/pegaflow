@@ -2363,3 +2363,37 @@ slice's baseline cold p50 (0.265) sits well above its own warm passes
 (0.248 / 0.201 / 0.216), so the -10 / -19% cold p50 figures are mostly
 baseline noise. Cold req/s is the steadier comparison: -0.7% for the
 default, -3.3% for KOff.
+
+## it7 under the merged gate (feat/semantics-rsi a4523f3: hybrid gate, cap sizing, lmcache gate)
+
+The connector is unchanged (it7, a59a254). The merged gate adds a baseline
+`resume-<label>` replay per arm on split-variant models, required as
+`G2.resume_reference` (honest self-test included). The it6 / it7 official
+records have no resume stage, so every arm fails that check (lmcache-gate
+review M2): P4's acceptance does not stand until an official TP2 rerun
+under this gate passes.
+
+gate.json changes, in the merge-adoption commit:
+- R3: `"lmcache_dist": "lmcache-0.5.6"`. `~/kexi/overlays/lmcache` holds
+  exactly `lmcache-0.5.6.dist-info`; `lmcache_build_problem` compares the
+  overlay's `lmcache-*.dist-info` names with the suffix stripped, so the
+  official lmcache arm passes `G0.lmcache_build` with that overlay. PR
+  #4467 (`lmcache-0.5.7.dev0+pr4467.e05c2ea`) crashes on MLA.
+- R4: `gsm8k_vllm_args` = deterministic inductor
+  (`--compilation-config {"inductor_compile_config":{"deterministic":true}}`).
+  Needed: since S5 every arm compiles fresh in its own cache, and the gsm8k
+  and resume stages compare outputs and computed KV across arms
+  (`G2.plain_equals_baseline`, `G2.split_control`, `G2.gsm8k_outputs`,
+  `digest_vs_baseline`, `G2.resume_reference`), which GATES.md
+  ("Compile determinism") says need not agree across two default
+  compiles. `G0.vllm_args` checks the flag on every gsm8k and resume stage.
+- spec.json: the committed dump predates probe schema 3 (no `compilation`,
+  `model_runner`, `probe.schema`, `prefix_cache_retention_interval`), so a
+  new run's `G0.spec` would fail on it. It is regenerated from the S5
+  self-test's baseline gsm8k dump (same flags as official) before the
+  official run, and checked against the official run's baseline dump.
+
+Plan (GPU): S5 self-test with the resume stage (plain, baseline, honest,
+liar, bitflip, offbyone on gsm8k, TP2), then M2 official (plain, baseline,
+old, native, lmcache, v2; gsm8k, replay, cap, preempt; preempt is R2: the
+S6 episode chain for preempted warm requests on a GPU).
