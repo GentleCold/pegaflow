@@ -241,7 +241,7 @@ cd .. && PYTHONPATH=. python/.venv/bin/python -m pytest -q -p no:cacheprovider r
 ```
 
 The full suite is the gate's test run, signal and teardown tests (real
-subprocesses) included: 310 tests in about 52 s on the 4090 host. Nothing is
+subprocesses) included: 311 tests in about 52 s on the 4090 host. Nothing is
 deselected. PR CI does not run them (it runs `python/tests` only); they are
 a manual gate for every change under `rsi/gates` until CI does (PROGRESS,
 user acceptance item). The isolation tests (`isolate.py`) need Linux and root and skip
@@ -955,7 +955,8 @@ the last accepted run record by hand until `--accepted` exists.
     `--replay-skip N` (replay and cap) starts at conversation N of the file.
     The official value is 0. Any N > 0 is a held-out slice
     (`summary.held_out`, `summary.replay_skip`), never official.
-    `auto`: before the baseline cap stage, from the baseline's spec dump,
+    `auto`: before the baseline cap stage, from the baseline's spec dump of
+    an earlier stage (a cap-only run: the committed dump; `cap_plan.spec`),
     conversations are added from the file start (at least 64) until the
     estimated `U` reaches `1.1 x 2 x GPU KV / 0.5`. `UniqueEstimate` applies
     the oracle's store rules per group Kind, at block bytes: Full / Window

@@ -2821,6 +2821,16 @@ class UniqueEstimate:
         return self._gen + sum(size * len(seen) for *_, size, seen in self._groups)
 
 
+def cap_plan_spec(arm_dir: Path, wls: list[str], committed: Path) -> Path | None:
+    """Spec dump ``--cap-convs auto`` sizes from: the baseline's own dump of
+    an earlier stage of this run, else the committed dump (a cap-only run has
+    no earlier stage; the G0 check holds the two equal)."""
+    for w in wls:
+        if (arm_dir / w / "probe" / "spec.json").exists():
+            return arm_dir / w / "probe" / "spec.json"
+    return committed if committed.is_file() else None
+
+
 def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
     """Resolve ``--cap-convs auto``: the fewest conversations (from
     ``CAP_MIN_CONVS``, all turns up to ``--cap-turns``) whose estimated
@@ -3459,17 +3469,12 @@ def main(argv: list[str] | None = None) -> int:
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
                 continue
             if kind == "baseline":
-                spec_file = next(
-                    (
-                        run_dir / label / w / "probe" / "spec.json"
-                        for w in wls
-                        if (run_dir / label / w / "probe" / "spec.json").exists()
-                    ),
-                    None,
-                )
+                spec_file = cap_plan_spec(run_dir / label, wls, committed)
                 args.cap_plan = plan_cap_convs(
                     args, json.loads(spec_file.read_text()) if spec_file else None
                 )
+                if spec_file:
+                    args.cap_plan["spec"] = str(spec_file)
                 print(f"[cap] plan {args.cap_plan}", flush=True)
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
                 continue

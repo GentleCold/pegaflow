@@ -858,7 +858,9 @@ names, magic constants that only exist in the old code).
   3.49 GB measured (was 4.47 GB). Official plans: Qwen3-4B 64 and
   DeepSeek-V2-Lite 76 unchanged (same bytes); Qwen3.5-4B all 256
   conversations est. 136.33 GB, above the floor (133.15 GB) but under the
-  1.1 margin (146.47 GB). Floor and margin unchanged.
+  1.1 margin (146.47 GB). Floor and margin unchanged. A cap-only run
+  (`--workloads cap`) had no earlier baseline spec dump and fell back to
+  64 conversations; auto now sizes from the committed dump there.
 
 ## Semantics changelog
 
@@ -904,7 +906,7 @@ Each entry: what was added, why, which vectors cover it.
   `G4.replay_cold` and `G4.gsm8k_cold`. It is reported per arm vs baseline
   as `G4.warmup_seconds` (not gated). Needs the user's confirmation.
 - For final acceptance: add rsi/gates tests to CI. PR CI runs
-  `python/tests` only (`ci.yml`), so the 310 gate tests
+  `python/tests` only (`ci.yml`), so the 311 gate tests
   (`rsi/gates/test_oracle_capacity.py`, `test_probe_steps.py`) are a manual
   gate today: whoever changes `rsi/gates` runs them (GATES.md
   "Implementation"). They need the built `pegaflow.semantics`, and

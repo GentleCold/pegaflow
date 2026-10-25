@@ -632,6 +632,19 @@ def test_unique_estimate_counts_only_saved_checkpoints():
     assert est.bytes == (6 + 2) * PAGE * LAYERS
 
 
+def test_cap_only_run_sizes_from_the_committed_spec(tmp_path):
+    """``--workloads cap`` has no earlier baseline stage: auto must size from
+    the committed dump, not fall back to ``CAP_MIN_CONVS``."""
+    committed = tmp_path / "spec.json"
+    arm = tmp_path / "baseline"
+    assert run_gate.cap_plan_spec(arm, ["cap"], committed) is None
+    committed.write_text("{}")
+    assert run_gate.cap_plan_spec(arm, ["cap"], committed) == committed
+    (arm / "gsm8k" / "probe").mkdir(parents=True)
+    (arm / "gsm8k" / "probe" / "spec.json").write_text("{}")
+    assert run_gate.cap_plan_spec(arm, ["gsm8k", "cap"], committed) == arm / "gsm8k/probe/spec.json"
+
+
 S1_CAP = Path(__file__).parent / "testdata/qwen3.5-4b-s1-cap-cold.json"
 
 
