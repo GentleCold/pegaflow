@@ -394,3 +394,197 @@ Qwen3-4B (MF5):
 
 Accuracy: DSV2 0.6725 in every cold pass, warm 0.6778 (v2) / 0.6770 (old,
 native). Qwen3-4B 0.8582 in every pass of every arm.
+
+## Re-review (2026-10-25, head a83f893)
+
+Range `ee09a26..a83f893`:
+- it7 a59a254 (`Scheduler.plan_saves` plus one unit test).
+- Docs 4e50f0f, 9502ae2, a83f893.
+
+I checked these runs on .44 (read-only, numbers from `summary.json`, the
+vLLM logs and the probe dirs):
+- `2026-10-25-dsv2-lite-p4-it7-off-a59a254` (M1a);
+- `2026-10-25-qwen3-4b-p4-it7-off-a59a254` (M1b);
+- `2026-10-25-dsv2-lite-p4-m2-a59a254` (A/B);
+- `2026-10-25-qwen3-4b-p4-m2-a59a254`;
+- `2026-10-25-dsv2-lite-p4-m2-cold-a59a254` / `...-coldctl-a1e7fd2`.
+
+### Verdict: ACCEPT
+
+M1 and M2 are resolved, and S1 to S5 are applied. What remains is listed at
+the end. None of it blocks acceptance.
+
+### 1. it7 correctness
+
+- **One entry per request.** `plan_saves` keys `GroupSave` by `(sid,
+  req_id)` (`core/scheduler.py:497-519`) and sorts by sid. The sort is
+  stable, so requests within a group keep their scheduled order.
+- **No save lost or duplicated.**
+  - Item validation (`offered`, `seen`) and `_saving` are unchanged: each
+    offered item lands in exactly one entry, and a request's blocks never
+    cross groups.
+  - The worker is unchanged since it6. It sends every entry as its own
+    `SaveLayer` per layer, and the 16 MiB budget already counts per-entry
+    overhead.
+  - Run data: `failed=0` in every save-stats window of M1a/M1b; 0
+    mismatched and 0 unreferenced in every digest of both officials.
+- **Preemption flush and `finished_sending` are unaffected.** `flush`, the
+  finish fences, `_release_held` and `poll` are untouched. Flushes in M1a cap
+  Max sent-wait in the it7 save stats is 1.35 to 1.73 s. The 8.4 s outlier (N2) did not recur.
+- **The test fails on it6 code.** In a HEAD export with the a59a254^
+  scheduler, `test_saves_keep_one_entry_per_request[stub]` fails, and the
+  other 119 cases pass. HEAD passes 474, skips 61.
+
+### 2. M1: both officials
+
+| run | official | v2 | `G2.digest_self.cap` v2 (preempted-uncertain / loaded) | old | native |
+|---|---|---|---|---|---|
+| DSV2 M1a | true, `[]` | every verdict passes | 9390 / 1,103,344 = 0.85%, 0 mismatched | all pass (0.54%) | G0.spec only (0.45%) |
+| Qwen3-4B M1b | true, `[]` | every verdict passes | 2219 / 489,905 = 0.45%, 0 mismatched | all pass (0.40%) | G0.spec, digest_vs_baseline (layout), G4 gsm8k (+6.4%) |
+
+Provenance, both runs:
+- gate ce645d7, server `d1970ead`, `under_test_rev` a59a254, verified;
+- CUDA 13.0, contamination `[]`, no provenance_watch change;
+- scan `flagged: []` and `allowlisted: []`;
+- `vllm_plugins` old `pegaflow`, all other arms `""`.
+
+Both `under-test-overlay` trees hash identically to `git ls-tree a59a254
+python/pegaflow` (64 files). HEAD's `python/` equals a59a254's.
+
+DSV2 split-variant checks on M1a:
+- outputs: cold_differ 0, warm_differ_vs_split 0 (aligned 0);
+- `digest_vs_baseline.gsm8k` 45008 / 45008 computed exact, coverage 1.0;
+- accuracy delta 0.0 / +0.53 pp.
+
+M1 is closed. MF5 stays on record. The share history (r3 0.41% up to MF5
+1.01%, back to 0.43% / 0.45% on it7) supports the variance reading.
+
+### 3. M2: A/B and the 0.25 judgment
+
+**A/B** (`...-m2-a59a254`, cap-only, MF4 plan). The doc's numbers match the
+summary:
+- 0.25: v2 0.449, old 0.550;
+- 0.5: 0.848 / 0.845;
+- 0.75: 0.899 / 0.888;
+- v2 resident/C 0.91 to 0.96 at every fraction.
+
+**Sim method.** `~/kexi/tmp/dsv2-p4/r3sim_p4.py` (sha256 2ae28f28...) is a
+copy of the server-reclaim `r3sim.py` (3f50d935...). The diff is only the
+`.gate/` result path and a `query == "local"` branch (`off = local_hit //
+BT`). `p4sim.py` takes C in blocks from the gate's `block_bytes`. I re-ran
+it on MF4 cap025 and got the doc's values exactly:
+- v2: faithful 0.541 / 0.448 at 1.0 / 0.9 C, local query 0.529 / 0.431;
+- old: faithful 0.558 / 0.518, local query 0.570 / 0.528;
+- v2 faithful-mode match against measured hit: 0.79 at 1.0 C, 0.92 at 0.9 C.
+
+**Each candidate against the numbers:**
+- **Query from the local hit.** Lowers v2's own trace (-0.012 / -0.017), so
+  it is ruled out.
+- **Resident deficit.** it7 brings v2 to old's resident level, and 0.25
+  moves only +0.016. Ruled out.
+- **Lost saves.** I re-ran `computed.py` on MF4 cap025: v2 inserts 0.98 to
+  0.99 of the blocks it computed, old 0.85 to 0.90. The sim saves every
+  computed block for both arms, so old's lower save ratio cannot explain
+  why old's trace still scores 0.07 higher. Ruled out.
+- **Server.** On both traces the sim matches measured hits at about 0.9 C.
+  The store treats both arms alike.
+
+**What is left** is a property of v2's access trace: whether a request finds
+its earlier blocks still in the store, and the recompute feedback at a
+capacity where H_lru falls 0.09 between 1.0 C and 0.93 C. That is honestly
+"cause unknown".
+
+**Judgment: acceptable.** "Cause unknown, 0.07 below old on the same
+server, below the 2x GPU-KV floor" is acceptable now:
+- it7 was tried and recorded;
+- each excluded candidate has numbers behind it;
+- old's own 0.25 spread across runs is 0.038 (0.512 to 0.550);
+- 0.25 is 1.14x GPU KV;
+- the gated 0.5 point is level with old, native and H_lru (0.847 / 0.845 /
+  0.851 / 0.847);
+- 0.75 is now above old (0.899 vs 0.886).
+
+Keeping it7 is compliant. It costs nothing at 0.5 (0.844 -> 0.847), adds
++0.036 at 0.75, and lifts Qwen3-4B at every fraction (0.392 / 0.838 /
+0.883 -> 0.409 / 0.859 / 0.908). Keep the 0.25 gap on the open list for the
+user's final pass. It is connector-side by elimination, not a server
+limitation.
+
+### 4. G4
+
+M1a DSV2 vs the same-run baseline (0.909 s cold p50):
+- cold p50 0.619 s (-31.8%), cold req/s 8.55 (+59.7%);
+- warm p50 -68.2 / -67.3%, warm req/s +131 / +126%;
+- gsm8k +0.32% / -1.96%;
+- all pass.
+
+Against it6 (MF4, the same 0.909 baseline):
+- cold p50 is +3.4% (0.619 vs 0.599), cold req/s -0.9% (8.55 vs 8.63);
+- both are inside v2's cross-run spread (MF1 0.665) and still ahead of old
+  (0.629);
+- warm is better.
+
+M1b Qwen3-4B:
+- warm -85.1 / -83.8%, +288 / +277%;
+- cold -62.3%, +145.0%;
+- gsm8k +0.92% / -0.43%;
+- all pass, no regression vs MF5 or it2d (same-run relative).
+
+8 x 6 cold pair:
+- v2 cold p50 is 0.1897 (it7) and 0.1900 (a1e7fd2 control);
+- the baselines are 0.1712 and 0.1923;
+- so the it7 slice's fail (+10.8%) comes from its baseline.
+
+Accepting it as baseline noise, with the full-replay official as the
+binding check, is compliant.
+
+### 5. Docs
+
+S1 to S5 are done:
+- MF5 note: r3/native failures and the byte-level check
+  (`ITERATIONS.md:1730-1747`);
+- 0.25 floor context;
+- E_C for the reference arms;
+- Qwen3-4B entry "P4 regression runs on this model", and the P3 row
+  updated;
+- PROGRESS "P4 acceptance tables".
+
+Every cell of the PROGRESS G3, G5 and G4 tables matches my extraction from
+the two officials.
+
+Nit: ITERATIONS M1b says "2219 of 488,983 loaded". The gate's denominator
+is 489,905 (0.453%). The share is unchanged; fix the count or cite its
+source.
+
+### 6. CI (local)
+
+- typos: clean;
+- `cz check --rev-range 1749353..HEAD`: successful;
+- `ruff check`: passes;
+- `ruff format --check` on connector_v2 and the test file: clean;
+- default Python unit gate: 474 passed.
+
+### lmcache
+
+The P4 tables say "pending (arm not comparable yet)". That is now stale:
+- the lmcache arm (`feat/rsi-gate-lmcache`, in review) is comparable on
+  Qwen3-4B (PR #4467, chunk 256, 0.75 excluded);
+- it is "comparable with caveat" on DSV2 (0.5.6).
+
+Once that gate branch merges, fill its numbers into the P4 acceptance
+tables (PROGRESS and both ITERATIONS files). A pending column is acceptable
+for this acceptance.
+
+### Remaining (non-blocking)
+
+- **S6:** there is still no PR or remote CI run for the branch
+  (`gh pr list` / `gh run list` on GentleCold/pegaflow are empty). Open the
+  stacked PR and confirm CI is green before merge.
+- PROGRESS P4 row: change "re-review pending" to accepted, citing this
+  section.
+- DSV2 0.25 gap: carry it as an open item for the user's final pass.
+- lmcache columns: fill in after the gate merges.
+- For the gate owner: N3 (the digest denominator) and digesting preempted
+  episodes (`feat/rsi-gate-hybrid`). DSV2 v2 is at 0.85% of the 1% limit on
+  M1a.
+- The M1b loaded-count nit above.
