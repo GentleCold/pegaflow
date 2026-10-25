@@ -779,6 +779,24 @@ def test_saves(sem, num_tokens, steps, block_ids, expected):
     assert _step_saves(sched, steps, block_ids) == expected
 
 
+@BOTH
+def test_saves_keep_one_entry_per_request(sem):
+    # The server pins one region per entry: two requests saving in one step
+    # must not share an entry. Groups in sid order, requests in scheduled order.
+    sched, _ = _sched(sem, {})
+    sched.on_new_request(_req(req_id="b", num_tokens=8, n_hashes=2))
+    sched.on_new_request(_req(req_id="a"))
+    ids = {"a": (WINDOW_IDS, FULL_IDS), "b": ([40, 41, 42], [30, 31, 32])}
+    assert _step_saves(sched, [[("a", 0, 13), ("b", 0, 8)]], ids) == [
+        [
+            (0, [10, 11, 12], H[:3]),
+            (0, [30, 31], H[:2]),
+            (1, [20, 21, 22], H[:3]),
+            (1, [40, 41], H[:2]),
+        ]
+    ]
+
+
 def test_saves_reoffer_after_missing_block_ids():
     sched, _ = _sched(StubSemantics, {})
     sched.on_new_request(_req())

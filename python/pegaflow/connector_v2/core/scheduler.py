@@ -494,7 +494,11 @@ class Scheduler:
             return
         offered = {item: item for item in items}
         chosen = self._policy.choose_saves(tuple(items))
-        by_sid: dict[int, GroupSave] = {}
+        # One GroupSave per (storage group, request): the server pins one region
+        # per layer entry, freed only once every block in it is evicted, so an
+        # entry mixing requests keeps the whole region pinned for the
+        # longest-lived of them.
+        by_key: dict[tuple[int, str], GroupSave] = {}
         sid_of = {g.gid: sid for sid, g in enumerate(layout.groups)}
         seen: set[SaveItem] = set()
         for picked in chosen:
@@ -508,10 +512,11 @@ class Scheduler:
             seen.add(item)
             self._saving.add(item.req_id)
             sid = sid_of[item.group]
-            save = by_sid.setdefault(sid, GroupSave(sid, [], []))
+            save = by_key.setdefault((sid, item.req_id), GroupSave(sid, [], []))
             save.block_ids.append(item.block_id)
             save.block_hashes.append(item.block_hash)
-        self._plan.saves.extend(by_sid[sid] for sid in sorted(by_sid))
+        # Stable sort: within a group, requests keep their scheduled order.
+        self._plan.saves.extend(sorted(by_key.values(), key=lambda s: s.sid))
 
     def _touches_unconfirmed(self, block_ids: tuple[list[int], ...]) -> bool:
         return any(
