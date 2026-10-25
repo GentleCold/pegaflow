@@ -5,6 +5,7 @@ docs/rsi/GATES.md ("Tests"). The isolation tests run only on Linux as root.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -581,6 +582,24 @@ def test_capacity_floor_fails_closed_and_g5_problems():
     assert run_gate.g5_problems({"X": flat}, high, None) == ["G5 trace does not separate freeze from H*_C"]  # fmt: skip
     assert run_gate.g5_problems({"X": {}}, high, None)  # freeze not evaluated: not official
     assert run_gate.g5_problems({"X": sep}, low, {"enough": False}) == ["capacity below 2x GPU KV (whole replay file used)"]  # fmt: skip
+    assert run_gate.g5_problems({"X": sep}, high, {"unmodeled": ["x"]}) == ["cap plan sized from an unmodeled spec: x"]  # fmt: skip
+
+
+def test_unmodeled_spec_only_flags_checkpoint_models():
+    """The Checkpoint step-end model assumes ``hash_block_size ==
+    block_size``, no Eagle, no prefill checkpoint blocks; Full-only specs
+    are counted exactly whatever those values are."""
+    ckpt = _spec(FULL, CKPT) | {"cache": {"mamba_cache_mode": "align"}}
+    assert run_gate.unmodeled_spec(ckpt) == []
+    committed = run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json"
+    assert run_gate.unmodeled_spec(json.loads(committed.read_text())) == []
+    sub = {**ckpt, "kv_cache_config": {**ckpt["kv_cache_config"], "hash_block_size": BT // 2}}
+    assert len(run_gate.unmodeled_spec(sub)) == 2  # both groups
+    full = _spec(FULL)
+    assert run_gate.unmodeled_spec({**full, "kv_cache_config": {**full["kv_cache_config"], "hash_block_size": 1}}) == []  # fmt: skip
+    pcb = json.loads(json.dumps(ckpt))
+    pcb["kv_cache_config"]["groups"][1]["spec"]["num_prefill_checkpoint_blocks"] = 1
+    assert run_gate.unmodeled_spec(pcb) == ["group 1: num_prefill_checkpoint_blocks 1"]
 
 
 def test_reference_locals_unmatched_path():
@@ -640,9 +659,16 @@ def test_cap_only_run_sizes_from_the_committed_spec(tmp_path):
     assert run_gate.cap_plan_spec(arm, ["cap"], committed) is None
     committed.write_text("{}")
     assert run_gate.cap_plan_spec(arm, ["cap"], committed) == committed
-    (arm / "gsm8k" / "probe").mkdir(parents=True)
-    (arm / "gsm8k" / "probe" / "spec.json").write_text("{}")
-    assert run_gate.cap_plan_spec(arm, ["gsm8k", "cap"], committed) == arm / "gsm8k/probe/spec.json"
+    # The preempt stage's dump has a shrunk GPU pool: never size from it.
+    (arm / "preempt" / "probe").mkdir(parents=True)
+    (arm / "preempt" / "probe" / "spec.json").write_text("{}")
+    assert run_gate.cap_plan_spec(arm, ["preempt", "cap"], committed) == committed
+    for w in ("replay", "gsm8k"):
+        (arm / w / "probe").mkdir(parents=True)
+        (arm / w / "probe" / "spec.json").write_text("{}")
+    wls = ["preempt", "replay", "gsm8k", "cap"]
+    assert run_gate.cap_plan_spec(arm, wls, committed) == arm / "gsm8k/probe/spec.json"
+    assert run_gate.cap_plan_spec(arm, ["preempt", "replay", "cap"], committed) == arm / "replay/probe/spec.json"  # fmt: skip
 
 
 S1_CAP = Path(__file__).parent / "testdata/qwen3.5-4b-s1-cap-cold.json"
@@ -653,8 +679,6 @@ def test_unique_estimate_matches_the_measured_hybrid_trace():
     measured on the baseline arm): within 5% of the measured ``U``, and not
     above it (an under-estimate only adds conversations). The estimate
     before the Checkpoint rule was 4.47 GB, 1.28x the measured 3.49 GB."""
-    import json
-
     spec = json.loads((run_gate.REPO / "docs/rsi/models/Qwen3.5-4B/spec.json").read_text())
     data = json.loads(S1_CAP.read_text())
     a = data["args"]

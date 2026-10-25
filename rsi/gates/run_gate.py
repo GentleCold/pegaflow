@@ -2729,8 +2729,9 @@ def prefill_step_ends(start: int, prompt_len: int, bt: int, budget: int, align: 
     ends on a block boundary; never run past the last cacheable boundary
     ``(prompt_len - 1) // bt * bt`` or the block-floored shared-prefix
     junction mid-chunk), plain budget chunks otherwise. Not modeled: budget
-    shared with other requests in the step (more, shorter chunks) and
-    sub-block hash hits (``hash_block_size < block_size``)."""
+    shared with other requests in the step (moved and extra chunk ends),
+    sub-block hash hits, Eagle and prefill checkpoint blocks
+    (:func:`unmodeled_spec`)."""
     last = (prompt_len - 1) // bt * bt
     out, s = [], start
     while s < prompt_len:
@@ -2766,11 +2767,14 @@ class UniqueEstimate:
       groups alone), and every boundary its decode crosses is a step end.
 
     For sizing only; the floor is checked on the measured ``U``. Checkpoint
-    bytes are a lower bound: concurrent requests share the step budget (and
-    GPU cache evictions move resume points back), which only adds step ends
-    and raises the measured ``U``, so the error is toward more conversations
-    (Qwen3.5-4B: 0.97 of measured at 8 x 6, 0.81 at 256 x 12 with 32
-    workers, where the Full group is exact)."""
+    bytes assume a request runs alone. Concurrent requests share the step
+    budget and GPU cache evictions move resume points back, which moves step
+    ends as well as adding them, so this is not a bound. On the recorded
+    traces the estimate was below measured (Qwen3.5-4B: 0.97 at 8 x 6, 0.81
+    at 256 x 12 with 32 workers, where the Full group is exact); an
+    over-estimate means fewer conversations and the measured floor fails the
+    run closed (not official). Spec values this does not model:
+    :func:`unmodeled_spec`."""
 
     def __init__(self, spec: dict[str, Any], out_tokens: int, budget: int):
         kinds = [(label, g, bt) for label, g, bt in oracle.group_kinds(spec) if g is not None]
@@ -2824,13 +2828,39 @@ class UniqueEstimate:
 
 
 def cap_plan_spec(arm_dir: Path, wls: list[str], committed: Path) -> Path | None:
-    """Spec dump ``--cap-convs auto`` sizes from: the baseline's own dump of
-    an earlier stage of this run, else the committed dump (a cap-only run has
-    no earlier stage; the G0 check holds the two equal)."""
-    for w in wls:
-        if (arm_dir / w / "probe" / "spec.json").exists():
-            return arm_dir / w / "probe" / "spec.json"
+    """Spec dump ``--cap-convs auto`` sizes from: the baseline's own gsm8k,
+    else replay, dump of this run, else the committed dump. Never the
+    preempt stage's: it runs with a shrunk GPU pool, so its ``gpu_kv_bytes``
+    would size the trace far below the floor. An official run always has
+    gsm8k before cap; only a non-official run (e.g. ``--workloads cap``)
+    reaches the committed fallback, and the floor reads GPU KV from the cap
+    stage's own dump either way."""
+    for w in ("gsm8k", "replay"):
+        if w in wls and (f := arm_dir / w / "probe" / "spec.json").exists():
+            return f
     return committed if committed.is_file() else None
+
+
+def unmodeled_spec(spec: dict[str, Any]) -> list[str]:
+    """Spec values ``UniqueEstimate`` / :func:`prefill_step_ends` do not model
+    (sub-block hash hits, Eagle's dropped last hit block, prefill checkpoint
+    blocks) on a model with a Checkpoint group; Full / Window counting does
+    not depend on them. Non-empty: the plan is recorded as ``unmodeled`` and
+    the run is not official."""
+    if not any(label == "checkpoint" for label, *_ in oracle.group_kinds(spec)):
+        return []
+    kc = spec.get("kv_cache_config") or {}
+    out = []
+    hbs = kc.get("hash_block_size")
+    for g in kc.get("groups", []):
+        s = g.get("spec", {})
+        if hbs is not None and hbs != s.get("block_size"):
+            out.append(f"group {g.get('id')}: hash_block_size {hbs} != block_size {s.get('block_size')}")  # fmt: skip
+        if g.get("is_eagle_group") or int(s.get("num_speculative_blocks") or 0):
+            out.append(f"group {g.get('id')}: Eagle / speculative blocks")
+        if int(s.get("num_prefill_checkpoint_blocks") or 0):
+            out.append(f"group {g.get('id')}: num_prefill_checkpoint_blocks {s['num_prefill_checkpoint_blocks']}")  # fmt: skip
+    return out
 
 
 def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
@@ -2856,7 +2886,7 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
         est.add(workloads.conv_turns(tok, json.loads(line), budget, args.cap_turns))
         if used >= CAP_MIN_CONVS and est.bytes >= need:
             break
-    return {
+    plan = {
         "cap_convs": used,
         "mode": "auto",
         "estimated_unique_bytes": est.bytes,
@@ -2864,6 +2894,9 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
         "enough": est.bytes >= need,
         "available_convs": len(lines),
     }
+    if unmodeled := unmodeled_spec(spec):
+        plan["unmodeled"] = unmodeled  # g5_problems: not official
+    return plan
 
 
 class PoolTooSmall(RuntimeError):
@@ -2924,6 +2957,8 @@ def g5_problems(v: dict[str, Any], floor: dict[str, Any], plan: dict[str, Any] |
     if not floor["pass"]:
         why = " (whole replay file used)" if (plan or {}).get("enough") is False else ""
         out.append(f"capacity below {MIN_CAPACITY_GPU_KV:g}x GPU KV{why}")
+    if (plan or {}).get("unmodeled"):
+        out.append(f"cap plan sized from an unmodeled spec: {'; '.join(plan['unmodeled'])}")
     for label, g in v.items():
         if label in _REFERENCE or label.startswith("selftest-"):
             continue
