@@ -908,6 +908,14 @@ names, magic constants that only exist in the old code).
   unresumable state, group-coherent resume, save cost off the step).
   (3) Tell the orchestrator before the official run (P4 merge first).
   Server stays at the base build (`pegaflow-semantics-rsi` 056eb4b).
+- P5 it2 slice s1 (25fcccb, GPU5, not official): correctness all pass
+  (digests in all 4 groups, preempt 106/106, alone_ref = baseline, E_ext
+  1.0); fails G4 cold replay (TTFT p50 +27.5 %, req/s -6.2 %) and G5 cap
+  (0 bytes loaded at every fraction). `hit stats` never reached vllm.log
+  (the API server force-kills EngineCore, `shutdown` never runs): bc9c38a
+  logs it when idle and every 30 s. Next: cap-only diagnostic slice
+  (baseline + v2) to attribute the 0-load per group, then the save-cost
+  hypothesis (checkpoint saves off the step, fenced on block reuse).
 
 ## Semantics changelog
 
