@@ -1098,7 +1098,7 @@ class JumpClock:
         return self.now
 
 
-def _worker(sem, rpc, states, layout=None, mark=FakeMark, clock=None, sync_saves=False, par=None):
+def _worker(sem, rpc, states, layout=None, mark=FakeMark, clock=None, par=None):
     it = iter(states)
     kwargs = {"clock": clock} if clock is not None else {}
     return Worker(
@@ -1110,7 +1110,6 @@ def _worker(sem, rpc, states, layout=None, mark=FakeMark, clock=None, sync_saves
         lambda t: b"ipc",
         lambda: next(it),
         mark,
-        sync_saves=sync_saves,
         **kwargs,
     )
 
@@ -1407,7 +1406,7 @@ def test_save_batching_flush_and_finish_fence():
 
 
 @pytest.mark.parametrize(
-    "fields,sync",
+    "fields,pin",
     [
         pytest.param({"needs_kv_cache_zeroing": False, "hash_block_size": 4}, False, id="plain"),
         pytest.param({"needs_kv_cache_zeroing": True, "hash_block_size": 4}, True, id="zeroing"),
@@ -1418,37 +1417,14 @@ def test_save_batching_flush_and_finish_fence():
         ),
     ],
 )
-def test_layouts_that_zero_or_copy_save_synchronously(fields, sync):
+def test_layouts_that_zero_or_copy_blocks(fields, pin):
     """S1: vLLM's V2 model runner zeroes and copies blocks before
-    handle_preemptions, too late for a flush there: such layouts wait for
-    their saves inside wait_for_save."""
+    handle_preemptions, too late for a flush there: such layouts pin their
+    saved blocks (connector ``_pin_saves``)."""
     cfg = _kv_cache_config(StubFullSpec())
     for name, value in fields.items():
         setattr(cfg, name, value)
-    assert may_zero_or_copy_blocks(cfg) is sync
-
-    class SlowMark:
-        def synchronize(self):
-            import time
-
-            time.sleep(0.05)
-
-    calls = []
-    rpc = FakeRpc()
-    rpc.save = lambda *args: calls.append(args[-1]) or (True, "")
-    layout = _layout(StubSemantics, StubFullSpec())
-    worker = _worker(StubSemantics, rpc, [], layout=layout, mark=SlowMark, sync_saves=sync)
-    # Save batching on (the shipped default): sync saves must ignore it.
-    worker._batch_steps = 32
-    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
-    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
-    # Sync: done before the next step can zero or copy a block, in its own
-    # RPC. Async: the job is held (batched) or still waits on the mark.
-    assert len(calls) == (1 if sync else 0)
-    assert worker.save_stats.rpcs == (1 if sync else 0)
-    assert len(worker._held) == (0 if sync else 1)
-    worker.shutdown()
-    assert len(calls) == 1
+    assert may_zero_or_copy_blocks(cfg) is pin
 
 
 @pytest.mark.parametrize(

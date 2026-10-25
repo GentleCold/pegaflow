@@ -22,8 +22,7 @@ calls after. Layouts where vLLM may zero or copy blocks, or free a checkpoint
 state block right after offering it, use pinned saves instead: the scheduler
 keeps every block it plans to save allocated in vLLM's block pool until all
 workers report the step's saves done (``saved_through``), so no such block is
-reallocated meanwhile. ``sync_saves`` (wait for every save inside
-``wait_for_save``) remains for callers without a block pool.
+reallocated meanwhile.
 """
 
 from __future__ import annotations
@@ -123,14 +122,10 @@ class Worker:
         new_load_state: Callable[[], Any],
         mark_compute: Callable[[], Any],
         clock: Callable[[], float] = time.perf_counter,
-        sync_saves: bool = False,
         batch_steps: int = 1,
         pinned_saves: bool = False,
     ):
-        """``sync_saves``: ``save`` returns only after the step's saves are done
-        (vLLM may zero or copy blocks before ``handle_preemptions`` runs).
-
-        ``batch_steps`` (policy ``save_batch_steps``): a step's save job is
+        """``batch_steps`` (policy ``save_batch_steps``): a step's save job is
         held and merged with later steps' jobs into one save RPC until the
         oldest held job has seen ``batch_steps`` steps or waited
         ``SAVE_HOLD_MAX_S``, whichever comes first (<= 1 sends every step).
@@ -138,7 +133,7 @@ class Worker:
 
         ``pinned_saves``: the scheduler pins the blocks of each plan's saves
         until ``saved_through`` reports that plan's step (``Scheduler``
-        ``pin_saves``), so saves need neither ``sync_saves`` nor batching.
+        ``pin_saves``), so saves need no batching.
         """
         self._layout = layout
         self._rpc = rpc
@@ -153,7 +148,6 @@ class Worker:
         self._new_load_state = new_load_state
         self._mark_compute = mark_compute
         self._clock = clock
-        self._sync_saves = sync_saves
         self._layer_bytes: dict[str, int] = {}  # bytes one block of a layer stores
         self.save_stats = SaveStats(_since=clock())
         # Registered layer names per storage group (index into layout.groups).
@@ -367,8 +361,7 @@ class Worker:
     def save(self, plan: StepPlan) -> None:
         """Queue this step's saves behind a mark on the compute stream.
 
-        Never blocks, except with ``sync_saves`` (then it waits for them).
-        With batching, the job is held and sent merged with later steps' jobs
+        Never blocks. With batching, the job is held and sent merged with later steps' jobs
         (``_release_due``). vLLM calls this every engine step, also steps
         without a forward, so held jobs keep aging while requests wait on
         ``finished_sending``.
@@ -421,8 +414,6 @@ class Worker:
                 stats.bytes += sum(len(ids) * self._layer_bytes[name] for name, ids, _ in saves)
                 stats.max_pending = max(stats.max_pending, self._submitted - self._completed)
             report = stats.steps >= self.SAVE_LOG_EVERY
-        if saves and self._sync_saves:
-            self.flush()
         if report:
             self.report_save_stats()
 
@@ -441,10 +432,7 @@ class Worker:
         return steps[0][1] - 1 if steps else self._last_step
 
     def _release_due(self, now: float) -> bool:
-        if self._sync_saves or self._batch_steps <= 1:
-            # No batching. Sync saves wait for every step's copy before the
-            # next step (vLLM may zero or copy the blocks), so nothing could
-            # be merged anyway.
+        if self._batch_steps <= 1:
             return True
         return (
             self._held_steps >= self._batch_steps or now - self._held_since >= self.SAVE_HOLD_MAX_S
