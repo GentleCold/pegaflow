@@ -3,5 +3,7 @@
  "batch_invariant": true,
  "invariant_attention_backend": "FLASH_ATTN",
  "vllm_args": [],
- "notes": "Dense full attention, one KV group. Batch invariance on FLASH_ATTN makes gsm8k outputs and KV bytes comparable across runs."
+ "lmcache_dist": "lmcache-0.5.7.dev0+pr4467.e05c2ea",
+ "gsm8k_vllm_args": ["--compilation-config", "{\"inductor_compile_config\":{\"deterministic\":true}}"],
+ "notes": "Dense full attention, one KV group. Batch invariance on FLASH_ATTN makes gsm8k outputs and KV bytes comparable across runs. gsm8k stages compile with deterministic inductor: with per-arm compile caches (S5) every arm compiles fresh, and two default compiles pick different reduction configs (qwen3-4b-gate-hybrid-slice-3d6b8e6: plain, baseline and connector_v2 all differed; GATES.md, 'Compile determinism')."
 }

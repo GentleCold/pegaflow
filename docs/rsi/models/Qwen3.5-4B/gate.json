@@ -1,0 +1,9 @@
+{
+ "attention_backend": null,
+ "batch_invariant": false,
+ "split_invariant": true,
+ "invariant_attention_backend": null,
+ "vllm_args": ["--mamba-cache-mode", "align", "--prefix-cache-retention-interval", "528"],
+ "gsm8k_vllm_args": ["--compilation-config", "{\"inductor_compile_config\":{\"deterministic\":true}}"],
+ "notes": "Hybrid: groups 0-2 GDN (MambaSpec, Checkpoint(528)), group 3 full attention, block 528. Align mode is what vLLM 0.32 forces with prefix caching; pinned explicitly. Retention 528 makes vLLM retain (and offer to connectors) the state at every block end, for every arm. Not batch invariant: vLLM 0.32's selector rejects VLLM_BATCH_INVARIANT for Mamba backends without supports_batch_invariance, and GDN has none; plain vLLM batched vs alone flips a completion (P5 it2 leg 1, 2026-10-24-qwen3.5-4b-p5-it2-ctrl). Split invariant per the same control (no divergence at 1056 / 1584). G2.batch_control measures the batch claim in every run; G2.split_control runs too but is vacuous on gsm8k (every prompt's last full block is the shared 1056 prefix, so nearly every pair starts at the same point) and reports so. gsm8k stages compile with deterministic inductor (no benchmark-driven kernel choices): vLLM compiles once per config hash and the hash includes whether a kv_transfer_config is set, so plain and the connector arms run separate compiles, and two default compiles of this model do not give the same logits (GATES.md, 'Compile determinism'). Other stages keep vLLM's default compile."
+}

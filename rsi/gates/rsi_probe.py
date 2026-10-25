@@ -13,13 +13,29 @@ test (MultiConnector) or alone (baseline) and records:
   refuses to start when they disagree.
 - ``requests.jsonl``: per request prompt length, computed tokens at finish,
   schedule *episodes* (first schedule and every resume after preemption:
-  step, local prefix-cache hit, computed tokens at start), *progress* (the
+  step, local prefix-cache hit, computed tokens at start; ``episode_tokens``:
+  the request's token count when each episode is scheduled), *progress* (the
   scheduler steps at which computed tokens crossed a ``key_tokens`` boundary,
   with the computed count after that step) and the prefix-key chain at
   ``key_tokens`` granularity (gcd of group block sizes). ``rsi.gates.oracle``
   replays this offline.
 - ``load_errors.jsonl``: invalid block ids / failed receives reported to the
   scheduler (``update_connector_output``).
+- Mamba state groups in ``mamba_cache_mode=align`` (vLLM keeps the state at
+  a block end only until compute moves on, so none is left at finish): a
+  state is digested in the step that holds it. Computed states: the
+  ``boundary_state_offloads`` vLLM offers in the step whose forward writes
+  them (``kv_connector_block_state``), digested in ``wait_for_save`` (after
+  that forward, before any later step can reuse the block). Loaded states:
+  the episode's start state, block ``start / block_size - 1`` of the
+  episode's first step (the local hit or what a connector loaded), digested
+  in ``handle_preemptions``. On vLLM 0.32's V2 runner that is after the
+  align precopy (which only reads the start block into a later one) and
+  before a sync ``start_load_kv`` and the forward, so it digests the bytes
+  the forward computes from (a sync load landing after it is too late for
+  the forward and shows up as a mismatch). These records carry ``episode`` (index into the request's
+  episodes), so a state computed in a preempted episode is tagged by that
+  episode. Outside align mode Mamba groups are skipped (running state).
 
 Config via ``kv_connector_extra_config``: ``probe_dir`` (required),
 ``digest``: ``"off"`` | ``"all"`` | ``"tagged"`` (only requests sent with
@@ -175,6 +191,42 @@ def _hf_summary(hf_config: Any) -> dict[str, Any]:
     return out
 
 
+def _compilation_summary(vllm_config: Any) -> dict[str, Any]:
+    """The compile settings that decide the model's numbers: mode, backend,
+    Inductor config and CUDA graph mode (the cache dir is volatile)."""
+    cc = getattr(vllm_config, "compilation_config", None)
+    if cc is None:
+        return {}
+    return {
+        k: _jsonable(getattr(cc, k, None))
+        for k in ("mode", "backend", "inductor_compile_config", "cudagraph_mode")
+    }
+
+
+# Spec dump schema (``probe.schema``); bump when a field is added, and add it
+# to ``run_gate.SPEC_FIELDS`` so older records are not judged on it.
+SPEC_SCHEMA = 3
+
+
+def _model_runner(vllm_config: Any) -> str:
+    """vLLM's model runner: V2 calls ``handle_preemptions`` after zeroing,
+    COW copies and the Mamba precopy, V1 before them."""
+    return "V2" if getattr(vllm_config, "use_v2_model_runner", False) else "V1"
+
+
+def _clobbered_blocks(scheduler_output: Any) -> dict[int, str]:
+    """Block ids vLLM overwrites this step before the forward: freshly
+    allocated blocks it zeroes (``new_block_ids_to_zero``) and COW copy
+    destinations (``kv_cache_block_copies``). On the V2 runner both happen
+    before ``handle_preemptions``, so a freed preempted block reallocated in
+    the same step no longer holds the preempted episode's bytes."""
+    out = {int(b): "zeroed" for b in getattr(scheduler_output, "new_block_ids_to_zero", None) or ()}
+    for c in getattr(scheduler_output, "kv_cache_block_copies", None) or ():
+        dst = c.dst_block_id if hasattr(c, "dst_block_id") else c[1]  # KVCacheBlockCopy
+        out[int(dst)] = "cow"
+    return out
+
+
 def prefix_keys(tokens: list[int], covered: list[int]) -> list[str]:
     """Hex prefix hash for each coverage length in ``covered`` (ascending)."""
     out: list[str] = []
@@ -200,6 +252,23 @@ def _span(v: torch.Tensor, base_ptr: int) -> tuple[int, int]:
     return lo, lo + extent * v.element_size()
 
 
+def _float_parts(spec: Any, page: int) -> list[tuple[int, int, torch.dtype]]:
+    """Byte ranges ``[lo, hi)`` of a page read as floats for the L1 report:
+    the whole page as the spec's dtype, or a state spec's packed states
+    (``shapes`` / ``dtypes``, contiguous from byte 0, as vLLM binds them)."""
+    dtype = getattr(spec, "dtype", None)
+    if isinstance(dtype, torch.dtype):
+        ok = dtype.is_floating_point and page % dtype.itemsize == 0
+        return [(0, page, dtype)] if ok else []
+    out, lo = [], 0
+    for shape, dt in zip(getattr(spec, "shapes", ()), getattr(spec, "dtypes", ()), strict=False):
+        n = math.prod(shape) * dt.itemsize
+        if dt.is_floating_point and lo + n <= page:
+            out.append((lo, lo + n, dt))
+        lo += n
+    return out
+
+
 def request_tags(request: Any) -> dict[str, Any]:
     sp = getattr(request, "sampling_params", None)
     return dict(getattr(sp, "extra_args", None) or {})
@@ -210,18 +279,52 @@ class _DigestJob:
     req_id: str
     # Per group: list of (block_index, block_id, prefix_key, covered_tokens).
     blocks: list[list[tuple[int, int, str, int]]]
+    # Schedule episode the bytes belong to: set for a preempted request
+    # (digested in ``handle_preemptions``); None = finish (last episode).
+    episode: int | None = None
+
+
+@dataclass
+class _StateJob:
+    """One Mamba state block to digest in this step: an offer in
+    ``wait_for_save``, a start state in ``handle_preemptions``."""
+
+    req_id: str
+    episode: int
+    group: int
+    block_id: int
+    key: str
+    covered: int
 
 
 @dataclass
 class ProbeMetadata(KVConnectorMetadata):
     jobs: list[_DigestJob] = field(default_factory=list)
+    states: list[_StateJob] = field(default_factory=list)
+    # Episode start states, digested as the forward reads them (V2: after
+    # the Mamba precopy, which only reads them, before any sync load).
+    start_states: list[_StateJob] = field(default_factory=list)
+    # Requests preempted this step: digested before this step's forward can
+    # reuse their freed blocks.
+    preempted: list[_DigestJob] = field(default_factory=list)
 
 
 @dataclass
 class _Live:
     tags: dict[str, Any]
     episodes: list[list[Any]] = field(default_factory=list)  # [step, local_hit, start]
+    episode_tokens: list[int | None] = field(default_factory=list)  # per episode
     progress: list[list[int]] = field(default_factory=list)  # [step, computed_after]
+    request: Any = None  # vLLM's Request (token ids for state keys)
+    # Mamba state digests: [episode, covered, group, "offer" | "start" | skip reason]
+    states: list[list[Any]] = field(default_factory=list)
+    # Block table per group (scheduler output: new, appended, resumed) and
+    # computed tokens after the last scheduled step: what a preemption frees.
+    blocks: list[list[int]] = field(default_factory=list)
+    computed: int = 0
+    preempt_digested: list[int] = field(default_factory=list)  # episodes
+    # Preempted blocks not digested: [episode, group, covered, "zeroed" | "cow"]
+    preempt_dropped: list[list[Any]] = field(default_factory=list)
 
 
 class RsiProbe(KVConnectorBase_V1, SupportsHMA):
@@ -237,6 +340,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         if self._digest not in ("off", "all", "tagged"):
             raise ValueError(f"RsiProbe digest must be off|all|tagged, got {self._digest!r}")
         self._groups = kv_cache_config.kv_cache_groups
+        self._state_groups = self._align_state_groups(vllm_config)
         self._skip_groups = self._undigestable_groups(vllm_config)
         self._connector_modules = [str(m) for m in extra.get("connector_modules", [])]
 
@@ -246,6 +350,10 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             self._step = 0
             self._key_tokens = math.gcd(*(g.kv_cache_spec.block_size for g in self._groups))
             self._pending: list[_DigestJob] = []
+            # States a step ended on, not offered in that step: vLLM may offer
+            # them one step later (a decode token's hash needs the sampled
+            # token). (req_id, group, covered, episode).
+            self._expect: list[tuple[str, int, int, int]] = []
             self._req_log = open(self._dir / "requests.jsonl", "a", buffering=1)  # noqa: SIM115
             self._err_log = None
             self._dump_scheduler_spec(vllm_config, kv_cache_config)
@@ -258,6 +366,20 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             self._digest_log = None
             self._weights: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
+    def _align_state_groups(self, vllm_config) -> set[int]:
+        """Mamba groups in align mode: digested per step (offers, episode
+        starts), never at finish."""
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        if getattr(vllm_config.cache_config, "mamba_cache_mode", None) != "align":
+            return set()
+        return {
+            gid
+            for gid, g in enumerate(self._groups)
+            if isinstance(g.kv_cache_spec, MambaSpec)
+            and not getattr(g.kv_cache_spec, "num_speculative_blocks", 0)
+        }
+
     def _undigestable_groups(self, vllm_config) -> dict[int, str]:
         """Groups whose block contents are not a function of the prefix alone."""
         from vllm.v1.kv_cache_interface import MambaSpec
@@ -265,13 +387,11 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         mode = getattr(vllm_config.cache_config, "mamba_cache_mode", None)
         out = {}
         for gid, g in enumerate(self._groups):
-            if isinstance(g.kv_cache_spec, MambaSpec):
+            if isinstance(g.kv_cache_spec, MambaSpec) and gid not in self._state_groups:
                 # Outside align mode a state block is the running state of the
-                # request, not the state at the block end. In align mode the
-                # block-end states are freed (nulled in the request's block
-                # table) as compute moves on, so none is left at finish, where
-                # the probe digests: not digested either way (the gate fails
-                # an arm whose transferable group is undigested).
+                # request, not the state at the block end (and speculative
+                # blocks shift it): not digested (the gate fails an arm whose
+                # transferable group is undigested).
                 out[gid] = f"MambaSpec with mamba_cache_mode={_jsonable(mode)}: not digested"
         return out
 
@@ -321,6 +441,10 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 "cache_dtype": _jsonable(cc.cache_dtype),
                 "enable_prefix_caching": cc.enable_prefix_caching,
                 "mamba_cache_mode": _jsonable(getattr(cc, "mamba_cache_mode", None)),
+                # Which Mamba / sliding-window states vLLM retains (and offers).
+                "prefix_cache_retention_interval": _jsonable(
+                    getattr(cc, "prefix_cache_retention_interval", None)
+                ),
             },
             "kv_cache_config": {
                 "num_blocks": kv_cache_config.num_blocks,
@@ -328,12 +452,24 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 "cache_hit_alignment_tokens": kv_cache_config.cache_hit_alignment_tokens,
                 "kv_cache_layout": kv_cache_config.kv_cache_layout,
                 "kv_tp_replicas": kv_cache_config.kv_tp_replicas,
+                "prefix_cache_retention_interval": _jsonable(
+                    getattr(kv_cache_config, "prefix_cache_retention_interval", None)
+                ),
                 "transfer_group_ids": list(kv_cache_config.transfer_group_ids),
                 "prefix_cacheable_group_ids": list(kv_cache_config.prefix_cacheable_group_ids),
                 "groups": groups,
                 "tensors": tensors,
             },
-            "probe": {"digest_skipped_groups": {str(k): v for k, v in self._skip_groups.items()}},
+            # Effective compile settings (G0.spec pins them): an arm whose
+            # compile differs from the baseline's computes other numbers.
+            "compilation": _compilation_summary(vllm_config),
+            # Decides the worker step order the probe's digests rely on.
+            "model_runner": _model_runner(vllm_config),
+            "probe": {
+                "schema": SPEC_SCHEMA,
+                "digest_skipped_groups": {str(k): v for k, v in self._skip_groups.items()},
+                "state_groups": sorted(self._state_groups),
+            },
             "modules": module_files(self._connector_modules),
         }
         (self._dir / "spec.json").write_text(json.dumps(dump, indent=1, sort_keys=True))
@@ -438,6 +574,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         self._local_hit[rid] = num_computed_tokens
         if rid not in self._live:
             self._live[rid] = _Live(tags=request_tags(request))
+        self._live[rid].request = request
         return 0, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
@@ -446,21 +583,173 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         self._step += 1
         sched = scheduler_output.num_scheduled_tokens
+        states: list[_StateJob] = []
+        starts: list[_StateJob] = []
+        # First: a request preempted (and possibly resumed) this step is
+        # digested from the block table of its previous episode.
+        clobbered = _clobbered_blocks(scheduler_output)
+        preempted = [
+            job
+            for rid in sorted(getattr(scheduler_output, "preempted_req_ids", None) or ())
+            if (job := self._preempt_job(rid, clobbered)) is not None
+        ]
         for req in scheduler_output.scheduled_new_reqs:
             self._episode(req.req_id, req.num_computed_tokens)
             self._advance(req.req_id, req.num_computed_tokens, sched.get(req.req_id, 0))
+            self._start_states(req.req_id, req.block_ids, req.num_computed_tokens, starts)
+            self._track(req.req_id, req.block_ids, True, req.num_computed_tokens, sched)
         cached = scheduler_output.scheduled_cached_reqs
         for i, rid in enumerate(cached.req_ids):
             before = cached.num_computed_tokens[i]
-            if rid in cached.resumed_req_ids:
+            resumed = rid in cached.resumed_req_ids
+            if resumed:
                 self._episode(rid, before)
+                # A resumed request's new_block_ids replace its block table.
+                self._start_states(rid, cached.new_block_ids[i], before, starts)
             self._advance(rid, before, sched.get(rid, 0))
+            self._track(rid, cached.new_block_ids[i], resumed, before, sched)
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        offers = getattr(block_state, "boundary_state_offloads", None) or {}
+        for rid, entries in offers.items():
+            # Only a request this step computes: vLLM also offers a state it
+            # caches after an async load landed (not a computation).
+            if sched.get(rid, 0) > 0:
+                self._offered_states(rid, entries, states)
+        if self._state_groups:
+            before = {r.req_id: r.num_computed_tokens for r in scheduler_output.scheduled_new_reqs}
+            before |= dict(zip(cached.req_ids, cached.num_computed_tokens, strict=True))
+            self._unoffered(before, sched, offers)
         jobs, self._pending = self._pending, []
-        return ProbeMetadata(jobs=jobs)
+        return ProbeMetadata(jobs=jobs, states=states, start_states=starts, preempted=preempted)
+
+    def _track(self, rid: str, block_ids, replace: bool, before: int, sched) -> None:
+        """Keep the block table (``replace``: new or resumed request) and the
+        computed tokens after this step."""
+        live = self._live.get(rid)
+        if live is None:
+            return
+        groups = [list(b or []) for b in (block_ids or [None] * len(self._groups))]
+        if replace or not live.blocks:
+            live.blocks = groups
+        else:
+            for table, new in zip(live.blocks, groups, strict=True):
+                table.extend(new)
+        live.computed = before + sched.get(rid, 0)
+
+    def _preempt_job(self, rid: str, clobbered: dict[int, str] | None = None) -> _DigestJob | None:
+        """The bytes a preempted episode leaves (its fully computed blocks),
+        tagged by that episode; without it its computations stay undigested
+        and its loads unjudged. ``clobbered`` (block id -> ``zeroed`` |
+        ``cow``): freed blocks vLLM reallocated this step and overwrites
+        before ``handle_preemptions`` on the V2 runner; they are dropped (no
+        reference from them) and recorded in ``preempt_dropped``."""
+        live = self._live.get(rid)
+        if live is None or not live.episodes or live.request is None:
+            return None
+        digest = self._digest_mode(live)
+        if digest is None:
+            return None
+        ep = len(live.episodes) - 1
+        tokens = list(live.request.all_token_ids)
+        computed = min(live.computed, len(tokens))
+        per_group = self._entries(tokens, computed, live.episodes[-1][2], digest, live.blocks)
+        if clobbered:
+            for gid, blocks in enumerate(per_group):
+                for b in blocks:
+                    if b[1] in clobbered:
+                        live.preempt_dropped.append([ep, gid, b[3], clobbered[b[1]]])
+                per_group[gid] = [b for b in blocks if b[1] not in clobbered]
+        live.preempt_digested.append(ep)
+        live.blocks, live.computed = [], 0
+        return _DigestJob(rid, per_group, episode=ep) if any(per_group) else None
+
+    def _unoffered(self, before: dict[str, int], sched: dict[str, int], offers) -> None:
+        """A step ending exactly on a state boundary computes that state; one
+        vLLM offered neither in that step nor in the next is never digested
+        (recorded ``not_offered``)."""
+        got = {(rid, gid, b) for rid, entries in offers.items() for gid, _, b in entries}
+        late, self._expect = self._expect, []
+        for rid, gid, after, ep in late:
+            live = self._live.get(rid)
+            if live is not None and (rid, gid, after) not in got:
+                live.states.append([ep, after, gid, "not_offered"])
+        for rid, n in sched.items():
+            live = self._live.get(rid)
+            if n <= 0 or live is None or not live.episodes or rid not in before:
+                continue
+            if self._digest_mode(live) not in ("full", "ref"):
+                continue
+            after = before[rid] + n
+            for gid in sorted(self._state_groups):
+                bt = self._groups[gid].kv_cache_spec.block_size
+                if after % bt == 0 and (rid, gid, after) not in got:
+                    self._expect.append((rid, gid, after, len(live.episodes) - 1))
+
+    @staticmethod
+    def _state_key(live: _Live, covered: int) -> str | None:
+        """Prefix key of the first ``covered`` tokens (None: not known yet)."""
+        tokens = live.request.all_token_ids if live.request is not None else []
+        if len(tokens) < covered:
+            return None
+        return prefix_keys(list(tokens[:covered]), [covered])[0]
+
+    def _start_states(self, rid: str, block_ids, start: int, out: list[_StateJob]) -> None:
+        """The state an episode starts from (local hit or loaded), per state
+        group: block ``start / bt - 1`` of the episode's block table."""
+        live = self._live.get(rid)
+        if not self._state_groups or start <= 0 or live is None:
+            return
+        if self._digest_mode(live) not in ("full", "hit"):
+            return
+        ep = len(live.episodes) - 1
+        for gid in sorted(self._state_groups):
+            bt = self._groups[gid].kv_cache_spec.block_size
+            ids = block_ids[gid] if block_ids is not None and gid < len(block_ids) else []
+            idx = start // bt - 1
+            bid = ids[idx] if start % bt == 0 and idx < len(ids) else None
+            key = self._state_key(live, start)
+            if start % bt:
+                what = "start_unaligned"
+            elif not bid:
+                what = "start_no_block"
+            elif key is None:
+                what = "start_no_tokens"
+            else:
+                what = "start"
+                out.append(_StateJob(rid, ep, gid, bid, key, start))
+            live.states.append([ep, start, gid, what])
+
+    def _offered_states(self, rid: str, entries, out: list[_StateJob]) -> None:
+        """States vLLM offers this step (``(group, block_id, boundary)``):
+        written by this step's forward. A boundary at or below the episode
+        start is the start state (``_start_states``), not a computation."""
+        live = self._live.get(rid)
+        if not self._state_groups or live is None or not live.episodes:
+            return
+        if self._digest_mode(live) not in ("full", "ref"):
+            return
+        ep, start = len(live.episodes) - 1, live.episodes[-1][2]
+        for gid, bid, boundary in entries:
+            if gid not in self._state_groups or boundary <= start:
+                continue
+            bt = self._groups[gid].kv_cache_spec.block_size
+            key = self._state_key(live, boundary)
+            if boundary % bt:
+                what = "offer_unaligned"
+            elif key is None:
+                what = "offer_no_tokens"
+            else:
+                what = "offer"
+                out.append(_StateJob(rid, ep, gid, bid, key, boundary))
+            live.states.append([ep, boundary, gid, what])
 
     def _episode(self, rid: str, start: int) -> None:
         live = self._live.setdefault(rid, _Live(tags={}))
         live.episodes.append([self._step, self._local_hit.pop(rid, None), start])
+        # Tokens the episode is scheduled with (prompt + output so far): a
+        # resumed episode's prompt, for the resume replay.
+        req = live.request
+        live.episode_tokens.append(len(req.all_token_ids) if req is not None else None)
 
     def _advance(self, rid: str, before: int, n: int) -> None:
         live = self._live.get(rid)
@@ -490,6 +779,11 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         computed = min(request.num_computed_tokens, len(tokens))
         live = self._live.pop(rid, None) or _Live(tags=request_tags(request))
         self._local_hit.pop(rid, None)
+        if self._state_groups:
+            # vLLM drops a finished request's pending offers.
+            for x in [x for x in self._expect if x[0] == rid]:
+                live.states.append([x[3], x[2], x[1], "not_offered"])
+            self._expect = [x for x in self._expect if x[0] != rid]
         first = live.episodes[0] if live.episodes else [None, None, None]
         kt = self._key_tokens
         digest = self._digest_mode(live)
@@ -509,7 +803,11 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                     "local_hit": first[1],
                     "first_computed": first[2],
                     "episodes": live.episodes,
+                    "episode_tokens": live.episode_tokens,
                     "progress": live.progress,
+                    **({"states": live.states} if self._state_groups else {}),
+                    "preempt_digested": live.preempt_digested,
+                    "preempt_dropped": live.preempt_dropped,
                     "finish_step": self._step,
                     "digest": digest,
                     "key_tokens": kt,
@@ -523,10 +821,19 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
 
         # Bytes held at finish come from the last episode: blocks ending at
         # or below its start were loaded (local or external), the rest computed.
-        start = live.episodes[-1][2]
+        per_group = self._entries(tokens, computed, live.episodes[-1][2], digest, block_ids)
+        if not any(per_group):
+            return False, None
+        self._pending.append(_DigestJob(rid, per_group))
+        return True, None
+
+    def _entries(self, tokens, computed: int, start: int, digest: str, block_ids):
+        """Per group: (index, block id, key, covered) of the blocks to digest."""
         per_group = []
-        for gid, ids in enumerate(block_ids):
-            if gid in self._skip_groups:
+        for gid in range(len(self._groups)):
+            ids = block_ids[gid] if gid < len(block_ids) else []
+            if gid in self._skip_groups or gid in self._state_groups:
+                # State groups are digested in their steps (_digest_states).
                 per_group.append([])
                 continue
             bt = self._groups[gid].kv_cache_spec.block_size
@@ -537,17 +844,14 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             entries = [
                 (i, bid)
                 for i, bid in enumerate(ids[:n])
-                if bid != 0 and (digest == "full" or (digest == "ref") == ((i + 1) * bt > start))
+                if bid and (digest == "full" or (digest == "ref") == ((i + 1) * bt > start))
             ]
             covered = [(i + 1) * bt for i, _ in entries]
             keys = prefix_keys(tokens, covered)
             per_group.append(
                 [(i, bid, k, c) for (i, bid), k, c in zip(entries, keys, covered, strict=True)]
             )
-        if not any(per_group):
-            return False, None
-        self._pending.append(_DigestJob(rid, per_group))
-        return True, None
+        return per_group
 
     def _digest_mode(self, live: _Live) -> str | None:
         """``full`` (every complete block), ``ref`` (computed blocks only, i.e.
@@ -569,16 +873,19 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         meta = self._get_connector_metadata()
         if not isinstance(meta, ProbeMetadata) or not meta.jobs:
             return
-        if self._digest_log is None:
-            self._digest_log = open(  # noqa: SIM115
-                self._dir / f"digest-{self._rank}.jsonl", "a", buffering=1
-            )
+        self._open_digest_log()
         for job in meta.jobs:
             for gid, blocks in enumerate(job.blocks):
                 if blocks:
                     self._digest_group(job.req_id, gid, blocks)
             with self._lock:
                 self._done.add(job.req_id)
+
+    def _open_digest_log(self) -> None:
+        if self._digest_log is None:
+            self._digest_log = open(  # noqa: SIM115
+                self._dir / f"digest-{self._rank}.jsonl", "a", buffering=1
+            )
 
     def _layer_regions(self, gid: int) -> list[tuple[str, int, int, int, Any, int]]:
         """(layer, base, block_stride, page_bytes, spec, num_blocks) per layer of a group."""
@@ -610,7 +917,10 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
             self._weights[key] = (w1, w2)
         return self._weights[key]
 
-    def _digest_group(self, req_id: str, gid: int, blocks) -> None:
+    def _digest_group(self, req_id: str, gid: int, blocks, episode: int | None = None) -> None:
+        """``episode``: a state record (digested in its step) or a preempted
+        episode's blocks, tagged by that schedule episode; None = a
+        finish-time record (last episode)."""
         assert self._raw is not None
         raw = self._raw
         ids = [b[1] for b in blocks]
@@ -620,12 +930,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
         regions = self._regions[gid]
         for _name, base, bstride, page, spec, nb in regions:
             pages = raw.as_strided((nb, page), (bstride, 1), base)
-            dtype = getattr(spec, "dtype", None)
-            floaty = (
-                isinstance(dtype, torch.dtype)
-                and dtype.is_floating_point
-                and page % dtype.itemsize == 0
-            )
+            parts = _float_parts(spec, page)
             chunk = max(1, _CHUNK_BYTES // page)
             for s in range(0, len(ids), chunk):
                 idx = torch.tensor(ids[s : s + chunk], device=raw.device)
@@ -635,23 +940,24 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                 h1 = (u * w1).sum(-1).tolist()
                 h2 = (u * w2).sum(-1).tolist()
                 del u
-                l1 = g.view(dtype).float().abs().sum(-1).tolist() if floaty else [0.0] * len(idx)
+                l1 = [0.0] * len(idx)
+                for lo, hi, dtype in parts:
+                    part = g[:, lo:hi].contiguous().view(dtype).float().abs().sum(-1).tolist()
+                    l1 = [a + b for a, b in zip(l1, part, strict=True)]
                 for j, b in enumerate(blocks[s : s + chunk]):
                     rows[b[0]]["exact"].append(f"{h1[j] & _MASK:016x}{h2[j] & _MASK:016x}")
                     rows[b[0]]["l1"].append(l1[j])
         assert self._digest_log is not None
-        self._digest_log.write(
-            json.dumps(
-                {
-                    "req_id": req_id,
-                    "rank": self._rank,
-                    "group": gid,
-                    "layers": [r[0] for r in regions],
-                    "blocks": [dict(index=i, **r) for i, r in sorted(rows.items())],
-                }
-            )
-            + "\n"
-        )
+        rec: dict[str, Any] = {
+            "req_id": req_id,
+            "rank": self._rank,
+            "group": gid,
+            "layers": [r[0] for r in regions],
+            "blocks": [dict(index=i, **r) for i, r in sorted(rows.items())],
+        }
+        if episode is not None:
+            rec["episode"] = episode
+        self._digest_log.write(json.dumps(rec) + "\n")
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
@@ -659,8 +965,47 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
     def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
         return
 
+    def handle_preemptions(self, kv_connector_metadata) -> None:
+        # vLLM 0.32's V2 runner (what runs; ``spec.json`` ``model_runner``)
+        # calls this from ``kv_connector.pre_forward``, after
+        # ``update_requests`` (zeroes new blocks, applies COW copies) and the
+        # Mamba align precopy, and before a sync ``start_load_kv`` and the
+        # forward. Freed preempted blocks still hold their episode's bytes
+        # except the ones reallocated and overwritten this step, which
+        # ``build_connector_meta`` already dropped (``preempt_dropped``). A
+        # start-state block holds what the forward computes from: the
+        # precopy only reads it (its destination is a later block), and a
+        # sync load lands after this digest.
+        meta = kv_connector_metadata
+        if not isinstance(meta, ProbeMetadata):
+            return
+        if meta.preempted:
+            self._open_digest_log()
+        for job in meta.preempted:
+            for gid, blocks in enumerate(job.blocks):
+                if blocks:
+                    self._digest_group(job.req_id, gid, blocks, episode=job.episode)
+        self._digest_states(meta.start_states)
+
     def wait_for_save(self):
-        return
+        # Mamba states this step's forward wrote (same stream), before a
+        # later step's forward can reuse the block.
+        meta = self._get_connector_metadata()
+        if isinstance(meta, ProbeMetadata):
+            self._digest_states(meta.states)
+
+    def _digest_states(self, states: list[_StateJob]) -> None:
+        if not states:
+            return
+        self._open_digest_log()
+        by: dict[tuple[str, int, int], list[tuple[int, int, str, int]]] = {}
+        for s in states:
+            bt = self._groups[s.group].kv_cache_spec.block_size
+            by.setdefault((s.req_id, s.episode, s.group), []).append(
+                (s.covered // bt - 1, s.block_id, s.key, s.covered)
+            )
+        for (rid, ep, gid), blocks in by.items():
+            self._digest_group(rid, gid, blocks, episode=ep)
 
     def get_finished(self, finished_req_ids: set[str]):
         with self._lock:
