@@ -1105,9 +1105,11 @@ From now on:
   own spread is 0.04). The cause is unknown after ruling out the resident
   deficit, block-0 query refresh, lost saves and server behaviour (section
   "M2"). Not pursued: below the 2x floor, not gated.
-- MF5 `G2.digest_self.cap` (1.008%, 0 mismatched): the recorded rerun is
-  M1. If it is over 1% again, the next step is the gate owner's (an
-  allowance, or digesting preempted episodes on `feat/rsi-gate-hybrid`).
+- MF5 `G2.digest_self.cap` (1.008%, 0 mismatched): closed by M1. The
+  recorded official rerun on it7 passes at 0.45% (section "it7", "M1b").
+  The verdict's margin stays thin on every arm (old r3 1.10%, native MF4
+  1.15%), so digesting preempted episodes (`feat/rsi-gate-hybrid`) is
+  still recommended to the gate owner.
 - lmcache is not compared yet: the arm is being fixed on
   feat/rsi-gate-lmcache.
 
@@ -1859,7 +1861,8 @@ is the same as before it6. Not saving across a preemption would only
 shrink the gate's unjudged share: it would drop valid hits, and old saves
 these blocks too. The final review agreed (no connector fault) but cannot
 waive a hard verdict, so M1 is one recorded official rerun, kept next to
-MF5 (section "M1" below). The gate-side remedy, digesting preempted
+MF5: `2026-10-25-qwen3-4b-p4-it7-off-a59a254` passes at 0.45% (section
+"it7", "M1b"). The gate-side remedy, digesting preempted
 episodes in `handle_preemptions` (`feat/rsi-gate-hybrid`), is for the gate
 owner.
 
@@ -2248,6 +2251,67 @@ and within 0.001 at 0.5 and 0.75):
   H_lru; 0.75 +0.036 over it6 and 0.013 above old; resident/C at old's
   level everywhere. 0.25 is +0.016 over it6 and 0.070 below old (old's
   own 0.25 across runs: 0.512 / 0.531 / 0.550 / 0.522).
+
+### M1b: official Qwen3-4B rerun on it7 (`2026-10-25-qwen3-4b-p4-it7-off-a59a254`, GPU 0, TP1, 64gb, run_gate pgid 3397857, 06:38:39 to 09:39:31Z)
+
+The recorded rerun the final review asked for (M1), on the accepted tree
+(it7), kept next to MF5. Setup:
+- `"official": true`, `not_official_because: []`.
+- Gate ce645d7, base server d1970ead, under test a59a254 (verified).
+- Arms plain, baseline, old, native, v2, the same as MF5. Workloads gsm8k
+  (1319), replay (32 x 12), cap (64 x 12 auto). C(0.5) = 27.2 GB, 2.44x
+  GPU KV.
+- No contamination, scan `flagged: []`, `vllm_plugins` old `pegaflow`
+  only. lmcache not run.
+
+Verdicts: v2 passes every verdict (`pass: true`). `G2.digest_self.cap`
+passes: 2219 preempted-uncertain of 488,983 loaded blocks (0.45%), 0
+mismatched (271616 ext and 213851 local matched). old passes every
+verdict. native fails G0.spec (by construction), its usual
+`G2.digest_vs_baseline.gsm8k` (layout) and G4 gsm8k (+6.4%).
+
+The share history for this verdict on Qwen3-4B, v2: r3 0.41%, MF2 0.51%,
+A 0.57%, B 0.53%, it6 cap 0.66%, MF5 1.01% (fail), it7 cap 0.43%, M1
+0.45%. old in M1 is 0.40% and native 0.43%. MF5 sits at the top of the
+range, and the next official run on the same code family lands in the
+middle. That fits the variance reading of the MF5 note.
+
+G4 (vs same-run baseline; warm = warm2 / warm3):
+
+| metric | baseline | v2 it7 | old | native | MF5 v2 it6 |
+|---|---|---|---|---|---|
+| replay warm TTFT p50 (s) | 3.697 / 3.565 | 0.551 / 0.577 (-85.1 / -83.8%) | 0.649 / 0.672 (-82.4 / -81.1%) | 0.561 / 0.563 (-84.8 / -84.2%) | -84.4 / -83.6% |
+| replay warm req/s | 2.49 / 2.55 | 9.66 / 9.63 (+288 / +277%) | 9.81 / 9.65 (+294 / +278%) | 9.29 / 9.43 (+273 / +269%) | +277 / +274% |
+| replay cold TTFT p50 (s) | 3.668 | 1.383 (-62.3%) | 1.383 (-62.3%) | 1.386 (-62.2%) | 1.377 (-63.0%) |
+| replay cold req/s | 2.57 | 6.31 (+145.0%) | 6.34 (+146.3%) | 5.92 (+130.1%) | +146.6% |
+| gsm8k cold (s) | 168.9 | 170.5 (+0.92%) | 172.0 (+1.82%) | 179.7 (+6.38%, fail) | +0.37% |
+| gsm8k warm (s) | 170.3 | 169.6 (-0.43%) | 172.9 (+1.52%) | 181.2 (+6.42%, fail) | -0.76% |
+| G4 verdicts | | all pass | all pass | gsm8k fails | all pass |
+
+No regression vs MF5 or it2d (same-run relative, see the review's Q5
+note on the moving baseline).
+
+Hits, unlimited store (local / ext / total; E_ext; excess):
+
+| pass | v2 | old | native | lmcache | H* |
+|---|---|---|---|---|---|
+| gsm8k warm | 0.922 / 0.070 / 0.992, E 1.0, excess 0 | 0.926 / 0.067 / 0.993, E 1.0, excess 1170 | 0.933 / 0.060 / 0.993, E 1.0, excess 1170 | pending (arm not comparable yet) | 0.992 |
+| replay cold | 0.385 / 0.479 / 0.864, E 1.0 | 0.381 / 0.483 / 0.864, E 1.0 | 0.384 / 0.480 / 0.864, E 1.0 | pending | 0.864 |
+| replay warm2 | 0.347 / 0.651 / 0.998, E 1.0, excess 0 | 0.361 / 0.638 / 0.998, E 1.0, excess 195 | 0.378 / 0.621 / 0.998, E 1.0, excess 195 | pending | 0.998 |
+| replay warm3 | 0.348 / 0.651 / 0.998, E 1.0, excess 0 | 0.367 / 0.632 / 0.998, E 1.0, excess 195 | 0.378 / 0.621 / 0.998, E 1.0, excess 195 | pending | 0.998 |
+
+G5 (cap 64 x 12, warm_timed; H_lru / H*_C from v2's trace, the reference
+arms within 0.006 / 0.003):
+
+| C/U | v2 it7 | v2 it6 (MF5) | old | native | lmcache | H_lru | H*_C | E_C v2 / old / native | resident/C v2 / old | insertions v2 / old |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0.25 | 0.409 | 0.392 | 0.396 | 0.533 | pending (arm not comparable yet) | 0.584 | 0.863 | 0.111 / 0.071 / 0.296 | 0.90 to 0.96 / 0.71 to 0.92 | 307122 / 311286 |
+| 0.5 | 0.859 | 0.838 | 0.829 | 0.862 | pending | 0.858 | 0.929 | 0.701 / 0.675 / 0.715 | 0.93 to 0.96 / 0.75 to 0.84 | 87419 / 98697 |
+| 0.75 | 0.908 | 0.883 | 0.878 | 0.927 | pending | 0.916 | 0.970 | 0.741 / 0.693 / 0.775 | 0.94 to 0.96 / 0.72 to 0.80 | 67889 / 80145 |
+
+v2 is above old at every fraction, at H_lru at 0.5 (0.859 vs 0.858), and
+0.003 below native there. it7 improves Qwen3-4B G5 by +0.017 / +0.021 /
++0.025 over MF5.
 
 ## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
 
