@@ -1101,14 +1101,13 @@ From now on:
   waiting-queue signal. Neither has been tried.
 - The gate port race (vLLM `EADDRINUSE` on the gate's chosen port) is
   with the gate owner.
-- DSV2 G5 at C/U 0.25 / 0.75 (MF4): v2 it6 is 0.076 / 0.026 below old on
-  the same server, with resident/C 0.05 to 0.15 below old's. The untested
-  lever is one save entry per (group, request) in `plan_saves`. It is not
-  done, per the coordinator. See "G5 hit-rate judgment (final)".
-- MF5 (Qwen3-4B, official) fails v2 `G2.digest_self.cap` (and G5 with
-  it): 1.008% preempted-uncertain against the gate's 1% limit, 0
-  mismatched. This is for the coordinator and the gate owner to decide:
-  rerun or allowance. See "MF5".
+- DSV2 G5 at C/U 0.25: v2 is 0.06 to 0.12 below old across runs (old's
+  own spread is 0.04). The cause is unknown after ruling out the resident
+  deficit, block-0 query refresh, lost saves and server behaviour (section
+  "M2"). Not pursued: below the 2x floor, not gated.
+- MF5 `G2.digest_self.cap` (1.008%, 0 mismatched): the recorded rerun is
+  M1. If it is over 1% again, the next step is the gate owner's (an
+  allowance, or digesting preempted episodes on `feat/rsi-gate-hybrid`).
 - lmcache is not compared yet: the arm is being fixed on
   feat/rsi-gate-lmcache.
 
@@ -1658,11 +1657,11 @@ so this does not affect P4. It passes every other correctness verdict.
 
 ### G5 (cap 76 x 12, warm_timed)
 
-| C/U | v2 it6 | old | native | lmcache | H_lru | H*_C | v2 E_C | resident/C v2 / old |
+| C/U | v2 it6 | old | native | lmcache | H_lru | H*_C | E_C v2 / old / native | resident/C v2 / old |
 |---|---|---|---|---|---|---|---|---|
-| 0.25 | 0.436 | 0.512 | 0.578 | pending (arm not comparable yet) | 0.673 | 0.851 | 0.040 | 0.78 to 0.90 / 0.90 to 0.95 |
-| 0.5 | 0.844 | 0.845 | 0.850 | pending | 0.847 | 0.925 | 0.615 | 0.78 to 0.83 / 0.92 to 0.95 |
-| 0.75 | 0.863 | 0.889 | 0.933 | pending | 0.919 | 0.968 | 0.581 | 0.79 to 0.82 / 0.94 |
+| 0.25 | 0.436 | 0.512 | 0.578 | pending (arm not comparable yet) | 0.673 | 0.851 | 0.040 / 0.161 / 0.271 | 0.78 to 0.90 / 0.90 to 0.95 |
+| 0.5 | 0.844 | 0.845 | 0.850 | pending | 0.847 | 0.925 | 0.615 / 0.621 / 0.624 | 0.78 to 0.83 / 0.92 to 0.95 |
+| 0.75 | 0.863 | 0.889 | 0.933 | pending | 0.919 | 0.968 | 0.581 / 0.632 / 0.712 | 0.79 to 0.82 / 0.94 |
 
 Other numbers from this run:
 - MF1 v2 for comparison: 0.428 / 0.765 / 0.855.
@@ -1720,6 +1719,32 @@ The same share in other runs:
 
 vLLM preemptions per cap pass are the same across these runs (2 to 9 for
 every arm).
+
+Cross-arm history (final review S1; shares as the gate computes them,
+`preempted_uncertain / (compared + uncertain)`):
+
+| run | v2 | old | native |
+|---|---|---|---|
+| Qwen3-4B r3 (8a05b7c) | 0.41% | 1.10% (fail) | 0.87% |
+| Qwen3-4B MF2 | 0.51% | 0.22% | |
+| Qwen3-4B A / B / it6 cap | 0.57% / 0.53% / 0.66% | | |
+| Qwen3-4B MF5 | 1.01% (fail) | 0.88% | 0.48% |
+| DSV2 MF1 / it6 / MF4 | 0.67% / 0.64% / 0.93% | MF4 0.50%, old-supp 0.71% | MF4 1.15% (fail) |
+
+- old failed this same verdict on Qwen3-4B r3 (5268 blocks, 1.10%, 0
+  mismatched), and native failed it on MF4 DSV2 (12774, 1.15%). Every
+  arm that loads from a store has crossed 1% at least once.
+- v2's own range is 0.41% (r3) to 1.01% (MF5). On DSV2 MF4 it passes at
+  0.93%, so the DSV2 margin is thin too.
+- Byte-level check (reviewer, gate's `digest_compare` at ce645d7 on the
+  MF5 cap(0.5) probe dirs): 4878 of the 4879 blocks have a digested copy
+  of the same key. Their closest per-layer rel-L1 to it is p50 0.00095,
+  p99 0.0071, 0.123% above 0.0175. Honest computed-vs-computed copies give
+  p50 0.00081, p99 0.0071, 0.107% above 0.0175. The same blocks against
+  the adjacent key's copy (what a wrong-block load would look like) give
+  p50 0.061 and a minimum of 0.0175. So the stored bytes are the right
+  blocks, at ordinary recompute noise. old (4205, p99 0.0098) and native
+  (2353, p99 0.0052) look the same.
 
 What this does and does not show:
 - In the same run, old's share also went from 0.22% (MF2) to 0.88%, so
@@ -1830,11 +1855,13 @@ Findings:
    change, and the blocks are valid KV.
 
 Conclusion: variance in which turns get preempted. v2's save behaviour
-is the same as before it6. A rerun would most likely land in the 0.5 to
-0.9% band, but that is not a reason to rerun for a pass. Whether a
-recorded rerun is warranted is for the reviewer. Not saving across a
-preemption would only shrink the gate's unjudged share: it would drop
-valid hits, and old saves these blocks too.
+is the same as before it6. Not saving across a preemption would only
+shrink the gate's unjudged share: it would drop valid hits, and old saves
+these blocks too. The final review agreed (no connector fault) but cannot
+waive a hard verdict, so M1 is one recorded official rerun, kept next to
+MF5 (section "M1" below). The gate-side remedy, digesting preempted
+episodes in `handle_preemptions` (`feat/rsi-gate-hybrid`), is for the gate
+owner.
 
 ### G4 (vs same-run baseline)
 
@@ -1860,11 +1887,11 @@ it2d. v2 has the best cold req/s of the three arms.
 
 ### G5 (cap 64 x 12, warm_timed)
 
-| C/U | v2 it6 | old | native | lmcache | H_lru | H*_C | v2 E_C | resident/C v2 / old | insertions v2 / old |
+| C/U | v2 it6 | old | native | lmcache | H_lru | H*_C | E_C v2 / old / native | resident/C v2 / old | insertions v2 / old |
 |---|---|---|---|---|---|---|---|---|---|
-| 0.25 | 0.392 | 0.398 | 0.542 | pending (arm not comparable yet) | 0.581 | 0.862 | 0.065 | 0.74 to 0.85 / 0.81 to 0.93 | 322810 / 308827 |
-| 0.5 | 0.838 | 0.820 | 0.861 | pending | 0.857 | 0.929 | 0.667 | 0.75 to 0.82 / 0.76 to 0.84 | 93389 / 98334 |
-| 0.75 | 0.883 | 0.873 | 0.927 | pending | 0.915 | 0.970 | 0.698 | 0.71 to 0.83 / 0.73 to 0.79 | 78308 / 81468 |
+| 0.25 | 0.392 | 0.398 | 0.542 | pending (arm not comparable yet) | 0.581 | 0.862 | 0.065 / 0.081 / 0.308 | 0.74 to 0.85 / 0.81 to 0.93 | 322810 / 308827 |
+| 0.5 | 0.838 | 0.820 | 0.861 | pending | 0.857 | 0.929 | 0.667 / 0.645 / 0.718 | 0.75 to 0.82 / 0.76 to 0.84 | 93389 / 98334 |
+| 0.75 | 0.883 | 0.873 | 0.927 | pending | 0.915 | 0.970 | 0.698 / 0.674 / 0.767 | 0.71 to 0.83 / 0.73 to 0.79 | 78308 / 81468 |
 
 MF2 v2 for comparison: 0.368 / 0.777 / 0.865. The it6 recovery holds on
 an official run: 0.838 here, 0.843 in the it6 cap run, 0.842 at r3.
@@ -1885,11 +1912,11 @@ side-by-side comparison of v2, old, native and lmcache.
 
 Qwen3-4B (MF5, 64 x 12):
 
-| C/U | v2 it6 | old | native | lmcache | H_lru | H*_C | resident/C v2 / old |
-|---|---|---|---|---|---|---|---|
-| 0.25 | 0.392 | 0.398 | 0.542 | pending (arm not comparable yet) | 0.581 | 0.862 | 0.74 to 0.85 / 0.81 to 0.93 |
-| 0.5 | 0.838 | 0.820 | 0.861 | pending | 0.857 | 0.929 | 0.75 to 0.82 / 0.76 to 0.84 |
-| 0.75 | 0.883 | 0.873 | 0.927 | pending | 0.915 | 0.970 | 0.71 to 0.83 / 0.73 to 0.79 |
+| C/U | v2 it6 | old | native | lmcache | H_lru | H*_C | E_C v2 / old / native | resident/C v2 / old |
+|---|---|---|---|---|---|---|---|---|
+| 0.25 | 0.392 | 0.398 | 0.542 | pending (arm not comparable yet) | 0.581 | 0.862 | 0.065 / 0.081 / 0.308 | 0.74 to 0.85 / 0.81 to 0.93 |
+| 0.5 | 0.838 | 0.820 | 0.861 | pending | 0.857 | 0.929 | 0.667 / 0.645 / 0.718 | 0.75 to 0.82 / 0.76 to 0.84 |
+| 0.75 | 0.883 | 0.873 | 0.927 | pending | 0.915 | 0.970 | 0.698 / 0.674 / 0.767 | 0.71 to 0.83 / 0.73 to 0.79 |
 
 Qwen3-4B judgment: close enough.
 - v2 is level with or above old at every fraction, 0.019 below H_lru
@@ -1906,11 +1933,11 @@ Qwen3-4B judgment: close enough.
 
 DSV2 (MF4, 76 x 12; the same plan as MF1 and the old supplement):
 
-| C/U | v2 it6 | old | native | lmcache | H_lru | H*_C | resident/C v2 / old |
-|---|---|---|---|---|---|---|---|
-| 0.25 | 0.436 | 0.512 | 0.578 | pending (arm not comparable yet) | 0.673 | 0.851 | 0.78 to 0.90 / 0.90 to 0.95 |
-| 0.5 | 0.844 | 0.845 | 0.850 | pending | 0.847 | 0.925 | 0.78 to 0.83 / 0.92 to 0.95 |
-| 0.75 | 0.863 | 0.889 | 0.933 | pending | 0.919 | 0.968 | 0.79 to 0.82 / 0.94 |
+| C/U | v2 it6 | old | native | lmcache | H_lru | H*_C | E_C v2 / old / native | resident/C v2 / old |
+|---|---|---|---|---|---|---|---|---|
+| 0.25 | 0.436 | 0.512 | 0.578 | pending (arm not comparable yet) | 0.673 | 0.851 | 0.040 / 0.161 / 0.271 | 0.78 to 0.90 / 0.90 to 0.95 |
+| 0.5 | 0.844 | 0.845 | 0.850 | pending | 0.847 | 0.925 | 0.615 / 0.621 / 0.624 | 0.78 to 0.83 / 0.92 to 0.95 |
+| 0.75 | 0.863 | 0.889 | 0.933 | pending | 0.919 | 0.968 | 0.581 / 0.632 / 0.712 | 0.79 to 0.82 / 0.94 |
 
 DSV2 judgment: close enough at the gated point, 0.5. v2 is level with old,
 native and H_lru (0.844 vs 0.845 / 0.850 / 0.847). Every external hit is
@@ -1926,15 +1953,22 @@ At 0.25 and 0.75 a gap remains:
   - About 0.02 of the gap is local hit (v2 0.401 to 0.414 vs old 0.417 to
     0.431), which is vLLM-side reuse, not the store.
   - The rest is external: E_C at 0.25 is 0.040 vs 0.161.
-- Candidate lever, untested and deliberately not done now (coordinator,
-  2026-10-25): one save entry per (group, request) in
-  `Scheduler.plan_saves`. A step's entry still mixes the requests that
-  saved in that step, and the base server keeps a region pinned until its
-  last block is evicted. 0.25 is an extreme capacity where base-server
-  pinning dominates. The user's guidance is not to chase the highest hit
-  rate.
-- Whether 0.076 below old at 0.25 is "差太多" (too far off) is for the
-  reviewer.
+- The per-request entry lever was tested after the final review (M2,
+  section "M2" below). It restores resident/C to old's level and lifts
+  0.75, but leaves the 0.25 gap. The 0.25 attribution is in that section,
+  and it replaces this one: the resident deficit does not explain 0.25.
+
+Context for the 0.25 point (final review S2):
+- C(0.25) is 3.43 GB, 1.14x GPU KV for DSV2 (Qwen3-4B 13.6 GB, 1.22x).
+  That is below the gate's 2x floor, which is what makes C(0.5) a
+  measurement of the external store. At 0.25 the store holds little more
+  than vLLM's own cache.
+- The server dominates that point: old itself is 0.16 below H_lru (0.512
+  vs 0.673) and native 0.10 below.
+- Local hit: v2's own local hit is 0.015 to 0.02 below old and native in
+  every cap run (MF4 0.401 to 0.414 vs old 0.417 to 0.431; also r3 and
+  batching-off B on Qwen3-4B). It is constant and predates P4, so it is not
+  counted as part of the 0.25 gap.
 
 Server vs connector for MF1's DSV2 gap at 0.5 (v2 0.765 vs native 0.852):
 - Connector, from the batching fold: +0.079. MF4's v2 is 0.844, with it6
@@ -1945,6 +1979,199 @@ Server vs connector for MF1's DSV2 gap at 0.5 (v2 0.765 vs native 0.852):
   noise. So at 0.5 nothing is left to attribute to the server once v2
   sends per-step entries. Point 2 of the MF1 judgment (all of it is server
   retention) was wrong.
+
+## M2 (final review): per-request save entries, and the 0.25 gap
+
+Hypothesis: a step's save entry mixes every request that saved in that
+step. The base server pins one region per entry until its last block is
+evicted, so one entry per (storage group, request) should strand fewer
+bytes. That should raise resident/C to old's level and close the 0.25 gap.
+
+Change (scheduler only, no knob): `Scheduler.plan_saves` builds one
+`GroupSave` per (sid, request) instead of one per sid. Groups stay in sid
+order and requests in scheduled order. The worker already sends several
+entries per layer (it6). New unit test
+`test_saves_keep_one_entry_per_request` (fails on the old code). Commit
+a59a254 on `exp/p4-per-request-save`, tree `~/kexi/p4-ut-a59a254`.
+
+### DSV2 cap-only A/B (`2026-10-25-dsv2-lite-p4-m2-a59a254`, GPU 0,1, TP2, 64gb, run_gate pgid 3230141, 00:16:04 to 01:45:54Z)
+
+Setup:
+- Gate ce645d7, base server d1970ead, arms baseline, old, native, v2.
+- Workload cap only, `--cap-convs 76` (MF4's auto plan). Non-official by
+  design; the gate lists `cap_convs=76 (official auto)`, no plain, and
+  cap-only. C(0.5) = 6.87 GB = 2.27x GPU KV, the same as MF4.
+- Excess 0 and unmatched 0 for v2. `G2.digest_self.cap`: 0 mismatched for
+  every arm (v2 9146 preempted-uncertain).
+
+The control is MF4 (same gate, server, plan and GPUs, a1e7fd2 = lever
+minus one commit). old and native are rerun in the same run.
+
+| C/U | v2 lever | v2 MF4 | old (this run) | old MF4 | native (this run) | lmcache | H_lru | H*_C | E_C v2 lever / old / native |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.25 | 0.449 | 0.436 | 0.550 | 0.512 | 0.576 | pending (arm not comparable yet) | 0.654 | 0.852 | 0.057 / 0.186 / 0.272 |
+| 0.5 | 0.848 | 0.844 | 0.845 | 0.845 | 0.851 | pending | 0.847 | 0.925 | 0.620 / 0.616 / 0.628 |
+| 0.75 | 0.899 | 0.863 | 0.888 | 0.889 | 0.932 | pending | 0.917 | 0.968 | 0.662 / 0.633 / 0.695 |
+
+Store churn per pass (cold / warm / warm2 / warm3). Server insertions and
+evictions are pass deltas. resident/C is at pass end. ext is
+`max(0, first_computed - local)` over prompt tokens:
+
+| C/U | arm | ext | insertions | evictions | resident/C |
+|---|---|---|---|---|---|
+| 0.25 | v2 MF4 | 0.038 / 0.020 / 0.019 / 0.013 | 74478 / 83805 / 88071 / 94907 | 69120 / 82944 / 88576 / 94720 | 0.78 / 0.90 / 0.83 / 0.86 |
+| 0.25 | old MF4 | 0.047 / 0.099 / 0.067 / 0.059 | 66265 / 61096 / 62646 / 78393 | 59904 / 60928 / 62976 / 78336 | 0.92 / 0.95 / 0.90 / 0.91 |
+| 0.25 | v2 lever | 0.059 / 0.106 / 0.022 / 0.023 | 70870 / 66985 / 86608 / 92113 | 64512 / 67072 / 86528 / 92160 | 0.92 / 0.91 / 0.92 / 0.91 |
+| 0.25 | old (M2 run) | 0.042 / 0.115 / 0.066 / 0.081 | 66974 / 58413 / 61407 / 57623 | 60928 / 58368 / 61440 / 57344 | 0.88 / 0.88 / 0.88 / 0.92 |
+| 0.5 | v2 MF4 | 0.337 / 0.370 / 0.289 / 0.286 | 27566 / 26873 / 26691 / 26945 | | 0.81 / 0.79 / 0.83 / 0.78 |
+| 0.5 | v2 lever | 0.328 / 0.369 / 0.291 / 0.287 | 27565 / 26192 / 26327 / 26152 | | 0.92 / 0.93 / 0.94 / 0.91 |
+| 0.5 | old (M2 run) | 0.328 / 0.364 / 0.293 / 0.284 | 27565 / 27131 / 26589 / 26777 | | 0.92 / 0.92 / 0.92 / 0.89 |
+| 0.75 | v2 MF4 | 0.328 / 0.399 / 0.300 / 0.293 | 27564 / 23096 / 23589 / 23452 | | 0.79 / 0.82 / 0.82 / 0.81 |
+| 0.75 | v2 lever | 0.330 / 0.422 / 0.343 / 0.333 | 27565 / 18328 / 18225 / 17475 | | 0.94 / 0.96 / 0.95 / 0.95 |
+| 0.75 | old (M2 run) | 0.330 / 0.390 / 0.330 / 0.315 | 27564 / 20566 / 19887 / 19122 | | 0.94 / 0.94 / 0.94 / 0.95 |
+
+Miss classes at 0.25, MF4, per warm request against the gate's own LRU
+model (`oracle.simulate("lru")` with the baseline's local hit). A
+request is "zero" if LRU serves it and the arm serves nothing; "lost" is
+the LRU tokens not served, over prompt tokens:
+
+| pass | v2 zero (n / lost) | v2 short | old zero (n / lost) | old short |
+|---|---|---|---|---|
+| cap_warm | 183 / 0.146 | 13 / 0.005 | 57 / 0.051 | 24 / 0.016 |
+| cap_warm2 | 214 / 0.177 | 8 / 0.006 | 151 / 0.124 | 28 / 0.024 |
+| cap_warm3 | 214 / 0.222 | 2 / 0.002 | 164 / 0.165 | 35 / 0.038 |
+
+At 0.5 the same classes are level (warm3 zero: v2 100 / 0.096, old 103 /
+0.098). The 0.25 loss is whole requests the store serves nothing to,
+not short hits.
+
+Result:
+- Resident/C: fixed. The lever brings v2 to 0.91 to 0.96 at every
+  fraction, at or above old in the same run (0.88 to 0.95). Insertions at
+  0.75 fall from 23k to 18k per warm pass, below old's 20k.
+- 0.75: +0.036 (0.863 -> 0.899), now 0.011 above old.
+- 0.5: unchanged (0.844 -> 0.848; old 0.845, H_lru 0.847).
+- 0.25: +0.013 (0.436 -> 0.449), still 0.101 below old in the same run.
+  The reviewer's thrash signature is still there: insertions rise from
+  67k to 92k per warm pass while ext falls from 0.106 to 0.023. old's
+  stay flat (58k to 61k).
+- Decision (coordinator, 2026-10-25): keep the lever as it7, provided the
+  Qwen3-4B cap regression and the DSV2 8 x 6 cold G4 check pass (below).
+
+### Qwen3-4B cap regression (`2026-10-25-qwen3-4b-p4-m2-a59a254`, GPU 0, TP1, 64gb, run_gate pgid 3280407, 01:55:12 to 03:14:35Z)
+
+Gate ce645d7, base server, cap 64 x 12 auto, arms baseline, old, v2.
+Non-official (cap only, no plain). Excess 0 and unmatched 0 for v2.
+`G2.digest_self.cap` passes: 2084 preempted-uncertain (0.43%), 0
+mismatched (old 0.71%).
+
+| C/U | v2 lever | v2 MF5 | v2 it6 cap | old (this run) | lmcache | H_lru | H*_C | E_C v2 lever / old | resident/C v2 / old |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.25 | 0.404 | 0.392 | 0.396 | 0.400 | pending (arm not comparable yet) | 0.584 | 0.863 | 0.099 / 0.080 | |
+| 0.5 | 0.859 | 0.838 | 0.843 | 0.836 | pending | 0.857 | 0.929 | 0.711 / 0.675 | 0.93 to 0.96 / 0.76 to 0.83 |
+| 0.75 | 0.908 | 0.883 | 0.878 | 0.876 | pending | 0.915 | 0.971 | 0.724 / 0.692 | |
+
+No regression. Qwen3-4B gains at every fraction (+0.016 to +0.030 over
+it6). At 0.5, v2 reaches H_lru (0.859 vs 0.857) with resident/C 0.93 to
+0.96.
+
+### DSV2 8 x 6 cold check (`2026-10-25-dsv2-lite-p4-m2-cold-a59a254`, pgid 3315766, 03:17:28 to 03:26:08Z; control `2026-10-25-dsv2-lite-p4-m2-coldctl-a1e7fd2`, pgid 3321088, 03:27:29 to 03:35:42Z)
+
+Same arguments as the it6 cold check (`--workloads replay --replay-convs
+8 --replay-turns 6`, GPU 0,1, arms baseline + v2). The control runs the
+accepted tree a1e7fd2 directly after, on the same GPUs.
+
+| run | tree | baseline cold p50 | v2 cold p50 | vs baseline | G4 cold p50 | v2 cold req/s | vs baseline | warm2 / warm3 p50 |
+|---|---|---|---|---|---|---|---|---|
+| it6 cold check | b5cf567 | 0.1880 | 0.1871 | -0.5% | pass | 5.692 | -0.2% | 0.103 / 0.109 |
+| lever | a59a254 | 0.1712 | 0.1897 | +10.8% | fail | 5.698 | +0.2% | 0.109 / 0.113 |
+| control | a1e7fd2 | 0.1923 | 0.1900 | -1.2% | pass | 5.689 | -0.1% | 0.098 / 0.108 |
+
+v2's cold p50 is the same on the lever and the control (0.1897 vs
+0.1900), within the it6 check's 0.1871. The baseline swings 0.171 to
+0.192 across three back-to-back runs of identical code. The lever run's
+G4 cold p50 fail comes from its fast baseline, against a 2% slack on a
+48-request slice. Every other replay verdict passes in both runs (warm
+p50 and req/s, cold req/s, digests 0 mismatched, E_ext 1.0).
+
+### 0.25: what the gap is not, and what is left
+
+old against itself at 0.25 (warm_timed hit) is 0.512 (MF4), 0.531 (old
+supplement) and 0.550 (this run), a spread of 0.038. v2 is 0.428 (MF1),
+0.439 (it6), 0.436 (MF4) and 0.449 (lever). So the v2-old gap is 0.06 to
+0.12 across runs, of which up to 0.04 is old's own run noise.
+
+Candidates, each tested:
+1. Resident deficit: ruled out. With the lever, v2's resident/C (0.91 to
+   0.92) is at or above old's (0.88 to 0.92) in the same run, and 0.25
+   moves only +0.013. That matches the reviewer's cross-check: at 0.5 the
+   deficit cost nothing.
+2. Block-0 query refresh: ruled out on this plan. v2 queries from block
+   0, so every query refreshes vLLM-local heads on the server; old queries
+   from its local hit. Test: the server-faithful sim from
+   feat/rsi-server-reclaim (`~/kexi/rsi-tools/server-reclaim/sim/r3sim.py`,
+   sha256 3f50d935...). It is copied to `~/kexi/tmp/dsv2-p4/r3sim_p4.py`
+   with two changes: a `query="local"` mode (scan from the request's own
+   local hit, refresh only what is scanned) and the newer `.gate/`
+   result layout. The driver is `p4sim.py`, which uses the gate's
+   block_bytes (C = 6897 DSV2 blocks). It replays each arm's real 0.25
+   trace with the base server's 512-block reclaim rounds; only blocks the
+   connector computed are saved. The faithful mode reproduces the logged
+   per-query hit count for 74 to 92% of timed requests (v2 79 to 92%,
+   old 74 to 85%). warm_timed hit:
+
+   | trace | C | measured | faithful (logged window) | query from block 0 | query from local hit |
+   |---|---|---|---|---|---|
+   | v2 MF4 | 1.0 C | 0.436 | 0.541 | 0.541 | 0.529 |
+   | v2 MF4 | 0.9 C | | 0.448 | 0.448 | 0.431 |
+   | old MF4 | 1.0 C | 0.512 | 0.558 | 0.557 | 0.570 |
+   | old MF4 | 0.9 C | | 0.518 | 0.511 | 0.528 |
+   | v2 lever | 1.0 C | 0.449 | 0.535 | 0.535 | 0.517 |
+   | v2 lever | 0.9 C | | 0.472 | 0.472 | 0.446 |
+   | old M2 run | 1.0 C | 0.550 | 0.599 | 0.619 | 0.608 |
+   | old M2 run | 0.9 C | | 0.546 | 0.556 | 0.554 |
+
+   On v2's trace, querying from the local hit costs 0.012 to 0.026; it
+   does not gain anything. On old's trace the query mode moves the hit by
+   at most +-0.02 either way. The earlier server sim on the old 32-conv
+   Qwen3-4B plan found the same sign for v2 (a local-prefix touch helped
+   old +0.06 and cost v2 -0.04). So "query from the local hit" is not a
+   lever for v2, and it is not proposed.
+3. Lost saves: ruled out. v2's server insertions are 0.95 to 0.99 of the
+   complete blocks its requests computed past their hit (old: 0.77 to
+   0.90).
+4. Server behaviour given the trace: the sim matches both arms at about
+   0.9 C (v2 0.448 vs 0.436 measured, old 0.518 vs 0.512 in MF4; M2 run
+   0.472 vs 0.449 and 0.546 vs 0.550). Given each arm's own trace, the
+   server behaves like an LRU at about its measured resident/C for both
+   arms.
+5. Local hit: v2's own local hit is 0.019 below old's (0.403 vs 0.422 in
+   the M2 run). With the baseline's local hit counted present in the sim
+   (gate semantics), the trace gap is still 0.04 to 0.05 at 0.9 C (v2
+   0.579 / 0.584 vs old 0.618 / 0.632).
+
+What is left: the same server LRU at the same capacity yields 0.05 to 0.07
+less on v2's trace than on old's (0.9 C: 0.448 vs 0.518, 0.472 vs 0.546).
+So the difference is in the access trace itself: which requests run when,
+and what each computes and saves, not in the store's treatment of
+it. At 0.25 the loop is closed and steep. In the gate's LRU model, warm hit
+falls from 0.673 to 0.579 between 1.0 C and 0.93 C at 0.25, against 0.847
+to 0.845 at 0.5. One fewer hit means more recompute, more saves and more
+evictions, which is the thrash the reviewer saw. The observed signature:
+v2's warm passes get their external hits almost only from the first 1/8
+of each pass (32 to 35 of 65 requests, ext 0.27 there) and close to none
+after, while old's hits are spread over the middle and end of the pass.
+I could not tie that to a connector mechanism from the traces, so the
+0.25 cause is recorded as unknown. 0.25 is below the 2x GPU-KV floor, hit
+rate is not gated, and the user's guidance is not to chase hit rate, so
+it is not pursued further.
+
+Scripts (all read-only over run dirs, on .44 under `~/kexi/tmp/dsv2-p4/`):
+`churn.py` (per-pass server metrics), `miss_classes.py` (gate LRU miss
+classes), `lru_variants.py` / `head_sim.py` (gate-model variants),
+`computed.py` (computed blocks vs insertions), `timeline.py` (ext hits
+over the pass), `r3sim_p4.py` + `p4sim.py` (server-faithful sim, sha256
+2ae28f28... / 8023ee17...).
 
 ## Qwen3-4B TP1 non-regression for it5 (`2026-10-24-qwen3-4b-p4-it5-nonreg`, GPU 0, 64gb, run_gate pgid 2194273, 01:16:19 to 01:56:30Z, rev it5-kv090)
 
