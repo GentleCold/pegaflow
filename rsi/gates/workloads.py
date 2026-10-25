@@ -84,6 +84,168 @@ def gsm8k_extract(text: str) -> str | None:
     return _norm(nums[-1]) if nums else None
 
 
+def _gsm8k_body(model: str, prompt: str | list[int], max_tokens: int) -> dict[str, Any]:
+    return {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stop": ["Question:", "\n\n\n"],
+    }
+
+
+async def tokenize(url: str, model: str, prompts: list[str]) -> list[list[int]]:
+    """Token ids of each prompt as the completions endpoint sees a string
+    prompt (``/tokenize``, special tokens added: both default to it)."""
+    out = []
+    async with session() as s:
+        for p in prompts:
+            async with s.post(f"{url}/tokenize", json={"model": model, "prompt": p}) as r:
+                r.raise_for_status()
+                out.append(list((await r.json())["tokens"]))
+    return out
+
+
+def cut_pieces(pieces: list[tuple[str, list[int]]], n: int) -> list[tuple[str, list[int]]] | None:
+    """The streamed chunks holding exactly the first ``n`` output tokens;
+    None when there are fewer, or a chunk straddles token ``n`` (its text
+    cannot be split by token)."""
+    out, got = [], 0
+    for text, toks in pieces:
+        if got == n:
+            break
+        if got + len(toks) > n:
+            return None
+        out.append((text, toks))
+        got += len(toks)
+    return out if got == n else None
+
+
+async def run_resume(
+    url: str,
+    model: str,
+    prompts: list[tuple[str, str]],
+    waves: list[list[tuple[int, int]]],
+    concurrency: int,
+    max_tokens: int = 384,
+    xargs: dict[str, Any] | None = None,
+    chains: dict[str, list[list[int]]] | None = None,
+) -> dict[str, Any]:
+    """Replay of another arm's gsm8k pass at that arm's resume points.
+
+    ``waves``: (prompt index, resume tokens R) groups in the arm's schedule
+    order. Per request: a ``max_tokens=1`` request of the first R prompt
+    tokens (pass ``<pass>_prewarm``) puts ``[0, R)`` in vLLM's prefix cache,
+    then the whole prompt runs (streamed) and starts computing at R. A wave
+    starts once every request of the previous wave has its first token
+    (prefill done, so its blocks are in the prefix cache, as they were for
+    the arm's later requests); decoding overlaps later waves.
+
+    ``chains`` (prompt index -> ``[episode, R, start, tokens]``): the
+    episodes after a preemption in the arm. Each runs once the previous
+    request of the prompt finished: a request (pass ``<pass>_ep``,
+    ``rsi_turn`` = episode) of the first ``tokens`` tokens of this replay's
+    own sequence (prompt and output so far), decoding the rest of
+    ``max_tokens``, after a pre-warm of its first R tokens as above; its
+    context is the replay's previous episode, held in vLLM's prefix cache. The prompt's
+    output is then the replay's text up to that point plus the episode's.
+    When the replay cannot form an episode (its output is shorter, or a
+    streamed chunk straddles the episode's first token) the chain stops, the
+    output is None (it counts as differing) and the stage's ``resume_check``
+    reports the episode missing. Returns ``outputs`` per prompt index (None
+    if not in any wave)."""
+    import aiohttp
+
+    sem = asyncio.Semaphore(concurrency)
+    outputs: list[str | None] = [None] * len(prompts)
+    ids = await tokenize(url, model, [p for p, _ in prompts])
+    tail: list[asyncio.Task[None]] = []
+    chains = chains or {}
+
+    async def stream(
+        s: aiohttp.ClientSession, body: dict[str, Any], prefilled: asyncio.Event
+    ) -> list[tuple[str, list[int]]]:
+        """Streamed (text, token ids) chunks of one completion."""
+        pieces: list[tuple[str, list[int]]] = []
+        async with s.post(f"{url}/v1/completions", json=body) as resp:
+            resp.raise_for_status()
+            async for raw in resp.content:
+                line = raw.strip()
+                if not line.startswith(b"data:") or line == b"data: [DONE]":
+                    continue
+                prefilled.set()
+                choices = json.loads(line[5:]).get("choices") or []
+                if choices:
+                    c = choices[0]
+                    pieces.append((c.get("text") or "", list(c.get("token_ids") or [])))
+        return pieces
+
+    async def one(s: aiohttp.ClientSession, i: int, r: int, prefilled: asyncio.Event) -> None:
+        tags = (xargs or {}) | {"rsi_conv": i}
+        try:
+            async with sem:
+                if r > 0:
+                    warm = _gsm8k_body(model, ids[i][:r], 1)
+                    warm["vllm_xargs"] = tags | {"rsi_pass": f"{tags.get('rsi_pass')}_prewarm"}
+                    async with s.post(f"{url}/v1/completions", json=warm) as resp:
+                        resp.raise_for_status()
+                        await resp.read()
+                body = _gsm8k_body(model, ids[i], max_tokens) | {"stream": True}
+                body["vllm_xargs"] = tags
+                chain = chains.get(str(i), [])
+                if chain:
+                    body["return_token_ids"] = True
+                pieces: list[tuple[str, list[int]]] | None = await stream(s, body, prefilled)
+                for k, rk, _start, n in chain:
+                    assert pieces is not None
+                    head = cut_pieces(pieces, n - len(ids[i]))
+                    left = max_tokens - (n - len(ids[i]))
+                    if head is None or left <= 0:
+                        pieces = None
+                        break
+                    seq = ids[i] + [t for _, ts in head for t in ts]
+                    tags_k = tags | {"rsi_turn": k}
+                    if rk > 0:
+                        warm = _gsm8k_body(model, seq[:rk], 1)
+                        warm["vllm_xargs"] = tags_k | {"rsi_pass": f"{tags.get('rsi_pass')}_ep_prewarm"}  # fmt: skip
+                        async with s.post(f"{url}/v1/completions", json=warm) as resp:
+                            resp.raise_for_status()
+                            await resp.read()
+                    ep = _gsm8k_body(model, seq, left) | {"stream": True, "return_token_ids": True}
+                    ep["vllm_xargs"] = tags_k | {"rsi_pass": f"{tags.get('rsi_pass')}_ep"}
+                    pieces = head + await stream(s, ep, asyncio.Event())
+                outputs[i] = None if pieces is None else "".join(t for t, _ in pieces)
+        finally:
+            prefilled.set()  # a failed request must not stall later waves
+
+    t0 = time.monotonic()
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=600)
+    async with session(timeout) as s:
+        for wave in waves:
+            events = []
+            for i, r in wave:
+                ev = asyncio.Event()
+                events.append(ev)
+                tail.append(asyncio.create_task(one(s, i, r, ev)))
+            await asyncio.gather(*(ev.wait() for ev in events))
+            for t in tail:
+                if t.done() and t.exception():
+                    raise t.exception()  # type: ignore[misc]
+        await asyncio.gather(*tail)
+    n = sum(o is not None for o in outputs)
+    correct = sum(
+        o is not None and gsm8k_extract(o) == g for o, (_, g) in zip(outputs, prompts, strict=True)
+    )
+    return {
+        "n": n,
+        "waves": len(waves),
+        "correct": correct,
+        "accuracy": correct / n if n else 0.0,
+        "seconds": time.monotonic() - t0,
+        "outputs": outputs,
+    }
+
+
 async def run_gsm8k(
     url: str,
     model: str,
@@ -112,17 +274,13 @@ async def run_gsm8k(
     tokens: list[dict[str, Any] | None] = [None] * len(prompts)
 
     async def one(session: aiohttp.ClientSession, i: int) -> None:
-        body = {
-            "model": model,
-            "prompt": prompts[i][0],
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "stop": ["Question:", "\n\n\n"],
-        }
+        body = _gsm8k_body(model, prompts[i][0], max_tokens)
         if free_run:
             body |= {"stop": [], "ignore_eos": True}
         if xargs:
-            body["vllm_xargs"] = xargs
+            # ``rsi_conv``: the prompt index (workload position), so a
+            # reference stage can replay a request of this pass by index.
+            body["vllm_xargs"] = xargs | {"rsi_conv": i}
         if logprobs:
             body["logprobs"] = 1
         async with sem:
@@ -131,7 +289,9 @@ async def run_gsm8k(
                 warm.pop("logprobs", None)
                 if xargs:
                     # Its own pass label: the oracle and verdicts never score it.
-                    warm["vllm_xargs"] = xargs | {"rsi_pass": f"{xargs.get('rsi_pass')}_prewarm"}
+                    warm["vllm_xargs"] = body["vllm_xargs"] | {
+                        "rsi_pass": f"{xargs.get('rsi_pass')}_prewarm"
+                    }
                 async with session.post(f"{url}/v1/completions", json=warm) as r:
                     r.raise_for_status()
                     await r.read()

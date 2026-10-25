@@ -13,7 +13,8 @@ test (MultiConnector) or alone (baseline) and records:
   refuses to start when they disagree.
 - ``requests.jsonl``: per request prompt length, computed tokens at finish,
   schedule *episodes* (first schedule and every resume after preemption:
-  step, local prefix-cache hit, computed tokens at start), *progress* (the
+  step, local prefix-cache hit, computed tokens at start; ``episode_tokens``:
+  the request's token count when each episode is scheduled), *progress* (the
   scheduler steps at which computed tokens crossed a ``key_tokens`` boundary,
   with the computed count after that step) and the prefix-key chain at
   ``key_tokens`` granularity (gcd of group block sizes). ``rsi.gates.oracle``
@@ -312,6 +313,7 @@ class ProbeMetadata(KVConnectorMetadata):
 class _Live:
     tags: dict[str, Any]
     episodes: list[list[Any]] = field(default_factory=list)  # [step, local_hit, start]
+    episode_tokens: list[int | None] = field(default_factory=list)  # per episode
     progress: list[list[int]] = field(default_factory=list)  # [step, computed_after]
     request: Any = None  # vLLM's Request (token ids for state keys)
     # Mamba state digests: [episode, covered, group, "offer" | "start" | skip reason]
@@ -744,6 +746,10 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
     def _episode(self, rid: str, start: int) -> None:
         live = self._live.setdefault(rid, _Live(tags={}))
         live.episodes.append([self._step, self._local_hit.pop(rid, None), start])
+        # Tokens the episode is scheduled with (prompt + output so far): a
+        # resumed episode's prompt, for the resume replay.
+        req = live.request
+        live.episode_tokens.append(len(req.all_token_ids) if req is not None else None)
 
     def _advance(self, rid: str, before: int, n: int) -> None:
         live = self._live.get(rid)
@@ -797,6 +803,7 @@ class RsiProbe(KVConnectorBase_V1, SupportsHMA):
                     "local_hit": first[1],
                     "first_computed": first[2],
                     "episodes": live.episodes,
+                    "episode_tokens": live.episode_tokens,
                     "progress": live.progress,
                     **({"states": live.states} if self._state_groups else {}),
                     "preempt_digested": live.preempt_digested,

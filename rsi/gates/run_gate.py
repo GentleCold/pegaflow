@@ -14,7 +14,7 @@ Arms:
   baseline                 vLLM + RsiProbe only (no PegaFlow)
   old                      reference connector (pegaflow.connector:PegaKVConnector), black box
   native                   reference: vLLM's OffloadingConnector (CPU offload), record only
-  lmcache                  reference: LMCacheConnectorV1, local CPU backend only, record only
+  lmcache                  reference: LMCache in-process connector, local CPU backend only, record only
   selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k and preempt only
   <module>:<Class>         connector under test
 
@@ -155,6 +155,16 @@ PREEMPT_OUT = 640
 PREEMPT_SPAN = 2048
 PREEMPT_REQS = 4
 MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
+# Split-variant models, every arm with a gsm8k stage: a baseline stage
+# ``baseline/resume-<label>`` replays the arm's warm pass at the arm's own
+# resume points (``resume_plan``), so warm KV computed from wherever the arm
+# resumed (an LMCache 256-token chunk end, not the last full block) has a
+# same-split, same-context reference, and the arm's warm completions have a
+# same-split reference (``resume_differ``).
+RESUME_PASS = "resume"
+# A later episode of a request the arm's vLLM preempted (S6, ``resume_plan``).
+RESUME_EP_PASS = f"{RESUME_PASS}_ep"
+RESUME_PREFIX = "resume-"
 
 
 def free_port() -> int:
@@ -833,16 +843,27 @@ _RECORD_ONLY = ("old", "native", "lmcache")
 # Reference stores without a PegaFlow server (a CPU cache inside vLLM).
 _OFFLOAD = ("native", "lmcache")
 LMCACHE_OVERLAY = Path.home() / "kexi" / "overlays" / "lmcache"
+LMCACHE_CONNECTOR = "LMCacheConnectorV1Dynamic"
+LMCACHE_CONNECTOR_MODULE = "lmcache.integration.vllm.lmcache_connector_v1"
+# ``LMCacheEngine.__init__`` logs its whole config on this line (0.5.6 and dev).
+LMCACHE_CONFIG_MARK = "Creating LMCacheEngine with config:"
+# One line per local CPU backend LMCache creates (0.5.6 and #4467).
+LMCACHE_BACKEND_MARK = "Created backend: LocalCPUBackend"
+# LMCache's default chunk (tokens): the primary reference config. Any other
+# value (e.g. the vLLM block size, to isolate chunk granularity) is a
+# secondary config and makes the run non-official.
+LMCACHE_CHUNK = 256
 
 
-def lmcache_env(cpu_bytes: int) -> dict[str, str]:
+def lmcache_env(cpu_bytes: int, chunk: int = LMCACHE_CHUNK) -> dict[str, str]:
     """LMCache config (env, read by ``LMCacheEngineConfig.from_env``): local
     CPU backend only, sized to exactly ``cpu_bytes``. ``max_local_cpu_size``
     is GiB and LMCache allocates ``int(GiB * 1024**3)`` bytes; ``bytes / 2**30``
-    is exact in a float and ``repr`` round-trips it. Chunk size stays at
-    LMCache's default (256 tokens); telemetry is off. Disk and remote stay at
-    their defaults (None); the caller drops any inherited ``LMCACHE_*``."""
+    is exact in a float and ``repr`` round-trips it. Chunk size ``chunk``
+    tokens (default LMCache's own 256); telemetry is off. Disk and remote stay
+    at their defaults (None); the caller drops any inherited ``LMCACHE_*``."""
     return {
+        "LMCACHE_CHUNK_SIZE": str(chunk),
         "LMCACHE_LOCAL_CPU": "True",
         "LMCACHE_MAX_LOCAL_CPU_SIZE": repr(cpu_bytes / (1 << 30)),
         "LMCACHE_MAX_LOCAL_DISK_SIZE": "0",
@@ -851,15 +872,100 @@ def lmcache_env(cpu_bytes: int) -> dict[str, str]:
     }
 
 
-def lmcache_config(log: Path, cpu_bytes: int) -> dict[str, Any]:
-    """What the lmcache arm ran with: the env we set and LMCache's own
-    ``LMCache Configuration:`` log line (chunk size, backends, CPU GiB)."""
-    line = next((x for x in log.read_text().splitlines() if "LMCache Configuration:" in x), None)
+def lmcache_dists(overlay: Path) -> list[str]:
+    """The lmcache dist(s) an overlay holds (``<name>-<version>``)."""
+    return sorted(p.name.removesuffix(".dist-info") for p in overlay.glob("lmcache-*.dist-info"))
+
+
+def lmcache_storing_ranks(spec: dict[str, Any] | None, tp: int) -> int | None:
+    """LMCache CPU backends a TP group creates (S1). LMCache sizes its local
+    CPU backend per worker; on an MLA model (one latent KV, the same on
+    every rank) only the first rank stores ("save only first rank"), else
+    every rank stores its own shard. None: unknown (no spec dump at TP > 1)."""
+    if tp == 1:
+        return 1
+    if spec is None:
+        return None
+    groups = (spec.get("kv_cache_config") or {}).get("groups", [])
+    mla = bool(groups) and all(
+        "MLAAttentionSpec" in (g.get("spec", {}).get("mro") or []) for g in groups
+    )
+    return 1 if mla else tp
+
+
+def lmcache_config(
+    log: Path,
+    cpu_bytes: int,
+    overlay: Path,
+    chunk: int = LMCACHE_CHUNK,
+    ranks: int = 1,
+) -> dict[str, Any]:
+    """What the lmcache arm ran with: the overlay and its lmcache dist (the
+    version names the source commit for a source build), the connector, the
+    env we set (each of ``ranks`` storing ranks gets ``cpu_bytes // ranks``),
+    LMCache's own config log line (``LMCACHE_CONFIG_MARK``: chunk size,
+    backends, CPU GiB) and how many local CPU backends it logged creating."""
+    text = log.read_text().splitlines()
+    line = next((x for x in text if LMCACHE_CONFIG_MARK in x), None)
+    per_rank = cpu_bytes // ranks
     return {
+        "overlay": str(overlay),
+        "dist": lmcache_dists(overlay),
+        "connector": f"{LMCACHE_CONNECTOR_MODULE}:{LMCACHE_CONNECTOR}",
         "cpu_bytes": cpu_bytes,
-        "env": lmcache_env(cpu_bytes),
-        "logged": line.split("LMCache Configuration:", 1)[1].strip()[:4000] if line else None,
+        "storing_ranks": ranks,
+        "per_rank_bytes": per_rank,
+        "backends": sum(LMCACHE_BACKEND_MARK in x for x in text),
+        "env": lmcache_env(per_rank, chunk),
+        "logged": line.split(LMCACHE_CONFIG_MARK, 1)[1].strip()[:4000] if line else None,
     }
+
+
+def lmcache_size_problem(cfg: dict[str, Any]) -> str | None:
+    """S1, fail-closed: LMCache must have created exactly the storing ranks'
+    backends, so its total CPU store is ``backends * per_rank_bytes <= C``."""
+    n, per, c = cfg["backends"], cfg["per_rank_bytes"], cfg["cpu_bytes"]
+    if n != cfg["storing_ranks"] or n * per > c:
+        return (
+            f"lmcache created {n} local CPU backends of {per} B (expected "
+            f"{cfg['storing_ranks']}, total <= {c} B)"
+        )
+    return None
+
+
+def lmcache_build_problem(gate: dict[str, Any], dists: list[str]) -> str | None:
+    """S2: the lmcache build of a model's reference numbers is declared in
+    its gate.json (``lmcache_dist``: ``<name>-<version>`` of the overlay's
+    dist, e.g. PR #4467 on Qwen3-4B, 0.5.6 on DeepSeek-V2-Lite where #4467
+    crashes on MLA). The overlay must hold exactly that dist; a model
+    without a declared build has no official lmcache arm."""
+    want = gate.get("lmcache_dist")
+    if not want:
+        return "lmcache arm: gate.json declares no lmcache_dist for this model"
+    if dists != [want]:
+        return f"lmcache overlay holds {dists}, gate.json lmcache_dist is {want}"
+    return None
+
+
+def lmcache_build_verdict(
+    per_wl: dict[str, dict[str, Any]], gate: dict[str, Any]
+) -> dict[str, Any]:
+    """G0.lmcache_build (lmcache arm): every stage recorded the overlay dist
+    gate.json declares (``lmcache_build_problem``) and a CPU store of at most
+    C (``lmcache_size_problem``; a record from before ``storing_ranks`` is
+    judged on the dist only)."""
+    bad: dict[str, str] = {}
+    for wl, r in per_wl.items():
+        cfg = r.get("lmcache")
+        if cfg is None:
+            bad[wl] = "no lmcache config recorded"
+            continue
+        msg = lmcache_build_problem(gate, [d.removesuffix(".dist-info") for d in cfg.get("dist", [])])  # fmt: skip
+        if msg is None and "storing_ranks" in cfg:
+            msg = lmcache_size_problem(cfg)
+        if msg:
+            bad[wl] = msg
+    return {"pass": bool(per_wl) and not bad, "want": gate.get("lmcache_dist"), "bad": bad}
 
 
 def arm_kind(arm: str) -> str:
@@ -932,8 +1038,16 @@ def kv_transfer_config(
             "kv_connector_extra_config": {"cpu_bytes_to_use": cpu_bytes},
         }
     elif kind == "lmcache":
-        # LMCache's vLLM connector; sized by env (``lmcache_env``).
-        under_test = {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both"}
+        # LMCache's in-process vLLM connector, loaded from the overlay by
+        # module path (LMCache's documented dynamic connector). vLLM's builtin
+        # ``LMCacheConnectorV1`` imports ``lmcache.integration.vllm.
+        # vllm_v1_adapter``, which LMCache dev moved under ``lmcache.inprocess``;
+        # this path exists in 0.5.6 and in dev. Sized by env (``lmcache_env``).
+        under_test = {
+            "kv_connector": LMCACHE_CONNECTOR,
+            "kv_connector_module_path": LMCACHE_CONNECTOR_MODULE,
+            "kv_role": "kv_both",
+        }
     else:
         if kind == "selftest":
             module, cls = SELFTEST.split(":")
@@ -976,6 +1090,8 @@ def vllm_server(
     """``num_gpu_blocks``: the stage's own GPU KV pool (preempt), else
     ``--num-gpu-blocks``. ``gsm8k``: the stage also gets gate.json's
     ``gsm8k_vllm_args`` (the cross-arm exact comparisons run there)."""
+    if arm_kind(arm) == "lmcache" and not getattr(args, "lmcache_ranks", None):
+        raise ValueError("lmcache: storing ranks unknown (TP > 1 without a committed spec dump)")
     lease = PortLease(1, block=VLLM_PORT_BLOCK, log=log)
     (port,) = lease.ports
     env = os.environ.copy()
@@ -1027,7 +1143,8 @@ def vllm_server(
         # LMCache lives in an overlay (its pins would downgrade the shared
         # venv); only this arm's vLLM sees it.
         env["PYTHONPATH"] = f"{env['PYTHONPATH']}:{args.lmcache_overlay}"
-        env |= lmcache_env(cpu_bytes)
+        # S1: LMCache sizes each storing rank's CPU backend; together they hold C.
+        env |= lmcache_env(cpu_bytes // args.lmcache_ranks, args.lmcache_chunk_size)
     cmd = [
         "vllm",
         "serve",
@@ -1185,6 +1302,109 @@ def match_locals(reqs: list[dict[str, Any]], ref: dict[str, int] | None) -> list
     return out
 
 
+def resume_stage_needed(gate: dict[str, Any], arms: list[str]) -> bool:
+    """Split-variant models only: every arm's gsm8k warm pass gets a baseline
+    replay at its resume points (needs the baseline arm)."""
+    return not gate.get("split_invariant", True) and "baseline" in arms
+
+
+def resume_plan(reqs: list[dict[str, Any]], n: int) -> dict[str, Any]:
+    """An arm's gsm8k warm pass as the baseline's ``resume`` stage replays it.
+
+    Per warm request (prompt index ``conv``), from its first schedule episode
+    ``[step, local, start]``: the arm started computing at ``start`` with
+    ``[0, local)`` from vLLM's prefix cache (filled by its earlier warm
+    requests) and ``[local, start)`` loaded by the connector. The replay
+    pre-warms ``[0, start)`` (only when ``start > local``: the local part
+    comes from the replay's own earlier requests, as in the arm), in waves of
+    the arm's schedule order (same ``step`` = same wave). Wave rows:
+    ``[prompt, pre-warm R, start, prompt_len]``.
+
+    A request vLLM preempted has later episodes ``k`` (S6): ``chains[prompt]``
+    lists ``[k, R_k, start_k, tokens_k]`` (``tokens_k``: the request's length
+    when episode ``k`` was scheduled, ``episode_tokens``; ``R_k`` the
+    pre-warm point, by the same rule). The replay runs each right after the
+    previous one finishes, as a request of the first ``tokens_k`` tokens of
+    the replay's own sequence so far, so its context is the replay's
+    previous episode (vLLM's local hit, as in the arm when the preempted
+    request's blocks were still cached). ``problems``: warm
+    requests without a usable prompt index or episode lengths (the plan then
+    fails closed)."""
+    rows, problems, seen = [], [], set()
+    chains: dict[str, list[list[int]]] = {}
+    for r in reqs:
+        if r.get("pass") != "warm" or not r.get("episodes"):
+            continue
+        i = r.get("conv")
+        if not isinstance(i, int) or not 0 <= i < n or i in seen:
+            problems.append(f"warm request {r.get('req_id')}: prompt index {i!r}")
+            continue
+        seen.add(i)
+        eps = r["episodes"]
+        step, local, start = eps[0]
+        rows.append((step, i, start, local or 0, r.get("prompt_len")))
+        if len(eps) > 1:
+            raw = r.get("episode_tokens")
+            toks = raw if isinstance(raw, list) else []
+            plen = r.get("prompt_len") or 0
+            if len(toks) != len(eps) or any(not isinstance(t, int) or t < plen for t in toks[1:]):
+                problems.append(f"warm request {r.get('req_id')}: episode lengths {raw!r}")
+                continue
+            chains[str(i)] = [
+                [k, s if s > (lk or 0) else 0, s, toks[k]]
+                for k in range(1, len(eps))
+                for _, lk, s in (eps[k],)
+            ]
+    waves: list[list[list[int]]] = []
+    last = None
+    for step, i, start, local, plen in sorted(rows):
+        if step != last:
+            waves.append([])
+            last = step
+        waves[-1].append([i, start if start > local else 0, start, plen])
+    if len(seen) != n:
+        problems.append(f"{len(seen)} of {n} prompts have a warm request")
+    return {"waves": waves, "chains": chains, "problems": problems}
+
+
+def resume_check(plan: dict[str, Any], reqs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Did the replay resume where the arm did? Per planned prompt: the
+    replayed ``resume`` request's prompt length and first-episode start vs
+    the arm's (a differing start leaves that request's computed blocks
+    without a same-split reference: unjudged, never matched). Per planned
+    later episode (``chains``, S6): the ``resume_ep`` request of that
+    episode (``turn``), its prompt length vs the arm's episode length and its
+    start vs the arm's episode start (``episode_*``, ``[prompt, episode]``)."""
+    got = {
+        r["conv"]: r for r in reqs if r.get("pass") == RESUME_PASS and r.get("episodes")
+    }  # fmt: skip
+    got_ep = {
+        (r["conv"], r.get("turn")): r
+        for r in reqs
+        if r.get("pass") == RESUME_EP_PASS and r.get("episodes")
+    }  # fmt: skip
+    planned = [x for w in plan["waves"] for x in w]
+    missing = [i for i, *_ in planned if i not in got]
+    plen = [i for i, _, _, p in planned if i in got and got[i].get("prompt_len") != p]
+    start = [i for i, _, s, _ in planned if i in got and got[i]["episodes"][0][2] != s]
+    eps = [(int(i), k, s, n) for i, rows in plan.get("chains", {}).items() for k, _, s, n in rows]
+    ep_missing = [[i, k] for i, k, _, _ in eps if (i, k) not in got_ep]
+    ep_plen = [[i, k] for i, k, _, n in eps if (i, k) in got_ep and got_ep[(i, k)].get("prompt_len") != n]  # fmt: skip
+    ep_start = [[i, k] for i, k, s, _ in eps if (i, k) in got_ep and got_ep[(i, k)]["episodes"][0][2] != s]  # fmt: skip
+    return {
+        "planned": len(planned),
+        "waves": len(plan["waves"]),
+        "missing": missing,
+        "prompt_len_differs": plen,
+        "start_differs": start,
+        "episodes_planned": len(eps),
+        "episode_missing": ep_missing,
+        "episode_prompt_len_differs": ep_plen,
+        "episode_start_differs": ep_start,
+        "plan_problems": plan["problems"],
+    }
+
+
 def run_arm_workload(
     args,
     gate,
@@ -1193,10 +1413,15 @@ def run_arm_workload(
     out: Path,
     capacity: int = 0,
     ref_local: dict[str, int] | None = None,
+    resume_from: Path | None = None,
+    resume_limit: int | None = None,
 ) -> dict[str, Any]:
     """``capacity`` (``cap*`` workloads): store bytes, for PegaFlow's pool or
     the native arm's CPU cache. Other workloads use ``--pool-size``.
-    ``ref_local``: baseline cap local hits (``reference_locals``)."""
+    ``ref_local``: baseline cap local hits (``reference_locals``).
+    ``resume_from`` (baseline, workload ``resume-<label>``): the arm's gsm8k
+    probe dir, whose warm pass this stage replays (``resume_plan``) over the
+    arm's ``resume_limit`` gsm8k prompts."""
     out.mkdir(parents=True, exist_ok=True)
     probe = out / "probe"
     if probe.exists():
@@ -1208,12 +1433,16 @@ def run_arm_workload(
         d.mkdir(parents=True)
     kind = arm_kind(arm)
     gsm = workload == "gsm8k"
+    resume = workload.startswith(RESUME_PREFIX)
+    if resume and (kind != "baseline" or resume_from is None):
+        raise ValueError("a resume stage is a baseline stage replaying an arm's gsm8k probe")
     pre = workload == PREEMPT
     cap = workload.startswith("cap")
     if cap and capacity <= 0 and kind != "baseline":
         raise ValueError("cap workload needs a capacity")
     store_bytes = capacity if cap else parse_size(args.pool_size)
-    invariant = gsm and bool(gate.get("batch_invariant"))
+    # The resume replay is judged like the gsm8k stage it references.
+    invariant = (gsm or resume) and bool(gate.get("batch_invariant"))
     split_inv = bool(gate.get("split_invariant", True))
     result: dict[str, Any] = {
         "arm": arm,
@@ -1240,11 +1469,20 @@ def run_arm_workload(
             out / "vllm.log",
             store_bytes if kind in _OFFLOAD else 0,
             args.preempt_blocks if pre else 0,
-            gsm8k=gsm,
+            gsm8k=gsm or resume,
         )
         stack.enter_context(cm)
         if kind == "lmcache":
-            result["lmcache"] = lmcache_config(out / "vllm.log", store_bytes)
+            result["lmcache"] = lmcache_config(
+                out / "vllm.log",
+                store_bytes,
+                Path(args.lmcache_overlay),
+                args.lmcache_chunk_size,
+                args.lmcache_ranks,
+            )
+            bad = lmcache_size_problem(result["lmcache"])
+            if bad:
+                raise RuntimeError(f"{arm}/{workload}: {bad}")
         if cap and pf_http:
             # What the server actually allocated: must not exceed C.
             m = asyncio.run(workloads.scrape(f"http://127.0.0.1:{pf_http}", ("pegaflow",)))
@@ -1266,6 +1504,12 @@ def run_arm_workload(
                 # One request at a time, warm (after reset + poison): the
                 # batch composition every arm shares, where G2.gsm8k gates.
                 names += [ALONE_REF]
+        elif resume:
+            assert resume_from is not None
+            prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, resume_limit)
+            plan = resume_plan(oracle.load_requests(resume_from / "requests.jsonl"), len(prompts))
+            result["resume_plan"] = plan
+            names = [RESUME_PASS]
         elif pre:
             prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, PREEMPT_N)
             names = ["cold", "warm"]
@@ -1325,6 +1569,19 @@ def run_arm_workload(
                 (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
                 if "tokens" in res:
                     (gdir / f"{name}-tokens.json").write_text(json.dumps(res.pop("tokens")))
+            elif resume:
+                res = asyncio.run(
+                    workloads.run_resume(
+                        url,
+                        "m",
+                        prompts,
+                        [[(i, r) for i, r, *_ in w] for w in plan["waves"]],
+                        args.concurrency,
+                        xargs={"rsi_pass": name, "rsi_digest": "full"},
+                        chains=plan["chains"],
+                    )
+                )
+                (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
             else:
                 # Replay: digest a conversation sample in the untimed passes;
                 # all turns of a sampled conversation, so its references are
@@ -1398,6 +1655,8 @@ def run_arm_workload(
     result["load_errors"] = (
         [json.loads(x) for x in errs.read_text().splitlines()] if errs.exists() else []
     )
+    if resume:
+        result["resume_check"] = resume_check(result["resume_plan"], reqs)
     result["digest_self"] = digest_compare.compare(probe, probe, invariant, split_inv)
     if kind == "selftest":
         result["sabotage"] = sabotage_counts(out / SABOTAGE_DIR)
@@ -1579,7 +1838,8 @@ def gate_args_verdict(
     results: dict[str, dict[str, Any]], gate: dict[str, Any] | None
 ) -> dict[str, Any]:
     """G0.vllm_args: every stage's vLLM ran with gate.json's ``vllm_args``
-    in force, and every gsm8k stage also with ``gsm8k_vllm_args`` (the last
+    in force, and every gsm8k stage and every resume stage (a replay of an
+    arm's gsm8k warm pass) also with ``gsm8k_vllm_args`` (the last
     occurrence of each flag carries the gate's value, so a later
     ``--vllm-arg`` cannot silently override it)."""
     gate = gate or {}
@@ -1595,7 +1855,7 @@ def gate_args_verdict(
             if cmd is None:
                 bad[f"{label}/{wl}"] = ["vllm command not recorded"]
                 continue
-            want = every + (gsm if wl == "gsm8k" else [])
+            want = every + (gsm if wl == "gsm8k" or wl.startswith(RESUME_PREFIX) else [])
             got = dict(_flag_values(cmd, names))  # last occurrence wins, as in argparse
             miss = [f"{f} {v}" for f, v in want if f not in got or got[f] != v]
             if miss:
@@ -1676,8 +1936,8 @@ def g0_provenance(
 # ------------------------------------------------------------- verdicts
 
 
-def _outputs(run_dir: Path, label: str, name: str) -> list[str] | None:
-    f = run_dir / GATE_DIR / label / "gsm8k" / f"{name}-outputs.json"
+def _outputs(run_dir: Path, label: str, name: str, wl: str = "gsm8k") -> list[Any] | None:
+    f = run_dir / GATE_DIR / label / wl / f"{name}-outputs.json"
     return json.loads(f.read_text()) if f.exists() else None
 
 
@@ -1914,6 +2174,64 @@ def split_differ(
     pairs = zip(ctrl["split_outputs"], got, ctrl["aligned"], strict=False)
     diff = [(a != b, al) for a, b, al in pairs]
     return sum(d for d, al in diff if not al), sum(d for d, al in diff if al)
+
+
+def resume_differ(
+    check: dict[str, Any],
+    plan: dict[str, Any],
+    ref: list[Any] | None,
+    got: list[str] | None,
+    align: int,
+) -> tuple[int | None, int | None]:
+    """Warm completions vs the baseline's replay at the arm's resume points
+    (``split_differ``'s shape: (differing among checked prompts, differing
+    among exempt ones)). Exempt: an aligned prompt (``prompt_len % align ==
+    0``) whose replay could not resume where the arm did (a connector's hit
+    may end inside the last block, vLLM's prefix cache cannot). Every other
+    prompt is checked; one without a replayed completion (missing, or not
+    resumed at the arm's point) counts as differing (fail closed, S7)."""
+    if got is None or ref is None or plan["problems"]:
+        return None, None
+    plen = {i: p for w in plan["waves"] for i, _, _, p in w}
+    unreplayed = set(check["missing"]) | set(check["start_differs"]) | set(check["prompt_len_differs"])  # fmt: skip
+    for k in ("episode_missing", "episode_start_differs", "episode_prompt_len_differs"):
+        unreplayed |= {i for i, _ in check.get(k, [])}  # a later episode replayed elsewhere (S6)
+    checked = exempt = 0
+    for i, out in enumerate(got):
+        p = plen.get(i)
+        aligned = bool(p) and p % align == 0
+        if i in unreplayed and aligned:
+            exempt += i < len(ref) and ref[i] != out
+            continue
+        checked += i in unreplayed or i >= len(ref) or ref[i] != out
+    return checked, exempt
+
+
+def _resume_verdict(r: dict[str, Any] | None) -> dict[str, Any]:
+    """``G2.resume_reference``: the baseline replay of the arm's warm pass ran
+    and is self-consistent (its local hits equal its computed copies). How
+    many requests resumed elsewhere than the arm is reported; their computed
+    blocks have no same-split copy and count as unjudged in the coverage."""
+    if r is None:
+        return {"pass": False, "reason": "no baseline replay of this arm's resume points"}
+    d = _digest_verdict(r.get("digest_self"), None)
+    c = r.get("resume_check", {})
+    return {
+        "pass": d["pass"] and not c.get("plan_problems"),
+        "digest_self": d["pass"],
+        **{k: c.get(k) for k in ("planned", "waves", "episodes_planned", "plan_problems")},
+        **{
+            k: len(c.get(k) or [])
+            for k in (
+                "missing",
+                "start_differs",
+                "prompt_len_differs",
+                "episode_missing",
+                "episode_start_differs",
+                "episode_prompt_len_differs",
+            )
+        },
+    }
 
 
 def _outputs_verdict(
@@ -2501,7 +2819,12 @@ def verdicts(
         else {"pass": True, "na": "no cap workload"},
         **({"G2.preempt": _preempt_verdict(base[PREEMPT], None)} if PREEMPT in base else {}),
     }
-    base_errors = {wl: r["error"] for wl, r in base.items() if "error" in r}
+    # A failed resume stage belongs to the arm it serves (``G2.resume_reference``).
+    base_errors = {
+        wl: r["error"]
+        for wl, r in base.items()
+        if "error" in r and not wl.startswith(RESUME_PREFIX)
+    }
     if base_errors:
         v["baseline"]["errors"] = base_errors
 
@@ -2517,11 +2840,26 @@ def verdicts(
         if pegaflow_dirs is not None:
             mod, root = connectors.get(label, (None, None))
             g["G0.provenance"] = g0_provenance(run_dir, label, pegaflow_dirs.get(label), mod, root)
+        if kind == "lmcache":
+            g["G0.lmcache_build"] = lmcache_build_verdict(per_wl, gate or {})
         g["G2.digest_self.gsm8k"] = _digest_verdict(gsm and gsm["digest_self"], MIN_JUDGED_GSM8K)
         g["G2.digest_groups"] = digest_groups(run_dir / label / "gsm8k" / "probe")
+        # Split-variant: the baseline's replay of this arm's warm resume
+        # points (``resume_plan``), when the run has one.
+        rl = f"{RESUME_PREFIX}{label}"
+        res_r = base.get(rl)
+        res_probe = run_dir / "baseline" / rl / "probe"
+        resumed = (
+            not split_inv
+            and res_r is not None
+            and "error" not in res_r
+            and (res_probe / "requests.jsonl").exists()
+        )
+        if not split_inv:
+            g["G2.resume_reference"] = _resume_verdict(res_r if resumed else None)
         vs_base = (
             digest_compare.compare(
-                base_probe,
+                [base_probe, res_probe] if resumed else base_probe,
                 run_dir / label / "gsm8k" / "probe",
                 invariant,
                 split_inv,
@@ -2532,11 +2870,24 @@ def verdicts(
         )
         g["G2.digest_vs_baseline.gsm8k"] = _digest_verdict(vs_base, MIN_JUDGED_GSM8K)
         # Split-variant: cold computed KV is judged against baseline cold,
-        # warm against the baseline's split pass (same split).
+        # warm against the baseline's replay at the arm's resume points (else
+        # its split pass: the last full block).
         _coverage_verdict(g["G2.digest_vs_baseline.gsm8k"], vs_base, ("cold", "warm"))
         diffs = {p: _differ(ref_cold, _outputs(run_dir, label, p)) for p in ("cold", "warm")}
-        split_diffs = split_differ(ctrl, _outputs(run_dir, label, "warm"))
+        if resumed:
+            assert res_r is not None
+            split_diffs = resume_differ(
+                res_r["resume_check"],
+                res_r["resume_plan"],
+                _outputs(run_dir, "baseline", RESUME_PASS, rl),
+                _outputs(run_dir, label, "warm"),
+                _hit_alignment(run_dir),
+            )
+        else:
+            split_diffs = split_differ(ctrl, _outputs(run_dir, label, "warm"))
         g["G2.gsm8k_outputs"] = _outputs_verdict(diffs, invariant, split_inv, split_diffs)
+        if resumed:
+            g["G2.gsm8k_outputs"]["warm_reference"] = rl
         if PREEMPT in per_all:
             g["G2.preempt"] = _preempt_verdict(per_all[PREEMPT], MIN_JUDGED_GSM8K)
         g["G2.gsm8k"] = gsm8k_accuracy_verdict(gsm, base.get("gsm8k"), batch_inv)
@@ -2564,6 +2915,9 @@ def verdicts(
                     "G2.gsm8k",
                     "G2.digest_groups",
                     *(("G2.preempt",) if "G2.preempt" in g else ()),
+                    # Split-variant: warm computed KV and outputs are judged
+                    # against the replay at the arm's resume points (S5).
+                    *(("G2.resume_reference",) if not split_inv else ()),
                 )
                 g["pass"] = all(g[k]["pass"] for k in need)
                 g["expect"] = "pass every G2 check"
@@ -3004,7 +3358,12 @@ def contamination(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def official_problems(
-    args, arms: list[str], wls: list[str], gate_file: Path, committed: Path
+    args,
+    arms: list[str],
+    wls: list[str],
+    gate_file: Path,
+    committed: Path,
+    gate: dict[str, Any] | None = None,
 ) -> list[str]:
     def same(k: str, v: Any) -> bool:
         got = getattr(args, k)
@@ -3034,6 +3393,12 @@ def official_problems(
         out.append(f"workload {PREEMPT} missing (required on models with a Mamba state group)")
     if args.num_gpu_blocks or args.vllm_arg:
         out.append("--num-gpu-blocks / --vllm-arg override")
+    if "lmcache" in kinds and args.lmcache_chunk_size != LMCACHE_CHUNK:
+        out.append(f"lmcache_chunk_size={args.lmcache_chunk_size} (official {LMCACHE_CHUNK})")
+    if "lmcache" in kinds:
+        bad = lmcache_build_problem(gate or {}, lmcache_dists(Path(args.lmcache_overlay)))
+        if bad:
+            out.append(bad)
     for a in arms:
         mod = a.split(":")[0]
         if arm_kind(a) == "under_test" and not (mod == "pegaflow" or mod.startswith("pegaflow.")):
@@ -3306,10 +3671,16 @@ def _teardown_failed(e: BaseException) -> bool:
     return False
 
 
-def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
+def run_stage(
+    args, gate, arm: str, wl: str, out: Path, record_only: bool | None = None, **kw
+) -> dict[str, Any]:
     """Run one stage; a reference arm's crash is recorded, not fatal, unless
     its teardown failed (the next stage would share a live GPU) or a stop
-    signal was received (whatever the exception became on the way)."""
+    signal was received (whatever the exception became on the way).
+    ``record_only``: override (a baseline ``resume`` stage serving a
+    reference arm is recorded like that arm)."""
+    if record_only is None:
+        record_only = arm_kind(arm) in _RECORD_ONLY
     check_stop()
     since = len(_LEASES)
     try:
@@ -3325,7 +3696,7 @@ def run_stage(args, gate, arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
             err["port_leases"] = release_leases(since)
             (gdir / "stage-error.json").write_text(json.dumps(err, indent=1))
         check_stop()
-        if arm_kind(arm) not in _RECORD_ONLY or _teardown_failed(e):
+        if not record_only or _teardown_failed(e):
             raise
         print(f"[{arm}/{wl}] reference arm failed: {e!r}", flush=True)
         return {"arm": arm, "workload": wl, "error": f"{type(e).__name__}: {e}"[:2000]}
@@ -3371,6 +3742,12 @@ def main(argv: list[str] | None = None) -> int:
         "--lmcache-overlay",
         default=str(LMCACHE_OVERLAY),
         help="dir with lmcache + its missing pure deps, on PYTHONPATH of the lmcache arm only",
+    )
+    ap.add_argument(
+        "--lmcache-chunk-size",
+        type=int,
+        default=LMCACHE_CHUNK,
+        help=f"lmcache arm chunk tokens (official {LMCACHE_CHUNK}, LMCache's default)",
     )
     ap.add_argument(
         "--under-test-path",
@@ -3425,6 +3802,11 @@ def main(argv: list[str] | None = None) -> int:
     model_dir = REPO / "docs" / "rsi" / "models" / Path(args.model).name
     gate_file, committed = model_dir / "gate.json", model_dir / "spec.json"
     gate = json.loads(gate_file.read_text()) if gate_file.exists() else {}
+    # S1: LMCache's storing ranks (MLA: the first only), from the committed
+    # dump; None at TP > 1 without one fails the lmcache arm's stages.
+    args.lmcache_ranks = lmcache_storing_ranks(
+        json.loads(committed.read_text()) if committed.exists() else None, args.tp
+    )
     args.preempt_blocks = 0
     if PREEMPT in args.workloads.split(","):
         if not committed.exists():
@@ -3475,6 +3857,9 @@ def main(argv: list[str] | None = None) -> int:
         return run_stage(args, gate, arm, wl, out, **kw)
 
     measured_u: dict[str, dict[str, Any]] = {}
+    # Split-variant: every arm's gsm8k warm pass gets a baseline replay at its
+    # resume points (needs the baseline arm, which always runs first).
+    needs_resume = resume_stage_needed(gate, arms)
 
     for arm in arms:
         kind = arm_kind(arm)
@@ -3504,6 +3889,25 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         pool_checks.append(measured_u[wl])
                 results.setdefault(label, {})[wl] = stage(arm, wl, run_dir / label / wl)
+                if wl == "gsm8k" and kind not in ("plain", "baseline") and needs_resume:
+                    # Same-split references at this arm's own warm resume points.
+                    rl = f"{RESUME_PREFIX}{label}"
+                    probe = run_dir / label / wl / "probe"
+                    if "error" in results[label][wl] or not (probe / "requests.jsonl").exists():
+                        results["baseline"][rl] = {
+                            "arm": "baseline",
+                            "workload": rl,
+                            "error": f"no {label} gsm8k probe to replay",
+                        }
+                    else:
+                        results["baseline"][rl] = stage(
+                            "baseline",
+                            rl,
+                            run_dir / "baseline" / rl,
+                            record_only=kind in _RECORD_ONLY,
+                            resume_from=probe,
+                            resume_limit=SELFTEST_LIMIT if kind == "selftest" else args.gsm8k_limit,
+                        )
                 continue
             if kind == "baseline":
                 spec_file = cap_plan_spec(run_dir / label, wls, committed)
@@ -3539,7 +3943,7 @@ def main(argv: list[str] | None = None) -> int:
     def strip(r: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
-    problems = official_problems(args, arms, wls, gate_file, committed)
+    problems = official_problems(args, arms, wls, gate_file, committed, gate)
     contaminated = contamination(results)
     problems += [
         f"contaminated: {c['arm']} replay/{c['pass']} p99 TTFT {c['ttft_p99']:.3g}s > "

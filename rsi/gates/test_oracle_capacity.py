@@ -419,8 +419,85 @@ def test_lmcache_cpu_size_is_exact_bytes(cpu_bytes):
     exactly the PegaFlow pool / C bytes, local CPU only."""
     env = run_gate.lmcache_env(cpu_bytes)
     assert int(float(env["LMCACHE_MAX_LOCAL_CPU_SIZE"]) * 1024**3) == cpu_bytes
+    assert (
+        env["LMCACHE_CHUNK_SIZE"] == "256"
+        and run_gate.lmcache_env(1, 16)["LMCACHE_CHUNK_SIZE"] == "16"
+    )
     assert env["LMCACHE_LOCAL_CPU"] == "True" and env["LMCACHE_MAX_LOCAL_DISK_SIZE"] == "0"
     assert not any(k in env for k in ("LMCACHE_LOCAL_DISK", "LMCACHE_REMOTE_URL"))
+
+
+_MLA = _group(0, "MLAAttentionSpec", ["MLAAttentionSpec", "FullAttentionSpec", "AttentionSpec", "KVCacheSpec"])  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "spec,tp,ranks,backends,c,ok",
+    [
+        (None, 1, 1, 1, 1000, True),
+        (_spec(_MLA), 2, 1, 1, 1000, True),  # DSV2: save only first rank
+        (_spec(FULL), 2, 2, 2, 1000, True),  # each rank stores its shard: C / 2 each
+        (None, 2, None, None, 1000, None),  # TP > 1, no dump: the arm cannot start
+        (_spec(FULL), 2, 2, 1, 1000, False),  # one backend fewer than storing ranks
+        (_spec(_MLA), 2, 1, 2, 1000, False),  # MLA but both ranks stored: 2 C
+    ],
+    ids=["tp1", "mla-tp2", "full-tp2", "tp2-unknown", "full-tp2-short", "mla-tp2-both"],
+)
+def test_lmcache_store_totals_c_over_storing_ranks(tmp_path, spec, tp, ranks, backends, c, ok):
+    """S1: LMCache sizes its CPU backend per worker. Each storing rank gets
+    C / ranks, and the log must show exactly that many backends, so the
+    arm's whole store is at most C (fail-closed otherwise)."""
+    assert run_gate.lmcache_storing_ranks(spec, tp) == ranks
+    if ranks is None:
+        args = SimpleNamespace(lmcache_overlay=str(tmp_path), lmcache_chunk_size=256, lmcache_ranks=None)  # fmt: skip
+        with pytest.raises(ValueError, match="storing ranks unknown"):
+            run_gate.vllm_server(args, {}, "lmcache", tmp_path, False, None, tmp_path / "l", c)
+        return
+    log = tmp_path / "vllm.log"
+    log.write_text(f"{run_gate.LMCACHE_BACKEND_MARK}\n" * backends)
+    cfg = run_gate.lmcache_config(log, c, tmp_path, 256, ranks)
+    assert cfg["per_rank_bytes"] * ranks <= c
+    assert int(float(cfg["env"]["LMCACHE_MAX_LOCAL_CPU_SIZE"]) * 1024**3) == c // ranks
+    assert (run_gate.lmcache_size_problem(cfg) is None) is ok
+
+
+@pytest.mark.parametrize(
+    "declared,dists,ok",
+    [
+        ("lmcache-0.5.6", ["lmcache-0.5.6"], True),
+        ("lmcache-0.5.7.dev0+pr4467.e05c2ea", ["lmcache-0.5.6"], False),  # wrong build
+        (None, ["lmcache-0.5.6"], False),  # nothing declared: no official lmcache
+        ("lmcache-0.5.6", [], False),  # empty overlay
+        ("lmcache-0.5.6", ["lmcache-0.5.6", "lmcache-0.5.7"], False),  # two dists
+    ],
+    ids=["declared", "other-build", "undeclared", "empty", "two"],
+)
+def test_lmcache_build_must_be_the_declared_one(tmp_path, declared, dists, ok):
+    """S2: the overlay's lmcache dist must be gate.json's ``lmcache_dist``:
+    the run is not official otherwise, and the arm fails G0.lmcache_build."""
+    import argparse
+
+    for d in dists:
+        (tmp_path / f"{d}.dist-info").mkdir()
+    gate = {"lmcache_dist": declared} if declared else {}
+    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "lmcache_chunk_size": 256, "lmcache_overlay": str(tmp_path)}  # fmt: skip
+    args = argparse.Namespace(**(run_gate.OFFICIAL | fixed))
+    arms = ["plain", "baseline", "lmcache", "pegaflow.m:C"]
+    probs = run_gate.official_problems(args, arms, list(run_gate.WORKLOADS), tmp_path, tmp_path, gate)  # fmt: skip
+    assert (not any("lmcache" in p for p in probs)) is ok, probs
+    stage = {"lmcache": {"dist": [f"{d}.dist-info" for d in dists], "cpu_bytes": 10, "storing_ranks": 1, "per_rank_bytes": 10, "backends": 1}}  # fmt: skip
+    assert run_gate.lmcache_build_verdict({"gsm8k": stage, "cap": stage}, gate)["pass"] is ok
+    assert not run_gate.lmcache_build_verdict({"gsm8k": {}}, gate)["pass"]
+
+
+def test_committed_gates_declare_their_lmcache_build():
+    """S2: every committed gate.json names the lmcache build its reference
+    numbers come from (GATES.md, "lmcache status per model")."""
+    for f in sorted((run_gate.REPO / "docs/rsi/models").glob("*/gate.json")):
+        gate = json.loads(f.read_text())
+        if f.parent.name == "Qwen3-4B":
+            assert gate["lmcache_dist"] == "lmcache-0.5.7.dev0+pr4467.e05c2ea", f
+        if f.parent.name.startswith("DeepSeek-V2-Lite"):
+            assert gate["lmcache_dist"] == "lmcache-0.5.6", f  # #4467 crashes on MLA
 
 
 @pytest.mark.parametrize(
@@ -717,17 +794,26 @@ def test_unique_estimate_matches_the_measured_hybrid_trace():
             False,
             id="rsi-module-under-test",
         ),  # fmt: skip
+        pytest.param(
+            {"lmcache_chunk_size": 256}, "lmcache_chunk_size", True, id="lmcache-chunk-default"
+        ),  # fmt: skip
+        pytest.param(
+            {"lmcache_chunk_size": 16}, "lmcache_chunk_size=16", False, id="lmcache-chunk-16"
+        ),  # fmt: skip
     ],
 )
 def test_official_args(tmp_path, over, key, ok):
     """cap_fractions compare as sets; ``--replay-skip`` > 0 is a held-out
     slice of the trace, never official; the arm under test's module must be
-    in the ``pegaflow`` package (M8: the only one the snapshot holds)."""
+    in the ``pegaflow`` package (M8: the only one the snapshot holds); the
+    lmcache arm is official only with LMCache's default chunk size."""
     import argparse
 
     arm = over.pop("arm", "pegaflow.m:C")
-    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python"} | over))  # fmt: skip
-    probs = run_gate.official_problems(args, ["plain", "baseline", arm], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
+    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python", "lmcache_chunk_size": run_gate.LMCACHE_CHUNK, "lmcache_overlay": str(tmp_path)}  # fmt: skip
+    args = argparse.Namespace(**(run_gate.OFFICIAL | fixed | over))
+    arms = ["plain", "baseline", "lmcache", arm]
+    probs = run_gate.official_problems(args, arms, list(run_gate.WORKLOADS), tmp_path, tmp_path)
     assert any(p.startswith(key) for p in probs) is not ok, probs
 
 
@@ -1606,6 +1692,8 @@ def test_only_the_old_arm_loads_the_pegaflow_plugin(tmp_path, monkeypatch, arm, 
         gpu="0", model="m", tp=1, max_model_len=8, max_num_batched_tokens=8, max_num_seqs=1,
         gpu_mem=0.5, vllm_arg=[], num_gpu_blocks=0, under_test_path="",
         lmcache_overlay=str(tmp_path),
+        lmcache_chunk_size=run_gate.LMCACHE_CHUNK,
+        lmcache_ranks=1,
     )  # fmt: skip
     run_gate.vllm_server(args, {}, arm, tmp_path / "probe", False, None, tmp_path / "log", 1 << 30)
     assert seen["plugins"] == plugins == run_gate.vllm_plugins(arm)
@@ -2287,6 +2375,394 @@ def test_split_variant_still_fails_wrong_loaded_bytes(tmp_path):
     d = digest_compare.compare(probe, probe, invariant=True, split_invariant=False)
     assert d["external_mismatched"] == 1
     assert not run_gate._digest_verdict(d, 0.0)["pass"]
+
+
+def _ctx_probe(tmp_path, name: str, rows: list[tuple[str, str, str]], seeds: tuple = ()):
+    """Requests resuming at 2 blocks: each loads context block ``p:1``
+    (bytes ``ctx``) and computes ``p:2`` (bytes ``out``). ``seeds``: bytes of
+    cold requests computing ``p:1`` from scratch (its reference copies)."""
+    reqs, digests = [], []
+    for j, ctx in enumerate(seeds):
+        rid = f"{name}s{j}"
+        reqs.append(_req("p", 2, 100 + 10 * j, "cold", 50 + j) | {"req_id": rid, "digest": "full", "episodes": [[100 + 10 * j, 0, 0]]})  # fmt: skip
+        blk = {"key": "p:1", "covered": 2 * BT, "exact": [ctx], "l1": [1.0]}
+        digests.append({"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": [blk]})  # fmt: skip
+    for i, (label, ctx, out) in enumerate(rows):
+        rid = f"{name}{i}"
+        r = _req("p", 3, 10 * i + 1, label, i) | {"req_id": rid, "digest": "full"}
+        r["episodes"] = [[10 * i + 1, 0, 2 * BT]]
+        r["progress"] = [[10 * i + 1, 3 * BT + 1]]
+        reqs.append(r)
+        blocks = [
+            {"key": "p:1", "covered": 2 * BT, "exact": [ctx], "l1": [1.0]},
+            {"key": "p:2", "covered": 3 * BT, "exact": [out], "l1": [1.0]},
+        ]
+        digests.append({"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": blocks})  # fmt: skip
+    d = tmp_path / name
+    d.mkdir()
+    return _probe(d, reqs, digests)
+
+
+@pytest.mark.parametrize(
+    "ref_rows,cand_rows,compared,exact,unmatched",
+    [
+        # Same split and context bytes: judged, equal.
+        ([("cold", "X", "A")], [("warm", "X", "A")], 1, 1, 0),
+        # Same split and context, other bytes: judged, inexact (a fault).
+        ([("cold", "X", "A")], [("warm", "X", "flip")], 1, 0, 0),
+        # Same split, context computed elsewhere (other bytes): no
+        # same-context copy, unjudged (the honest DSV2 lmcache case).
+        ([("cold", "X", "A")], [("warm", "Y", "B")], 0, 0, 1),
+    ],
+    ids=["same-context", "same-context-wrong", "other-context"],
+)
+def test_split_key_includes_context_bytes(tmp_path, ref_rows, cand_rows, compared, exact, unmatched):  # fmt: skip
+    """Split-variant: a computed block is judged only against copies computed
+    from the same context bytes; the context itself is judged as loaded
+    blocks (here ``p:1`` external: ``Y`` has no reference copy)."""
+    from rsi.gates import digest_compare
+
+    ref = _ctx_probe(tmp_path, "ref", ref_rows, seeds=(ref_rows[0][1],))
+    cand = _ctx_probe(tmp_path, "cand", cand_rows)
+    d = digest_compare.compare(ref, cand, invariant=True, split_invariant=False)
+    got = (d["computed_compared"], d["computed_exact"], d["computed_unmatched_split"])
+    assert got == (compared, exact, unmatched), d
+    assert d["external_mismatched"] == (cand_rows[0][1] != ref_rows[0][1])
+    if compared and not exact:
+        assert not run_gate._digest_verdict(d, None)["pass"]
+
+
+def test_reference_pools_several_probe_dirs(tmp_path):
+    """The resume replay adds same-split copies to the baseline's: a block
+    unjudged against the baseline alone is judged against both, and a wrong
+    one is still inexact."""
+    from rsi.gates import digest_compare
+
+    base = _ctx_probe(tmp_path, "base", [("cold", "X", "A")], seeds=("X",))
+    # The replay computed the context at the arm's split too (bytes Y).
+    res = _ctx_probe(tmp_path, "res", [("resume", "Y", "B")], seeds=("Y",))
+    for out, ok in (("B", True), ("flip", False)):
+        cand = _ctx_probe(tmp_path, f"cand{out}", [("warm", "Y", out)])
+        alone = digest_compare.compare(base, cand, True, False)
+        assert alone["computed_unmatched_split"] == 1
+        both = digest_compare.compare([base, res], cand, True, False)
+        assert (both["computed_compared"], both["computed_exact"]) == (1, int(ok))
+        assert both["external_mismatched"] == 0  # ``Y`` was computed by the replay
+        assert run_gate._digest_verdict(both, None)["pass"] is ok
+
+
+def _warm(conv, step: int, local: int, start: int, plen: int = 30) -> dict:
+    return {
+        "req_id": f"w{conv}",
+        "pass": "warm",
+        "conv": conv,
+        "prompt_len": plen,
+        "episodes": [[step, local, start]],
+    }
+
+
+def test_resume_plan_replays_the_arm_schedule():
+    """Waves follow the arm's first-episode steps; the replay pre-warms the
+    arm's resume point only where the connector loaded (start > local);
+    other passes are ignored; a missing or bad prompt index fails closed."""
+    reqs = [
+        _warm(1, 5, 0, 16),  # first request: loaded [0, 16)
+        _warm(0, 7, 16, 16),  # local only: no pre-warm
+        _warm(2, 7, 16, 24, 32),  # local + loaded, resumes at 24
+        {"pass": "cold", "conv": 0, "episodes": [[1, 0, 0]]},
+    ]
+    plan = run_gate.resume_plan(reqs, 3)
+    assert plan == {
+        "waves": [[[1, 16, 16, 30]], [[0, 0, 16, 30], [2, 24, 24, 32]]],
+        "chains": {},
+        "problems": [],
+    }
+    assert run_gate.resume_plan(reqs, 4)["problems"] == ["3 of 4 prompts have a warm request"]
+    bad = run_gate.resume_plan([*reqs, _warm(None, 9, 0, 0)], 3)
+    assert bad["problems"] == ["warm request wNone: prompt index None"]
+    dup = run_gate.resume_plan([*reqs, _warm(2, 9, 0, 0)], 3)
+    assert dup["problems"] == ["warm request w2: prompt index 2"]
+
+
+def test_resume_check_and_differ_fail_closed():
+    """Only a prompt whose replay resumed where the arm did is compared; an
+    unreplayed one counts as differing unless its prompt is block-aligned."""
+    plan = {"waves": [[[0, 16, 16, 30], [1, 16, 16, 32], [2, 24, 24, 30]]], "problems": []}
+    reqs = [
+        {"pass": "resume", "conv": 0, "prompt_len": 30, "episodes": [[1, 0, 16]]},
+        {"pass": "resume", "conv": 1, "prompt_len": 32, "episodes": [[1, 0, 32]]},  # moved
+        {"pass": "resume_prewarm", "conv": 2, "prompt_len": 24, "episodes": [[1, 0, 0]]},
+    ]
+    check = run_gate.resume_check(plan, reqs)
+    assert (check["missing"], check["start_differs"], check["prompt_len_differs"]) == ([2], [1], [])  # fmt: skip
+    ref = ["a", "b", None]
+    # Prompt 1 (32 tokens, aligned) is exempt; prompt 2 (missing) differs.
+    assert run_gate.resume_differ(check, plan, ref, ["a", "x", "c"], 16) == (1, 1)
+    assert run_gate.resume_differ(check, plan, ref, ["x", "b", "c"], 16) == (2, 0)
+    full = run_gate.resume_check(plan, reqs[:1] + [
+        {"pass": "resume", "conv": 1, "prompt_len": 32, "episodes": [[1, 0, 16]]},
+        {"pass": "resume", "conv": 2, "prompt_len": 30, "episodes": [[1, 16, 24]]},
+    ])  # fmt: skip
+    assert run_gate.resume_differ(full, plan, ["a", "b", "c"], ["a", "b", "c"], 16) == (0, 0)
+    assert run_gate.resume_differ(full, plan | {"problems": ["x"]}, ["a"], ["a"], 16) == (None, None)  # fmt: skip
+    v = run_gate._resume_verdict(None)
+    assert not v["pass"]
+
+
+@pytest.mark.parametrize(
+    "ep1,tokens,chain,problem",
+    [
+        ([9, 24, 24], [30, 40], [[1, 0, 24, 40]], None),  # resumed from its own cached blocks
+        ([9, 16, 24], [30, 40], [[1, 24, 24, 40]], None),  # connector loaded [16, 24)
+        ([9, 24, 24], None, None, "episode lengths None"),  # record predates episode_tokens
+        ([9, 24, 24], [30, 20], None, "episode lengths [30, 20]"),  # shorter than the prompt
+    ],
+    ids=["local-resume", "loaded-resume", "no-lengths", "bad-lengths"],
+)
+def test_resume_plan_chains_preempted_episodes(ep1, tokens, chain, problem):
+    """S6: a warm request vLLM preempted is replayed at its first episode in
+    the wave, then at every later episode (its start, pre-warm by the same
+    rule, its length then); without usable lengths the plan fails closed."""
+    pre = _warm(0, 5, 0, 16) | {"episodes": [[5, 0, 16], ep1]}
+    if tokens is not None:
+        pre["episode_tokens"] = tokens
+    plan = run_gate.resume_plan([pre, _warm(1, 5, 0, 16)], 2)
+    assert plan["waves"] == [[[0, 16, 16, 30], [1, 16, 16, 30]]]
+    assert plan["chains"].get("0") == chain
+    assert plan["problems"] == ([f"warm request w0: {problem}"] if problem else [])
+
+
+@pytest.mark.parametrize(
+    "ep_req,key",
+    [
+        ({"prompt_len": 40, "episodes": [[4, 24, 24]]}, None),
+        ({"prompt_len": 40, "episodes": [[4, 32, 32]]}, "episode_start_differs"),
+        ({"prompt_len": 41, "episodes": [[4, 24, 24]]}, "episode_prompt_len_differs"),
+        (None, "episode_missing"),
+    ],
+    ids=["replayed", "start-differs", "length-differs", "missing"],
+)
+def test_resume_check_judges_each_later_episode(ep_req, key):
+    """S6: a later episode replayed elsewhere than the arm's leaves its
+    computed blocks unjudged and its completion counts as differing."""
+    plan = {"waves": [[[0, 16, 16, 30]]], "chains": {"0": [[1, 0, 24, 40]]}, "problems": []}
+    reqs = [{"pass": "resume", "conv": 0, "prompt_len": 30, "episodes": [[1, 0, 16]]}]
+    if ep_req:
+        reqs.append({"pass": run_gate.RESUME_EP_PASS, "conv": 0, "turn": 1} | ep_req)
+    check = run_gate.resume_check(plan, reqs)
+    assert check["episodes_planned"] == 1
+    for k in ("episode_missing", "episode_start_differs", "episode_prompt_len_differs"):
+        assert check[k] == ([[0, 1]] if k == key else []), k
+    assert run_gate.resume_differ(check, plan, ["a"], ["a"], 16) == ((1, 0) if key else (0, 0))
+    assert run_gate._resume_verdict({"digest_self": _digest_ok(), "resume_check": check})["pass"]
+
+
+@pytest.mark.parametrize(
+    "n,want",
+    [(0, []), (1, [("a", [1])]), (3, [("a", [1]), ("bc", [2, 3])]), (2, None), (5, None)],
+    ids=["none", "first", "chunk-edge", "straddles", "too-short"],
+)
+def test_resume_episode_prompt_cuts_on_chunk_edges(n, want):
+    """S6: a later episode's prompt is the replay's own first ``n`` output
+    tokens; the text kept with it must be exactly those tokens' chunks."""
+    from rsi.gates import workloads
+
+    pieces = [("a", [1]), ("bc", [2, 3]), ("d", [4])]
+    assert workloads.cut_pieces(pieces, n) == want
+
+
+def _blk_rec(rid: str, blocks: list[tuple[int, str]], prompt: str = "p", **kw) -> dict:
+    """A digest record of group 0: (covered, bytes) per block."""
+    blks = [{"key": f"{prompt}:{c // BT - 1}", "covered": c, "exact": [b], "l1": [1.0]} for c, b in blocks]  # fmt: skip
+    return {"req_id": rid, "rank": "pp0-tp0", "group": 0, "layers": ["l0"], "blocks": blks} | kw
+
+
+def _ep_req(rid: str, label: str, conv: int, episodes: list, progress: list, n: int = 3, prompt: str = "p") -> dict:  # fmt: skip
+    return _req(prompt, n, episodes[0][0], label, conv) | {
+        "req_id": rid, "digest": "full", "episodes": episodes, "progress": progress,
+    }  # fmt: skip
+
+
+def test_pooled_reference_keeps_the_zero_and_state_rules(tmp_path):
+    """M1: pooling probe dirs keeps hybrid R2 (an all-zero computed copy is
+    never a reference, counted over every dir) and unions the state groups."""
+    z = digest_compare.ZERO_DIGEST
+    dirs = []
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+        dirs.append(_zero_probe(tmp_path / name, z, False))
+    (dirs[1] / "spec.json").write_text(json.dumps({"probe": {"state_groups": [1]}}))
+    ref = digest_compare.Reference(dirs)
+    assert ref.zero_copies == 2 and ref.state_groups == {1}
+    d = digest_compare.compare(dirs, dirs[0], invariant=False)
+    assert d["external_matched"] == 0 and d["ref_zero_copies"] == 2
+
+
+@pytest.mark.parametrize(
+    "ep0_byte,exact", [("A3", 3), ("flip", 2)], ids=["honest", "wrong-preempted-block"]
+)
+def test_context_fingerprint_is_per_episode(tmp_path, ep0_byte, exact):
+    """M1: a preempted episode's blocks (digested at preemption) are keyed by
+    that episode's own start and context, not the last episode's: episode 0
+    computed from 0 is judged against the baseline's cold copies, and a wrong
+    byte there fails; episode 1 (resumed at 2 blocks) has no same-context
+    copy and stays unjudged."""
+    (tmp_path / "ref").mkdir()
+    (tmp_path / "cand").mkdir()
+    ref = _probe(
+        tmp_path / "ref",
+        [_ep_req("a", "cold", 0, [[1, 0, 0]], [[1, 3 * BT + 1]])],
+        [_blk_rec("a", [(BT, "A1"), (2 * BT, "A2"), (3 * BT, "A3")])],
+    )
+    b = _ep_req("b", "cold", 0, [[1, 0, 0], [5, 0, 2 * BT]], [[1, 3 * BT], [5, 3 * BT + 1]])
+    b["preempt_digested"] = [0]
+    cand = _probe(
+        tmp_path / "cand",
+        [b],
+        [
+            _blk_rec("b", [(BT, "A1"), (2 * BT, "A2"), (3 * BT, ep0_byte)], episode=0),
+            _blk_rec("b", [(BT, "A1"), (2 * BT, "A2"), (3 * BT, "B3")]),  # finish: episode 1
+        ],
+    )
+    d = digest_compare.compare(ref, cand, invariant=True, split_invariant=False)
+    assert (d["computed_compared"], d["computed_exact"], d["computed_unmatched_split"]) == (3, exact, 1)  # fmt: skip
+    assert d["external_matched"] == 2
+    assert run_gate._digest_verdict(d, None)["pass"] is (exact == 3)
+
+
+def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, resume_ok: bool = True):  # fmt: skip
+    """A gsm8k record of the baseline and an honest self-test arm. Prompt 1
+    (``q``, 10 blocks) is computed from scratch in every pass: 10 judged warm
+    blocks. Prompt 0 is 13 tokens (keys ``p:0..2``, not aligned to vLLM's
+    16). Baseline
+    cold computes ``A1 A2 A3``; the arm's warm request resumes at 2 blocks
+    (loads ``p:0 p:1``) and computes ``p:2``: ``A3`` when split invariant,
+    else ``B3`` (MLA's merge at the split). ``resume``: the baseline's
+    replay at the arm's resume point (it computes ``B3`` there too).
+    ``wrong``: the arm loaded an honest copy of ``p:1`` computed at another
+    split (``S2``: baseline and arm both computed it from 1 block) and wrote
+    wrong bytes ``W3`` over it."""
+    run = tmp_path / "run"
+    spec = _spec(FULL)
+    committed = run / "spec.json"
+
+    def probe(label: str, wl: str, reqs: list, digests: list) -> Path:
+        d = run / label / wl / "probe"
+        d.mkdir(parents=True)
+        (d / "requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reqs))
+        (d / "digest-pp0-tp0.jsonl").write_text("".join(json.dumps(x) + "\n" for x in digests))
+        (d / "spec.json").write_text(json.dumps(spec))
+        return d
+
+    full = [[1, 3 * BT + 1]]
+    cold = [(BT, "A1"), (2 * BT, "A2"), (3 * BT, "A3")]
+    other = [(BT, "A1"), (2 * BT, "S2"), (3 * BT, "S3")]  # computed from 1 block
+    qn = 10
+    qblocks = [((j + 1) * BT, f"Q{j}") for j in range(qn)]
+
+    def q(rid: str, label: str, step: int) -> dict:
+        return _ep_req(rid, label, 1, [[step, 0, 0]], [[step, qn * BT + 1]], qn, "q")
+
+    base_reqs = [_ep_req("bc", "cold", 0, [[1, 0, 0]], full), q("bq", "cold", 1)]
+    base_digs = [_blk_rec("bc", cold), _blk_rec("bq", qblocks, "q")]
+    arm_reqs = [_ep_req("xc", "cold", 0, [[1, 0, 0]], full), q("xq", "cold", 1), q("xwq", "warm", 10)]  # fmt: skip
+    arm_digs = [_blk_rec("xc", cold), _blk_rec("xq", qblocks, "q"), _blk_rec("xwq", qblocks, "q")]  # fmt: skip
+    if wrong:
+        base_reqs.append(_ep_req("bs", "split", 0, [[5, BT, BT]], [[5, 3 * BT + 1]]))
+        base_digs.append(_blk_rec("bs", other))
+        arm_reqs.append(_ep_req("xs", "cold", 2, [[3, BT, BT]], [[3, 3 * BT + 1]]))
+        arm_digs.append(_blk_rec("xs", other))
+    warm3 = "A3" if split_inv else "W3" if wrong else "B3"
+    arm_reqs.append(_ep_req("xw", "warm", 0, [[10, 0, 2 * BT]], [[10, 3 * BT + 1]]))
+    arm_digs.append(_blk_rec("xw", [(BT, "A1"), (2 * BT, "S2" if wrong else "A2"), (3 * BT, warm3)]))  # fmt: skip
+    label = "selftest-honest"
+    bp = probe("baseline", "gsm8k", base_reqs, base_digs)
+    ap = probe(label, "gsm8k", arm_reqs, arm_digs)
+    committed.write_text(json.dumps(spec))
+    acc = {"cold": {"accuracy": 1.0}, "warm": {"accuracy": 1.0}}
+    results: dict = {
+        "baseline": {
+            "gsm8k": {
+                "invariant": True,
+                "passes": acc,
+                "digest_self": digest_compare.compare(bp, bp, True, split_inv),
+            }
+        },  # fmt: skip
+        label: {
+            "gsm8k": {"passes": acc, "digest_self": digest_compare.compare(ap, ap, True, split_inv)}
+        },  # fmt: skip
+    }
+    two = ["ans", "ansq"]
+    outs = {("baseline", "gsm8k", "cold"): two, (label, "gsm8k", "cold"): two, (label, "gsm8k", "warm"): two}  # fmt: skip
+    if resume:
+        rl = f"{run_gate.RESUME_PREFIX}{label}"
+        pre = _ep_req("rp", "resume_prewarm", 0, [[2, 0, 0]], [[2, 2 * BT]], n=2)
+        pre["prompt_len"] = pre["computed"] = 2 * BT
+        rr = _ep_req("rr", run_gate.RESUME_PASS, 0, [[3, 2 * BT, 2 * BT]], [[3, 3 * BT + 1]])
+        rq = q("rq", run_gate.RESUME_PASS, 3)
+        rp = probe("baseline", rl, [pre, rr, rq], [_blk_rec("rp", cold[:2]), _blk_rec("rr", cold[:2] + [(3 * BT, "B3")]), _blk_rec("rq", qblocks, "q")])  # fmt: skip
+        plan = run_gate.resume_plan(oracle.load_requests(ap / "requests.jsonl"), 2)
+        ds = digest_compare.compare(rp, rp, True, split_inv)
+        results["baseline"][rl] = {
+            "resume_plan": plan,
+            "resume_check": run_gate.resume_check(
+                plan, oracle.load_requests(rp / "requests.jsonl")
+            ),
+            "digest_self": ds if resume_ok else ds | {"local_mismatched": 1},
+        }
+        outs[("baseline", rl, run_gate.RESUME_PASS)] = two
+    for (lab, wl, name), o in outs.items():
+        f = run / run_gate.GATE_DIR / lab / wl / f"{name}-outputs.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(o))
+    gate = {"batch_invariant": True, "split_invariant": split_inv}
+    return run_gate.verdicts(results, run, committed, gate)[label], gate
+
+
+@pytest.mark.parametrize(
+    "split_inv,resume,wrong,resume_ok,ok,failing",
+    [
+        (False, False, False, True, False, "G2.resume_reference"),
+        (False, True, False, True, True, None),
+        (False, True, False, False, False, "G2.resume_reference"),  # S5: required alone
+        (True, False, False, True, True, None),
+        (False, True, True, True, False, "G2.digest_vs_baseline.gsm8k"),
+    ],
+    ids=[
+        "split-variant-no-resume",
+        "split-variant-resume",
+        "resume-reference-fails",
+        "split-invariant",
+        "wrong-over-other-split",
+    ],  # fmt: skip
+)
+def test_verdicts_judge_warm_kv_at_the_arm_resume_points(tmp_path, split_inv, resume, wrong, resume_ok, ok, failing):  # fmt: skip
+    """S4/S5 at verdict level. Split-variant: without a ``resume-<label>``
+    stage the arm fails G2.resume_reference; with one, warm computed KV is
+    judged against the pooled baseline + replay copies and warm outputs
+    against the replay, and the honest self-test needs G2.resume_reference.
+    Split-invariant: no resume check and no resume stage. A wrong computed
+    block over an honest other-split context has no same-context copy
+    (``unmatched_split``): it fails through S7, not as mismatched."""
+    g, gate = _resume_run(tmp_path, split_inv, resume, wrong, resume_ok)
+    assert run_gate.resume_stage_needed(gate, ["baseline", "selftest:honest"]) is (not split_inv)
+    assert ("G2.resume_reference" in g) is (not split_inv)
+    assert g["pass"] is ok, {k: x for k, x in g.items() if isinstance(x, dict) and not x.get("pass", True)}  # fmt: skip
+    if failing:
+        assert not g[failing]["pass"]
+        others = [k for k, x in g.items() if isinstance(x, dict) and k.startswith("G2.") and x.get("pass") is False]  # fmt: skip
+        if resume:
+            assert others == [failing], others
+    d = g["G2.digest_vs_baseline.gsm8k"]
+    if resume and not split_inv:
+        assert g["G2.gsm8k_outputs"]["warm_reference"].startswith(run_gate.RESUME_PREFIX)
+        warm = d["computed_coverage_by_pass"]["warm"]
+        # The wrong case clears coverage (10 of 11 judged): only S7 catches it.
+        assert warm["coverage"] >= run_gate.MIN_COMPUTED_COVERAGE
+        assert warm["unjudged_nonaligned"] == (1 if wrong else 0)
+        assert d["external_mismatched"] == d["local_mismatched"] == 0
+    if split_inv:
+        assert d["computed_exact"] == d["computed_compared"] > 0
 
 
 def test_workload_sessions_never_reuse_connections():

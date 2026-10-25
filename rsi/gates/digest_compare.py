@@ -45,8 +45,12 @@ Without split invariance (``split_invariant=False``: the computed KV depends
 on where the computation started, e.g. vLLM's MLA prefill attends to the
 cached context separately and merges), a computed block is judged only
 against copies computed with the same *split*: the start of the computing
-episode and the chunk ends before the block (``progress`` values below its
-end). Blocks with copies at other splits only are ``computed_unmatched_split``
+episode, the chunk ends before the block (``progress`` values below its
+end) and a fingerprint of the context bytes the episode started from (the
+digests of every block at or below its start: a context block computed at
+another split carries other bytes, and so does every block computed on top
+of it). Wrong context bytes are judged where they enter: as loaded blocks.
+Blocks with copies at other splits only are ``computed_unmatched_split``
 (not judged); with REF != CAND a computed block REF never computed is
 ``computed_unreferenced``. ``computed_by_pass`` breaks the computed counts
 down by the candidate's ``rsi_pass`` (the gate requires a minimum coverage per
@@ -65,6 +69,7 @@ Usage: python -m rsi.gates.digest_compare REF_DIR CAND_DIR [--invariant]
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import Counter, defaultdict
@@ -96,7 +101,24 @@ def computed_ranges(r: dict[str, Any]) -> list[tuple[int, int]]:
     return out
 
 
-Split = tuple[int, tuple[int, ...]]  # episode start, chunk ends before the block
+# Episode start, chunk ends before the block, context fingerprint.
+Split = tuple[int, tuple[int, ...], str]
+
+
+def _digest_recs(probe_dir: Path, known: set[str]) -> list[tuple[Path, dict[str, Any]]]:
+    out = []
+    layers: dict[tuple[str, int], list[str]] = {}
+    for f in sorted(probe_dir.glob("digest-*.jsonl")):
+        for line in f.read_text().splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec["req_id"] not in known:
+                raise ValueError(f"{f}: digested request {rec['req_id']} not in requests.jsonl")
+            if layers.setdefault((rec["rank"], rec["group"]), rec["layers"]) != rec["layers"]:
+                raise ValueError(f"{f}: layer list of group {rec['group']} changed")
+            out.append((f, rec))
+    return out
 
 
 def _episode_views(r: dict[str, Any]) -> list[tuple[int, int, list[int]]]:
@@ -130,41 +152,59 @@ def records(
     probe_dir: Path,
 ) -> Iterator[tuple[Key, str, tuple[str, ...], list[float], str, Split, int]]:
     """(key, tag, per-layer exact digests, per-layer l1, req_id, split,
-    episode index) per digested block; ``split`` = (start of the episode, its
-    ``progress`` chunk ends below the block's end). The episode is the
-    record's ``episode`` (state records, digested in their step), else the
-    last one (finish)."""
+    episode index) per digested block. The episode is the record's
+    ``episode`` (state records, digested in their step, and the blocks a
+    preempted episode left), else the last one (finish). ``split`` = (start
+    of that episode, its ``progress`` chunk ends below the block's end, the
+    episode's context fingerprint on the block's rank).
+
+    The context fingerprint hashes the digests of every block that episode
+    started from (``covered <= start`` in the records of that episode: local
+    and external, every group of the request on that rank). A computed block
+    is a function of its tokens, the split and the context KV bytes; on a
+    split-variant model two honest copies at the same split still differ
+    when their context was itself computed at different splits (e.g. a
+    prefix block a connector's chunk boundary made the arm recompute)."""
     views: dict[str, list[tuple[int, int, list[int]]]] = {}
     for r in _requests(probe_dir):
         if r["episodes"]:
             views[r["req_id"]] = _episode_views(r)
-    layers: dict[tuple[str, int], list[str]] = {}
-    for f in sorted(probe_dir.glob("digest-*.jsonl")):
-        for line in f.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            if rec["req_id"] not in views:
-                raise ValueError(f"{f}: digested request {rec['req_id']} not in requests.jsonl")
-            if layers.setdefault((rec["rank"], rec["group"]), rec["layers"]) != rec["layers"]:
-                raise ValueError(f"{f}: layer list of group {rec['group']} changed")
-            eps = views[rec["req_id"]]
-            ep = rec.get("episode", len(eps) - 1)
-            if not 0 <= ep < len(eps):
-                raise ValueError(f"{f}: {rec['req_id']} has no episode {ep}")
-            local, start, ends = eps[ep]
-            for blk in rec["blocks"]:
-                c = blk["covered"]
-                tag = "local" if c <= local else "external" if c <= start else "computed"
-                key = (rec["rank"], rec["group"], blk["key"])
-                split = (start, tuple(e for e in ends if e < c))
-                yield key, tag, tuple(blk["exact"]), blk["l1"], rec["req_id"], split, ep
+    recs = []
+    for f, rec in _digest_recs(probe_dir, set(views)):
+        eps = views[rec["req_id"]]
+        ep = rec.get("episode", len(eps) - 1)
+        if not 0 <= ep < len(eps):
+            raise ValueError(f"{f}: {rec['req_id']} has no episode {ep}")
+        recs.append((rec, ep))
+    # (req_id, rank, episode) -> (group, covered, per-layer digests) of the
+    # context that episode started from.
+    ctx: dict[tuple[str, str, int], list[tuple[int, int, tuple[str, ...]]]] = defaultdict(list)
+    for rec, ep in recs:
+        start = views[rec["req_id"]][ep][1]
+        for blk in rec["blocks"]:
+            if blk["covered"] <= start:
+                ctx[(rec["req_id"], rec["rank"], ep)].append(
+                    (rec["group"], blk["covered"], tuple(blk["exact"]))
+                )
+    fp = {k: hashlib.sha256(repr(sorted(v)).encode()).hexdigest()[:16] for k, v in ctx.items()}
+    for rec, ep in recs:
+        local, start, ends = views[rec["req_id"]][ep]
+        cfp = fp.get((rec["req_id"], rec["rank"], ep), "")
+        for blk in rec["blocks"]:
+            c = blk["covered"]
+            tag = "local" if c <= local else "external" if c <= start else "computed"
+            key = (rec["rank"], rec["group"], blk["key"])
+            split = (start, tuple(e for e in ends if e < c), cfp)
+            yield key, tag, tuple(blk["exact"]), blk["l1"], rec["req_id"], split, ep
 
 
 class Reference:
-    """Computed copies of one probe dir, and how often each key was computed."""
+    """Computed copies of one or more probe dirs (runs of the same model and
+    config, e.g. the baseline stage and the baseline's replay of an arm's
+    warm resume points), and how often each key was computed in them."""
 
-    def __init__(self, probe_dir: Path):
+    def __init__(self, probe_dirs: Path | list[Path]):
+        dirs = [probe_dirs] if isinstance(probe_dirs, Path) else list(probe_dirs)
         # key -> per-layer digest tuple -> [occurrences, per-layer l1]
         self.copies: dict[Key, dict[tuple[str, ...], list[Any]]] = defaultdict(dict)
         # (key, split) -> per-layer digest tuple -> [occurrences, per-layer l1]
@@ -175,18 +215,12 @@ class Reference:
         # allocated attention blocks, so a zero copy (a block overwritten
         # before it was digested) would match a load that wrote nothing.
         self.zero_copies = 0
-        for key, tag, exact, l1, _, split, _ep in records(probe_dir):
-            if tag == "computed":
-                if is_zero(exact):
-                    self.zero_copies += 1
-                    continue
-                self.copies[key].setdefault(exact, [0, l1])[0] += 1
-                self.split_copies[(key, split)].setdefault(exact, [0, l1])[0] += 1
+        # Groups digested per step (Mamba align state), over every dir.
+        self.state_groups: set[int] = set()
         # (kind, prefix key) -> number of (request, episode) that computed it.
         # Kind "block": a block end crossed by the episode's compute; kind
         # "state" (state groups): a step of the episode ended exactly on it,
         # the only way a state at that length exists.
-        self.state_groups = state_groups(probe_dir)
         self.computers: Counter[tuple[str, str]] = Counter()
         # Of those, computations whose bytes were never digested: a preempted
         # (non-last) episode of a digested request the probe did not digest
@@ -195,6 +229,18 @@ class Reference:
         # untagged requests count.
         self.preempted: Counter[tuple[str, str]] = Counter()
         self.untagged: Counter[tuple[str, str]] = Counter()
+        for probe_dir in dirs:
+            self._add(probe_dir)
+
+    def _add(self, probe_dir: Path) -> None:
+        for key, tag, exact, l1, _, split, _ep in records(probe_dir):
+            if tag == "computed":
+                if is_zero(exact):
+                    self.zero_copies += 1
+                    continue
+                self.copies[key].setdefault(exact, [0, l1])[0] += 1
+                self.split_copies[(key, split)].setdefault(exact, [0, l1])[0] += 1
+        self.state_groups |= state_groups(probe_dir)
         for r in _requests(probe_dir):
             kt = r["key_tokens"]
             ranges = computed_ranges(r)
@@ -262,17 +308,19 @@ def _uncertain(g: dict[str, Any], tag: str, ref: Reference, key: Key) -> None:
 
 
 def compare(
-    ref_dir: Path,
+    ref_dir: Path | list[Path],
     cand_dir: Path,
     invariant: bool,
     split_invariant: bool = True,
     align: int | None = None,
 ) -> dict[str, Any]:
-    """``align``: vLLM's hit alignment; with it, ``computed_by_pass`` also
+    """``ref_dir``: one probe dir or several (their computed copies pooled).
+    ``align``: vLLM's hit alignment; with it, ``computed_by_pass`` also
     counts unjudged computed blocks of requests whose prompt length is not a
     multiple of it (``unjudged_nonaligned``; a missing length counts)."""
-    ref = Reference(ref_dir)
-    own = 1 if ref_dir.resolve() == cand_dir.resolve() else 0
+    ref_dirs = [ref_dir] if isinstance(ref_dir, Path) else list(ref_dir)
+    ref = Reference(ref_dirs)
+    own = 1 if any(d.resolve() == cand_dir.resolve() for d in ref_dirs) else 0
     groups: dict[int, dict[str, Any]] = defaultdict(_group)
     reqs = list(_requests(cand_dir))
     pass_of = {r["req_id"]: r.get("pass") for r in reqs}
