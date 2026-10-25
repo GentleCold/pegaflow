@@ -293,3 +293,124 @@ Semantic items that do not conflict but must be handled in the merge:
   the Qwen3.5 selftest / it2 records and DSV2 it6 / lmcache-ref with the
   merged tree. Expect identical verdicts except the new failing
   `G2.resume_reference` on DSV2 records without the stage (M2).
+
+## Re-review (8f8f0f0..af5a38e)
+
+Scope: 59c4490 (merge of feat/semantics-rsi 9a02fb5: hybrid gate plus cap
+sizing), 4c78a83 (S6), fe661de (S5), b7ad034 (S1, S2), feb3115 (S4 tests),
+af5a38e (docs). Line numbers are at af5a38e. No GPU run.
+
+Verdict: **ACCEPT**. M1 is fixed. M2 is documented and stays an open item
+for DSV2's acceptance: an official TP2 rerun with the resume stage is still
+needed, but it does not block this branch. S1-S6 and N1 / N3 are addressed.
+I found nothing relaxed. The two SHOULD-FIX items below are non-blocking
+follow-ups.
+
+### Resolution
+
+| item | status | evidence |
+|---|---|---|
+| M1 | fixed | `digest_compare.py:235-269` `_add`: zero-digest skip and `zero_copies` (:238), `state_groups \|=` per dir (:243), `(kind, key)` counters with `preempt_digested` / `preempt_dropped`; fingerprint keyed `(req_id, rank, episode)` from that episode's records (:181-190). Tests `test_pooled_reference_keeps_the_zero_and_state_rules`, `test_context_fingerprint_is_per_episode`. |
+| M2 | documented, open (GPU) | GATES.md:307, PROGRESS.md:896. Re-score below: the only change on DSV2 records is the failing `G2.resume_reference`. |
+| S1 | fixed, fail-closed | `lmcache_storing_ranks` (run_gate.py:880): 1 at TP1 or all-MLA, else `tp`, None without a spec at TP > 1. With None, `vllm_server` raises (:1094). Each rank gets `C // ranks`. `lmcache_size_problem` (:924) raises in the stage (:1483) unless the backends logged == storing ranks and their total <= C. For a record-only arm, `run_stage` records the error and the arm fails. |
+| S2 | fixed, fail-closed | `lmcache_dist` in Qwen3-4B gate.json. `official_problems` (:3399) and `G0.lmcache_build` (:2844) fail on another dist and on a model with no declaration. |
+| S3 | fixed | GATES.md:198: DSV2 0.5.6 is "comparable with caveat", rule unchanged. |
+| S4 | fixed | `test_verdicts_judge_warm_kv_at_the_arm_resume_points` (5 ids). The `wrong-over-other-split` case clears coverage (10/11) and fails only through S7, as required. |
+| S5 | code fixed; GPU self-test still to run | `G2.resume_reference` added to the honest arm's `need` on split-variant models (:2920). |
+| S6 | fixed (unit-tested only, see R2) | `resume_plan` (:1311) replays the first episode in wave order and chains the later ones by `episode_tokens`. `resume_check` / `resume_differ` judge each episode. A missing or bad `episode_tokens` is a plan problem. |
+| merge semantics | fixed | resume stage gets `gsm8k_vllm_args` (`gsm8k=gsm or resume`, :1472), and `G0.vllm_args` checks it (:1858). |
+
+### Merge check (59c4490 vs both parents)
+
+- `git show --remerge-diff 59c4490`: every conflict hunk keeps both sides
+  (Arms docstring; `pre` and `resume`; pass names with `elif resume:` next
+  to `elif pre:`; `warm_reference` plus `G2.preempt` / `alone_ref_differ`;
+  `_gsm8k_body` plus `free_run`; GATES.md overlay section plus the hybrid
+  self-test paragraph).
+- Lines of 9a02fb5 missing from af5a38e (run_gate 31, digest_compare 42,
+  workloads 9, rsi_probe 1, GATES.md 32): each is replaced by the lmcache
+  version of the same code (records loop moved into `_digest_recs`,
+  `Reference(probe_dir)` -> pooled `_add`, `lmcache_env` / `lmcache_config`
+  signatures, `_outputs(wl)`, resume-aware `base_errors` / `split_diffs` /
+  `run_stage`, the replaced 0.5.6 paragraph). `selftest/connector.py` and
+  `oracle.py`: 0 lines removed. `cap_plan_spec` / `unmodeled_spec` (cap
+  sizing) are present.
+- Test functions: 70 at 8f8f0f0 and 100 at 9a02fb5. The 113 at af5a38e
+  include every function of both parents, and `test_probe_steps.py` is
+  complete.
+
+### Adversarial: S6
+
+- Can the arm shape the plan? Only through its trace (`episodes`,
+  `episode_tokens`), which is the existing M7 residual. The replay is still
+  an honest baseline stage. A forged length makes the replay compute honest
+  bytes elsewhere: `episode_prompt_len_differs` / `episode_start_differs`.
+  Those blocks stay unjudged (coverage, S7) and the prompt's completion
+  counts as differing. No forged value can make a wrong block match.
+- Missing or misaligned episodes: a non-int, None or too-short
+  `episode_tokens` is a plan problem, so `G2.resume_reference` fails and
+  `resume_differ` returns None, which fails `G2.gsm8k_outputs`. An episode
+  the replay cannot form (output too short, or a chunk straddles token `n`:
+  `cut_pieces`) stops the chain, and its output is None, which counts as
+  differing. vLLM 0.32 streams `token_ids` with `return_token_ids`
+  (`completion/serving.py:413-419`). The replay chains from its own
+  sequence. If the arm's earlier output differs, the episode's keys differ,
+  and its blocks are `unreferenced`, which is unjudged and fails closed on
+  non-aligned prompts.
+
+### SHOULD-FIX (non-blocking)
+
+- R1. `resume_differ` (run_gate.py:2196-2206) gives `episode_*` problems
+  the aligned-prompt exemption. That exemption exists because a
+  connector's hit can end inside the last prompt block. It does not apply
+  to a later episode. A preempted request on an aligned prompt whose later
+  episode was not replayed has its completion reported only. Its blocks are
+  still bounded by coverage >= 0.9, and its loads are still judged, so this
+  is not a way to pass wrong bytes. Fix: exempt only `start_differs` /
+  `prompt_len_differs` of the first episode, and always count `episode_*`.
+- R2. The S6 chain has never run on a GPU. Every recorded gsm8k probe
+  (DSV2 it6 / lmcache-ref, Qwen3-4B it6: all arms) has 0 preempted warm
+  requests. Add a split-variant run with preemption to the DSV2 TP2 rerun
+  (M2), for example a small `--num-gpu-blocks`, non-official.
+
+### NITS
+
+- R3. DSV2's gate.json lives on `feat/rsi-deepseek-v2-lite` and has no
+  `lmcache_dist` yet. `test_committed_gates_declare_their_lmcache_build`
+  will fail (KeyError) when it merges, which is the intended catch. Add
+  `"lmcache_dist": "lmcache-0.5.6"` there. Qwen3.5-4B declares none, so its
+  lmcache arm is not official (it has not been run).
+- R4. The 2026-10-23 DSV2 self-test record predates `split_invariant` in
+  its stored gate, so re-scoring it adds no `G2.resume_reference`.
+
+### Verified (re-review)
+
+1. Worktree at af5a38e: `typos` clean; `cz check --rev-range
+   1749353..origin/feat/rsi-gate-lmcache`: successful.
+2. Fresh export `~/kexi/tmp/review-lmcache-af5a38e` (new dir): `353 passed,
+   14 warnings in 52.18s`.
+3. Re-score of every verdict leaf, 9a02fb5 vs af5a38e trees
+   (`~/kexi/tmp/review-lmcache/vdump.py`, `v_sem.json` / `v_new.json`):
+   - 0 diffs: Qwen3-4B it6 and it7, Qwen3.5-4B selftest-790bddc and
+     p5-it2-s1, DSV2 selftest 2026-10-23.
+   - DSV2 it6 and it7: 3 diffs each, `G2.resume_reference` false for old /
+     native / v2 (M2). Nothing else changes.
+   - DSV2 lmcache-ref-b05e507: the merged gate gives computed 55026/55026,
+     14 unmatched, local 0 mismatched, `G2.resume_reference` and
+     `G2.gsm8k_outputs` true. That equals my first-round numbers at a30a27d,
+     so the merge kept the lmcache side. 9a02fb5 alone gives 10544 local
+     mismatched there, because it has no context key. `G0.lmcache_build`
+     false: the record's stored gate has no `lmcache_dist`.
+   - Qwen3-4B lmcache-ref-1afec5a: `G0.lmcache_build` true with the
+     committed gate.json, false with the record's stored gate.
+4. S1 / S2 on host data: one `Created backend: LocalCPUBackend` in every
+   lmcache stage of both lmcache-ref runs (5 + 5). Storing ranks: Qwen3-4B
+   and Qwen3.5-4B 1 at TP1, 2 at TP2; DSV2 spec at TP2 1; no spec at TP2
+   None. `lmcache_build_problem(Qwen3-4B gate, 0.5.6 overlay)` reports the
+   mismatch; with the pr4467 overlay it reports None. A config with 2
+   backends where 1 is expected reports the problem.
+
+### lmcache status table
+
+Unchanged from the first round, and now as GATES.md:192-199 states it.
+DSV2 0.5.6 is "comparable with caveat", record only.
