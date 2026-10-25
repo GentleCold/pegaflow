@@ -1070,6 +1070,11 @@ local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
   Measure: gsm8k cold/warm s, replay cold TTFT p50 vs baseline (read
   replay cold p50 on the official-size run; the slice is noisy).
   Correctness unchanged.
+- P5 it2 s4b (800630d = H2, not official; no cap): every v2 verdict that
+  ran passes. gsm8k cold -0.1%, warm -0.7%; replay cold TTFT p50 +1.6%,
+  req/s -1.3%. gsm8k prefix queries 6046 -> 23. Hits unchanged (replay
+  warm 0.936 = H*). Merged `feat/semantics-rsi` 9a02fb5 (cap sizing) as
+  be0622f. Next: official run on GPU5 (gsm8k, replay, cap, preempt).
 - P4 final-review fixes (`reviews/P4-final.md`, ACCEPT-WITH-FIXES).
   Changes are in connector_v2's scheduler, its unit test and the docs; no
   semantics or server change.

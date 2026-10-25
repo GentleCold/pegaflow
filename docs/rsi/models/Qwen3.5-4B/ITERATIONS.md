@@ -774,3 +774,37 @@ Prediction: gsm8k cold / warm within 2% of baseline, replay cold TTFT p50
 closer to baseline. Hits and correctness unchanged. Replay cold p50 is
 judged on the official-size run: the 8 x 6 slice is noisy (P4 saw
 baseline swing 0.171-0.192).
+
+### Slice s4b (800630d): H2 result
+
+Run `2026-10-25-qwen3.5-4b-p5-it2-s4b-800630d`: arms plain, baseline, v2;
+full gsm8k, replay 8 x 6, preempt. No cap: the cap was sub-floor at 8 x 6
+anyway. Not official. An earlier attempt (`...-s4-800630d`) is void: the
+gate looked for the server binary in the gate tree, and the v2 server
+failed to start. s4b passes `--pegaflow-server` for the base build.
+
+All v2 verdicts that ran pass (cap verdicts not run):
+- G2: digests 110/110 external in gsm8k (also vs baseline), replay 39/39,
+  preempt 106/106; 0 local mismatches; `G2.digest_groups`; alone_ref
+  delta 0.0 pp;
+- G3: E_ext 1.0 (gsm8k, replay); no eviction in any pass.
+
+| G4 metric | s3 (H1) | s4b (H2) v2 vs baseline |
+|---|---|---|
+| gsm8k cold s | +5.3% (fail) | 95.28 vs 95.33, -0.1% (pass) |
+| gsm8k warm s | +5.3% (fail) | 94.67 vs 95.30, -0.7% (pass) |
+| replay cold TTFT p50 | +3.8% (fail) | 0.2194 vs 0.2159, +1.6% (pass) |
+| replay cold req/s | -1.7% | 5.069 vs 5.133, -1.3% (pass) |
+| replay warm TTFT p50 (warm2/warm3) | 0.140/0.139 vs 0.207/0.209 | 0.146/0.135 vs 0.209/0.209 |
+| replay warm req/s | 6.86/6.87 vs 5.41/5.41 | 6.85/6.97 vs 5.41/5.41 |
+
+The gsm8k server log has 23 prefix queries, against 6046 in s3. Replay has
+141.
+
+Hits, unlimited pool (local / ext / total = H*, E_ext 1.0): replay warm
+0.678 / 0.257 / 0.936, preempt warm 0.667 / 0.261 / 0.928, gsm8k warm
+0.911 / 0.015 / 0.926. Totals match s3 and s1. gsm8k shifts 0.008 from
+local to external.
+
+H2 verdict: prediction met. Replay cold p50 is +1.6% on this slice, and the
+official-size run decides it.
