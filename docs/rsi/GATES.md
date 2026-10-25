@@ -162,21 +162,184 @@ so such stranded bytes are possible today.
   `C` CPU bytes) and `lmcache` (LMCache local CPU backend of exactly `C`
   bytes, 256-token chunks) record their G5 numbers and are never required;
   phase 2 will gate warm replay and `E_C` against `native`.
-- lmcache: not comparable on vLLM 0.32 (wrong KV), 2026-10-23. lmcache 0.5.6
-  (wheel built against torch 2.13.0; ops load under the shared venv's
-  2.13.0+cu130), vLLM 0.32.0, Qwen3-4B, FLASH_ATTN, layout `LBNHC`, LMCache
-  detects `NL_X_NB_BS_NH_CS`. Default adapter (LMCache's "latest dev"):
-  gsm8k cold accuracy 0.859 (= baseline), warm 0 (outputs empty / one
-  token); under batch invariance external digests 64/64 mismatched vs
-  baseline (gsm8k) and 468/468 (replay, self), every one of 36 layers.
-  The wrong blocks are not the poison pattern (per-layer L1 is never the
-  all-0x3F value 24448) and equal no computed copy of any key (so no
-  block / chunk mix-up and not a load after poison); per-layer L1 differs
-  from the right block by 6-46%: wrong bytes, not a reordering of the right
-  ones. vLLM's in-tree adapter (`use_native: true`) does not start with
-  0.5.6 (`ImportError: CudaIPCWrapper` from
-  `lmcache.v1.multiprocess.custom_types`). The arm stays wired
-  (`--arms ...,lmcache`) for a later lmcache; it is not in official runs.
+- lmcache store size. LMCache sizes its local CPU backend per worker
+  process, not per instance. On an MLA model (DeepSeek-V2-Lite, TP2) only
+  the first rank stores (`save only first rank: True`, one `Created
+  backend: LocalCPUBackend` for two `Creating LMCacheEngine`), so a
+  backend of `C` bytes is the whole store: the same one-copy convention as
+  `native` and PegaFlow. On a non-MLA model at TP > 1 every rank stores
+  its own shard, so the gate gives each storing rank `C / tp`
+  (`lmcache_storing_ranks`, from the committed spec dump: all groups
+  `MLAAttentionSpec` = 1 rank, else `tp`). The stage fails closed unless
+  vLLM's log shows exactly that many backends, and an lmcache arm at
+  TP > 1 without a committed spec dump does not start.
+  `result.lmcache` records `storing_ranks`, `per_rank_bytes`, `backends`.
+- lmcache build per model. gate.json `lmcache_dist` names the overlay
+  dist (`<name>-<version>`) a model's lmcache numbers come from:
+  Qwen3-4B `lmcache-0.5.7.dev0+pr4467.e05c2ea`
+  (`~/kexi/overlays/lmcache-pr4467`), DeepSeek-V2-Lite-Chat
+  `lmcache-0.5.6` (`~/kexi/overlays/lmcache`; PR #4467 crashes on MLA,
+  below). A run whose `--lmcache-overlay` holds another dist, or a model
+  without `lmcache_dist`, is not official, and the arm fails
+  `G0.lmcache_build` (each stage's recorded `result.lmcache.dist`). The
+  dist is what the overlay holds; `lmcache.__file__` from the worker is
+  not logged (review N3).
+- lmcache status per model (vLLM 0.32.0, shared venv torch 2.13.0+cu130).
+  The arm is comparable on a model only when its loads are digest-verified
+  there (`G2.digest_self.*` and `G2.digest_vs_baseline.gsm8k` pass with 0
+  mismatches, warm accuracy within `ACC_TOL` of baseline):
+
+  | model | lmcache | chunk | status | evidence |
+  |---|---|---|---|---|
+  | Qwen3-4B (FLASH_ATTN, `LBNHC`) | 0.5.6 (PyPI) | 256 | not comparable: wrong KV | below |
+  | Qwen3-4B | source build of LMCache PR #4467 head `e05c2ea` | 256 | comparable, except the `cap075` curve point (wrong loads) | below |
+  | Qwen3-4B | PR #4467 `e05c2ea` | 16 (secondary) | not comparable: claimed hits never loaded | below |
+  | DeepSeek-V2-Lite-Chat (TP2, MLA) | PR #4467 `e05c2ea` | 256 | not comparable: crashes | below |
+  | DeepSeek-V2-Lite-Chat | 0.5.6 | 256 | comparable with caveat (record only): G3 / G5 numbers usable; `G2.digest_vs_baseline.gsm8k` fails S7 on 14 warm blocks of 1 request (a reference gap, not wrong bytes; rule unchanged) | below |
+
+  The gate pins an unmerged upstream PR (#4467) for the lmcache arm on
+  Qwen3-4B: an open item for the user's final acceptance.
+
+  `native` on Qwen3-4B (`2026-10-24-qwen3-4b-lmcache-ref-1afec5a`):
+  `G2.digest_self.cap` fails at `C/U = 0.5` on the preempted-uncertain
+  bound only. 0 mismatched; all 5140 unjudged loaded blocks are keys whose
+  only undigested computations are preempted episodes (every request is
+  digested), 1.04% of loaded blocks vs `MAX_PREEMPTED_UNCERTAIN` 1%
+  (0.25: 0.24%, 0.75: 0.79%, both pass). That is the bound working as
+  written, not wrong KV; its G5 numbers are reported with that flag.
+
+- Qwen3-4B, PR #4467, chunk 256: `2026-10-24-qwen3-4b-lmcache-ref-1afec5a`
+  (`--arms baseline,native,lmcache`, official flags, cap plan 64 convs as
+  in the official runs). gsm8k (1319) and replay: every G2 digest check
+  passes, external 64/64 (gsm8k) and 14971 (replay) matched, accuracy =
+  baseline. `G2.digest_self.cap` passes at the gated `C/U = 0.5` and at
+  0.25. At 0.75 it fails: 738 external blocks of 2 warm requests
+  (`cap_warm` conv 43 turn 5, `cap_warm2` conv 0 turn 6), every one of 36
+  layers, are wrong: 722 carry the bytes of computed blocks of other
+  conversations at other positions (e.g. `cap_cold` conv 25 turn 2:
+  LMCache served another prefix's chunks), 16 equal no computed copy. No load error was reported. That curve point is wrong KV
+  and is not used; the gated point and the rest stand.
+- Qwen3-4B, PR #4467, chunk 16 (secondary config, to separate chunk
+  granularity from policy: `2026-10-24-qwen3-4b-lmcache-chunk16-91fbc41`,
+  gsm8k 64 + cap): 4 of 64 warm requests got a hit from LMCache's lookup
+  (`need to load` 48-112 tokens) but no `Retrieved` line ever followed. Their
+  19 external blocks hold the poison: one digest, all 36 layers, in all 19.
+  Warm accuracy 0.8125 vs 0.8594, 4 completions differ: not comparable.
+  So the 256 config stays the only one.
+
+- DeepSeek-V2-Lite-Chat, 2026-10-24, gsm8k 64 questions, TP2,
+  TRITON_MLA, batch invariant, not split-invariant. vLLM 0.32 hands MLA
+  layers to connectors as rank-4 `[NB, BS, 1, 576]`, which LMCache's vLLM
+  detector reads as fused K/V (`NL_X_NB_BS_NH_CS`, NH 1, CS 576), not as
+  MLA (its rank-4 branch only special-cases the DSA indexer plane).
+  - PR #4467 build (`2026-10-24-dsv2-lite-lmcache-pr4467-slice`): the first
+    store raises in `multi_layer_kv_transfer` (the PR's new layout check
+    wants a split `[2, L, T, NH*HS]` object for a fused format; the MLA
+    object is `[1, L, T, 576]`): every request HTTP 500, stage error
+    recorded. Upstream bug in the PR for MLA on vLLM >= 0.29, not patched
+    here.
+  - 0.5.6 (`2026-10-24-dsv2-lite-lmcache-056-slice`): for MLA the packed
+    addressing is the object's own layout, so bytes round-trip: external
+    128/128 matched vs baseline and vs self, local 0 mismatched vs self,
+    cold outputs = baseline. It still fails `G2.digest_vs_baseline.gsm8k`
+    (504 local mismatched, warm computed 0/1010 exact, warm computed
+    coverage 0.77 < 0.9), `G2.digest_self.gsm8k` (computed 0/2020 exact)
+    and `G2.gsm8k` (warm 0.672 vs 0.688, one question). Cause: the first
+    warm request after poison loads 4 x 256-token chunks (1024 tokens) and
+    computes blocks 64-67 from token 1024, a split the cold pass never had;
+    every one of the 504 mismatched local blocks equals that request's own
+    warm-computed copy (split `(1024, ())`, layers 1-26 differ). Later
+    requests reuse those blocks locally, so their computed KV differs from
+    the cold copies with the same split key from layer 2 on. This looks like
+    MLA split-variance carried through the context (the split key did not
+    capture it), not a wrong load.
+  - It was the gate's reference. The baseline `split` pass resumes each
+    request at its last full prompt block (where a block-granular
+    connector's hit ends: 63 of 64 warm requests of `native` resume at
+    1120-1184). LMCache resumes at a 256-token chunk end, so every lmcache
+    warm request computes from 1088 (vLLM's own local hit) or 1024. None of
+    its warm computed blocks had a same-split copy except by accident: 0.77
+    coverage, 258 of them on non-aligned prompts. No load was missing (every
+    lookup hit was retrieved, 128/128 external matched). The fix, for every
+    arm (gate `b05e507`): the split key also fingerprints the context bytes
+    an episode starts from, and a baseline stage `resume-<label>` replays
+    each arm's warm pass at that arm's own resume points (Implementation,
+    "Split-variant references").
+  - Rerun with it (`2026-10-24-dsv2-lite-lmcache-056-resume-b05e507`,
+    0.5.6, 64 questions): `G2.resume_reference` 64/64 requests resumed
+    where lmcache did, 31 waves. `G2.digest_vs_baseline.gsm8k` passes:
+    local 17136/17136 and external 128/128 matched, computed 2708/2708
+    exact, cold and warm coverage 1.0. `G2.gsm8k_outputs` passes (warm 0
+    differ from the resume replay). `G2.digest_self.gsm8k` passes; its
+    computed blocks are all unjudged there, since no two copies in one run
+    share a context. `G2.gsm8k` fails: warm 0.672 vs 0.688, one question
+    (-1.56 pp, `ACC_TOL` 1 pp). The baseline's own replay at lmcache's
+    resume points scores 0.672 too, with the same completions. That is the
+    cost of resuming at chunk ends on a split-variant model, not of the
+    bytes.
+  - Full size (`2026-10-24-dsv2-lite-lmcache-ref-b05e507`, gate `b05e507`,
+    0.5.6, official flags, cap plan 76 convs = the official run's,
+    U 13730052096 B): `G2.resume_reference` 1319/1319 resumed where lmcache
+    did (1104 waves). `G2.gsm8k` passes: cold 0.6725 = baseline, warm
+    0.6717 (-0.08 pp), and the replay also scores 0.6717. `G2.gsm8k_outputs`
+    passes (0 non-aligned differ from the replay). `G2.digest_self` passes
+    for gsm8k, replay and every cap fraction (0 mismatched).
+    `G2.digest_vs_baseline.gsm8k` fails, with local 358496/358496 and
+    external 152/152 matched and computed 55026/55026 exact: 14 warm
+    computed blocks of one non-aligned request (prompt 1077, 1284 tokens)
+    have no same-context copy (S7 needs 0). lmcache resumed it at 1280
+    from local 1088 plus 12 loaded blocks, whose bytes equal baseline cold
+    copies (computed from 1088 in a prefill over the whole 1284-token
+    prompt). The replay's prewarm recomputed them from 1088 in a prefill
+    that ends at 1280, which gives other bytes on this build, so the
+    resumed request's context fingerprint differs. The reference is
+    incomplete for that request; nothing judged is wrong (the review
+    reproduced it). The fix would be a prewarm that reproduces the prefill
+    the loaded blocks came from. That is not done, so the check keeps
+    failing and the rule is unchanged; the model's lmcache status is
+    "comparable with caveat": its G3 / G5 numbers are usable, since every
+    digest check behind them passes with 0 mismatched, and the row says
+    which check fails.
+  - The official DSV2 records (`2026-10-24-dsv2-lite-p4-it6-off-a1e7fd2`,
+    `2026-10-25-dsv2-lite-p4-it7-off-a59a254`, gate `ce645d75`) predate the
+    resume stage. Their digest checks and coverage re-score identically
+    under the merged gate, but every arm (`old`, `native` and the required
+    connector_v2) now fails `G2.resume_reference` ("no baseline replay of
+    this arm's resume points"): fail-closed and correct for a record
+    without the stage. DSV2's acceptance on those records does not stand
+    under the merged gate until an official TP2 rerun with the resume
+    stage passes (review M2).
+
+- lmcache 0.5.6 is wrong on vLLM 0.32's fused K/V page, 2026-10-23,
+  re-confirmed 2026-10-24 (`2026-10-24-qwen3-4b-lmcache-repro056`, vLLM's
+  builtin `LMCacheConnectorV1`; `2026-10-24-qwen3-4b-lmcache-056-dynamic`,
+  LMCache's dynamic connector: same result). vLLM's page is
+  `[NB, BS, NH, 2*HS]` (K | V per head); LMCache detects it as
+  `NL_X_NB_BS_NH_CS`. gsm8k (64 questions, batch invariant) cold accuracy
+  0.859 (= baseline), warm 0; external digests 64/64 mismatched vs baseline
+  and vs self, every one of 36 layers. Earlier evidence (2026-10-23): the
+  wrong blocks are not the poison pattern and equal no computed copy of
+  any key; per-layer L1 differs from the right block by 6-46%. Cause
+  (LMCache issue #4463, fix PR #4467, open): the in-process
+  `VLLMPagedMemGPUConnectorV2` keeps split `KV_2LTD` objects
+  (`[2, L, T, NH*HS]`) while the transfer kernel addresses the fused
+  buffer as packed (`[1, L, T, NH*CS]`): the slot stride is half the row,
+  slots alias and the V half never round-trips. `use_gpu_connector_v3`
+  crashes on the first store (shape mismatch, same issue). vLLM's in-tree
+  adapter (`use_native: true`) does not start with 0.5.6 (`ImportError:
+  CudaIPCWrapper`), and is missing `get_kv_events` (vLLM issue #62216).
+- lmcache build used by the arm: `~/kexi/overlays/lmcache-pr4467`, a source
+  build of https://github.com/LMCache/LMCache/pull/4467 head
+  `e05c2ea9781b4021081f34dfb982189ec0fabc15` (base: dev `18651e8f`, 2026-10-21),
+  (an open, unmerged PR: pinned by commit; final acceptance is the user's),
+  unmodified, wheel version `0.5.7.dev0+pr4467.e05c2ea`, CUDA 13.0 nvcc,
+  `TORCH_CUDA_ARCH_LIST=8.9`, `--no-build-isolation` against the shared
+  venv's torch (build tools in `~/kexi/tmp/lmcache-buildtools`, never in the
+  venv), plus the pure deps the venv lacks (aiofile, aiofiles, caio, redis,
+  sortedcontainers, as in the 0.5.6 overlay). No local patch: PR #4467 is
+  upstream's fix for #4463 and is used as published (validated upstream on
+  vLLM 0.32.0, A100, by the issue reporter). Rebuild recipe: below
+  ("lmcache overlay").
 - Known server limit (slice 2026-10-23, `old` and connector_v2 on the same
   build): reclaim evicts `RECLAIM_BATCH_SIZE = 512` blocks per round
   (`pegaflow-core/src/storage/mod.rs`), so on a small pool each eviction
@@ -262,9 +425,32 @@ CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python/.venv/bin:~/kexi/cuda13/bin:
 LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 ~/kexi/pegaflow/python/.venv/bin/python -m rsi.gates.run_gate \
   --model ~/kexi/models/<model> --tag <model>-it<N> \
-  --arms plain,baseline,old,native,lmcache,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0
+  --arms plain,baseline,old,native,lmcache,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0 \
+  --lmcache-overlay <the overlay of gate.json lmcache_dist: ~/kexi/overlays/lmcache-pr4467 on Qwen3-4B>
 # G5 smoke on a slice (below the capacity floor: not official, no E_C conclusion):
 #   ... --gsm8k-limit 64 --replay-convs 8 --replay-turns 6 --cap-convs 8 --cap-turns 6
+```
+
+Official runs include `native` and `lmcache` on every model where the arm
+is comparable (G5 "lmcache status per model"); where it is not, drop
+`lmcache` and cite that table. A reference-arm rerun that is not part of an
+official run (e.g. `--arms plain,baseline,native,lmcache`) lines up with
+an official run only with the same model, flags and cap plan (`cap_convs`
+`auto` resolves to the same count from the same baseline trace; check
+`summary.args.cap_plan`) and the same baseline `U`.
+
+lmcache overlay (a source build of one pinned LMCache commit; on .44):
+
+```bash
+git -C ~/kexi/tmp/lmcache-src fetch origin pull/4467/head && git -C ~/kexi/tmp/lmcache-src checkout e05c2ea9781b
+# build tools (pip, grpcio-tools 1.78, setuptools_scm, wheel) in a --target dir, never the venv;
+# the venv's python only provides torch / ninja (pip wheel installs nothing)
+cd ~/kexi/tmp/lmcache-src && CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python/.venv/bin:~/kexi/cuda13/bin:$PATH \
+  LD_LIBRARY_PATH=~/kexi/cuda13-lib PYTHONPATH=~/kexi/tmp/lmcache-buildtools TORCH_CUDA_ARCH_LIST=8.9 \
+  LMCACHE_CUDA_MAJOR=13 SETUPTOOLS_SCM_PRETEND_VERSION=0.5.7.dev0+pr4467.e05c2ea \
+  ~/kexi/pegaflow/python/.venv/bin/python -m pip wheel . --no-build-isolation --no-deps -w dist
+<any pip> install --no-deps --target ~/kexi/overlays/lmcache-pr4467 dist/lmcache-*.whl
+# + aiofile aiofiles caio redis sortedcontainers (copied from the 0.5.6 overlay)
 ```
 
 Self-test at onboarding (gsm8k, 128 questions per self-test arm, no PegaFlow;
@@ -362,14 +548,22 @@ the last accepted run record by hand until `--accepted` exists.
   switches `kv_cache_layout` to `LBHNC`, so its `G0.spec` and
   `G2.digest_vs_baseline.gsm8k` fail by construction: layout, not data;
   `G2.digest_self.*` and `G2.gsm8k_outputs` are its correctness evidence),
-  `lmcache` (reference arm, record only: LMCache's vLLM connector
-  `LMCacheConnectorV1`, lmcache 0.5.6 from the overlay `--lmcache-overlay`
-  (default `~/kexi/overlays/lmcache`, on `PYTHONPATH` of that arm's vLLM
-  only: its pins would downgrade numpy / protobuf / otel in the shared venv),
+  `lmcache` (reference arm, record only: LMCache's in-process vLLM
+  connector, loaded by module path as LMCache documents it
+  (`lmcache.integration.vllm.lmcache_connector_v1:LMCacheConnectorV1Dynamic`;
+  vLLM's builtin `LMCacheConnectorV1` imports a module LMCache dev moved),
+  from the overlay `--lmcache-overlay` (on `PYTHONPATH` of that arm's vLLM
+  only: its pins would downgrade numpy / protobuf / otel in the shared venv;
+  official runs pass the overlay of the model's gate.json `lmcache_dist`
+  (G5 "lmcache build per model": Qwen3-4B `~/kexi/overlays/lmcache-pr4467`,
+  DeepSeek-V2-Lite the default `~/kexi/overlays/lmcache`, 0.5.6, which is
+  wrong KV on Qwen3-4B); `result.lmcache.dist` records the overlay's
+  lmcache version and `G0.lmcache_build` checks it),
   no PegaFlow server, configured by env only (inherited `LMCACHE_*` dropped):
-  `LMCACHE_LOCAL_CPU=True`, `LMCACHE_MAX_LOCAL_CPU_SIZE` = `B / 2^30` GiB
-  (exact: LMCache allocates `int(GiB x 2^30)` bytes = `B`, same `B` as
-  `native`), `LMCACHE_MAX_LOCAL_DISK_SIZE=0`, no disk / remote URL, chunk
+  `LMCACHE_LOCAL_CPU=True`, `LMCACHE_MAX_LOCAL_CPU_SIZE` = `B / r / 2^30`
+  GiB per storing rank (`r` = 1 on MLA or TP1, else `tp`; exact: LMCache
+  allocates `int(GiB x 2^30)` bytes = `B / r`, so the store totals the
+  same `B` as `native`; G5 "lmcache store size"), `LMCACHE_MAX_LOCAL_DISK_SIZE=0`, no disk / remote URL, chunk
   size LMCache's default 256 tokens, telemetry off (`LMCACHE_TRACK_USAGE=false`,
   `DO_NOT_TRACK=1`); `result.lmcache` records the env and LMCache's logged
   configuration. LMCache stores and looks up 256-token chunks (a trailing
@@ -528,7 +722,7 @@ the last accepted run record by hand until `--accepted` exists.
     only registers connector names (lazy imports). The other arms' children
     report no stats (probe, selftest, `connector_v2` today), or are vLLM
     builtins registered under their class names (native
-    `OffloadingConnector`, lmcache `LMCacheConnectorV1`). If the connector
+    `OffloadingConnector`), or report none (lmcache's dynamic connector). If the connector
     under test starts reporting stats, it hits the same lookup and fails
     loudly (HTTP 500 on every request), never silently. The fix is in that
     connector: its own module registers its class under its class name when
@@ -646,8 +840,13 @@ the last accepted run record by hand until `--accepted` exists.
   never computed the key. A computed block is `exact` if it equals another
   computed copy; with `split_invariant=false` only copies with the same
   *split* count as references: split = (start of the computing episode, the
-  `progress` chunk ends of that episode below the block's end), i.e. where the
-  cached context ended and how prefill was chunked up to the block. A computed
+  `progress` chunk ends of that episode below the block's end, a hash of the
+  digests of every block of the request at or below the start on that rank),
+  i.e. where the cached context ended, how prefill was chunked up to the
+  block, and which context bytes it attended to (a context block computed at
+  another split has other bytes, and so does everything computed on top of
+  it; wrong context bytes are judged where they enter, as loaded blocks).
+  REF may be several probe dirs (their computed copies pooled). A computed
   block with copies only at other splits is `computed_unmatched_split`, one
   REF never computed is `computed_unreferenced` (REF != CAND); both are not
   judged. `computed_by_pass` breaks these counts down by the candidate's
@@ -689,8 +888,9 @@ the last accepted run record by hand until `--accepted` exists.
   `computed_exact == computed_compared`. With `split_invariant=false`,
   digest_vs_baseline.gsm8k also needs, in each of `cold` and `warm`, judged
   computed blocks > 0 and `compared / (compared + unmatched_split +
-  unreferenced) >= 0.9` (`MIN_COMPUTED_COVERAGE`; warm is judged against the
-  baseline's `split` pass), and in `warm` zero unjudged computed blocks on
+  unreferenced) >= 0.9` (`MIN_COMPUTED_COVERAGE`; REF is the baseline's
+  gsm8k probe plus its `resume-<label>` replay of this arm, below), and in
+  `warm` zero unjudged computed blocks on
   prompts whose length is not a multiple of the hit alignment (a prompt
   without a recorded length counts as non-aligned; only aligned prompts,
   where the plain split stops one block short of a connector's hit, may
@@ -735,11 +935,56 @@ the last accepted run record by hand until `--accepted` exists.
   reported only, see `G2.batch_control`): every completion equals
   baseline cold, cold and warm; with `split_invariant=false`: every cold
   completion equals baseline cold (same split), and every warm completion
-  equals the plain arm's `split` completion of the same prompt, except on
-  prompts with `prompt_len % cache_hit_alignment_tokens == 0`
-  (`warm_differ_vs_split_aligned`, reported only: vLLM's own hit stops one
-  block short there, a connector's need not). The warm differ count vs
-  baseline cold is reported only.
+  equals the baseline `resume-<label>` replay's completion of the same
+  prompt (`warm_reference`; without that stage, the plain arm's `split`
+  completion), except on prompts with `prompt_len %
+  cache_hit_alignment_tokens == 0` that the replay could not resume where
+  the arm did (`warm_differ_vs_split_aligned`, reported only: vLLM's own
+  hit stops one block short there, a connector's need not); a non-aligned
+  prompt the replay missed or resumed elsewhere counts as differing. The
+  warm differ count vs baseline cold is reported only.
+- Split-variant references (`split_invariant=false`, every arm with a
+  gsm8k stage, needs the baseline arm): right after the arm's gsm8k stage
+  the gate runs a fresh baseline stage `baseline/resume-<label>`
+  (`run_gate.resume_plan`, `workloads.run_resume`). From the arm's probe
+  trace it takes each warm request's prompt index (`rsi_conv`, set on every
+  gsm8k request), its first episode `[step, local, start]` and groups the
+  requests by `step` into waves in the arm's schedule order. After a
+  warmup and reset + poison it replays the waves. Each request whose start
+  exceeds its local hit is first sent as its first `start` prompt tokens
+  with `max_tokens=1` (`resume_prewarm`, never scored), then whole
+  (`resume`, streamed). A wave starts once every request of the previous
+  wave has its first token, so the replay's local hits come from its own
+  earlier requests, as the arm's did. A warm request vLLM preempted in the
+  arm (several episodes; the probe digests every one) gets its later
+  episodes chained: after the replay's request of that prompt finishes,
+  each episode `k` runs as a request of the first `episode_tokens[k]`
+  tokens of the replay's own sequence (prompt + its output so far,
+  `return_token_ids`), pre-warmed to its start by the same rule
+  (`resume_ep`, `rsi_turn` = k), so its context is the replay's previous
+  episode, held in vLLM's prefix cache, and its computed blocks get a
+  same-split copy. Its completion is the replay's text up to that point
+  plus the episode's. An episode the replay cannot form (its output is
+  shorter, or a streamed chunk straddles the episode's first token) stops
+  the chain; that prompt then has no completion (differs) and the episode
+  is `episode_missing`. A trace without `episode_tokens` (probe before
+  this field) makes the plan fail closed. Its digests join REF and its
+  completions are the warm outputs reference. `G2.resume_reference` (per
+  arm, and required for the honest self-test on split-variant models)
+  passes iff the stage ran, its `digest_self` passes and the plan has no
+  problem (every prompt has exactly one warm request with a valid index,
+  and every preempted one its episode lengths); how many requests or
+  later episodes the replay resumed elsewhere (`start_differs`,
+  `episode_start_differs`), or missed, is reported, and their blocks stay
+  unjudged (coverage) and their completions count as differing
+  (non-aligned). The resume stage gets gate.json `gsm8k_vllm_args` like
+  the gsm8k stage it replays (`G0.vllm_args` checks it). A resume stage
+  that crashes fails that arm's `G2.resume_reference`, not the baseline,
+  for a record-only arm; for the arm under test the gate re-raises and the
+  run aborts (review N1). The replay shows what the
+  baseline computes from the arm's resume points; it cannot make wrong
+  loaded bytes look right: those are matched against computed copies,
+  never against the arm's own.
 - Split invariance (`split_invariant`, `G2.split_control`, baseline verdicts).
   Batch invariance makes a token's KV independent of batch composition, not
   of *where the request's computation starts*. vLLM 0.32's MLA prefill
