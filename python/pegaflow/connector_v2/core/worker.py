@@ -91,10 +91,13 @@ class SaveStats:
     sent: int = 0  # finished requests reported in finished_sending
     sent_wait_s: float = 0.0  # their total time held between finish and report
     max_sent_wait_s: float = 0.0
-    sync_loads: int = 0  # sync load RPCs issued
-    sync_first_steps: int = 0  # steps whose sync loads were moved ahead of async ones
-    sync_wait_s: float = 0.0  # step thread: waiting for them (on the critical path)
+    sync_loads: int = 0  # sync loads whose RPC was accepted (failed RPCs are not waited for)
+    sync_first_steps: int = 0  # steps where a sync load was moved ahead of an async one
+    sync_wait_s: float = 0.0  # step thread: waiting for their copies (on the critical path)
     max_sync_wait_s: float = 0.0  # longest wait of one step
+    load_steps: int = 0  # steps with any load plan
+    load_issue_s: float = 0.0  # step thread: all of _start_loads (RPCs + sync wait)
+    max_load_issue_s: float = 0.0
     _since: float = field(default=0.0, repr=False)
 
 
@@ -313,11 +316,12 @@ class Worker:
         after the step's async loads would stall the step for their copies
         too.
         """
+        if not plan.loads:
+            return
+        t0 = self._clock()
         sync: list[tuple[Any, list[int]]] = []
         ordered = sorted(plan.loads, key=lambda lp: not lp.sync)
-        if ordered != plan.loads:
-            with self._cv:
-                self.save_stats.sync_first_steps += 1
+        reordered = ordered != plan.loads
         for lp in ordered:
             if lp.fail:
                 if lp.sync:
@@ -340,6 +344,13 @@ class Worker:
                     self._batches.append(_Batch(state, [lp.req_id]))
         if sync:
             self._wait_sync(sync)
+        issued = self._clock() - t0
+        with self._cv:
+            stats = self.save_stats
+            stats.sync_first_steps += reordered
+            stats.load_steps += 1
+            stats.load_issue_s += issued
+            stats.max_load_issue_s = max(stats.max_load_issue_s, issued)
 
     def _start_load(self, req_id: str, loads: list[tuple[bytes, list[list[int | None]]]]) -> Any:
         """Issue the load RPC; the load state, or None if the RPC failed."""
@@ -596,7 +607,8 @@ class Worker:
             "blocks=%d bytes=%d submit_ms=%.1f flushes=%d flush_ms=%.1f wait_ms=%.1f "
             "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d rpcs=%d pressure_rpcs=%d "
             "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f kv_usage_unknown_steps=%d "
-            "sync_loads=%d sync_first_steps=%d sync_wait_ms=%.1f max_sync_wait_ms=%.2f",
+            "sync_loads=%d sync_first_steps=%d sync_wait_ms=%.1f max_sync_wait_ms=%.2f "
+            "load_steps=%d load_issue_ms=%.1f max_load_issue_ms=%.2f",
             self._par.tp_rank,
             now - s._since,
             s.steps,
@@ -621,6 +633,9 @@ class Worker:
             s.sync_first_steps,
             s.sync_wait_s * 1e3,
             s.max_sync_wait_s * 1e3,
+            s.load_steps,
+            s.load_issue_s * 1e3,
+            s.max_load_issue_s * 1e3,
         )
 
     def shutdown(self) -> None:

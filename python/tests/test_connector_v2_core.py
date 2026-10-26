@@ -717,70 +717,223 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
     worker.shutdown()
 
 
+# Short-hit demotion (policy ``async_demote``) script: "long" / "short" look
+# up and allocate a 12- / 8-token hit (the short one expected "sync" or
+# "demoted"), "sharer" a request on another's blocks (expected deferred),
+# "bad-alloc" looks up at the given local hit and allocates more tokens than
+# planned (the plan fails); "step"
+# plans a step, "done" reports loads landed or failed, "finish" aborts.
+DEMOTE = Policy(sync_load_tokens=8, async_demote=True)
+CASCADE = [("long", "a"), ("step",), ("short", "b1", "demoted"), ("step",)]
+CASCADE += [("short", "b2", "demoted"), ("done", "a"), ("short", "b3", "sync"), ("step",)]
+CASCADE += [("wait", 0.25), ("done", "b1", "b2")]
+
+
 @pytest.mark.parametrize(
-    "steps_between,second_async,expected",
+    "policy,script,stats",
     [
         # The workers send a step's sync loads first: an async load of the
         # same step is no reason to demote.
-        pytest.param(None, False, True, id="same-step"),
-        # The server copies loads in arrival order: right after last step's
-        # async load, a sync load would stall the step behind it.
-        pytest.param(1, False, False, id="after-async-step"),
-        pytest.param(1, True, False, id="async-both-steps"),
-        pytest.param(2, False, True, id="two-steps-later"),
+        pytest.param(
+            DEMOTE, [("long", "a"), ("short", "b", "sync")], {"sync_planned": 1}, id="same-step"
+        ),
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("short", "b", "demoted"), ("step",), ("done", "b")],
+            {"sync_demoted": 1, "max_demoted_run": 1, "demoted_done": 1}
+            | {"demoted_ms": 0, "max_demoted_ms": 0, "demoted_steps": 1, "max_demoted_steps": 1},
+            id="behind-long",
+        ),
+        pytest.param(
+            Policy(sync_load_tokens=8),
+            [("long", "a"), ("step",), ("short", "b", "sync")],
+            {"sync_planned": 1},
+            id="knob-off",
+        ),
+        # Failed and aborted long loads end the demotion like landed ones.
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("done", "a"), ("short", "b", "sync")],
+            {"sync_planned": 1},
+            id="long-done",
+        ),
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("finish", "a"), ("short", "b", "sync")],
+            {"sync_planned": 1},
+            id="long-aborted",
+        ),
+        pytest.param(
+            DEMOTE,
+            [("bad-alloc", "a", 0), ("step",), ("short", "b", "sync")],
+            {"sync_planned": 1},
+            id="long-plan-failed",
+        ),
+        # Sync loads are copied before the forward: nothing in flight after.
+        pytest.param(
+            DEMOTE,
+            [("short", "a", "sync"), ("step",), ("short", "b", "sync")],
+            {"sync_planned": 2},
+            id="after-sync",
+        ),
+        # M1: demoted loads do not demote: once the long load is done the
+        # next short hit loads sync while b1, b2 are still in flight.
+        pytest.param(
+            DEMOTE,
+            CASCADE,
+            {"sync_planned": 1, "sync_demoted": 2, "max_demoted_run": 2, "demoted_done": 2}
+            | {
+                "demoted_steps": 3,
+                "max_demoted_steps": 2,
+                "demoted_ms": 500,
+                "max_demoted_ms": 250,
+            },
+            id="cascade",
+        ),
+        # A failed demoted plan is a failed receive, not a demotion.
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("bad-alloc", "b", 4)],
+            {},
+            id="demoted-plan-failed",
+        ),
+        # An aborted demoted load leaves nothing behind and is not done.
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("short", "b", "demoted"), ("finish", "b"), ("done", "b")],
+            {"sync_demoted": 1, "max_demoted_run": 1},
+            id="demoted-aborted",
+        ),
+        # A preempted loader that loads again is a long load again.
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("done", "a"), ("step", "a"), ("long", "a"), ("step",)]
+            + [("short", "b", "demoted"), ("done", "a"), ("short", "c", "sync")],
+            {"sync_planned": 1, "sync_demoted": 1, "max_demoted_run": 1},
+            id="preempted-reloads",
+        ),
+        # A request on a demoted load's blocks waits for it (S2).
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("short", "b", "demoted"), ("sharer", "s", "b")]
+            + [("wait", 0.05), ("done", "a", "b"), ("short", "s", "sync")],
+            {"sync_planned": 1, "sync_demoted": 1, "max_demoted_run": 1, "demoted_done": 1}
+            | {"demoted_ms": 50, "max_demoted_ms": 50, "demoted_steps": 0, "max_demoted_steps": 0}
+            | {"deferred": 1, "deferred_demoted": 1, "deferred_demoted_ms": 50}
+            | {"max_deferred_demoted_ms": 50},
+            id="sharer-deferred",
+        ),
     ],
 )
-def test_sync_load_demoted_after_async_load(steps_between, second_async, expected):
+def test_sync_load_demotion(policy, script, stats):
+    layout = _layout(StubSemantics, StubFullSpec())
+    rpc = FakeRpc({0: Ready(3, b"L0")})
+    clock = Clock()
+    sched = Scheduler(
+        layout, policy, rpc, "inst", clock=clock, semantics=StubSemantics, sync_loads=True
+    )
+    reqs = {}
+
+    def req(rid, like=None):
+        r = _req(req_id=rid)
+        r.block_hashes = [b"%s%d" % ((like or rid).encode(), i) for i in range(3)]
+        return reqs.setdefault(rid, r)
+
+    for op, *args in script:
+        if op == "step":
+            sched.plan_saves([], lambda _: None, preempted=args)
+        elif op == "wait":
+            clock.now += args[0]
+        elif op == "done":
+            sched.on_loads_done(args)
+        elif op == "finish":
+            sched.request_finished(args[0])
+        elif op == "sharer":
+            assert sched.get_num_new_matched_tokens(req(args[0], args[1]), 4) == (None, False)
+        else:
+            r = reqs.pop(args[0], None) or req(args[0])
+            reqs[args[0]] = r
+            num_computed = {"long": 0, "bad-alloc": args[-1]}.get(op, 4)
+            n, is_async = sched.get_num_new_matched_tokens(r, num_computed)
+            n += 4 * (op == "bad-alloc")
+            sched.update_state_after_alloc(r, ([10, 11, 12, 13],), n)
+            (lp,) = [lp for lp in sched.take_plan().loads if lp.req_id == args[0]]
+            got = (
+                "fail" if lp.fail else "sync" if lp.sync else "async" if op == "long" else "demoted"
+            )
+            want = {"long": "async", "bad-alloc": "fail"}.get(op) or args[1]
+            assert (args[0], got, is_async) == (args[0], want, want != "sync")
+    assert {k: v for k, v in sched.hit_stats.items() if k != "lookups"} == stats
+    # Nothing is left once every request finished.
+    for rid in reqs:
+        sched.request_finished(rid)
+    assert (sched._long_loads, sched._demoted, sched._deferred_demoted) == ({}, {}, {})
+
+
+def test_demoted_load_fails():
+    """A failed demoted load is a failed receive: vLLM recomputes it."""
     layout = _layout(StubSemantics, StubFullSpec())
     rpc = FakeRpc({0: Ready(3, b"L0")})
     sched = Scheduler(
-        layout,
-        Policy(sync_load_tokens=8),
-        rpc,
-        "inst",
-        clock=Clock(),
-        semantics=StubSemantics,
-        sync_loads=True,
+        layout, DEMOTE, rpc, "inst", clock=Clock(), semantics=StubSemantics, sync_loads=True
     )
-    ids = ([10, 11, 12, 13],)
-
-    def alloc(req, num_computed):
-        n, is_async = sched.get_num_new_matched_tokens(req, num_computed)
-        sched.update_state_after_alloc(req, ids, n)
-        return is_async
-
-    assert alloc(_req(req_id="a"), 0)  # 12 tokens: async
-    for _ in range(steps_between or 0):
+    worker = _worker(StubSemantics, rpc, [FakeLoadState(), FakeLoadState(state=-1)], layout=layout)
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    a, b = _req(req_id="a"), _req(req_id="b")
+    b.block_hashes = [b"y0", b"y1", b"y2"]
+    for r, num_computed in ((a, 0), (b, 4)):
+        n, _ = sched.get_num_new_matched_tokens(r, num_computed)
+        sched.update_state_after_alloc(r, ([10, 11, 12, 13],), n)
         sched.plan_saves([], lambda _: None)
-    if second_async:
-        assert alloc(_other(req_id="a2", diverge_at=0), 0)
-    short = _req(req_id="b")  # 8 tokens past the local hit, not waiting on a or a2
-    short.block_hashes = [b"y0", b"y1", b"y2"]
-    assert alloc(short, 4) is not expected
-    sync = [p.sync for p in sched.take_plan().loads if p.req_id == "b"]
-    assert (sync, sched.hit_stats.get("sync_demoted", 0)) == ([expected], int(not expected))
-    sched.on_loads_done(["b"])
-    assert sched._demoted == {}
-
-
-def test_worker_sends_sync_loads_first():
-    """A sync load sent after an async one waits for its copy as well."""
-    rpc = FakeRpc()
-    worker = _worker(StubSemantics, rpc, [FakeLoadState(), FakeLoadState(), FakeLoadState()])
-    plan = StepPlan(
-        loads=[
-            LoadPlan("long", [(b"L0", [[1]])]),
-            LoadPlan("short", [(b"L1", [[2]])], sync=True, covered=[2]),
-            LoadPlan("long2", [(b"L2", [[3]])]),
-        ]
-    )
-    worker.start(plan)
-    assert [loads[0][0] for loads in rpc.loads] == [b"L1", b"L0", b"L2"]
-    stats = worker.save_stats
-    assert (stats.sync_loads, stats.sync_first_steps) == (1, 1)
+        worker.start(sched.take_plan())
+    _, recving, failed = worker.poll()
+    assert (recving, failed, worker.take_invalid()) == ({"a", "b"}, {"b"}, set())
+    sched.on_loads_done(recving)
+    assert (sched.hit_stats["sync_demoted"], sched.hit_stats["demoted_done"]) == (1, 1)
     worker.shutdown()
 
 
+@pytest.mark.parametrize(
+    "loads,order,stats,invalid",
+    [
+        # A sync load sent after an async one waits for its copy as well.
+        pytest.param(
+            ["long", "short", "long2"],
+            [b"L1", b"L0", b"L2"],
+            (1, 1, 1.0, 1, 3.0),
+            set(),
+            id="reordered",
+        ),
+        pytest.param(
+            ["short", "long"], [b"L1", b"L0"], (1, 0, 1.0, 1, 3.0), set(), id="already-first"
+        ),
+        # A sync load whose RPC failed is invalid, never waited for.
+        pytest.param(
+            ["long", "bad"], [b"bad", b"L0"], (0, 1, 0.0, 1, 1.0), {2}, id="sync-rpc-failed"
+        ),
+        pytest.param([], [], (0, 0, 0.0, 0, 0.0), set(), id="no-loads"),
+    ],
+)
+def test_worker_sends_sync_loads_first(loads, order, stats, invalid):
+    rpc = FakeRpc()
+    rpc.load_ok[b"bad"] = False
+    plans = {
+        "long": LoadPlan("long", [(b"L0", [[1]])]),
+        "short": LoadPlan("short", [(b"L1", [[2]])], sync=True, covered=[2]),
+        "bad": LoadPlan("bad", [(b"bad", [[2]])], sync=True, covered=[2]),
+        "long2": LoadPlan("long2", [(b"L2", [[3]])]),
+    }
+    # The clock advances 1 s per read: sync_wait = 1, load_issue = 1 + 2 per sync wait.
+    states = [FakeLoadState() for _ in loads]
+    worker = _worker(StubSemantics, rpc, states, clock=JumpClock(1.0))
+    worker.start(StepPlan(loads=[plans[k] for k in loads]))
+    s = worker.save_stats
+    got = (s.sync_loads, s.sync_first_steps, s.sync_wait_s, s.load_steps, s.load_issue_s)
+    assert ([lo[0][0] for lo in rpc.loads], got, worker.take_invalid()) == (order, stats, invalid)
+    worker.shutdown()
+
+
+# Step 2 onwards, after vLLM processed step 0's outcome. "X" is shared's next
 # turn: a new request whose prefix hit covers shared's blocks 10, 11, 20, 21.
 OK_NEXT = [[("r", 17, 1), ("shared", 17, 1)], [("X", 16, 5)]]
 FAIL_NEXT = [[("r", 4, 13), ("shared", 17, 1)], [("X", 16, 5)]]

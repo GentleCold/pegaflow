@@ -63,6 +63,15 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     the hit's tokens), which vLLM recomputes. Sync loads are only used when
     vLLM can recover them: one KV cache group and no block zeroing
     (`needs_kv_cache_zeroing`); otherwise every load is asynchronous.
+    The server copies a device's loads one at a time in arrival order, so
+    the workers send a step's sync loads before its async ones. With
+    `async_demote` (off by default, pending gate evidence) a short hit is
+    loaded asynchronously instead while a long async load from an earlier
+    step is still in flight (until vLLM reports it done or the request
+    finishes): a sync load behind it would hold the step for both copies.
+    Demoted loads never cause further demotions. A demoted request waits a
+    scheduler round trip, and requests sharing its prefix wait for its load
+    (`_defer_for_inflight`); both costs are in `hit stats`.
     The server keeps the first copy of a key, so nothing computed on a load
     that may have failed is saved:
     - a request whose blocks include a sync-loaded block saves nothing until
@@ -140,7 +149,16 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   longest resume point the full group backs, how often and how many tokens
   were lost, counted once per request and resume point (vLLM re-queries a
   waiting request every scheduling pass) (`missing=` with no group: the policy lowered `p`). This is the
-  group-coherence signal for server eviction.
+  group-coherence signal for server eviction. Load counters:
+  - `deferred`: requests that waited for another request's async load;
+    `deferred_demoted` of them behind a demoted load, with their wait
+    (`deferred_demoted_ms`, sum and `max_`) counted when they are allocated;
+  - `sync_planned`: sync loads planned (a sync load is a short hit loaded
+    before the forward);
+  - `sync_demoted`: short hits loaded asynchronously (`async_demote`),
+    `max_demoted_run` the longest run of consecutive steps that demoted;
+    once vLLM reports them done (`demoted_done`, landed or failed), the time and plan steps
+    from allocation (`demoted_ms`, `demoted_steps`, sum and `max_`).
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first, and `LayerDecl.layout` when an
@@ -161,7 +179,13 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   - on the step thread: `submit_ms` and preemption `flushes` / `flush_ms`;
   - on the saver thread: `wait_ms` (compute event), `rpc_ms`, `max_job_ms`,
     `max_pending` jobs;
-  - failed saves.
+  - failed saves;
+  - loads, on the step thread: `sync_loads` (sync loads whose RPC the server
+    accepted), `sync_first_steps` (steps where a sync load was moved ahead
+    of an async one), `sync_wait_ms` / `max_sync_wait_ms` (waiting for the
+    sync copies, per step), and `load_steps` / `load_issue_ms` /
+    `max_load_issue_ms` (all of `start_load_kv`: every load RPC plus the
+    sync wait, over steps with a load plan).
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;
   - every TP rank's declarations must pass `semantics.seal_plan` (V0).
