@@ -2637,7 +2637,7 @@ def _native_perf_verdicts(
     timed warm pass values, medians, pass-to-pass ranges, ``gap`` (median -
     native median), ``gap_pct`` (of native's median; for TTFT positive is
     slower, for req/s negative is slower), ``noise`` (the larger range) and
-    ``within_noise`` (|gap| < noise, a diagnostic). Only native's timing is
+    ``within_noise`` (|gap| <= noise, a diagnostic). Only native's timing is
     used. ``void`` when the arm's replay KV was wrong (its timing measures
     nothing then)."""
     g: dict[str, Any] = {}
@@ -2657,12 +2657,16 @@ def _native_perf_verdicts(
                 "gap": a - b,
                 "gap_pct": 100 * (a - b) / b if b else None,
                 "noise": max(rng, nrng),
-                "within_noise": abs(a - b) < max(rng, nrng),
+                "within_noise": abs(a - b) <= max(rng, nrng),
             }
         if not replay_ok:
             v["void"] = "G2.digest_self.replay fails: the timing is not comparable"
         if native_rep is None:
             v["reason"] = "no native replay stage in this run"
+        elif not theirs:
+            v["reason"] = f"native replay has no timed warm pass with {key}"
+        elif not mine:
+            v["reason"] = f"no timed warm pass with {key}"
         g[f"G4.replay_warm.{key}_vs_native"] = v
     return g
 
@@ -3180,15 +3184,23 @@ def hit_report(v: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _behind_pct(x: dict[str, Any]) -> float | None:
+    pct = x.get("gap_pct")
+    return None if pct is None else (pct if x["lower_is_better"] else -pct)
+
+
 def native_report(v: dict[str, Any]) -> dict[str, Any]:
-    """Per arm judged against native: median, native median, gap %, within
-    noise per ``*_vs_native`` key (full verdicts stay in ``verdicts``)."""
+    """Per arm judged against native: median, native median, gap %,
+    ``behind_pct`` (positive = slower than native, whatever the direction of
+    the key), within noise per ``*_vs_native`` key (full verdicts stay in
+    ``verdicts``)."""
     out: dict[str, Any] = {}
     for label, g in v.items():
         keys = [k for k in g if k.endswith("_vs_native")] if isinstance(g, dict) else []
         if keys:
             out[label] = {
                 k: {f: g[k].get(f) for f in ("median", "native_median", "gap_pct", "within_noise", "void", "reason")}
+                | {"behind_pct": _behind_pct(g[k])}
                 for k in keys
             }  # fmt: skip
     return out

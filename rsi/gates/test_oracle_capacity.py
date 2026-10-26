@@ -1924,11 +1924,12 @@ NATIVE_KEYS = ("G4.replay_warm.ttft_p50_vs_native", "G4.replay_warm.req_per_s_vs
         (((0.2957, 0.3035), (12.4927, 12.1985)), ((0.2799, 0.3039), (13.0061, 13.1634)), (2.64, -5.65), (True, False)),
         # Qwen3.5 it2: TTFT +72% (0.300 s vs 0.172 s), reported, never a fail.
         (((0.2996, 0.2952), (14.6105, 14.6551)), ((0.1745, 0.1712), (13.1495, 13.1609)), (72.06, 11.23), (False, False)),
-        # |gap| == the larger range is outside noise (exact binary fractions).
-        (((0.5, 1.0), (2.0, 3.0)), ((0.25, 0.25), (1.5, 1.5)), (200.0, 66.67), (False, False)),
-        (((0.3, 0.3), (8.0, 8.0)), ((0.3, 0.3), (8.0, 8.0)), (0.0, 0.0), (False, False)),  # tie, range 0
+        # |gap| == the larger range is within noise (exact binary fractions).
+        (((0.5, 1.0), (2.0, 3.0)), ((0.25, 0.25), (1.5, 1.5)), (200.0, 66.67), (True, True)),
+        (((0.5, 1.0), (2.0, 3.0)), ((0.125, 0.125), (1.0, 1.0)), (500.0, 150.0), (False, False)),
+        (((0.3, 0.3), (8.0, 8.0)), ((0.3, 0.3), (8.0, 8.0)), (0.0, 0.0), (True, True)),  # tie, range 0
     ],
-    ids=["qwen3-4b-it7", "dsv2-it7", "qwen35-it2", "gap-equals-range", "tie"],
+    ids=["qwen3-4b-it7", "dsv2-it7", "qwen35-it2", "gap-equals-range", "gap-above-range", "tie"],
 )  # fmt: skip
 def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
     """User, 2026-10-26: v2 vs native on G4 warm is a judged comparison
@@ -1951,8 +1952,14 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
         assert x["noise"] == max(x["range"], x["native_range"])
         assert x["gap_pct"] == pytest.approx(pct, abs=0.01) and x["within_noise"] is w
     assert g["G4.replay_warm.ttft_p50"]["pass"] and g["G4.replay_warm.req_per_s"]["pass"]
-    rep = run_gate.native_report(v)["pegaflow.m:C"][NATIVE_KEYS[0]]
-    assert rep["gap_pct"] == g[NATIVE_KEYS[0]]["gap_pct"]
+    # Arm-level pass is what it is without the *_vs_native keys, whatever the gap.
+    alone = {"baseline": results["baseline"], "pegaflow.m:C": results["pegaflow.m:C"]}
+    without = run_gate.verdicts(alone, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert g["pass"] == without["pass"]
+    rep = run_gate.native_report(v)["pegaflow.m:C"]
+    for k, pct, lower in zip(NATIVE_KEYS, gap_pct, (True, False), strict=True):
+        assert rep[k]["gap_pct"] == g[k]["gap_pct"]
+        assert rep[k]["behind_pct"] == pytest.approx(pct if lower else -pct, abs=0.01)
     # A wrong-KV replay marks the comparison void (the arm fails on G2 / G4 vs baseline).
     results["pegaflow.m:C"]["replay"]["digest_self"] = None
     g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
@@ -1962,6 +1969,10 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
     results["pegaflow.m:C"]["replay"] = _replay(*mine)
     g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
     assert all(g[k]["reason"] and "gap" not in g[k] and "pass" not in g[k] for k in NATIVE_KEYS)
+    # Native ran but has no timed warm pass: reported with the reason too.
+    results["native"] = {"replay": _replay(0.3, 8.0, warm=())}
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert all("timed warm pass" in g[k]["reason"] for k in NATIVE_KEYS)
 
 
 def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):

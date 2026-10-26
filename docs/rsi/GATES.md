@@ -28,7 +28,7 @@ regression" clauses).
   on the unlimited runs, the cap pool and load proofs (`pool_ok`,
   `loads_ok`, `unmatched_requests == 0`), the G5 capacity floor and freeze
   separation (run validity, `not_official_because`), and every G0 / G2 / G4
-  check.
+  check (except `*_vs_native`, reported).
 - Hit-rate judgment: the onboarding agent writes a "hit-rate judgment" in
   the model's `ITERATIONS.md` for each accepted run. It compares the
   measured hit rate with `H*` / `H*_C` and the reference arms (`H_lru`,
@@ -1199,8 +1199,9 @@ the last accepted run record by hand until `--accepted` exists.
     the arm under test's timed warm passes vs the in-run `native` arm's
     (vLLM's OffloadingConnector). Each records both arms' pass values,
     medians and pass-to-pass ranges, the gap and gap % (of native's
-    median), `noise` (the larger range) and `within_noise` (|gap| < noise,
-    a diagnostic); `summary.native_report` lists them. The onboarding agent
+    median), `noise` (the larger range) and `within_noise` (|gap| <= noise,
+    a diagnostic); `summary.native_report` lists them with `behind_pct`
+    (positive = slower than native). The onboarding agent
     writes a "perf vs native judgment" next to the hit-rate judgment: the
     gap in %, attributed (load path, save path, scheduling, server), and
     whether it is close enough; the review agent checks it. No numeric
