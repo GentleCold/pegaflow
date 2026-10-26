@@ -1583,6 +1583,109 @@ apportioned to passes by time):
   impossible here. The TP1 pair cf67695 (stats) vs daa5e11 (part 1) gives
   it in one session.
 
+### Qwen3.5-4B TTFT p50 attribution (offline, both it4 pair runs)
+
+Main rejected "the p50 gap is structural": native's loads are async too,
+yet native reaches p50 0.17-0.21 s against v2's 0.284-0.295 s. Data:
+`2026-10-26-qwen3.5-4b-p5-it4-pair-{02b6767,c8a8842}`, warm2/warm3, probe
+steps, server query timestamps, vLLM histograms. Scripts are in
+`~/kexi/tmp/p5-it3-attr/`: q35rt, q35time, q35hist2, q35wave, q35wave2,
+q35seg.
+
+1. **Round trip in steps.** v2 needs as many steps as native or fewer, in
+   every class:
+
+   | class (warm2, 02b6767) | n | native steps (gap+pre) | v2 steps | v2 - native (paired) |
+   |---|---|---|---|---|
+   | t0 (ext 1584) | 32 | 66 p50 | 4 | -58 |
+   | t>0, ext=0 | 67 | 3 | 3 | 0 |
+   | t>0, ext ≤528 | 81 | 7 | 6 | -1 |
+   | t>0, ext ≤1056 | 40 | 7 | 6 | -1 |
+   | t>0, ext >1056 | 32 | 7 | 6 | -1 |
+
+   The other pass and the c8a8842 run give the same within ±0.1 steps.
+   Async loads cost 3 extra steps in v2 (lookup and issue, the one-step-late
+   done report, promotion) and 4 in native. The step-count gap is in v2's
+   favour.
+2. **Load size and tasks per request.** They are the same. Each pass has
+   185 load RPCs, one per external hit (153 t>0 + 32 t0). One RPC covers
+   all 4 groups. Native also has 185 loads.
+
+   | per warm pass | v2 | native |
+   |---|---|---|
+   | bytes loaded | 16.42 GB | 16.35 GB |
+   | copy time | 0.744 s, 4.0 ms/load | 0.785 s, 4.2 ms/load |
+   | load RPC time | 14 ms total | - |
+   | queries | 740 query RPCs (4 groups × 185), 12 ms total | 31 async lookups, 32.5-38.7 s total |
+
+   The 4-group layout does not multiply v2's per-load cost: it has one
+   server task per request, and the per-group queries cost 0.016 ms each.
+   Native's 31 async lookups are all turn 0, about 1.1 s each, and they are
+   native's slow t0 tail.
+3. **Where the distributions split: convoys.** v2 starts all 32
+   conversations within 3-5 steps of the pass start. Native spreads its
+   starts over 48-65 steps (p50; p90 84-112), because its t0 lookups are
+   slow. Every turn has the same output length (64 tokens, ignore_eos), so
+   the start phase carries through the whole pass:
+
+   | warm2 / warm3 (02b6767) | native | v2 |
+   |---|---|---|
+   | t>0 arrivals in the same step, mean | 1.2 / 1.3 | 4.1 / 3.8 |
+   | t>0 arrivals in the same step, p90 | 2 | 8 / 7 |
+   | prefill tokens in a request's first step, p50 | 330 / 349 | 915 / 795 |
+   | steps with arrivals | 195 / 189 | 82 / 90 |
+   | max finishes in one step | 3 | 9 |
+
+   In the cold pass both arms start staggered (cold t0 is computed), and v2
+   arrivals per step are 1.6 vs 1.4. The convoy comes from v2's fast warm
+   t0.
+4. **Wall cost of the waited steps.** A least-squares fit of v2 step wall
+   time on the query-timestamp anchors (R² 1.00) gives about 11.4 ms/step,
+   plus 28-38 ms per 1k prefill tokens, plus 0.31 ms per running request.
+   Issued and landed loads come out at +6-7 and -2-4 ms per load, which
+   cancel over a round trip. An ext>0 request in v2 waits through steps
+   that cost about 42-45 ms each, against a pass average of 21 ms. Five
+   steps at about 44 ms gives the measured ~210 ms from query to first
+   token.
+
+   v2 wall TTFT (query to first token) by convoy size:
+
+   | convoy size | 02b6767 warm2 / warm3 | c8a8842 warm2 / warm3 |
+   |---|---|---|
+   | 1 | 164 / 160 ms | 167 / 159 ms |
+   | 2-3 | 216 / 209 | 219 / 221 |
+   | 4-6 | 218 / 232 | 214 / 231 |
+   | 7+ | 201 / 216 | 190 / 164 |
+
+   A lone v2 request lands at 160-167 ms. That is native's t>0 ext>0 level:
+   146-170 ms (6 steps × native ms/step).
+
+**Split of the p50 gap** (about +0.09-0.12 s client side):
+
+| share | source | why |
+|---|---|---|
+| ~0 | connector | v2 is 1 step faster per external hit and about 15× faster on warm t0. Load bytes, RPC count and per-load copy time match native. |
+| ~0 | server | 4 ms/load and 0.016 ms/query. The 4-group layout adds queries, not load tasks. |
+| ~all | vLLM-native batching under workload phase lock | Fast warm t0 phase-locks the 32 conversations, which have equal output lengths. Their turns arrive in convoys of about 4 (up to 8), each step prefills about 3× the tokens, and those steps cost about 2× the pass mean. Native's slow t0 (about 1.1 s per async lookup) staggers the conversations, so its t>0 requests prefill alone in cheap steps. Native pays for that in its tail: t0 TTFT about 1.2-1.4 s, p99 2.3 s vs v2's 0.585 s. |
+| ±0.02-0.04 s | noise | Native p50 is 0.170-0.210 across the two runs with the same workload. |
+
+The p50 metric rewards the staggered schedule. Mean TTFT is close
+(0.297 vs 0.281 and 0.295 vs 0.350), p99 is 4× better for v2, and req/s
+is +12-36%.
+
+**Next connector-side hypothesis: none proposed.**
+- At equal convoy size v2 already matches native.
+- The 3-step async round trip is vLLM's protocol (async scheduling reports
+  the load one step late). The only connector lever that would shorten it
+  is sync loads for multi-group layouts, and lifting the one-group limit
+  is ruled out.
+- Delaying t0 or staggering requests to break convoys would game the
+  metric, so I do not propose it.
+- One open diagnostic, for when a GPU slot is free: whether the first
+  `poll()` after the issuing step already sees the load ready (4 ms copy
+  vs a ~40 ms step). If it does, the round trip is at vLLM's minimum and
+  this item closes.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
