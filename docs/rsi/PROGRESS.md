@@ -146,7 +146,7 @@ names, magic constants that only exist in the old code).
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"). Hit-rate judgment on the base server: close enough. G5 hit at C/U 0.5 is v2 0.838-0.843 before P4 it7 (r3, P4 it6 cap, P4 MF5) and 0.859 on it7 (P4 M1b official), vs old 0.820-0.840, native 0.861-0.862, H_lru 0.857-0.858; the gap from H_lru to H*_C is the base server's (server proposals H1-H5 parked, see "Server limitations"). P4 regression record: `models/Qwen3-4B/ITERATIONS.md` "P4 regression runs on this model" |
-| P4 | onboard DeepSeek-V2-Lite-Chat | RERUN PENDING under the merged gate (a4523f3: hybrid gate, cap sizing, lmcache gate): the it6 / it7 records fail `G2.resume_reference` (no resume stage, DSV2 is split_invariant=false), so the acceptance below does not stand until an official TP2 rerun with the resume stage passes (S5 self-test + M2 official, GPU pending). gate.json gained `lmcache_dist` (R3) and `gsm8k_vllm_args` (R4). Previous state, on gate ce645d7: it7 a59a254 on `feat/rsi-deepseek-v2-lite` (TP2, MLA). ACCEPTED 2026-10-25: final review ACCEPT-WITH-FIXES, M1, M2 and S1-S5 applied, re-review ACCEPT (`reviews/P4-final.md`, 4164173). Open for the user's final pass: DSV2 G5 at C/U 0.25 is 0.07 below old on the same server, cause unknown (connector side by elimination; below the 2x GPU-KV floor); lmcache numbers go into the P4 tables when `feat/rsi-gate-lmcache` merges; the gate owner should revisit the preempted-uncertain bound (DSV2 v2 at 0.85% of 1%). Official on it7: DSV2 `2026-10-25-dsv2-lite-p4-it7-off-a59a254` and Qwen3-4B `2026-10-25-qwen3-4b-p4-it7-off-a59a254`, where v2 passes every verdict (Qwen `G2.digest_self.cap` 0.45%). Hit judgment: close enough. Tables: "P4 acceptance tables" below. lmcache: pending (arm not comparable yet) |
+| P4 | onboard DeepSeek-V2-Lite-Chat | RERUN DEFERRED to P5's it3 connector fix. Under the merged gate (a4523f3 + 1f00e5a) the it6 / it7 records fail `G2.resume_reference`, so the 2026-10-25 acceptance below does not stand. S5 self-test passed (e764fd5). The M2 full-arm run `2026-10-25-dsv2-lite-p4-it7-m2off-e764fd5` (it7 a59a254 connector, all six arms incl. lmcache 0.5.6) is UNOFFICIAL: it was launched before e764fd5 was pushed, so provenance could not verify any tree, the under-test overlay stayed empty and v2 fails `G0.provenance` (the code it ran is identical; SKILL lesson added). Otherwise v2 passes every verdict, including `G2.resume_reference` and `G2.preempt`. Re-scored with the merged oracle (0514f7c), it gives identical numbers, with plain Belady winning everywhere. New hard G4 rule (user, 2026-10-26): v2 warm replay is WORSE than native in the same run (TTFT p50 +12%, req/s -5%; on it7 M1a req/s -4 / -7% and p50 +6% / equal), so the a59a254 connector cannot be accepted. The official DSV2 rerun happens once, on P5's it3 connector fix, with the full arm set. gate.json gained `lmcache_dist` (R3) and `gsm8k_vllm_args` (R4). Open: DSV2 G5 at C/U 0.25 (v2 0.442 vs old 0.505, native 0.584, lmcache 0.561); R2 (`episodes_planned` 0, so the S6 chain is still not exercised on a GPU). Records: `models/DeepSeek-V2-Lite-Chat/ITERATIONS.md` (M1a official on gate ce645d7; "M2 ... UNOFFICIAL"). Tables: "P4 acceptance tables" below (DSV2 lmcache from M2, unofficial) |
 | P5 | onboard Qwen3.5-4B | todo |
 | P6 | onboard gemma-4-E4B-it | todo |
 
@@ -154,15 +154,19 @@ names, magic constants that only exist in the old code).
 
 Both runs are official: arms plain, baseline, old, native, v2, GPU 0(,1).
 Full records are in `models/DeepSeek-V2-Lite-Chat/ITERATIONS.md` ("it7",
-M1a and M1b).
+M1a and M1b). The DSV2 lmcache cells come from the unofficial M2 run
+(`2026-10-25-dsv2-lite-p4-it7-m2off-e764fd5`, lmcache 0.5.6, comparable
+with caveat per GATES.md). In that run the same cells for v2 / old /
+native are within 0.02 of these, except the 0.25 points (v2 0.442, old
+0.505).
 
 G3, unlimited store (local / ext / total; H*; E_ext; excess tokens):
 
 | model / pass | v2 | old | native | lmcache | H* |
 |---|---|---|---|---|---|
-| DSV2 gsm8k warm | 0.937 / 0.056 / 0.993; E 1.0; 0 | 0.938 / 0.055 / 0.993; E 1.0; 1230 | 0.940 / 0.053 / 0.993; E 1.0; 1230 | pending (arm not comparable yet) | 0.993 |
-| DSV2 replay cold | 0.493 / 0.349 / 0.843; E 1.0 | 0.491 / 0.352 / 0.843; E 1.0 | 0.498 / 0.345 / 0.842; E 0.9998 | pending | 0.843 |
-| DSV2 replay warm2 | 0.465 / 0.533 / 0.998; E 1.0; 0 | 0.519 / 0.479 / 0.998; E 1.0; 210 | 0.461 / 0.537 / 0.998; E 1.0; 210 | pending | 0.998 |
+| DSV2 gsm8k warm | 0.937 / 0.056 / 0.993; E 1.0; 0 | 0.938 / 0.055 / 0.993; E 1.0; 1230 | 0.940 / 0.053 / 0.993; E 1.0; 1230 | M2 (unofficial): 0.940 / 0.001 / 0.941; E 0.015; 0 | 0.993 |
+| DSV2 replay cold | 0.493 / 0.349 / 0.843; E 1.0 | 0.491 / 0.352 / 0.843; E 1.0 | 0.498 / 0.345 / 0.842; E 0.9998 | M2: 0.487 / 0.345 / 0.832; E 0.969 | 0.843 |
+| DSV2 replay warm2 | 0.465 / 0.533 / 0.998; E 1.0; 0 | 0.519 / 0.479 / 0.998; E 1.0; 210 | 0.461 / 0.537 / 0.998; E 1.0; 210 | M2: 0.465 / 0.513 / 0.978; E 0.962; 0 | 0.998 |
 | Qwen3-4B gsm8k warm | 0.922 / 0.070 / 0.992; E 1.0; 0 | 0.926 / 0.067 / 0.993; E 1.0; 1170 | 0.933 / 0.060 / 0.993; E 1.0; 1170 | pending | 0.992 |
 | Qwen3-4B replay cold | 0.385 / 0.479 / 0.864; E 1.0 | 0.381 / 0.483 / 0.864; E 1.0 | 0.384 / 0.480 / 0.864; E 1.0 | pending | 0.864 |
 | Qwen3-4B replay warm2 | 0.347 / 0.651 / 0.998; E 1.0; 0 | 0.361 / 0.638 / 0.998; E 1.0; 195 | 0.378 / 0.621 / 0.998; E 1.0; 195 | pending | 0.998 |
@@ -172,9 +176,9 @@ computed on v2's trace:
 
 | model, C/U | v2 | old | native | lmcache | H_lru | H*_C |
 |---|---|---|---|---|---|---|
-| DSV2 0.25 (1.14x GPU KV) | 0.452 (0.070) | 0.522 (0.180) | 0.579 (0.282) | pending (arm not comparable yet) | 0.671 | 0.854 |
-| DSV2 0.5 (2.27x) | 0.847 (0.620) | 0.845 (0.614) | 0.851 (0.622) | pending | 0.847 | 0.925 |
-| DSV2 0.75 | 0.899 (0.659) | 0.886 (0.616) | 0.933 (0.708) | pending | 0.918 | 0.968 |
+| DSV2 0.25 (1.14x GPU KV) | 0.452 (0.070) | 0.522 (0.180) | 0.579 (0.282) | M2 (unofficial): 0.561 (0.231) | 0.671 | 0.854 |
+| DSV2 0.5 (2.27x) | 0.847 (0.620) | 0.845 (0.614) | 0.851 (0.622) | M2: 0.839 (0.615) | 0.847 | 0.925 |
+| DSV2 0.75 | 0.899 (0.659) | 0.886 (0.616) | 0.933 (0.708) | M2: 0.917 (0.690) | 0.918 | 0.968 |
 | Qwen3-4B 0.25 (1.22x) | 0.409 (0.111) | 0.396 (0.071) | 0.533 (0.296) | pending | 0.584 | 0.863 |
 | Qwen3-4B 0.5 (2.44x) | 0.859 (0.701) | 0.829 (0.675) | 0.862 (0.715) | pending | 0.858 | 0.929 |
 | Qwen3-4B 0.75 | 0.908 (0.741) | 0.878 (0.693) | 0.927 (0.775) | pending | 0.916 | 0.970 |
@@ -186,11 +190,18 @@ G4, change vs the same-run baseline (warm = warm2 / warm3):
 | DSV2 v2 | -68.2 / -67.3% | +131 / +126% | -31.8% | +59.7% | +0.32 / -1.96% |
 | DSV2 old | -57.8 / -63.8% | +131 / +126% | -30.8% | +57.6% | +1.04 / -0.98% |
 | DSV2 native | -69.9 / -67.2% | +141 / +144% | -38.8% | +63.8% | +0.63 / -1.57% |
+| DSV2 lmcache (M2, unofficial) | -56.5 / -58.3% | +106 / +106% | -46.5% | +25.9% | +0.49 / +1.03% |
+| DSV2 v2 vs native, M2 (new rule) | +11.9 / +12.1% (worse) | -4.8 / -5.3% (worse) | +8.8% | -1.3% | -0.2 / -0.7% |
 | Qwen3-4B v2 | -85.1 / -83.8% | +288 / +277% | -62.3% | +145.0% | +0.92 / -0.43% |
 | Qwen3-4B old | -82.4 / -81.1% | +294 / +278% | -62.3% | +146.3% | +1.82 / +1.52% |
 | Qwen3-4B native | -84.8 / -84.2% | +273 / +269% | -62.2% | +130.1% | +6.38 / +6.42% (fail) |
 
-Judgment: close enough. At the gated point, 0.5, v2 is at H_lru on both
+Under the new G4 rule (2026-10-26) DSV2 v2 fails against native: it is
+worse on warm TTFT p50 and on warm req/s in M2. In M1a it is worse on req/s
+and on warm2 p50, and equal on warm3 p50. The hit
+judgment below stands; the perf acceptance does not.
+
+Hit judgment: close enough. At the gated point, 0.5, v2 is at H_lru on both
 models and level with the reference arms. The one gap is DSV2 0.25, where v2
 is 0.07 below old. Old's run-to-run noise there is 0.038 (0.512 to 0.550). C
 there is 1.14x GPU KV, below the 2x floor. The sim rules out the
@@ -1043,6 +1054,23 @@ local-hit query as a cause, and the cause is unknown (DSV2 file, "M2").
     self-test needs `G2.resume_reference` on split-variant models (DSV2
     self-test with the resume stage: GPU, pending). S6: the resume replay
     chains every episode of a preempted warm request.
+
+### 2026-10-26
+
+- P4 M2 (`2026-10-25-dsv2-lite-p4-it7-m2off-e764fd5`, TP2, all six arms,
+  about 5 GPU-hours) is UNOFFICIAL: it was launched before e764fd5 was
+  pushed, so provenance could not fetch the rev and the under-test overlay
+  stayed empty. The record: v2 fails only `G0.provenance` (it ran identical
+  code from the gate tree). native fails only `G0.spec`. lmcache fails
+  only the known S7 `G2.digest_vs_baseline.gsm8k` caveat (14 warm blocks,
+  0 mismatched). G4 passes vs baseline on every arm.
+  - Re-scored with the merged gate (0514f7c, fallback-aware oracle): the
+    numbers are identical and plain Belady wins.
+  - v2 is worse than native on warm replay (TTFT p50 +12%, req/s -5%),
+    which fails the new G4 rule. No rerun on a59a254: the single official
+    DSV2 rerun waits for P5's it3 connector fix.
+  - Write-up: DSV2 ITERATIONS "M2 ... UNOFFICIAL". SKILL lesson: push
+    before launch.
 
 ## Semantics changelog
 

@@ -2432,3 +2432,146 @@ arm got its own `resume-selftest-<mode>` baseline replay.
   stage replays the gsm8k warm pass, and no gsm8k warm request was
   preempted; the `preempt` workload is its own stage and is judged by
   `G2.preempt`, not replayed.
+
+### M2: full-arm run on it7 under the merged gate, UNOFFICIAL (provenance: launched before push) (`2026-10-25-dsv2-lite-p4-it7-m2off-e764fd5`, GPU 0,1, TP2, 64gb, run_gate pgid 3679771, 21:38 to 02:36:59Z)
+
+Setup:
+- Gate tree and under-test tree at e764fd5 (connector a59a254, unchanged
+  since it7); base server d1970ead.
+- Arms plain, baseline, old, native, lmcache, v2. Workloads gsm8k (1319),
+  replay (32 x 12), cap (76 x 12 auto, C(0.5) = 6.87 GB = 2.27x GPU KV),
+  preempt.
+- `--lmcache-overlay ~/kexi/overlays/lmcache`.
+- No contamination. Scan `flagged: []`. `vllm_plugins`: old `pegaflow`,
+  every other arm "".
+
+Why it is not official (my error): e764fd5 was not pushed when the run
+started.
+- Provenance could not fetch the rev ("cannot fetch e764fd5... from
+  github.com/gentlecold/pegaflow.git"), so the gate tree, the venv pegaflow
+  and the under-test tree were all unverified (`official: false`, three
+  problems).
+- Because the source did not verify, the under-test snapshot
+  `<run>/under-test-overlay/pegaflow` stayed empty. Every v2 stage therefore
+  imported `pegaflow` (and `connector_v2`) from the gate tree
+  `~/kexi/p4-gate-e764fd5/python`, and v2 fails `G0.provenance` (20 dump
+  problems on cap025, cap and cap075).
+- The code v2 ran is still the code under test: `diff -r` of the two trees'
+  `python/pegaflow` is empty apart from `__pycache__`. So the numbers stand
+  as data but not as an official record. A SKILL lesson was added (push
+  before launch, or dry-run `provenance.Trees` first).
+- Not rerun: under the new G4 rule (below) the a59a254 connector would fail
+  against native anyway. The official DSV2 rerun happens once, with P5's it3
+  connector fix and the full arm set.
+
+Re-score with the merged gate (feat/semantics-rsi 1f00e5a, fallback-aware
+G5 oracle; this branch at 0514f7c):
+- All 12 cap stages (v2, old, native, lmcache x 0.25 / 0.5 / 0.75), rebuilt
+  with the merged oracle, are identical to the record in every shared
+  segment field and in `diagnostics`.
+- Plain Belady wins every segment (`oracle_c_policies` belady, lru), as
+  GATES.md predicts for full-only models.
+- The only verdict diffs are the new `oracle_c_policy` fields, plus
+  `G0.provenance` on every arm. The second is an artifact of re-scoring from
+  another tree: the dumps record `rsi_probe` under the run's gate tree.
+- The tables below are the record's numbers, which equal the re-score.
+
+Verdicts (record):
+
+| arm | fails | resume_reference | preempt | digest_self.cap | digest_vs_baseline.gsm8k | gsm8k acc delta cold / warm | gsm8k_outputs |
+|---|---|---|---|---|---|---|---|
+| baseline | none | - | pass (46 preempted, 8468 / 8468 computed exact) | pass | - | 0.6725 / 0.6725 | plain == baseline 0 differ; split control 647 / 1319 |
+| v2 | G0.provenance (see above) | pass: 1319 planned, 1117 waves, 0 missing, 0 start_differs | pass: 49 preempted, 3496 ext matched, 0 mismatched | pass: 530724 ext matched, 0 mismatched, 0 preempted-uncertain | pass: 10526 ext matched; 45008 / 45008 computed exact | 0.0 / +0.53 pp | pass (647 differ = split) |
+| old | none | pass: 1050 waves, 82 start_differs | pass: 47 preempted, 3390 ext | pass: 508870 ext | pass: 10254 ext; 43836 / 43836 | 0.0 / +0.45 pp | pass (642) |
+| native | G0.spec (LBHNC, by construction) | pass: 1040 waves, 82 start_differs | pass: 44 preempted, 898 ext | pass: 510210 ext | pass: 9982 ext; 43836 / 43836 | 0.0 / +0.45 pp | pass (642) |
+| lmcache | G2.digest_vs_baseline.gsm8k | pass: 1107 waves, 0 start_differs | pass: 44 preempted, 128 ext | pass: 500804 ext | fail (coverage reason): 152 ext matched, 0 mismatched; 55026 / 55026 exact; 14 warm blocks unjudged on a non-aligned prompt | 0.0 / -0.08 pp | pass (666) |
+
+- lmcache passes `G0.lmcache_build` (want `lmcache-0.5.6`, bad `{}`): R3
+  works.
+- Its one failure is the expected S7 signature from the lmcache gate
+  review: `computed_unmatched_split` 14, warm `unjudged_nonaligned` 14, zero
+  mismatched anywhere.
+- So the lmcache arm is comparable with that caveat. Its hit numbers are a
+  valid reference and its gsm8k digest verdict is recorded, not judged.
+- `G2.digest_self.cap` records 0 preempted-uncertain blocks (local and
+  external) on every arm. On the it7 official run (gate ce645d7) v2 had
+  9390, 0.85% of the 1% bound. So the bound did not bind here.
+- R2 (S6 episode chain on a GPU) is still not exercised.
+  `episodes_planned` = 0 for every arm: `resume_plan` replays the gsm8k warm
+  pass, and no gsm8k warm request was preempted at the official sizes. The
+  preempt workload (44 to 49 preempted requests per arm) is judged by
+  `G2.preempt`, not replayed. Exercising the chain on DSV2 would need a
+  gsm8k warm pass under block pressure. That is a gate-side question; I
+  have reported it, not changed it.
+
+G4 (vs the same-run baseline; warm = warm2 / warm3). The last row is the
+new hard rule (user, 2026-10-26): warm TTFT p50 and req/s no worse than
+native.
+
+| metric | baseline | v2 | native | old | lmcache |
+|---|---|---|---|---|---|
+| replay warm TTFT p50 (s) | 0.926 / 0.932 | 0.303 / 0.300 (-67.2 / -67.8%) | 0.271 / 0.268 (-70.7 / -71.3%) | 0.317 / 0.377 (-65.8 / -59.5%) | 0.403 / 0.389 (-56.5 / -58.3%) |
+| replay warm req/s | 5.41 / 5.41 | 12.57 / 12.45 (+132 / +130%) | 13.19 / 13.14 (+144 / +143%) | 12.54 / 12.16 (+132 / +125%) | 11.12 / 11.13 (+106 / +106%) |
+| replay cold TTFT p50 (s) | 1.322 | 0.674 (-49.0%) | 0.619 (-53.1%) | 0.736 (-44.3%) | 0.707 (-46.5%) |
+| replay cold req/s | 5.05 | 7.80 (+54.5%) | 7.90 (+56.5%) | 7.70 (+52.4%) | 6.36 (+25.9%) |
+| gsm8k cold / warm (s) | 195.2 / 194.5 | 196.2 / 190.5 (+0.53 / -2.06%) | 196.5 / 191.9 (+0.68 / -1.34%) | 197.6 / 193.0 (+1.24 / -0.76%) | 196.1 / 196.5 (+0.49 / +1.03%) |
+| G4 verdicts (vs baseline) | | all pass | all pass | all pass | all pass |
+| v2 vs native | | warm p50 +11.9 / +12.1%, warm req/s -4.8 / -5.3% (WORSE on both); cold p50 +8.8%, cold req/s -1.3% | | | |
+
+- FLAG: v2 is worse than native on warm replay, by about 0.03 s of TTFT
+  p50 and about 0.6 req/s. Under the new rule P4 is not accepted on the
+  a59a254 connector.
+- The it7 official run (M1a) had the same direction: warm p50 0.296 /
+  0.304 vs native 0.280 / 0.304, and req/s 12.49 / 12.20 vs 13.01 / 13.16
+  (-4.0 / -7.3%). So the gap comes from the connector, not from this run.
+- v2 is ahead of old and lmcache on every replay metric.
+- Baseline replay cold p50 is 1.322 s here (0.909 in it7). Cold deltas are
+  therefore larger than it7's, and the warm baseline is unchanged.
+
+G3, unlimited store (local / ext / total; H*; E_ext; excess tokens):
+
+| pass | v2 | old | native | lmcache | H* |
+|---|---|---|---|---|---|
+| gsm8k warm | 0.937 / 0.055 / 0.993; E 1.0; 0 | 0.939 / 0.055 / 0.993; E 1.0; 1230 | 0.940 / 0.053 / 0.993; E 1.0; 1230 | 0.940 / 0.001 / 0.941; E 0.015; 0 | 0.993 |
+| replay cold | 0.498 / 0.344 / 0.843; E 1.0 | 0.491 / 0.352 / 0.843; E 1.0 | 0.498 / 0.345 / 0.842; E 1.0 | 0.487 / 0.345 / 0.832; E 0.969 | 0.843 |
+| replay warm2 | 0.458 / 0.541 / 0.998; E 1.0; 0 | 0.565 / 0.434 / 0.998; E 1.0; 210 | 0.467 / 0.532 / 0.998; E 1.0; 210 | 0.465 / 0.513 / 0.978; E 0.962; 0 | 0.998 |
+| replay warm3 | 0.452 / 0.546 / 0.998; E 1.0; 0 | 0.503 / 0.495 / 0.998; E 1.0; 210 | 0.461 / 0.538 / 0.998; E 1.0; 210 | 0.465 / 0.513 / 0.978; E 0.962; 0 | 0.998 |
+
+lmcache's gsm8k E_ext of 0.015 follows from its 256-token chunks. Its hit
+ends at a chunk end (1024 on the shared few-shot prefix), and that is
+usually below vLLM's own local hit (1088, GATES.md G5 "lmcache status per
+model"). So it adds almost nothing over the local cache. Most likely the
+same granularity is also behind its 0.978 total on warm replay (vs
+0.998).
+
+G5 (cap 76 x 12, warm_timed). Each cell is hit (E_C). H_lru and H*_C are on
+each arm's own trace; plain Belady sets H*_C on every segment.
+
+| C/U | v2 | old | native | lmcache | H_lru v2 / old / native / lmcache | H*_C | v2 it7 (official, ce645d7) |
+|---|---|---|---|---|---|---|---|
+| 0.25 (1.14x GPU KV) | 0.442 (0.045) | 0.505 (0.152) | 0.584 (0.284) | 0.561 (0.231) | 0.651 / 0.646 / 0.656 / 0.674 | 0.853 to 0.857 | 0.452 (0.070) |
+| 0.5 (2.27x, gated) | 0.847 (0.631) | 0.845 (0.617) | 0.851 (0.624) | 0.839 (0.615) | 0.847 / 0.847 / 0.847 / 0.847 | 0.924 to 0.925 | 0.847 (0.620) |
+| 0.75 | 0.899 (0.650) | 0.889 (0.625) | 0.932 (0.710) | 0.917 (0.690) | 0.919 / 0.918 / 0.917 / 0.920 | 0.968 | 0.899 (0.659) |
+
+- Local / ext of warm2 + warm3:
+  - v2: 0.402 / 0.039 at 0.25, 0.397 / 0.450 at 0.5, 0.414 / 0.485 at 0.75.
+  - old: 0.420 / 0.085, 0.419 / 0.426, 0.436 / 0.454.
+  - native: 0.418 / 0.166, 0.424 / 0.427, 0.440 / 0.493.
+  - lmcache: 0.418 / 0.143, 0.419 / 0.420, 0.433 / 0.484.
+- Excess at 0.5: v2 0 and lmcache 0, old 75, native 135.
+
+Hit-rate judgment: close enough at the gated point, not at the edges.
+- At 0.5, v2 is at H_lru (0.847 = 0.847), and level with old (+0.002),
+  native (-0.004) and lmcache (+0.008). Its E_C, 0.631, is the highest of
+  the four.
+- At 0.75, v2 is 0.020 below H_lru and below native (-0.033) and lmcache
+  (-0.018); it is above old.
+- At 0.25, v2 is 0.209 below H_lru and below every reference arm: old
+  -0.063, lmcache -0.119, native -0.142. Its external share is 0.039, half
+  of old's.
+- The 0.25 and 0.75 numbers reproduce it7 (0.452 / 0.899), so this is the
+  connector's low-capacity behaviour and not noise. lmcache, on its own
+  store and its own eviction, now joins native above old at 0.25, which
+  makes the gap clearer.
+- The 0.25 and 0.75 gaps stay open items for the next connector iteration,
+  alongside the G4 native gap.

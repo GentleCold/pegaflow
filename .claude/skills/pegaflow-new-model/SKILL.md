@@ -241,3 +241,14 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   merge commits included: name a merge `Merge branch '<src>' into <dst>`
   (git's default) or use a commitizen type (`chore(rsi): merge ...`), never
   `merge(...)`. Locally: `typos` and `cz` install from PyPI into a temp venv.
+- Push the rev before launching a gate run. Provenance verifies every tree
+  (gate, venv pegaflow, under test) by fetching its `.rsi-rev` from the
+  remote. If the commit is not pushed, all three are unverified and the run
+  is not official. Worse, the `--under-test-path` snapshot
+  (`<run>/under-test-overlay/pegaflow`) stays empty, so the arm under test
+  silently imports the gate tree's `pegaflow` and fails `G0.provenance`
+  (P4 M2 `2026-10-25-dsv2-lite-p4-it7-m2off-e764fd5`, about 5 GPU-hours
+  lost). Before `setsid nohup`, check that
+  `git branch -r --contains <rev>` is non-empty, or dry-run
+  `provenance.Trees(<scratch>).tree(<root>, <subpaths>, provenance.native_module())`
+  on the remote and expect `verified: True`.
