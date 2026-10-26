@@ -254,3 +254,43 @@ against it.
 ## KV pool size follows the compile cache
 
 Since fcd0534 every arm gets a fresh compile cache, and a fresh compile profiles 9.82 GiB of KV (71,472 tokens on Qwen3-4B TP1). An AOT load from the shared `~/.cache/vllm` profiles 10.4 GiB (75,696 tokens). Within a run all arms compile fresh, so v2 vs native stays fair. Cross-run comparisons with records whose logs show `Directly load AOT` (e.g. it7 `2026-10-25-qwen3-4b-p4-it7-off-a59a254`) need this caveat: the -5.6% pool shifted v2's warm p50 vs native from -1% to +17.5% in `2026-10-26-qwen3-4b-p5-it3-slice-c8a8842` (P5 it3).
+
+## Controls record: full-set, passing, fail-closed
+
+Only a run with `plain` at `--gsm8k-limit 0` whose three controls pass
+writes `summary.controls_record`; `controls_problem` fails closed on a
+missing run / rev, a non-passing or `na` verdict, a subset record or an
+empty `inputs_recomputed`. Full-set because the split control must judge
+every prompt the official warm pass judges. `control_inputs` also hashes
+the vLLM launch, gsm8k pass plan and request args, output comparison,
+`--gpu-mem`, `--settle`, overrides and the dataset (27b4214). Records: tp1
+`2026-10-26-qwen3-4b-p5-s1-4bb7d8d` (rev 4bb7d8d, off the slim lineage;
+refreshed with the Qwen3.5 plain self-test after the merge), tp2
+`2026-10-26-qwen3-4b-tp2-off2-4bb7d8d` (rev 48e6493); both split 1319 and
+batch 64 with 0 differ, `inputs_recomputed` = extraction only.
+
+## G5 cap workers scale with GPU KV (TP>1)
+
+`2026-10-26-qwen3-4b-tp2-off2-4bb7d8d`: `freeze_vs_oracle_c` 0.918 at 0.5
+(0.914 / 0.918 at 0.25 / 0.75), `lru_vs_oracle_c` 0.003. 32 cap workers x
+~4.7k-token turns = 0.75x TP2 GPU KV (203,488 tokens): vLLM's prefix cache
+keeps every live conversation (baseline local hit 0.853 every pass), the
+store sees only cross-pass reuse in pass order, which LRU has evicted and a
+frozen first fill holds. Same cause as "E_C ~ 0 for any LRU store at
+f <= 0.5 on TP2". More convs alone: 256 at 32 workers, freeze 0.918.
+Offline model (`~/kexi/tmp/g5-tp2-sep/gpusim.py`, .44: vLLM prefix cache over
+the recorded cap keys) vs records, local / freeze / LRU at 0.5: TP2@32
+0.852 / 0.919 / 0.006 (0.853 / 0.918 / 0.003); TP1@32 0.39 / 0.67 / 0.88
+(0.39 / 0.62 / 0.87); DSV2 freeze 0.549 (0.55). TP2 sweep at 0.5:
+
+| workers | in-flight / GPU KV | freeze | LRU |
+|---|---|---|---|
+| 48 | 1.11 | 0.923 | 0.01 |
+| 56 | 1.29 | 0.59 | 0.755 |
+| 65 (rule) | 1.5 | 0.602 | 0.852 |
+
+At 65 (local 0.46), 0.25 / 0.75: freeze 0.45 / 0.79, LRU 0.36 / 0.92. TP1
+at 16 workers (1.04x) fails the same way (0.935 / 0.21). Rule (1f7414e):
+workers = max(32, ceil(1.5 x GPU KV tokens / mean turn)), convs >= 2 x
+workers; TP2 gets 65, the other models stay 32. Hardware check: the next
+TP2 run on the merged gate.

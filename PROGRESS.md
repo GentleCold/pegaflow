@@ -36,6 +36,8 @@ state the rule only; the date and quote live here.
 | 2026-10-26 | G4 vs native "close enough" ("不一定和native保持一致，差不多就行了"): `*_vs_native` is a judged comparison, reported and never failing; the onboarding agent writes a "perf vs native judgment", the reviewer checks it. G4 vs baseline stays hard | GATES.md G4 (once `feat/rsi-gate-g4-noise` lands) |
 | 2026-10-26 | Slim gate ("我感觉现在测试跑的太慢了，gate可以精简一下不用跑那么多，lmcache我看性能不太行，那性能就主要和native的比？旧connector没有必要再跑一遍了吧，然后纯vllm的baseline主要用来比精度就行？"; "plain和baseline有啥区别，我觉得是不是只要跑v2和native就行了？精度啥的也可以和它对比，对标这个就行了"): official arms baseline (correctness only, replay cold only), native (every perf reference) and the arm under test; old / lmcache optional, evaluated when run; plain moves to onboarding (gate.json `controls` record, staleness-checked); G5 gates C = 0.5 only, curve behind `--cap-curve`; G4 overhead vs native settled in the next row. Baseline stays the correctness reference: native fails `G0.spec` by construction and cannot be the byte reference | GATES.md "Arms", "Official run", G4, G5, "Onboarding controls" (once `feat/rsi-gate-slim` lands) |
 | 2026-10-26 | Perf vs native option (b) and the stopping rule ("其实可以迭代优化到你觉得在connector侧没有优化空间了为止"): G4 hard part is gsm8k seconds at most 2% worse than native (regression floor); replay cold and warm vs native are reported and judged. A model is not done when close to native: the agent iterates, one hypothesis at a time, until it judges no connector-side optimization is left, for perf and hit rate; each accepted run's judgment splits the remaining gap (warm, cold, gsm8k) into connector / server / vLLM-native structure / noise and lists the hypotheses tried and why the rest are not worth trying, with numbers; the reviewer checks the attribution. Guards unchanged (server out of scope, H*_C a ceiling, no tuning to the trace, policy complexity budget) | GATES.md G4 "Perf vs native judgment", "Hit rate"; skill steps 5-7 (once `feat/rsi-gate-slim` lands) |
+| 2026-10-26 | Controls record hardening (technical, slim review SHOULD fixes): a gate.json `controls` record comes only from a full-set (`--gsm8k-limit 0`) run with `plain` whose three controls pass, and `controls_problem` fails closed on any gap; `control_inputs` widened to the vLLM launch, gsm8k plan, output comparison, run args and dataset | GATES.md "Onboarding controls" (once `feat/rsi-gate-slim` lands); evidence `gates-evidence.md` |
+| 2026-10-26 | G5 cap workers scale with GPU KV (technical; bar unchanged, coordinator: "Don't relax the bar"): every cap stage runs max(32, ceil(1.5 x GPU KV tokens / mean turn)) workers, convs >= 2 x workers, so a frozen store separates at TP>1 (Qwen3-4B TP2: 65 workers, simulated freeze 0.60 vs 0.918 recorded at 32) | GATES.md G5 `auto` (once `feat/rsi-gate-slim` lands); evidence and simulator table `gates-evidence.md` |
 
 Open for the user's final acceptance: GATES.md is a draft; the lmcache arm
 on Qwen3-4B pins unmerged LMCache PR #4467 (`e05c2ea`); the official DSV2
@@ -1019,6 +1021,20 @@ names, magic constants that only exist in the old code).
   `2026-10-26-qwen3-4b-tp2-selftest-478187e` (GPUs 0,1): fresh baseline dump
   0 diffs vs the committed one, honest passes, liar / bitflip / offbyone
   caught, all G0.spec 0 diffs, controls 0 differ.
+- Slim gate review fixes (`feat/rsi-gate-slim` 27b4214): the controls
+  record must be full-set and passing, its fingerprint is widened, and
+  both Qwen3-4B records (tp1 `p5-s1-4bb7d8d`, tp2 `tp2-off2-4bb7d8d`)
+  carry verdicts and an `inputs_recomputed` reason. The TP1 record is off
+  the slim lineage; it is refreshed with the Qwen3.5 plain self-test after
+  the merge (one GPU job per model), not separately.
+- Qwen3-4B TP2 off2 was non-official on G5 freeze separation (0.918). Root
+  cause offline: 32 cap workers fill only 0.75x of the TP2 GPU KV, so
+  vLLM's prefix cache serves every in-pass reuse; the same cause gives
+  LRU E_C ~ 0 at f <= 0.5. Fix 1f7414e scales cap workers to 1.5x GPU KV
+  (TP2: 65; other models unchanged at 32), backed by a simulator over the
+  recorded keys (`gates-evidence.md`). No GPU run: hardware confirmation
+  comes from the next TP2 run on the merged gate, after P5's TP2 and
+  Qwen3.5 pairs finish.
 
 ## Semantics changelog
 
