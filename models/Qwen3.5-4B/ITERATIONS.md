@@ -1980,6 +1980,146 @@ reuse). That leaves fewer free blocks for the FIFO head in v2.
   sent_wait_ms falling.
 - The t0 spread (server serial load worker) stays a server limitation.
 
+### Probe run (DIAGNOSTIC, not official): t3-4 head-of-line blocker (baa8b49, 2026-10-27)
+
+Runs: `2026-10-26-qwen3-4b-p5-diag-tp1-baa8b49` and
+`2026-10-26-qwen3.5-4b-p5-diag-tp1-baa8b49` (GPU3, TP1, replay only,
+native + v2 baa8b49 in-run, base server). Both exit 1 because of
+`official: false` and no spec dump/gsm8k. That is expected for a
+diagnostic run.
+- **Hook.** `~/kexi/tmp/p5-diag-hook/sitecustomize.py` is not in any
+  repo. It is env-gated (`PEGA_DIAG_SCHED=1` plus PYTHONPATH) and only
+  used in this run, not in the official gate path. It monkeypatches vLLM
+  0.32 `Scheduler.schedule`, `allocate_slots`,
+  `coordinator.get_num_blocks_to_allocate`, the connector's
+  `get_num_new_matched_tokens`, `_handle_blocked_waiting_request` and
+  `_preempt_request`.
+- **What it logs.** One `PEGA_DIAG` line per step. It records:
+  - why the waiting loop stopped;
+  - the head request, with new/ext/local tokens, need, free, resv and
+    watermark;
+  - free blocks;
+  - blocks held by WAITING_FOR_REMOTE_KVS requests (total and
+    ref_cnt==1);
+  - blocks held by finished-not-freed requests (total and exclusive);
+  - lookup µs.
+
+  It works the same way in both arms. It produced 0 `PEGA_DIAG_ERR`.
+- **Scripts.** `diaghol.py`, `diaghol2.py`, `diaghol3.py`, `diaglk.py`,
+  `diagwall.py`, `diagstep.py` and `diagtok.py` in
+  `~/kexi/tmp/p5-it3-attr/`.
+
+**Qwen3-4B TP1** (warm2 / warm3):
+
+| | native | v2 |
+|---|---|---|
+| client ttft p50 (s) | 0.503 / 0.589 | 0.564 / 0.620 |
+| rps | 9.08 / 9.09 | 10.01 / 9.98 |
+| t3-4 TTFT steps p50 (mean) | 10 (29.5) / 10 (30.4) | 24 (37.9) / 25 (38.8) |
+| all t>0 TTFT steps p50 | 13 / 12 | 27 / 29 |
+| arrival→1st token ms p50, t>0 (scheduler clock) | 567 / 605 | 656 / 706 |
+| ms/step inside TTFT windows p50 | 39 / 33 | 24.5 / 24.4 |
+| t3-4 waiting req-steps stopped by `alloc_fail` | 1566/1570, 1619/1619 | 1962/1974, 2077/2077 (rest: 1 preemption) |
+| of which the full-ISL check failed | 100% / 99% | 99.5% / 99.5% |
+| of which the head is an async load | 100% | 96% / 99% |
+| watermark at the failing head | 0 | 0 |
+| head shortfall (blocks) p50 / mean | 133 / 165, 122 / 160 | 71 / 110, 86 / 100 |
+| free at the failing head p50 | 85 / 86 | 147 / 193 |
+| finished-not-freed exclusive blocks/step, pass mean (max) | **0** | **126 (1553) / 135 (1553)** |
+| finished-not-freed hold | 0 | 3.2 / 3.4 steps per request |
+| async-held blocks/step mean | 387 / 435 | 436 / 437 |
+| async admit→running steps p50 / mean / p90 | 4 / 4.1 / 5, 5 / 4.7 / 6 | 5 / 5.8 / 9, 5 / 6.0 / 9 |
+| blocked steps in head episodes, episodes, len p50 / p90 | 819 in 109, 2 / 51; 826 in 87, 1 / 59 | 833 in 144, 2 / 9; 865 in 149, 2 / 8 |
+| lookup µs/call, ms/step | 356 / 194, 0.35 / 0.19 | 1173 / 1324, 1.11 / 1.29 |
+
+1. **The t3-4 head-of-line blocker.** It is the FIFO head itself: a t3/t4
+   request with an async external hit (need 260-310 blocks p50). It fails
+   `allocate_slots`'s full-sequence check
+   (`scheduler_reserve_full_isl`: need > free). The loop breaks, and the
+   about 11-12 requests behind it are not looked up. This is the same in
+   both arms. The in-flight reservation (`resv`, mean 1-3 blocks) and the
+   watermark (0) are not the blocker: they decide fewer than 1% of the
+   failures. The head is the waiting t3-4 request itself in 177-216 of
+   about 2000 v2 req-steps (206-210 of about 1600 native).
+2. **Connector-controlled part: yes, the finished-not-sent hold.**
+   - Native's equivalent is 0: `request_finished` returns False, and the
+     hook saw 0 finished-not-freed blocks in every native step. So the
+     probe's own digest holds are not a factor.
+   - v2 keeps on average 126-135 exclusive blocks per step in finished
+     requests, for 3.2-3.4 steps each.
+   - In the steps where a t3-4 request waits behind a failing head, the
+     held exclusive blocks alone cover the head's shortfall in 76/229
+     (warm2) and 79/229 (warm3) steps, about 33%.
+   - First-order counterfactual: free the held blocks at finish, with
+     everything else unchanged. This ends the head episode earlier in
+     261/833 and 270/865 blocked steps (31%). The median per episode is 2
+     steps, the episode-length p50.
+   - This is an upper bound on the direct effect, because each admission
+     makes the next head wait on its own need. It is still the only
+     connector-controlled term that the data shows. It contradicts the
+     earlier ms-based "about 0" reading: the hold is short in ms
+     (about 75 ms) but lands exactly on the steps where the head is a few
+     dozen blocks short.
+   - Not connector-controlled:
+     - Async-held blocks are about equal in both arms (436 vs 387-435
+       mean), and v2 admits async loads at the same need (full-ISL).
+     - The reservation does not matter (point 1).
+     - The sync/async split does not change the blocker: the heads are
+       async in both arms.
+3. **Server.** v2's async load takes 1-2 steps longer to land (admit→running
+   p50 5 vs 4, p90 9 vs 5-6). `async_first_poll=0`, and
+   `async_ready_ms` is about 63 ms mean per batch (max 113): 16 batches
+   in the last window, 3.6 polls each. That is the base server's
+   load-copy throughput (14.7 vs 22.3 GB/s, as recorded before). Native
+   lands a load in 4-5 steps at 33-39 ms/step; v2 needs 5-9 steps at
+   24 ms/step. In wall time the round trip is about the same.
+4. **Lookup cost.** v2 costs about 1.2 ms/call vs native 0.2-0.36 ms, with
+   one call per waiting request per step. That is 1.1-1.3 ms per 23 ms
+   step (about 5%). It is a real per-step cost, but it is not why t3-4
+   waits more steps.
+
+**Qwen3.5-4B TP1** (warm2 / warm3; G3 hit rate identical, 0.946):
+
+| | native | v2 |
+|---|---|---|
+| client ttft p50 (s) | 0.219 / 0.215 | 0.290 / 0.293 |
+| rps | 10.54 / 10.53 | 14.62 / 14.62 |
+| t3-4 TTFT steps p50 / all t>0 p50 | 6 / 5 | 5 / 5 |
+| head episodes (`alloc_fail`) in warm passes | 0 | 0 |
+| finished-not-freed blocks | 0 | 0 |
+| arrival→admit ms p50 | 82-83 | 117-119 |
+| admit→1st token ms p50 | 74 | 113-114 |
+| ms/step inside TTFT windows p50 | 36-37 | 56-57 |
+| tokens/step inside TTFT windows, mean | 163-184 | 830-835 |
+| async admit→running steps p50 | 4 | 3 |
+| lookup µs/call, ms/step | 49-51, 0.09 | 864-878, 0.24 |
+
+- **Probe readings for v2 (last save-stats window).** `async_first_poll`
+  is 0 of 23, and `async_ready_ms` is 36.8 ms mean (max 59, 2 polls
+  each). The hit stats show `lookup_cost` calls=1065, rpcs=2920
+  (2.7 RPCs per lookup, one per group layout) and 0.87 ms/call. There
+  are no sent holds (`sent=0`): checkpoint layouts save synchronously.
+- **No head-of-line blocker and no hold.** TTFT in steps is equal or
+  better in v2. The whole p50 gap (about 70 ms) is step duration: v2's
+  steps in the TTFT window carry 4.5-5× the prefill tokens of native's
+  and take 56 vs 37 ms. That is the phase lock already attributed
+  (section "Qwen3.5-4B TTFT p50 attribution"): v2 has higher rps and
+  fewer, heavier steps.
+- **H6 (L1, lookup cost) has a ceiling below 1 ms per request.** That is
+  one 0.87 ms call per request against a 70 ms gap, about 0.24 ms per
+  44 ms step. Proposal: do not spend a gate run on H6 for Qwen3.5 p50.
+  The same cost is 5% of step time on Qwen3-4B, so it fits there better.
+
+**Decision.** Step 2's answer for Qwen3-4B TP1 is **yes**: part of the
+t3-4 blocked-head shortfall is connector-controlled, namely the
+finished-not-sent hold. So it5 (release at finish with GPU-observed save
+completion, or the native pattern of returning False and fencing the
+store against block reuse) is the next hypothesis. Its first-order
+ceiling is 31% of blocked steps. Qwen3.5 has neither the blocker nor the
+hold, so it5 is a no-op there. Qwen3.5's p50 stop stays the phase lock
+(server load path plus vLLM step composition). Its numbers are in the
+table above.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
