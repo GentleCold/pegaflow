@@ -1952,10 +1952,6 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
         assert x["noise"] == max(x["range"], x["native_range"])
         assert x["gap_pct"] == pytest.approx(pct, abs=0.01) and x["within_noise"] is w
     assert g["G4.replay_warm.ttft_p50"]["pass"] and g["G4.replay_warm.req_per_s"]["pass"]
-    # Arm-level pass is what it is without the *_vs_native keys, whatever the gap.
-    alone = {"baseline": results["baseline"], "pegaflow.m:C": results["pegaflow.m:C"]}
-    without = run_gate.verdicts(alone, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
-    assert g["pass"] == without["pass"]
     rep = run_gate.native_report(v)["pegaflow.m:C"]
     for k, pct, lower in zip(NATIVE_KEYS, gap_pct, (True, False), strict=True):
         assert rep[k]["gap_pct"] == g[k]["gap_pct"]
@@ -1973,6 +1969,29 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
     results["native"] = {"replay": _replay(0.3, 8.0, warm=())}
     g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
     assert all("timed warm pass" in g[k]["reason"] for k in NATIVE_KEYS)
+    # The arm under test has no timed warm pass, native is normal.
+    results["native"] = {"replay": _replay(*native)}
+    results["pegaflow.m:C"]["replay"] = _replay(0.3, 8.0, warm=())
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert all(g[k]["reason"].startswith("no timed warm pass") and "gap" not in g[k] for k in NATIVE_KEYS)  # fmt: skip
+
+
+def test_g4_vs_native_never_fails_a_passing_arm(tmp_path):
+    """An arm under test that passes every gated check still passes with its
+    warm TTFT far behind native's, outside both pass-to-pass ranges
+    (Qwen3.5 it2-like: 0.297 s vs 0.173 s): ``*_vs_native`` and its
+    ``within_noise`` never reach the arm's ``pass``."""
+    nat = _replay((0.1745, 0.1712), (13.1495, 13.1609))
+    cap = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    cap["digest_self"] |= {"external_compared": 1}
+    gsm = {"hit": nat["hit"], "load_errors": []}
+    arm = {"replay": _replay((0.2996, 0.2952), (14.6105, 14.6551)), "cap": cap, "gsm8k": gsm}
+    extra = {"baseline": {"replay": _replay(5.0, 1.0)}, "pegaflow.m:C": arm, "native": {"replay": nat}}  # fmt: skip
+    g, _ = _resume_run(tmp_path, True, False, label="pegaflow.m:C", extra=extra)
+    assert g["pass"] is True, {k: x for k, x in g.items() if isinstance(x, dict) and x.get("pass") is False}  # fmt: skip
+    t = g["G4.replay_warm.ttft_p50_vs_native"]
+    assert t["gap_pct"] > 70 and abs(t["gap"]) > 10 * t["noise"]
+    assert all(g[k]["status"] == "reported" and g[k]["within_noise"] is False for k in NATIVE_KEYS)
 
 
 def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
@@ -2886,8 +2905,10 @@ def test_context_fingerprint_is_per_episode(tmp_path, ep0_byte, exact):
     assert run_gate._digest_verdict(d, None)["pass"] is (exact == 3)
 
 
-def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, resume_ok: bool = True):  # fmt: skip
-    """A gsm8k record of the baseline and an honest self-test arm. Prompt 1
+def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, resume_ok: bool = True, label: str = "selftest-honest", extra: dict | None = None):  # fmt: skip
+    """A gsm8k record of the baseline and arm ``label`` (an honest self-test
+    arm by default); ``extra``: more stage fields per arm and workload,
+    merged into the record. Prompt 1
     (``q``, 10 blocks) is computed from scratch in every pass: 10 judged warm
     blocks. Prompt 0 is 13 tokens (keys ``p:0..2``, not aligned to vLLM's
     16). Baseline
@@ -2931,11 +2952,10 @@ def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, re
     warm3 = "A3" if split_inv else "W3" if wrong else "B3"
     arm_reqs.append(_ep_req("xw", "warm", 0, [[10, 0, 2 * BT]], [[10, 3 * BT + 1]]))
     arm_digs.append(_blk_rec("xw", [(BT, "A1"), (2 * BT, "S2" if wrong else "A2"), (3 * BT, warm3)]))  # fmt: skip
-    label = "selftest-honest"
     bp = probe("baseline", "gsm8k", base_reqs, base_digs)
     ap = probe(label, "gsm8k", arm_reqs, arm_digs)
     committed.write_text(json.dumps(spec))
-    acc = {"cold": {"accuracy": 1.0}, "warm": {"accuracy": 1.0}}
+    acc = {p: {"accuracy": 1.0, "seconds": 1.0} for p in ("cold", "warm")}
     results: dict = {
         "baseline": {
             "gsm8k": {
@@ -2948,6 +2968,8 @@ def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, re
             "gsm8k": {"passes": acc, "digest_self": digest_compare.compare(ap, ap, True, split_inv)}
         },  # fmt: skip
     }
+    for lab, per in (extra or {}).items():
+        results[lab] = results.get(lab, {}) | {wl: results.get(lab, {}).get(wl, {}) | r for wl, r in per.items()}  # fmt: skip
     two = ["ans", "ansq"]
     outs = {("baseline", "gsm8k", "cold"): two, (label, "gsm8k", "cold"): two, (label, "gsm8k", "warm"): two}  # fmt: skip
     if resume:

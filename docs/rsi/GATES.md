@@ -1190,7 +1190,7 @@ the last accepted run record by hand until `--accepted` exists.
   measured on the baseline's trace, exceeds `--pool-size`;
   `summary.pool_checks` records each check.
 - G4 (hard since 2026-10-23, user: "性能需要达标才行，需要比基准快"; every
-  check is against the baseline arm on the same run,
+  gated check is against the baseline arm on the same run,
   medians over the listed passes, `MAX_OVERHEAD = 0.02`):
   - `G4.replay_warm.ttft_p50` / `.req_per_s`: timed warm passes (warm2..N)
     strictly better than baseline's.
