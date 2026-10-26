@@ -67,7 +67,10 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
     """``main`` with the stages stubbed: lmcache storing ranks, the
     unique-bytes estimate, the cap plan fallback, ``official_problems`` and
     the verdicts (G0.spec) all get this TP's file; the preempt pool is
-    sized from it (``preempt_gpu_blocks``). Without one: no estimate, no
+    sized from it (``preempt_gpu_blocks``); every cap stage (the baseline's
+    and each ``--cap-curve`` point of a store arm) runs with the plan's
+    ``workers``, every other stage with ``--concurrency``. Without one: no
+    estimate, no
     storing ranks, and the run names the missing dump."""
     repo = _gate_repo(tmp_path)
     model_dir = repo / "docs/rsi/models/Qwen3-4B"
@@ -86,14 +89,22 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
     spy("preempt_gpu_blocks", run_gate.preempt_gpu_blocks)
     spy("estimate_unique", lambda _a, _s, w: {"workload": w, "unique_bytes": 0, "how": "stub"}, arg=1)  # fmt: skip
     spy("cap_plan_spec", run_gate.cap_plan_spec, arg=2)
-    spy("plan_cap_convs", ret={}, arg=1)
+    spy("plan_cap_convs", ret={"workers": 77}, arg=1)
     spy("official_problems", run_gate.official_problems, arg=4)
     spy("verdicts", ret={}, arg=2)
-    _stub_main(monkeypatch, repo, lambda _a, _g, arm, wl, _o, **_k: {"arm": arm, "workload": wl})  # fmt: skip
+    workers: dict[str, set[int]] = {}
+
+    def stage(a, _g, arm, wl, _o, **_k):
+        workers.setdefault(wl, set()).add(a.concurrency)
+        # The baseline cap trace sizes the store arm's cap stages.
+        cap = {"unique_bytes": 1 << 30, "gpu_kv_bytes": 1 << 28} if wl == "cap" else {}
+        return {"arm": arm, "workload": wl} | cap
+
+    _stub_main(monkeypatch, repo, stage)
     wls = "gsm8k,replay,cap" + (",preempt" if selected else "")
     argv = ["--model", "/m/Qwen3-4B", "--tag", "t", "--runs-root", str(tmp_path / "runs"),
             "--arms", "plain,baseline,old", "--workloads", wls,
-            "--tp", str(tp), "--gpu", ",".join(map(str, range(tp)))]  # fmt: skip
+            "--cap-curve", "--tp", str(tp), "--gpu", ",".join(map(str, range(tp)))]  # fmt: skip
     assert run_gate.main(argv) == 1  # never official: sliced arms, provenance stubbed
 
     (summary,) = (tmp_path / "runs").glob("*-t/summary.json")
@@ -102,6 +113,12 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
     assert seen["official_problems"] == [want]
     assert seen["verdicts"] == [want]
     assert seen["cap_plan_spec"] == [want]
+    # The cap plan's workers drive the cap stages only.
+    caps = sorted(w for w in workers if w.startswith("cap"))
+    assert caps == ["cap", "cap025", "cap075"], workers
+    for w in caps:
+        assert workers.pop(w) == {77}, w
+    assert set().union(*workers.values()) == {run_gate.OFFICIAL["concurrency"]}
     if selected:
         assert seen["preempt_gpu_blocks"] == [want_spec]
         assert seen["estimate_unique"] == [want_spec, want_spec]  # gsm8k, replay
@@ -111,6 +128,48 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
         assert "preempt_gpu_blocks" not in seen and "estimate_unique" not in seen
         assert seen["plan_cap_convs"] == [None]
         assert f"committed spec dump {want} missing (no dump for --tp {tp})" in problems
+
+
+_VERIFIED = {"gate": {"verified": True}, "venv_pegaflow": {"verified": True}}
+
+
+@pytest.mark.parametrize(
+    "prov,watch,extra,withheld",
+    [
+        (_VERIFIED, [], [], None),
+        (_VERIFIED | {"gate": {"verified": False, "root": "/g", "reason": "dirty"}}, [], [], "run not clean: gate tree (rsi/, the judge) /g at an unverified rev (dirty)"),
+        (_VERIFIED, ["gate tree changed before plain/gsm8k: rsi/x"], [], "run not clean: gate tree changed before plain/gsm8k"),
+        (_VERIFIED, [], ["--vllm-arg=--enforce-eager"], "run not clean: --num-gpu-blocks / --vllm-arg override"),
+        (_VERIFIED, [], ["--num-gpu-blocks", "100"], "run not clean: --num-gpu-blocks / --vllm-arg override"),
+    ],
+    ids=["clean", "dirty-tree", "tree-changed", "vllm-arg", "num-gpu-blocks"],
+)  # fmt: skip
+def test_main_withholds_the_controls_record_from_unclean_runs(tmp_path, monkeypatch, prov, watch, extra, withheld):  # fmt: skip
+    """``main`` with plain and passing controls: a clean run writes
+    ``summary.controls_record``; an unverified tree, a tree changed during
+    the run (ProvenanceWatch) or a vLLM override writes None and the reason
+    in ``controls_record_withheld``."""
+    repo = _gate_repo(tmp_path)
+    _stub_main(monkeypatch, repo, lambda _a, _g, arm, wl, _o, **_k: {"arm": arm, "workload": wl})
+    monkeypatch.setattr(run_gate, "record_provenance", lambda *_: prov)
+    monkeypatch.setattr(
+        run_gate,
+        "ProvenanceWatch",
+        lambda *_: SimpleNamespace(check=lambda _w: {}, problems=lambda: watch, record=lambda: {}),
+    )
+    passed = {k: {"pass": True} for k in run_gate.CONTROL_VERDICTS}
+    monkeypatch.setattr(run_gate, "verdicts", lambda *_a, **_k: {"baseline": {"pass": True} | passed})  # fmt: skip
+    argv = ["--model", "/m/Qwen3-4B", "--tag", "t", "--runs-root", str(tmp_path / "runs"),
+            "--arms", "plain,baseline", "--workloads", "gsm8k", "--tp", "1", "--gpu", "0", *extra]  # fmt: skip
+    assert run_gate.main(argv) == 1  # never official: sliced arms
+    (summary,) = (tmp_path / "runs").glob("*-t/summary.json")
+    s = json.loads(summary.read_text())
+    if withheld is None:
+        assert s["controls_record_withheld"] is None
+        assert s["controls_record"]["verdicts"] == passed and s["controls_record"]["tag"] == "t"
+    else:
+        assert s["controls_record"] is None
+        assert s["controls_record_withheld"].startswith(withheld), s["controls_record_withheld"]
 
 
 def test_preempt_without_this_tps_dump_does_not_start(tmp_path, monkeypatch, capsys):

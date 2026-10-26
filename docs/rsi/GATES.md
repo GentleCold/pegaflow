@@ -18,7 +18,7 @@ model regresses.
 | G1 Semantics vectors | `cargo test -p pegaflow-semantics`; each new Kind/Shard ships vectors for resolve / saveable / needed / seal_plan | hard (outside `run_gate`'s exit code) |
 | G2 Correctness | byte digests of every loaded block, output identity, gsm8k accuracy, controls | hard |
 | G3 Hit rate, unlimited store | `H`, `H*`, `E_ext`, excess, no eviction | excess, load errors, no eviction hard; levels reported |
-| G4 Performance | TTFT, req/s, wall time vs baseline; warm replay vs `native` | vs baseline hard; vs `native` reported and judged |
+| G4 Performance | TTFT, req/s, wall time vs the in-run `native` | gsm8k overhead hard; replay cold and warm reported and judged |
 | G5 Capacity hit rate | `E_C` at a fixed store size `C` | correctness, load proof, run validity hard; `E_C` reported |
 
 G2 also requires, outside `run_gate`, greedy output identity with baseline vLLM
@@ -29,9 +29,10 @@ first); `|warm - baseline|` and `|cold - baseline| <= 1.0pp`.
 
 ## Hit rate
 
-No hit-rate level is a hard gate. The agent judges whether it is enough; it
-must not be far off. G4 warm replay vs `native` is judged the same way (G4,
-"Perf vs native judgment").
+No hit-rate level is a hard gate. The agent iterates until it judges that no
+connector-side headroom is left, with every remaining gap attributed. G4
+replay vs `native` is judged the same way (G4, "Perf vs native judgment").
+"Close enough" is not a stopping point.
 
 - Reported, never gated: `H`, `H*`, `E_ext`, `H*_C`, `H_lru`, `H_freeze`,
   `E_C`, oracle hit rate, per-group attribution. Each verdict carries a
@@ -48,9 +49,12 @@ must not be far off. G4 warm replay vs `native` is judged the same way (G4,
   `*_vs_native`, reported).
 - Hit-rate judgment, per accepted run, in
   `rsi-notes:models/<model>/ITERATIONS.md`: measured vs `H*` / `H*_C` and the
-  reference arms (`H_lru`, `old`, `native`, `lmcache`), every gap explained
-  (Kind limits, retention, eviction, per-group misses), and whether it is
-  close enough. A warm gsm8k pass that loads little says little about loaded
+  reference arms (`H_lru`, `native`; `old`, `lmcache` when run), every gap explained
+  (Kind limits, retention, eviction, per-group misses) and split into
+  connector-side headroom, server (GATES.md "Known server limits"), Kind /
+  vLLM structure and noise; the connector-side hypotheses tried (with
+  results) and why each remaining one is not worth trying, with numbers.
+  `H*_C` is a ceiling, not a target. A warm gsm8k pass that loads little says little about loaded
   KV; say so. The review agent checks the numbers against
   `summary.hit_report` and the explanation against the attribution, and can
   reject the run on it.
@@ -64,9 +68,12 @@ Constants (`run_gate.py`): `ACC_TOL` 0.01, `MIN_JUDGED_GSM8K` 0.9,
 10.
 
 Arms column: "every arm" = every arm except `plain` and `baseline` (store
-arms and self-test arms); "store arms" = `old`, `native`, `lmcache` and the
-arm under test. Self-test arms get no G3 / G4 / G5 verdict; `plain` and
-`baseline` get no G3 / G4 / G5 verdict either.
+arms and self-test arms); "store arms" = `native`, the arm under test, and
+`old` / `lmcache` when run. Self-test arms get no G3 / G4 / G5 verdict;
+`plain` and `baseline` get no G3 / G4 / G5 verdict either. "Onboarding" =
+the verdict needs the `plain` arm: without it the verdict is `{"pass": true,
+"na": "onboarding control: ..."}` and the run is official only with a
+current gate.json `controls` record of `--tp` ("Onboarding controls").
 
 | Verdict | Arms | Passes iff | Section |
 |---|---|---|---|
@@ -74,10 +81,10 @@ arm under test. Self-test arms get no G3 / G4 / G5 verdict; `plain` and
 | `G0.vllm_args` | baseline verdicts | every stage's `vllm_cmd` carries each gate.json flag as its last occurrence | Per-model settings |
 | `G0.provenance` | every arm, baseline | spec dumps' module files resolve under the expected roots | Provenance |
 | `G0.lmcache_build` | `lmcache` | every stage's `result.lmcache.dist` = gate.json `lmcache_dist` | lmcache |
-| `G2.plain_equals_baseline` | baseline | plain and baseline gsm8k cold completions identical | G2 controls |
+| `G2.plain_equals_baseline` | baseline, onboarding | plain and baseline gsm8k cold completions identical | G2 controls |
 | `G2.warm_equals_cold` | baseline | warm completions = cold (gated under batch invariance) | G2 controls |
-| `G2.split_control` | baseline | measured split invariance = gate.json `split_invariant` | Split invariance |
-| `G2.batch_control` | baseline | measured batch invariance = gate.json `batch_invariant` | Batch invariance |
+| `G2.split_control` | baseline, onboarding | measured split invariance = gate.json `split_invariant` | Split invariance |
+| `G2.batch_control` | baseline, onboarding | measured batch invariance = gate.json `batch_invariant` | Batch invariance |
 | `G2.digest_self.gsm8k` | baseline, every arm | digest verdict of the gsm8k probe against itself | Digest verdicts |
 | `G2.digest_vs_baseline.gsm8k` | every arm | digest verdict vs baseline's gsm8k probe (+ resume replay) | Digest verdicts |
 | `G2.digest_self.replay` | store arms | digest verdict, no judged-fraction floor | Digest verdicts |
@@ -90,11 +97,9 @@ arm under test. Self-test arms get no G3 / G4 / G5 verdict; `plain` and
 | `G2.caught_per_group` | negative self-tests | every sabotaged group caught in both gsm8k digest checks | Self-test arms |
 | `G3.gsm8k_warm`, `G3.replay_warm` | store arms | excess within one block per request, no load errors | G3 |
 | `G3.no_eviction` | store arms | no server eviction in any gsm8k / replay pass | G3 |
-| `G4.replay_warm.{ttft_p50,req_per_s}` | store arms | timed warm passes strictly better than baseline | G4 |
-| `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` | arm under test only | reported, never fails (no `pass` key); judged | G4 |
-| `G4.replay_cold.{ttft_p50,req_per_s}` | store arms | at most 2% worse than baseline | G4 |
-| `G4.gsm8k_{cold,warm}.seconds` | store arms | wall time at most 2% worse than baseline | G4 |
-| `G4.warmup_seconds` | store arms | reported only | Passes |
+| `G4.replay_{cold,warm}.{ttft_p50,req_per_s}_vs_native` | arm under test only | reported, never fails (no `pass` key); judged | G4 |
+| `G4.gsm8k_{cold,warm}.seconds` | store arms but `native` | wall time at most 2% worse than `native`'s same pass | G4 |
+| `G4.warmup_seconds` | store arms but `native` | reported only | Passes |
 | `G5.replay_warm` | store arms | at `f = 0.5`: excess, load errors, refs, `G2.digest_self.cap`, pool and load proof | G5 verdicts |
 | `G5.curve` | store arms | same at the other fractions; never gated | G5 verdicts |
 
@@ -109,7 +114,8 @@ Exit 0 only for an official run in which every required verdict passes;
 `summary.json` lists `not_official_because`. A required verdict that cannot
 be evaluated fails. Required: the verdicts of `baseline` and of the connector
 under test (including `G2.digest_self.cap`, `G5.replay_warm`). Recorded but
-not required: `old`, `native`, `lmcache`. A crashed reference-arm stage is
+not required: `native`, and `old` / `lmcache` when run (optional, never
+required; evaluated like any store arm when present). A crashed reference-arm stage is
 recorded under its `errors` and the run continues; a crash of baseline or the
 arm under test aborts.
 
@@ -117,8 +123,9 @@ Official only if all hold:
 
 | Condition | Rule |
 |---|---|
-| Profile | `run_gate.OFFICIAL`: full gsm8k, 8 shots, replay 32 x 12 with 64 output tokens, 3 replay passes, digest every 4th conversation, `replay_skip` 0, concurrency 32, `max_model_len` 8192, pinned scheduler flags, cap `auto` x 12 at fractions 0.25 / 0.5 / 0.75; lmcache chunk 256 |
-| Arms | `plain`, `baseline`, `native`, one connector under test; `lmcache` wherever comparable (else drop it citing "lmcache status per model") |
+| Profile | `run_gate.OFFICIAL`: full gsm8k, 8 shots, replay 32 x 12 with 64 output tokens, 3 replay passes, digest every 4th conversation, `replay_skip` 0, concurrency 32 (cap: the plan's `workers`), `max_model_len` 8192, pinned scheduler flags, cap `auto` x 12 at fraction 0.5 (or the curve 0.25 / 0.5 / 0.75, `--cap-curve`); lmcache chunk 256 |
+| Arms | `baseline`, `native`, one connector under test; `plain`, `old`, `lmcache` optional |
+| Onboarding controls | with `plain`: its verdicts. Without: gate.json `controls["tp<N>"]` of `--tp` names a run and rev, holds three passing control verdicts, is full-set (`gsm8k_limit` 0), and its `inputs` = this run's `control_inputs` (`run_gate.controls_problem`; a missing, failing, subset or stale record is non-official, naming what is wrong) |
 | Workloads | `gsm8k`, `replay`, `cap`; plus `preempt` on a model with a Mamba state group (committed spec): there gsm8k loads a single prefix, and only `preempt` judges every resumed episode's state load |
 | No overrides | no `--num-gpu-blocks` / `--vllm-arg` |
 | Committed files | `docs/rsi/models/<model>/gate.json` and the committed spec dump of `--tp` (G0), recording `parallel.tp` = `--tp`; a TP without one is non-official (`committed spec dump ... missing (no dump for --tp N)`) |
@@ -131,8 +138,8 @@ Official only if all hold:
 | Isolation | arm under test isolated (Linux, root) |
 | Static scan | no non-allowlisted hit in the snapshot |
 | CUDA toolchain | every nvcc on `CUDA_HOME` / `PATH` has the venv torch's CUDA major; a missing nvcc, or a `CUDA_HOME` without one, is non-official. `summary.cuda_env` records torch CUDA, `CUDA_HOME`, `LD_LIBRARY_PATH`, `PATH`, each nvcc's path and version |
-| Not contaminated | per G4-timed replay pass (`cold`, `warm2..`): no arm's p99 TTFT `> 10x` baseline's, and baseline's not `> 10x` the median of the arms' p99. Recorded in `summary.contamination`; the pass is still judged |
-| Working native | native's replay stage present, not crashed, has every baseline timed warm pass with `ttft_p50` and `req_per_s`, no load error, warm excess within limit, every timed warm pass `E_ext >= 0.9` (`run_gate.g4_native_problems`). Validity of the reference only: native's hit levels stay reported and its own G0 / G2 verdicts never make a run non-official. A model without a working native is listed under "native", never let through |
+| Not contaminated | per G4-timed replay pass (`cold`, `warm2..`): no other arm's p99 TTFT `> 10x` native's, and native's not `> 10x` the median of the other arms' p99 (baseline not looked at: no G4 role). Recorded in `summary.contamination`; the pass is still judged |
+| Working native | native's replay stage present, not crashed, has `cold` and every timed warm pass `warm2..N` of the profile with `ttft_p50` and `req_per_s`, no load error, warm excess within limit, every timed warm pass `E_ext >= 0.9` (`run_gate.g4_native_problems`). Validity of the reference only: native's hit levels stay reported and its own G0 / G2 verdicts never make a run non-official. A model without a working native is listed under "native", never let through |
 | Not held out | `--replay-skip 0` |
 
 - Slices (`--gsm8k-limit 64 --replay-convs 8 --replay-turns 6 --cap-convs 8
@@ -146,15 +153,27 @@ Official only if all hold:
 
 ## Arms
 
-| Arm | What |
-|---|---|
-| `plain` | no kv-transfer-config; gsm8k only |
-| `baseline` | probe only |
-| `old` | black-box reference: old `PegaKVConnector` from the venv's `pegaflow` |
-| `native` | vLLM `OffloadingConnector`; verdicts not required; a working native replay is (G4 vs native reference) |
-| `lmcache` | LMCache in-process connector, record only |
-| `selftest:<mode>` | gate self-test connector; gsm8k and preempt only |
-| `<module>:<Class>` | connector under test |
+| Arm | Official | What |
+|---|---|---|
+| `baseline` | required | probe only; the correctness reference (gsm8k, preempt, resume, cap; replay `cold` only) |
+| `native` | required | vLLM `OffloadingConnector`; every G4 reference; its verdicts are not required, a working native is |
+| `<module>:<Class>` | required | connector under test |
+| `plain` | optional | no kv-transfer-config; gsm8k only; the onboarding controls (run with the self-test) |
+| `old` | optional | black-box reference: old `PegaKVConnector` from the venv's `pegaflow`, record only |
+| `lmcache` | optional | LMCache in-process connector, record only |
+| `selftest:<mode>` | self-test | gate self-test connector; gsm8k and preempt only |
+
+An optional reference arm is not run by default; when run it gets every
+store-arm verdict (recorded, not required) and its G3 / G5 numbers are
+reported next to the arm under test's.
+
+Wall time on the 4090 host (`gsm8k,replay,cap` at the official profile):
+default arm set `baseline,native,<arm>` about 1 h on Qwen3-4B, about 2 h on
+Qwen3.5-4B (with `preempt`). Each optional store arm (`old`, `lmcache`)
+adds about 40 min (Qwen3-4B) / 80 min (Qwen3.5-4B); `--cap-curve` adds about
+25 / 40 min per store arm; `plain` about 10 min. These are TP 1 numbers.
+At TP 2 the cap stages are larger (Qwen3-4B: 65 workers, at least 130
+conversations, against 32 x 64 at TP 1), so each cap stage takes longer.
 
 `old`, `native`, `lmcache` and the arm under test run as
 `MultiConnector[arm, RsiProbe]`. The arm under test gets
@@ -174,6 +193,7 @@ Official only if all hold:
 | `vllm_args` | every arm's vLLM (e.g. `mamba_cache_mode`, `prefix_cache_retention_interval`) |
 | `gsm8k_vllm_args` | appended on gsm8k and resume stages ("Compile determinism") |
 | `lmcache_dist` | the lmcache build the model's lmcache numbers come from |
+| `controls` | per TP (`"tp<N>"`): the onboarding control run's `summary.controls_record` (`run`, `rev`, `gsm8k_limit` 0, `verdicts`, `inputs`; `inputs_recomputed` when the inputs postdate the run); "Onboarding controls" |
 
 `G0.vllm_args` parses every spelling vLLM accepts (`--flag=value`, `_` for
 `-`, abbreviations, `-cc`, dotted keys). The spec dump records
@@ -195,12 +215,13 @@ invariance (`VLLM_BATCH_INVARIANT=1` + FLASH_ATTN).
 - `cold`, then per warm pass: sleep `--settle`, reset prefix cache, `POST
   /collective_rpc {"method": "rsi_poison"}` (fills every KV byte with 0x3F, a
   finite bf16/fp16 value), run. Warm reuse can only come from the connector.
-- gsm8k: `cold`, `warm`. Plain also runs `split_ref`, `split`, `alone`;
+- gsm8k: `cold`, `warm`. Plain (onboarding) also runs `split_ref`, `split`, `alone`;
   plain and baseline run `alone_ref` when `batch_invariant=false`; baseline
   runs `split` when `split_invariant=false`. `<pass>_prewarm` requests are
   never scored.
 - Replay: `cold`, `warm` (digested), `warm2..warmN` (timed, N =
-  `--replay-repeats`).
+  `--replay-repeats`). Baseline runs `cold` only (measured `U` for the pool
+  check, cap plan fallback): it has no perf role.
 - Requests carry `vllm_xargs.rsi_pass` (the oracle scores by it), replay and
   gsm8k also `rsi_conv` / `rsi_turn`.
 
@@ -291,8 +312,9 @@ only make an honest block inexact, never a wrong one exact.
   do not start, the pool estimate is skipped, and the run is non-official.
 - gate.json is per model, not per TP: its claims (`batch_invariant`,
   `split_invariant`, backends, vLLM args) hold at every TP the model has a
-  dump for, and `G2.batch_control` / `G2.split_control` re-measure them in
-  every run, so a TP where one does not hold fails there.
+  dump for, and `G2.batch_control` / `G2.split_control` measure them per TP
+  at onboarding (`controls["tp<N>"]`), so a TP where one does not hold fails
+  there.
 - The adapter's declared layout (Kind, Shard, unit size, needed set) is
   checked against it: sizes add up, every layer in exactly one group.
 - `G0.spec`: arm's scheduler dump and layer view layouts (shape without the
@@ -306,6 +328,101 @@ only make an honest block inexact, never a wrong one exact.
 `G2.plain_equals_baseline` (the probe changes nothing) and
 `G2.warm_equals_cold` (reset + poison change nothing) compare completions;
 with `batch_invariant=false` they follow the batch-variant rule below.
+
+### Onboarding controls
+
+`G2.plain_equals_baseline`, `G2.split_control` and `G2.batch_control` need
+the `plain` arm. They run at onboarding, in a full-set self-test with
+`plain` at each TP the model is gated at. A clean run with `plain` whose
+three controls pass at `--gsm8k-limit 0` writes `summary.controls_record`.
+Clean means verified, unchanged gate and connector trees (provenance and the
+provenance watch), a sane CUDA env, this TP's committed dump, and no
+`--num-gpu-blocks` / `--vllm-arg` override: a dirty tree never yields a
+pasteable record. Any other run writes None there and the reason in
+`summary.controls_record_withheld`. The record goes into gate.json
+`controls["tp<N>"]` unchanged:
+
+- `run` (run dir name), `tag` (`--tag`) and `rev` (gate rev);
+- `files`: sha256 of every file the control verdicts may read, by path in
+  the run dir (`control_files`): the plain and baseline
+  `.gate/<label>/gsm8k/*-outputs.json` and `*-tokens.json`, and the baseline
+  gsm8k spec dump (hit alignment). Both cold outputs must be named;
+- `gsm8k_limit`: always 0. A record is full-set because official runs are
+  full-set: the split control judges every prompt whose warm pass the
+  official run judges, and a subset leaves the rest unmeasured;
+- `verdicts`: the three control verdicts, each a measured pass (`na` is not
+  one) with its counts, typed (`CONTROL_MEASURED`: counts are ints, claims
+  bools);
+- `inputs` = `control_inputs` of that run.
+
+A run without `plain` reports the three `na`. It is official only if the
+record of `--tp` names a run, tag and rev, hashes its files, holds three
+passing verdicts, has
+`gsm8k_limit` exactly the integer 0, its verdicts hold when re-judged, and
+its `inputs` equal this run's `control_inputs`
+(`run_gate.controls_problem`). Re-judged: each verdict carries its counts
+with the right types (a malformed value is a problem, not a crash),
+plain equals baseline with 0 differing, the split and batch controls
+measured gate.json's current `split_invariant` / `batch_invariant` claims
+and found them, pre-warmed at least `MIN_PREWARMED` of a non-empty set, the
+split reference equals cold, and the batch control compared
+`BATCH_CONTROL_N`. A pasted `{"pass": true}` is rejected. Any gap is
+non-official and names what is missing or changed.
+
+The gate cannot tell a forged but self-consistent record from a real one;
+`tag` and `files` let the reviewer check it on the host where the run dir
+lives. From a gate tree at the record's `rev`, run
+`run_gate.recheck_controls_record(<run dir>, <record>)`. It must return
+`[]`: the run dir's name, summary.json's `tag` and `rev` match the record,
+every file hashes as in `files` (none added or missing), and
+`control_verdicts` re-run on the run dir (summary.json's `results` and
+`gate`) gives the record's `verdicts`. The reviewer also checks
+summary.json's `controls_record` against the record and that
+`controls_record_withheld` is None. `control_inputs`
+holds:
+
+- `identity`: the model (dir name), `--tp`, and sha256 of that TP's
+  committed spec dump. A record copied under another TP's key or into
+  another model's gate.json is rejected;
+- sha256 of `rsi_probe.py` and `workloads.py`;
+- sha256 of the AST (docstrings dropped) of every function between the
+  control stages' arguments and the verdicts (`CONTROL_CODE`): which arm
+  runs which workload with which args (`runs_workload`, `stage_args`,
+  `cap_stage_args`, `run_stage`, `arm_label`), the stage
+  (`run_arm_workload`), the vLLM launch (`vllm_server`,
+  `kv_transfer_config`, `vllm_plugins`, the compile cache and its autotune
+  seed), the gsm8k pass plan and per-pass request arguments (`gsm8k_plan`,
+  `run_gsm8k_pass`: passes, prompt subset, concurrency, logprobs,
+  pre-warm), batch invariance per stage, reset + poison, the output and
+  token readers (`_outputs`, `_tokens`, `_differ`, `_hit_alignment`), the
+  control functions, the three verdict functions and their assembly
+  (`control_verdicts`: which arm's outputs and which claims each verdict
+  reads; `_predates`, `_ran_without`). Not hashed: process plumbing that
+  reaches neither vLLM's arguments nor its env (port leases, launch and
+  teardown, isolation of the arm under test), and the one-line calls into
+  these functions from `main` and from `verdicts()` (which places the three
+  `control_verdicts` results in `v["baseline"]`);
+- the constants `SPLIT_PASSES`, `MIN_PREWARMED`, `BATCH_PASS`,
+  `BATCH_CONTROL_N`, `ALONE_REF`, `_ALONE`, `_REFERENCE`, `AUTOTUNE_SOURCE`;
+- the run arguments of the gsm8k stages: `shots`, `concurrency`,
+  `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `gpu_mem`,
+  `num_gpu_blocks`, `vllm_arg`, `settle`;
+- sha256 of the gsm8k dataset (`train.jsonl`, `test.jsonl` under
+  `--gsm8k-dir`);
+- gate.json `attention_backend`, `invariant_attention_backend`,
+  `batch_invariant`, `split_invariant`, `vllm_args`, `gsm8k_vllm_args`.
+
+The model and TP select the record (the model's gate.json,
+`controls["tp<N>"]`) and `identity` ties it to them. vLLM and the model
+are pinned by `G0.spec` (committed dump). Any change to these makes the record stale: rerun the
+self-test with `plain` (or add `plain` to the run, which then judges the
+controls itself) and replace the record. A record whose `inputs` were
+computed later than its run, because the run's rev is off this lineage or
+the fingerprint grew since, carries `inputs_recomputed`: what differs
+between `rev` and the recomputed inputs, and why the controls behave the
+same. Without that reason the record is rejected. The reviewer checks the
+reason. `test_committed_controls_records_are_current` fails on a stale or
+incomplete committed record.
 
 ### G2.gsm8k
 
@@ -321,7 +438,7 @@ Gated under batch invariance, else reported.
 - Split invariant: every completion = baseline cold, cold and warm.
 - Split variant: cold = baseline cold; warm = the baseline resume replay's
   completion of the prompt (`warm_reference`; without that stage, plain's
-  `split`). Reported only (`warm_differ_vs_split_aligned`): prompts with
+  `split`; with neither the check fails). Reported only (`warm_differ_vs_split_aligned`): prompts with
   `prompt_len % cache_hit_alignment_tokens == 0` the replay could not resume
   where the arm did. A non-aligned prompt missed or resumed elsewhere
   differs.
@@ -345,7 +462,7 @@ vLLM 0.32's MLA prefill merges new-token and cached-context attention, so
 outputs after a hit depend on where it ends; dense FLASH_ATTN does not.
 gate.json's `split_invariant` is never trusted:
 
-- Plain runs `split_ref` (gsm8k, greedy, logprobs, after reset + poison) and
+- Plain (onboarding) runs `split_ref` (gsm8k, greedy, logprobs, after reset + poison) and
   `split` (each request preceded by its prompt with `max_tokens=1`, so the
   hit ends at the last full prompt block, like a connector's warm load).
   `--enable-prompt-tokens-details` (plain only) reports cached tokens.
@@ -434,8 +551,8 @@ Prompt tokens: `local_hit`, `external_hit`, `computed`. `H = external_hit /
 (prompt_tokens - local_hit)`; `H*` = the trace replayed through
 `semantics.resolve` with unlimited capacity; `E = H / H*`. Also reported per
 group: hit tokens, resolve fallbacks and tokens lost to them, lease /
-prefetch failures, loaded-but-unused and saved-but-never-loaded bytes; `old`'s
-`H` as a black-box reference.
+prefetch failures, loaded-but-unused and saved-but-never-loaded bytes;
+`native`'s `H` (and `old`'s when run) as black-box references.
 
 Oracle (`oracle.py`) replays `requests.jsonl`: a block ending at token e is
 stored at the first step whose `progress` reaches e (checkpoint groups: a step
@@ -456,13 +573,15 @@ local))`.
   outputs; gsm8k prompts), or later the baseline-measured `U`, exceeds
   `--pool-size` (`summary.pool_checks`).
 
-## G4 Performance (hard)
+## G4 Performance (gsm8k hard, replay judged)
 
-Every gated check is against the baseline arm of the same run; G4 vs
-`native` is reported and judged. Store arms get the vs-baseline checks
-(required only for the arm under test; `old`, `native`, `lmcache` record
-them); only the arm under test gets `*_vs_native`. Self-test arms, `plain`
-and `baseline` get no G4 verdict.
+Every G4 reference is the in-run `native` arm. The gsm8k overhead check is
+hard (the regression floor); replay cold and warm vs `native` are reported
+and judged. Store arms other than `native` get the gsm8k check (required
+only for the arm under test; `old` / `lmcache` record it); only the arm
+under test gets `*_vs_native`.
+Self-test arms, `plain`, `baseline` and `native` get no G4 verdict. Baseline
+has no perf role (its replay runs `cold` only).
 
 Workload: multi-turn agent traces (user-provided "agentx" when available;
 until then R2EGym-SFT-Trajectories as growing multi-turn chat,
@@ -473,36 +592,54 @@ p99 recorded, not gated.
 
 | Check | Rule |
 |---|---|
-| `G4.replay_warm.ttft_p50`, `.req_per_s` | `warm2..N` strictly better than baseline |
-| `..._vs_native` | reported, not gated: `warm2..N` vs in-run `native`'s `warm2..N`. Arm under test only; only native's timing is used. `reason` set when native has no replay stage (missing or crashed: run non-official), when native's replay or the arm's has no timed warm pass with the key |
-| `G4.replay_cold.ttft_p50`, `.req_per_s` | at most 2% worse than baseline cold (bounds the save cost) |
-| `G4.gsm8k_{cold,warm}.seconds` | at most 2% worse than baseline (bounds per-step overhead) |
+| `G4.gsm8k_{cold,warm}.seconds` | hard: at most 2% worse than `native`'s same pass (bounds per-step overhead); a missing or crashed native gsm8k stage fails it (no reference) |
+| `G4.replay_cold.{ttft_p50,req_per_s}_vs_native` | reported, not gated: `cold` vs `native`'s `cold` (the save cost). Arm under test only |
+| `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` | reported, not gated: `warm2..N` vs `native`'s `warm2..N`. Arm under test only |
 | last accepted iteration | no > 5% regression (by hand) |
 
-Every gated replay G4 check is void (fail) if `G2.digest_self.replay`
-fails; a `*_vs_native` record is marked `void` then. Overhead checks stay vs
-baseline: native has its own save cost, so the two would add up. G2
-references stay baseline's (native fails `G0.spec` by construction).
+A `*_vs_native` record carries `reason` when native has no replay stage
+(missing or crashed: run non-official), or when native's replay or the
+arm's has no pass of that stage with the key; it is marked `void` when
+`G2.digest_self.replay` fails (the arm fails on that verdict). The gsm8k bar
+is relative to native, which carries its own save cost: an arm that costs as
+much as vLLM's own offloading passes; one that costs more than 2% beyond it
+fails. G2 references stay baseline's (native fails `G0.spec` by
+construction).
 
 ### Perf vs native judgment
 
 Each `*_vs_native` record holds both arms' pass values, medians and
 pass-to-pass ranges, `gap` (median - native median), `gap_pct` (of native's
 median; TTFT positive = slower, req/s negative = slower), `noise` (the larger
-range) and `within_noise` (`|gap| <= noise`, a diagnostic); median, gap and
-noise are absent when either side has no timed warm pass with the key.
+range) and `within_noise` (`|gap| <= noise`, a diagnostic; `null` for
+`replay_cold`, one pass per side, so no range); median, gap and noise are
+absent when either side has no pass of that stage with the key.
 `summary.native_report` (the `[gate] perf vs native (reported, not gated)`
 line) lists median, native median, `gap_pct`, `behind_pct` (positive = the
 arm is slower than native, for either metric), `within_noise`, `void`,
 `reason` per arm and key.
 
-Per accepted run, in `rsi-notes:models/<model>/ITERATIONS.md` next to the
-hit-rate judgment: the gap in %, attributed (load path, save path,
-scheduling, server), and whether it is close enough. No numeric threshold: a
-gap within run noise or a few percent is close; a large gap needs attribution
-and a hypothesis before acceptance (compare the load paths first: sync vs
-async load, load round trip in steps, per-request load size). The review
-agent checks the judgment against `summary.native_report`.
+Stopping rule: a model is not done when it is close to native. The agent
+iterates, one hypothesis at a time, until it judges that no connector-side
+optimization is left. Per accepted run, in
+`rsi-notes:models/<model>/ITERATIONS.md` next to the hit-rate judgment:
+
+- the remaining gap in % for warm replay, cold replay and gsm8k, each split
+  into four parts with numbers: connector (load path, save path,
+  scheduling), server ("Known server limits": not ours to fix), vLLM /
+  native structural differences (e.g. native's in-process CPU copy vs a
+  server round trip, layouts), and noise (pass-to-pass ranges);
+- the connector-side hypotheses tried, each with its result, and why each
+  remaining one is not worth trying, with numbers (measured upper bound of
+  its gain, cost, or a guard below that rules it out).
+
+Compare the load paths first: sync vs async load, load round trip in steps,
+per-request load size. Guards stay: the server is out of scope, `H*_C` is a
+ceiling and not a target, no tuning to the trace (held-out slice), and the
+policy complexity budget (skill step 5). The review agent checks the
+numbers against `summary.native_report` and that the attribution holds (no
+connector-side part labeled server, structural or noise without evidence),
+and can reject the run on it.
 
 ## G5 Capacity hit rate
 
@@ -523,9 +660,12 @@ Server fragmentation and headroom count against the connector/server.
   reset + poison, digested). `U` = bytes of distinct (group, key) blocks the
   unlimited oracle stores in `cap_cold`. `ref(pass, conv, turn)` = baseline's
   `local_hit` there (`cap_cold` for `cap_cold`, `cap_warm` for warm passes).
-- `C = int(f x U)`, `--cap-fractions` must include 0.5 (official 0.25, 0.5,
-  0.75); only 0.5 is gated. `G5.capacity_floor`: `C(0.5) >= 2 x` baseline GPU
-  KV bytes, else non-official.
+- `C = int(f x U)`, `--cap-fractions` must include 0.5. Official: 0.5 alone
+  (default), or the curve 0.25, 0.5, 0.75 (`--cap-curve`, exclusive with
+  `--cap-fractions`; each point is a full cap stage per store arm); only 0.5
+  is gated, the curve is reported (`G5.curve`) and adds no hard check.
+  `G5.capacity_floor`: `C(0.5) >= 2 x` baseline GPU KV bytes, else
+  non-official.
 - Block bytes per (group, key) = `real_page_size_bytes` (else
   `page_size_bytes`) x group `num_layers` (`UniformTypeKVCacheSpecs`: x 1) x
   `tp / kv_tp_replicas`. One copy of replicated bytes (PegaFlow, and native's
@@ -534,8 +674,20 @@ Server fragmentation and headroom count against the connector/server.
   once) x the same copies.
 - `auto` (`summary.cap_plan`): spec from this run's baseline gsm8k dump (else
   replay; never preempt; else committed; `cap_plan.spec`); the floor reads
-  GPU KV from the cap stage's dump. Conversations from the file start (>= 64)
-  until estimated `U >= 1.1 x 2 x GPU KV / 0.5`. `UniqueEstimate` per Kind:
+  GPU KV from the cap stage's dump. Conversations from the file start (>= 64
+  and >= 2 x `workers`) until estimated `U >= 1.1 x 2 x GPU KV / 0.5`.
+  `workers` (`cap_workers`, every cap stage's concurrency, baseline
+  included) = `max(--concurrency, ceil(1.5 x GPU KV tokens / mean turn))`,
+  turn = prompt + `--replay-out-tokens`, GPU KV tokens = `num_blocks / Σ
+  1/block_size` over GPU groups. Fewer in-flight tokens than GPU KV and
+  vLLM's prefix cache keeps every live conversation: the store is reused
+  only across passes, in pass order, so `H_lru` gets nothing and a store
+  frozen after `cap_cold` nearly reaches `H*_C` (Qwen3-4B TP2 at 32
+  workers, 0.75 x GPU KV: local hit 0.85, `lru_vs_oracle_c` 0.003,
+  `freeze_vs_oracle_c` 0.92 at every fraction; TP1 at 32 is 2 x GPU KV:
+  0.39, 0.87, 0.62). Fewer conversations than `2 x workers` (the whole file
+  used) or more workers than `--max-num-seqs` are `cap_plan.problems`,
+  non-official; too few workers otherwise show as freeze separation. `UniqueEstimate` per Kind:
   Full / Window = distinct prompt-prefix blocks + generated complete blocks;
   Checkpoint = only step ends on a boundary, with vLLM 0.32's align-mode
   prefill split (`prefill_step_ends`) and every decode boundary, assuming a
@@ -604,7 +756,8 @@ Per segment (`warm_timed` = `cap_warm2..N`, and per pass):
   reported `preempted_uncertain`). Arm under test needs `judged > 0`; a
   reference arm with none passes flagged `vacuous`; baseline needs no
   external block.
-- `G5.curve`: same at the other fractions, never gated.
+- `G5.curve`: same at the other fractions (only with `--cap-curve` or a
+  listed `--cap-fractions`), never gated.
 - Separation: arm under test's `freeze_vs_oracle_c >= 0.9` at f = 0.5 makes
   the run non-official (`G5 trace does not separate freeze from H*_C`).
 
@@ -633,8 +786,9 @@ Preempt per-group counts and output deltas are reported only.
 
 `OffloadingConnector` via `--kv-offloading-size`,
 `kv_connector_extra_config = {"cpu_bytes_to_use": B}`, no server; `B` =
-`--pool-size` (gsm8k / replay) or `C` (cap). G4 warm is judged against it
-(reported); `E_C` reported. It switches `kv_cache_layout` to `LBHNC`, so `G0.spec` and
+`--pool-size` (gsm8k / replay) or `C` (cap). Required in every official run:
+it is every G4 reference (gsm8k overhead hard, replay cold and warm
+judged); `E_C` reported. It switches `kv_cache_layout` to `LBHNC`, so `G0.spec` and
 `G2.digest_vs_baseline.gsm8k` fail by construction; `G2.digest_self.*` and
 `G2.gsm8k_outputs` are its correctness evidence.
 
@@ -642,9 +796,15 @@ Models without a working native: none. On Qwen3-4B native fails
 `G2.digest_self.cap` at 0.5 on the preempted-uncertain bound only (0
 mismatched); its G5 numbers carry that flag.
 
+### old
+
+Optional, record only: the old `PegaKVConnector` from the venv's `pegaflow`,
+run as a black box when its numbers are wanted. When run it gets every
+store-arm verdict (G2 / G3 / G4 vs native / G5), none required.
+
 ### lmcache
 
-Loaded by module path
+Optional, record only. Loaded by module path
 (`lmcache.integration.vllm.lmcache_connector_v1:LMCacheConnectorV1Dynamic`)
 from `--lmcache-overlay`, on that arm's `PYTHONPATH` only; no server; env
 only (`LMCACHE_*` inherited dropped): `LMCACHE_LOCAL_CPU=True`,
@@ -661,7 +821,8 @@ chunks (no trailing partial) are a granularity loss inside its `E` / `E_C`.
 
 #### lmcache status per model
 
-vLLM 0.32.0, torch 2.13.0+cu130. Comparable only where its loads are
+Optional: run it when a comparison is wanted, never required. vLLM 0.32.0,
+torch 2.13.0+cu130. Comparable only where its loads are
 digest-verified (`G2.digest_self.*`, `G2.digest_vs_baseline.gsm8k` with 0
 mismatches, warm accuracy within `ACC_TOL`). Never use a wrong-KV number.
 
@@ -852,24 +1013,32 @@ CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python/.venv/bin:~/kexi/cuda13/bin:
 LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 ~/kexi/pegaflow/python/.venv/bin/python -m rsi.gates.run_gate \
   --model ~/kexi/models/<model> --tag <model>-it<N> \
-  --arms plain,baseline,old,native,lmcache,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0 \
-  --under-test-path <tree>/python \
-  --lmcache-overlay <overlay of gate.json lmcache_dist: ~/kexi/overlays/lmcache-pr4467 on Qwen3-4B>
+  --arms baseline,native,<module>:<Class> --workloads gsm8k,replay,cap --gpu 0 \
+  --under-test-path <tree>/python
 # add ,preempt to --workloads on models with a Mamba state group
+# optional: --cap-curve (G5 curve 0.25/0.5/0.75, reported); old / lmcache in
+#   --arms (lmcache needs --lmcache-overlay <gate.json lmcache_dist overlay:
+#   ~/kexi/overlays/lmcache-pr4467 on Qwen3-4B>); plain (re-judges the
+#   onboarding controls in this run)
 # slice smoke (not official, no E_C conclusion):
 #   ... --gsm8k-limit 64 --replay-convs 8 --replay-turns 6 --cap-convs 8 --cap-turns 6
 ```
 
 ### Self-test at onboarding
 
-gsm8k, 128 questions per self-test arm, no PegaFlow, once per TP the model
-is gated at (`--tp N --gpu` with N devices). Add `preempt` (on state-group
-models the honest arm fails without it) and `selftest:sync` there:
+gsm8k, 128 questions per self-test arm (`SELFTEST_LIMIT`), the full set for
+`plain` and `baseline`, no PegaFlow, once per TP the model is gated at
+(`--tp N --gpu` with N devices), and again whenever the gate.json `controls`
+record of a TP goes stale ("Onboarding controls"). The `plain` arm here is
+where the onboarding controls run: when they pass, copy
+`summary.controls_record` into gate.json `controls["tp<N>"]`. Add `preempt`
+(on state-group models the honest arm fails without it) and `selftest:sync`
+there:
 
 ```bash
 ... run_gate --model ... --tag <model>-selftest \
   --arms plain,baseline,selftest:honest,selftest:liar,selftest:bitflip,selftest:offbyone \
-  --workloads gsm8k,preempt --gsm8k-limit 128
+  --workloads gsm8k,preempt
 ```
 
 `preempt` needs the committed dump of `--tp`: for a TP without one, run
