@@ -2463,7 +2463,7 @@ def test_controls_record_is_bound_to_model_and_tp(tmp_path, key, args, problem):
 # ``identity``: stale until the next plain run of that model and TP replaces
 # them (official runs there need the plain arm until then). Drop an entry
 # with its refresh; an entry that is current fails, so the list cannot rot.
-_AWAITING_REFRESH = {("Qwen3-4B", "tp1"), ("Qwen3-4B", "tp2")}
+_AWAITING_REFRESH = {("Qwen3-4B", "tp1")}
 
 
 def test_committed_controls_records_are_current(monkeypatch):
