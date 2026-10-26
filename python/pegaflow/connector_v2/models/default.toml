@@ -2,7 +2,10 @@
 # Keys must be fields of pegaflow.connector_v2.policy.Policy.
 
 # How long a request may stay unscheduled while the server prefetches
-# (SSD / remote). 0 = never wait: a Loading answer counts as a miss.
+# (SSD / remote), and, on a separate clock, while another request's async
+# load of its blocks lands (vLLM then serves them from its prefix cache).
+# 0 = never wait: a Loading answer counts as a miss and every request loads
+# its own copy.
 loading_wait_ms = 1000
 
 # Hits of at most this many tokens are copied before the forward of the step

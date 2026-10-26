@@ -223,6 +223,9 @@ class Scheduler:
         # A previous hit that was never allocated (allocation failed) is stale.
         self._drop_hit(req_id)
         if self._defer_for_inflight(request, num_computed):
+            # Its own clock bounds this wait: a prefetch wait before it must not
+            # expire the moment the request is looked up again.
+            self._loading_since.pop(req_id, None)
             return None, False
 
         try:
@@ -274,10 +277,14 @@ class Scheduler:
         (``semantics.resolve``: e.g. no checkpoint state at a shared
         boundary, no gain). No server query, so no lease is held while
         deferred. A failed or aborted load ends the wait (``on_loads_done``,
-        ``request_finished``); ``loading_wait_ms`` bounds it per request.
+        ``request_finished``); ``loading_wait_ms`` bounds it per request,
+        separately from the prefetch wait. Not for a request that skips
+        vLLM's prefix cache: vLLM ignores its hit (and a None) anyway.
         """
         req_id = request.request_id
         if not self._defer_inflight or self._policy.loading_wait_ms <= 0:
+            return False
+        if getattr(request, "skip_reading_prefix_cache", False):
             return False
         if not self._inflight_refs or req_id in self._inflight:
             self._deferred_since.pop(req_id, None)

@@ -44,7 +44,9 @@ class SaveItem:
 @dataclass
 class Policy:
     # Defaults equal models/default.toml (a test pins this).
-    loading_wait_ms: int = 1000  # how long to wait while the server prefetches
+    # How long a request may wait while the server prefetches, and, on its own
+    # clock, while another request's async load of its blocks lands; 0 = never.
+    loading_wait_ms: int = 1000
     # Hits of at most this many tokens load before the step's forward (where the
     # layout allows it), longer ones asynchronously between steps.
     sync_load_tokens: int = 256

@@ -494,10 +494,11 @@ def test_hit_lifecycle(sem):
     assert sched.get_num_new_matched_tokens(req, 0) == (0, False)
 
 
-def _other(num_tokens=13, n_hashes=3, req_id="b", diverge_at=None):
+def _other(num_tokens=13, n_hashes=3, req_id="b", diverge_at=None, skip_reading=False):
     req = _req(num_tokens, n_hashes, req_id)
     if diverge_at is not None:
         req.block_hashes[diverge_at:] = [b"x%d" % i for i in range(diverge_at, n_hashes)]
+    req.skip_reading_prefix_cache = skip_reading
     return req
 
 
@@ -511,6 +512,20 @@ def _other(num_tokens=13, n_hashes=3, req_id="b", diverge_at=None):
         pytest.param((StubFullSpec(),), {}, {}, 0, "landed", (12, True), id="landed"),
         pytest.param((StubFullSpec(),), {}, {}, 0, "aborted", (12, True), id="loader-aborted"),
         pytest.param((StubFullSpec(),), {}, {}, 0, "expired", (12, True), id="wait-expired"),
+        # Refcounted: another load of the same blocks is still in flight.
+        pytest.param((StubFullSpec(),), {}, {}, 0, "one-of-two-landed", None, id="two-loaders"),
+        # The wait clock restarts once the request was allocated: after an
+        # expired wait, a load and a preemption it waits again.
+        pytest.param((StubFullSpec(),), {}, {}, 0, "requeued", None, id="requeued-waits"),
+        # The multi-turn shape: a loads blocks 1-2 past its local hit, b has
+        # the same local hit, so a's load gives b a resume point at 12.
+        pytest.param(
+            (StubFullSpec(),), {"a_local": 4}, {}, 4, None, None, id="local-plus-inflight"
+        ),
+        # vLLM ignores the hit (and a None) of a request skipping its prefix cache.
+        pytest.param(
+            (StubFullSpec(),), {}, {"skip_reading": True}, 0, None, (12, True), id="skip-reading"
+        ),
         # vLLM's local hit already covers the in-flight blocks: nothing to wait for.
         pytest.param((StubFullSpec(),), {}, {}, 12, None, (0, False), id="local-covers"),
         # Sharing only block 0 still waits: vLLM then serves 4 tokens locally.
@@ -561,32 +576,62 @@ def test_waits_for_inflight_loads_of_its_blocks(
         answers[1] = Ready(1, b"C", [2])
     rpc = FakeRpc(answers)
     kw = dict(kw)
+    a_local = kw.pop("a_local", 0)
     policy = kw.pop("policy", Policy(sync_load_tokens=0 if not kw.get("sync_loads") else 256))
     sched = Scheduler(layout, policy, rpc, "inst", clock=Clock(), semantics=sem, **kw)
-    a = _req(req_id="a")
-    matched = sched.get_num_new_matched_tokens(a, 0)
     ids = ([0, 0, 33], FULL_IDS) if checkpoint else (FULL_IDS,)
-    sched.update_state_after_alloc(a, ids, matched[0])
-    assert not sched.take_plan().loads[0].fail
-    rpc.queried.clear()
 
+    def load(*req_ids):  # look all up first: none waits for another's load
+        reqs = [_req(req_id=r) for r in req_ids]
+        matched = [sched.get_num_new_matched_tokens(r, a_local) for r in reqs]
+        for r, m in zip(reqs, matched, strict=True):
+            sched.update_state_after_alloc(r, ids, m[0])
+        assert not any(lp.fail for lp in sched.take_plan().loads)
+
+    load(*(("a", "a2") if event == "one-of-two-landed" else ("a",)))
     b = _other(**other)
-    if event == "landed":
+    if event in ("landed", "one-of-two-landed"):
         sched.on_loads_done({"a"})
     elif event == "aborted":
         sched.request_finished("a")
-    elif event == "expired":
+    elif event in ("expired", "requeued"):
         assert sched.get_num_new_matched_tokens(b, num_computed) == (None, False)
         sched._clock.now += 1.0
+    if event == "requeued":
+        assert sched.get_num_new_matched_tokens(b, num_computed) == (12, True)
+        sched.update_state_after_alloc(b, ids, 12)
+        sched.take_plan()
+        sched.on_loads_done({"a", "b"})
+        load("c")  # b, preempted, is looked up again while c loads its blocks
     if checkpoint and other.get("diverge_at") == 2:
         rpc.answers = {0: Ready(2, b"F2"), 1: Ready(0, b"")}
+    rpc.queried.clear()
     got = sched.get_num_new_matched_tokens(b, num_computed)
+    deferred = {"expired": 1, "requeued": 2}.get(event, 1 if expected is None else None)
     if expected is None:
         assert (got, rpc.queried) == ((None, False), [])
-        assert sched.hit_stats.get("deferred") == 1
     else:
         assert got == expected
-        assert sched.hit_stats.get("deferred") == (1 if event == "expired" else None)
+    assert sched.hit_stats.get("deferred") == deferred
+
+
+def test_inflight_wait_restarts_prefetch_wait(sem):
+    """The in-flight wait and the prefetch wait each get ``loading_wait_ms``:
+    a prefetch clock left from before a deferral does not expire at once."""
+    layout = _layout(sem, StubFullSpec())
+    rpc = FakeRpc({0: Loading()})
+    sched = Scheduler(layout, Policy(sync_load_tokens=0), rpc, "inst", clock=Clock(), semantics=sem)
+    b = _other()
+    assert sched.get_num_new_matched_tokens(b, 0) == (None, False)  # prefetching
+    rpc.answers = {0: Ready(3, b"F")}
+    a = _req(req_id="a")
+    sched.update_state_after_alloc(a, (FULL_IDS,), sched.get_num_new_matched_tokens(a, 0)[0])
+    sched._clock.now += 0.9
+    assert sched.get_num_new_matched_tokens(b, 0) == (None, False)  # waits for a
+    sched._clock.now += 0.2
+    sched.on_loads_done({"a"})  # vLLM evicted a's blocks meanwhile: no local hit
+    rpc.answers = {0: Loading()}
+    assert sched.get_num_new_matched_tokens(b, 0) == (None, False)
 
 
 FULL_IDS, WINDOW_IDS = [10, 11, 12, 13], [20, 21, 22, 23]
