@@ -5,6 +5,7 @@ docs/rsi/GATES.md ("Tests"). The isolation tests run only on Linux as root.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -1931,6 +1932,7 @@ def _replay(
 
 
 NATIVE_KEYS = ("G4.replay_warm.ttft_p50_vs_native", "G4.replay_warm.req_per_s_vs_native")
+COLD_KEYS = ("G4.replay_cold.ttft_p50_vs_native", "G4.replay_cold.req_per_s_vs_native")
 
 
 @pytest.mark.parametrize(
@@ -1951,11 +1953,14 @@ NATIVE_KEYS = ("G4.replay_warm.ttft_p50_vs_native", "G4.replay_warm.req_per_s_vs
     ids=["qwen3-4b-it7", "dsv2-it7", "qwen35-it2", "gap-equals-range", "gap-above-range", "tie"],
 )  # fmt: skip
 def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
-    """User, 2026-10-26: v2 vs native on G4 warm is a judged comparison
-    ("差不多就行了"), not a gate. ``*_vs_native`` is ``reported`` (no ``pass``
-    key) and carries what the perf vs native judgment needs: per-arm pass
+    """Replay vs native is judged, not gated: the onboarding agent iterates
+    until no connector-side optimization is left and attributes the
+    remaining gap (connector, server, vLLM / native structure, noise); the
+    reviewer checks the attribution. ``*_vs_native`` is ``reported`` (no
+    ``pass`` key) and carries what that judgment needs: per-arm pass
     values, medians, ranges, gap, gap %, noise, ``within_noise``. Native's
-    own G0 / G2 do not matter; the overhead bound vs native stays hard."""
+    own G0 / G2 do not matter; the gsm8k overhead bound vs native stays
+    hard."""
     results = {"baseline": {"replay": _replay(5.0, 1.0)}}
     results |= {"pegaflow.m:C": {"replay": _replay(*mine)}}
     results |= {"native": {"replay": _replay(*native) | {"digest_self": None}}}
@@ -1978,7 +1983,7 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
     # A wrong-KV replay marks the comparison void (the arm fails on G2.digest_self.replay).
     results["pegaflow.m:C"]["replay"]["digest_self"] = None
     g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
-    assert all("void" in g[k] and "pass" not in g[k] for k in NATIVE_KEYS)
+    assert all("void" in g[k] and "pass" not in g[k] for k in (*NATIVE_KEYS, *COLD_KEYS))
     # No native replay: reported with the reason (the run is not official).
     del results["native"]
     results["pegaflow.m:C"]["replay"] = _replay(*mine)
@@ -2074,47 +2079,75 @@ def test_official_needs_native_warm_replay(tmp_path, arms, wls, native, problem)
 def _slim_args(tmp_path, **over):
     import argparse
 
-    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "tp": 1, "lmcache_chunk_size": run_gate.LMCACHE_CHUNK, "lmcache_overlay": str(tmp_path)}  # fmt: skip
+    data = tmp_path / "gsm8k"
+    if not data.is_dir():
+        data.mkdir()
+        for f in run_gate.GSM8K_FILES:
+            (data / f).write_text(f"{f}\n")
+    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "tp": 1, "lmcache_chunk_size": run_gate.LMCACHE_CHUNK, "lmcache_overlay": str(tmp_path), "gpu_mem": run_gate.GPU_MEM, "settle": 5.0, "gsm8k_dir": str(data)}  # fmt: skip
     return argparse.Namespace(**(run_gate.OFFICIAL | fixed | over))
 
 
-def _controls_gate(gate: dict, tp: int = 1, **edit) -> dict:
-    """``gate`` with a controls record for ``tp`` measured at the current
-    inputs, then ``edit`` applied to the gate (a setting changed after)."""
-    rec = {"run": "r", "inputs": run_gate.control_inputs(gate)}
-    return gate | {"controls": {f"tp{tp}": rec}} | edit
+_PASSED = {k: {"pass": True} for k in run_gate.CONTROL_VERDICTS}
+
+
+def _controls_gate(tmp_path, gate: dict, tp: int = 1, rec: dict | None = None, **edit) -> dict:
+    """``gate`` with a passing full-set controls record for ``tp`` measured
+    at the current inputs, ``rec`` merged into the record, then ``edit``
+    applied to the gate (a setting changed after)."""
+    inputs = run_gate.control_inputs(gate, _slim_args(tmp_path, tp=tp))
+    full = {"run": "r", "rev": "abc", "gsm8k_limit": 0, "verdicts": _PASSED, "inputs": inputs}
+    return gate | {"controls": {f"tp{tp}": full | (rec or {})}} | edit
 
 
 _SLIM = ["baseline", "native", "pegaflow.m:C"]
 _GATE = {"batch_invariant": True, "invariant_attention_backend": "FLASH_ATTN"}
+_FAILED = _PASSED | {"G2.split_control": {"pass": False}}
+_NA = _PASSED | {"G2.batch_control": {"pass": True, "na": run_gate.ONBOARDING_NA}}
+_REC = "onboarding controls for --tp 1 (gate.json, run r)"
 
 
 @pytest.mark.parametrize(
     "arms,gate,tp,problem",
     [
-        (_SLIM, _controls_gate(_GATE), 1, None),
-        (["plain", *_SLIM], {}, 1, None),  # plain measures the controls itself
-        ([*_SLIM, "old", "lmcache"], _controls_gate(_GATE | {"lmcache_dist": "lmcache-0.5.6"}), 1, None),  # fmt: skip
+        (_SLIM, (_GATE, {}), 1, None),
+        (["plain", *_SLIM], None, 1, None),  # plain measures the controls itself
+        ([*_SLIM, "old", "lmcache"], (_GATE | {"lmcache_dist": "lmcache-0.5.6"}, {}), 1, None),
+        (_SLIM, (_GATE, {"inputs_recomputed": "only an error message changed"}), 1, None),
         (_SLIM, _GATE, 1, "onboarding controls for --tp 1 not recorded"),
-        (_SLIM, _controls_gate(_GATE), 2, "onboarding controls for --tp 2 not recorded"),
-        (_SLIM, _controls_gate(_GATE, batch_invariant=False), 1, "onboarding controls for --tp 1 (gate.json, run r) are stale: settings.batch_invariant"),  # fmt: skip
-        (_SLIM, _controls_gate(_GATE, vllm_args=["--x"]), 1, "onboarding controls for --tp 1 (gate.json, run r) are stale: settings.vllm_args"),  # fmt: skip
-        (["native", "pegaflow.m:C"], _controls_gate(_GATE), 1, "arm baseline missing"),
-        (["baseline", "pegaflow.m:C"], _controls_gate(_GATE), 1, "arm native missing"),
-        (["baseline", "native"], _controls_gate(_GATE), 1, "arm under_test missing"),
+        (_SLIM, (_GATE, {}), 2, "onboarding controls for --tp 2 not recorded"),
+        (_SLIM, (_GATE, {}, {"batch_invariant": False}), 1, f"{_REC} are stale: settings.batch_invariant"),
+        (_SLIM, (_GATE, {}, {"vllm_args": ["--x"]}), 1, f"{_REC} are stale: settings.vllm_args"),
+        (_SLIM, (_GATE, {"run": ""}), 1, "onboarding controls for --tp 1 (gate.json) name no run and rev"),
+        (_SLIM, (_GATE, {"rev": None}), 1, "onboarding controls for --tp 1 (gate.json) name no run and rev"),
+        (_SLIM, (_GATE, {"verdicts": _FAILED}), 1, f"{_REC} record no passing G2.split_control"),
+        (_SLIM, (_GATE, {"verdicts": _NA}), 1, f"{_REC} record no passing G2.batch_control"),
+        (_SLIM, (_GATE, {"verdicts": None}), 1, f"{_REC} record no passing G2.plain_equals_baseline, G2.split_control, G2.batch_control"),
+        (_SLIM, (_GATE, {"gsm8k_limit": 128}), 1, f"{_REC} ran gsm8k_limit=128, not the full set (0)"),
+        (_SLIM, (_GATE, {"gsm8k_limit": None}), 1, f"{_REC} ran gsm8k_limit=None"),
+        (_SLIM, (_GATE, {"inputs_recomputed": ""}), 1, f"{_REC}: inputs_recomputed must say why"),
+        (["native", "pegaflow.m:C"], (_GATE, {}), 1, "arm baseline missing"),
+        (["baseline", "pegaflow.m:C"], (_GATE, {}), 1, "arm native missing"),
+        (["baseline", "native"], (_GATE, {}), 1, "arm under_test missing"),
     ],
-    ids=["slim", "with-plain", "with-optional-refs", "no-controls-record", "other-tp-record",
-         "stale-setting", "stale-vllm-args", "no-baseline", "no-native", "no-arm-under-test"],
+    ids=["slim", "with-plain", "with-optional-refs", "recomputed-with-why", "no-controls-record",
+         "other-tp-record", "stale-setting", "stale-vllm-args", "no-run", "no-rev", "failed-verdict",
+         "na-verdict", "no-verdicts", "subset-record", "no-limit", "recomputed-without-why",
+         "no-baseline", "no-native", "no-arm-under-test"],
 )  # fmt: skip
 def test_official_arm_set(tmp_path, arms, gate, tp, problem):
     """Official: baseline (correctness), native (perf) and the arm under
     test; old, lmcache and plain are optional. Without plain the onboarding
-    controls come from gate.json ``controls["tp<N>"]``, which must have been
-    measured at the current ``control_inputs``."""
+    controls come from gate.json ``controls["tp<N>"]``: a named full-set run
+    (``rev``) whose three controls passed, measured at the current
+    ``control_inputs``; recomputed inputs say why. Each gap fails closed."""
     (tmp_path / "lmcache-0.5.6.dist-info").mkdir()
     gate_file, committed = _official_files(tmp_path)
     committed.write_text(json.dumps({"parallel": {"tp": tp}}))
-    probs = run_gate.official_problems(_slim_args(tmp_path, tp=tp), arms, list(run_gate.WORKLOADS), gate_file, committed, gate)  # fmt: skip
+    if isinstance(gate, tuple):
+        base, rec, *edit = gate
+        gate = _controls_gate(tmp_path, base, 1, rec, **(edit[0] if edit else {}))  # a TP 1 record
+    probs = run_gate.official_problems(_slim_args(tmp_path, tp=tp), arms, list(run_gate.WORKLOADS), gate_file, committed, gate or {})  # fmt: skip
     if problem is None:
         assert probs == [], probs
     else:
@@ -2131,34 +2164,131 @@ def _probe_edited(mp, tmp_path):
     mp.setattr(run_gate, "REPO", tmp_path)
 
 
+def _code_edited(name: str, old: str, new: str):
+    """This gate's source with one control function edited."""
+
+    def mutate(mp, tmp_path):
+        src = Path(run_gate.__file__).read_text()
+        start = src.index(f"\ndef {name}(")
+        end = src.index("\ndef ", start + 1)
+        assert src.count(old, start, end) == 1, (name, old)
+        body = src[start:end].replace(old, new)
+        f = tmp_path / "run_gate.py"
+        f.write_text(src[:start] + body + src[end:])
+        mp.setattr(run_gate, "__file__", str(f))
+
+    return mutate
+
+
+def _dataset_edited(mp, tmp_path):
+    (tmp_path / "gsm8k" / "test.jsonl").write_text("other\n")
+
+
 @pytest.mark.parametrize(
-    "part,mutate",
+    "part,mutate,args",
     [
-        ("files.rsi/gates/rsi_probe.py", _probe_edited),
-        ("constants.BATCH_CONTROL_N", lambda mp, _t: mp.setattr(run_gate, "BATCH_CONTROL_N", 32)),
-        ("profile.shots", lambda mp, _t: mp.setitem(run_gate.OFFICIAL, "shots", 5)),
+        ("files.rsi/gates/rsi_probe.py", _probe_edited, {}),
+        ("constants.BATCH_CONTROL_N", lambda mp, _t: mp.setattr(run_gate, "BATCH_CONTROL_N", 32), {}),
+        ("profile.shots", lambda mp, _t: None, {"shots": 5}),
+        ("profile.gpu_mem", lambda mp, _t: None, {"gpu_mem": 0.5}),
+        ("dataset.test.jsonl", _dataset_edited, {}),
+        ("code._outputs", _code_edited("_outputs", "f.exists()", "f.is_file()"), {}),
+        ("code._differ", _code_edited("_differ", "a != b", "a.strip() != b.strip()"), {}),
+        ("code.kv_transfer_config", _code_edited("kv_transfer_config", '"recompute"', '"fail"'), {}),
+        ("code.run_gsm8k_pass", _code_edited("run_gsm8k_pass", 'kind == "plain" and name in SPLIT_PASSES', 'kind == "plain"'), {}),
+        ("code.gsm8k_plan", _code_edited("gsm8k_plan", "[*SPLIT_PASSES, BATCH_PASS]", "[*SPLIT_PASSES]"), {}),
+        ("code.run_arm_workload", _code_edited("run_arm_workload", "reset_and_poison(url)", "{}"), {}),
+        ("profile.settle", lambda mp, _t: None, {"settle": 0.0}),
     ],
-    ids=["probe", "constant", "profile"],
-)
-def test_onboarding_controls_go_stale(tmp_path, monkeypatch, part, mutate):
-    """A change to the probe, the workload driver, a control constant or the
-    gsm8k profile makes the recorded control run stale (rerun the self-test
-    with plain), and the problem names what changed."""
-    gate = _controls_gate(_GATE)
-    assert run_gate.controls_problem(gate, 1) is None
+    ids=["probe", "constant", "profile", "gpu-mem", "dataset", "outputs-reader", "differ",
+         "kv-transfer-config", "logprobs-condition", "plain-passes", "poison-before-warm", "settle"],
+)  # fmt: skip
+def test_onboarding_controls_go_stale(tmp_path, monkeypatch, part, mutate, args):
+    """A change to anything between the control stages' arguments and the
+    three verdicts (probe, workload driver, control code incl. the plain
+    pass plan and logprobs condition, constants, gsm8k profile, --gpu-mem,
+    dataset) makes the recorded control run stale (rerun the self-test with
+    plain), and the problem names what changed."""
+    gate = _controls_gate(tmp_path, _GATE)
+    assert run_gate.controls_problem(gate, _slim_args(tmp_path)) is None
     mutate(monkeypatch, tmp_path)
-    bad = run_gate.controls_problem(gate, 1)
+    bad = run_gate.controls_problem(gate, _slim_args(tmp_path, **args))
     assert bad and "stale" in bad and part in bad, bad
 
 
-def test_committed_controls_records_are_current():
-    """Every controls record committed in a gate.json was measured at the
-    current inputs: a gate change that touches the controls fails here, so
-    its PR carries a new self-test run (or drops the record)."""
+def test_control_code_is_hashed():
+    """Every CONTROL_CODE name is a module-level function the fingerprint
+    finds (a rename would hash None and pass silently between records), and
+    run_arm_workload reaches the gsm8k plan and pass through them."""
+    inputs = run_gate.control_inputs({}, argparse.Namespace(**(run_gate.OFFICIAL | {"gpu_mem": 0.8, "num_gpu_blocks": 0, "vllm_arg": [], "settle": 5.0, "gsm8k_dir": "/nonexistent"})))  # fmt: skip
+    assert all(inputs["code"][k] for k in run_gate.CONTROL_CODE), inputs["code"]
+    src = Path(run_gate.__file__).read_text()
+    body = src[src.index("\ndef run_arm_workload(") : src.index("\ndef ", src.index("\ndef run_arm_workload(") + 1)]  # fmt: skip
+    for call in (
+        "gsm8k_plan(",
+        "run_gsm8k_pass(",
+        "stage_invariant(",
+        "gsm8k_stage(",
+        "vllm_server(",
+    ):
+        assert call in body, call
+    assert "logprobs" not in body and "SPLIT_PASSES" not in body
+
+
+def _control_verdicts(ok: bool = True, na: bool = False) -> dict:
+    x = {"pass": True, "na": run_gate.ONBOARDING_NA} if na else {"pass": ok}
+    return {"baseline": dict.fromkeys(run_gate.CONTROL_VERDICTS, x)}
+
+
+@pytest.mark.parametrize(
+    "v,plain,limit,why",
+    [
+        (_control_verdicts(), True, 0, None),
+        (_control_verdicts(), False, 0, "no plain arm"),
+        (_control_verdicts(na=True), True, 0, "controls not passing"),
+        (
+            {"baseline": _control_verdicts()["baseline"] | {"G2.batch_control": {"pass": False}}},
+            True,
+            0,
+            "controls not passing: G2.batch_control",
+        ),
+        ({}, True, 0, "controls not passing"),
+        (_control_verdicts(), True, 128, "gsm8k_limit=128"),
+    ],
+    ids=["passed", "no-plain", "na", "failed", "no-verdicts", "subset"],
+)
+def test_controls_record_only_from_passing_full_set_runs(tmp_path, v, plain, limit, why):
+    """``summary.controls_record`` (what gate.json takes) exists only for a
+    full-set run with the plain arm whose three controls passed; it carries
+    run, rev, limit, the verdicts and the inputs, and a record pasted from it
+    is accepted. Otherwise it is None with the reason."""
+    args = _slim_args(tmp_path, gsm8k_limit=limit)
+    rec, got = run_gate.controls_record(_GATE, args, "run-x", "abc", v, plain)
+    if why is None:
+        assert got is None and rec["verdicts"] == v["baseline"], got
+        assert (rec["run"], rec["rev"], rec["gsm8k_limit"]) == ("run-x", "abc", 0)
+        gate = _GATE | {"controls": {"tp1": rec}}
+        assert run_gate.controls_problem(json.loads(json.dumps(gate)), args) is None
+    else:
+        assert rec is None and why in got, got
+
+
+def test_committed_controls_records_are_current(monkeypatch):
+    """Every controls record committed in a gate.json is accepted at the
+    current inputs, for the official args with the dataset its run read: a
+    gate change that touches the controls fails here, so its PR carries a
+    new self-test run (or drops the record). The dataset hash is the
+    record's (the files live on the GPU host); ``controls_problem`` checks
+    it against ``--gsm8k-dir`` in every real run."""
     for f in sorted((run_gate.REPO / "docs/rsi/models").glob("*/gate.json")):
         gate = json.loads(f.read_text())
-        for tp in gate.get("controls", {}):
-            assert run_gate.controls_problem(gate, int(tp.removeprefix("tp"))) is None, f
+        for tp, rec in gate.get("controls", {}).items():
+            monkeypatch.setattr(
+                run_gate, "gsm8k_dataset", lambda _d, ds=rec["inputs"]["dataset"]: ds
+            )
+            args = argparse.Namespace(**(run_gate.OFFICIAL | {"tp": int(tp.removeprefix("tp")), "gpu_mem": run_gate.GPU_MEM, "num_gpu_blocks": 0, "vllm_arg": [], "settle": run_gate.SETTLE, "gsm8k_dir": str(run_gate.GSM8K_DIR)}))  # fmt: skip
+            assert run_gate.controls_problem(gate, args) is None, (f, tp)
+            assert all(rec["inputs"]["dataset"].values()), (f, tp)
 
 
 def test_without_plain_controls_are_onboarding_na(tmp_path):

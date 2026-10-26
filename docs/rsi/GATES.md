@@ -125,7 +125,7 @@ Official only if all hold:
 |---|---|
 | Profile | `run_gate.OFFICIAL`: full gsm8k, 8 shots, replay 32 x 12 with 64 output tokens, 3 replay passes, digest every 4th conversation, `replay_skip` 0, concurrency 32, `max_model_len` 8192, pinned scheduler flags, cap `auto` x 12 at fraction 0.5 (or the curve 0.25 / 0.5 / 0.75, `--cap-curve`); lmcache chunk 256 |
 | Arms | `baseline`, `native`, one connector under test; `plain`, `old`, `lmcache` optional |
-| Onboarding controls | with `plain`: its verdicts. Without: gate.json `controls["tp<N>"].inputs` of `--tp` = this run's `control_inputs` (`run_gate.controls_problem`; missing or stale is non-official, naming the changed inputs) |
+| Onboarding controls | with `plain`: its verdicts. Without: gate.json `controls["tp<N>"]` of `--tp` names a run and rev, holds three passing control verdicts, is full-set (`gsm8k_limit` 0), and its `inputs` = this run's `control_inputs` (`run_gate.controls_problem`; a missing, failing, subset or stale record is non-official, naming what is wrong) |
 | Workloads | `gsm8k`, `replay`, `cap`; plus `preempt` on a model with a Mamba state group (committed spec): there gsm8k loads a single prefix, and only `preempt` judges every resumed episode's state load |
 | No overrides | no `--num-gpu-blocks` / `--vllm-arg` |
 | Committed files | `docs/rsi/models/<model>/gate.json` and the committed spec dump of `--tp` (G0), recording `parallel.tp` = `--tp`; a TP without one is non-official (`committed spec dump ... missing (no dump for --tp N)`) |
@@ -191,7 +191,7 @@ adds about 40 min (Qwen3-4B) / 80 min (Qwen3.5-4B); `--cap-curve` adds about
 | `vllm_args` | every arm's vLLM (e.g. `mamba_cache_mode`, `prefix_cache_retention_interval`) |
 | `gsm8k_vllm_args` | appended on gsm8k and resume stages ("Compile determinism") |
 | `lmcache_dist` | the lmcache build the model's lmcache numbers come from |
-| `controls` | per TP (`"tp<N>"`): the onboarding control run (`run`, `rev`, `gsm8k_limit`) and its `inputs` (`summary.control_inputs`); "Onboarding controls" |
+| `controls` | per TP (`"tp<N>"`): the onboarding control run's `summary.controls_record` (`run`, `rev`, `gsm8k_limit` 0, `verdicts`, `inputs`; `inputs_recomputed` when the inputs postdate the run); "Onboarding controls" |
 
 `G0.vllm_args` parses every spelling vLLM accepts (`--flag=value`, `_` for
 `-`, abbreviations, `-cc`, dotted keys). The spec dump records
@@ -330,28 +330,60 @@ with `batch_invariant=false` they follow the batch-variant rule below.
 ### Onboarding controls
 
 `G2.plain_equals_baseline`, `G2.split_control` and `G2.batch_control` need
-the `plain` arm. They run at onboarding, in the self-test with `plain` at
-each TP the model is gated at, and are recorded in gate.json
-`controls["tp<N>"]`: `run` (tag), `rev` (gate rev), `gsm8k_limit`, and
-`inputs` = that run's `summary.control_inputs`, copied when all three pass.
-A run without `plain` reports them `na` and is official only if the record of
-`--tp` equals this run's `control_inputs` (`run_gate.controls_problem`):
+the `plain` arm. They run at onboarding, in a full-set self-test with
+`plain` at each TP the model is gated at. A run with `plain` whose three
+controls pass at `--gsm8k-limit 0` writes `summary.controls_record`; any
+other run writes None there and the reason in
+`summary.controls_record_withheld`. The record goes into gate.json
+`controls["tp<N>"]` unchanged:
+
+- `run` (run dir name) and `rev` (gate rev);
+- `gsm8k_limit`: always 0. A record is full-set because official runs are
+  full-set: the split control judges every prompt whose warm pass the
+  official run judges, and a subset leaves the rest unmeasured;
+- `verdicts`: the three control verdicts, each a measured pass (`na` is not
+  one);
+- `inputs` = `control_inputs` of that run.
+
+A run without `plain` reports the three `na`. It is official only if the
+record of `--tp` names a run and rev, holds three passing verdicts, has
+`gsm8k_limit` 0, and its `inputs` equal this run's `control_inputs`
+(`run_gate.controls_problem`). Any gap is non-official and names what is
+missing or changed. `control_inputs` holds:
 
 - sha256 of `rsi_probe.py` and `workloads.py`;
-- sha256 of the AST (docstrings dropped) of `vllm_server`, `split_control`,
-  `batch_control` and the three verdict functions;
+- sha256 of the AST (docstrings dropped) of every function between the
+  control stages' arguments and the verdicts (`CONTROL_CODE`): the vLLM
+  launch (`vllm_server`, `kv_transfer_config`, `vllm_plugins`, the compile
+  cache and its autotune seed), the gsm8k pass plan and per-pass request
+  arguments (`gsm8k_plan`, `run_gsm8k_pass`: passes, prompt subset,
+  concurrency, logprobs, pre-warm), batch invariance per stage, reset +
+  poison, the output and token readers (`_outputs`, `_tokens`, `_differ`,
+  `_hit_alignment`), the control functions and the three verdict functions.
+  Process plumbing that reaches neither vLLM's arguments nor its env (port
+  leases, launch and teardown, isolation of the arm under test) is not
+  hashed;
 - the constants `SPLIT_PASSES`, `MIN_PREWARMED`, `BATCH_PASS`,
-  `BATCH_CONTROL_N`, `ALONE_REF`;
-- the gsm8k profile (`shots`, `concurrency`, `max_model_len`,
-  `max_num_batched_tokens`, `max_num_seqs`);
+  `BATCH_CONTROL_N`, `ALONE_REF`, `_ALONE`, `_REFERENCE`, `AUTOTUNE_SOURCE`;
+- the run arguments of the gsm8k stages: `shots`, `concurrency`,
+  `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `gpu_mem`,
+  `num_gpu_blocks`, `vllm_arg`;
+- sha256 of the gsm8k dataset (`train.jsonl`, `test.jsonl` under
+  `--gsm8k-dir`);
 - gate.json `attention_backend`, `invariant_attention_backend`,
   `batch_invariant`, `split_invariant`, `vllm_args`, `gsm8k_vllm_args`.
 
-vLLM and the model are pinned by `G0.spec` (committed dump). Any change to
-these makes the record stale: rerun the self-test with `plain` (or add
-`plain` to the run, which then judges the controls itself) and update
-`controls`. `test_committed_controls_records_are_current` fails on a stale
-committed record.
+The model and TP select the record (the model's gate.json,
+`controls["tp<N>"]`). vLLM and the model are pinned by `G0.spec`
+(committed dump). Any change to these makes the record stale: rerun the
+self-test with `plain` (or add `plain` to the run, which then judges the
+controls itself) and replace the record. A record whose `inputs` were
+computed later than its run, because the run's rev is off this lineage or
+the fingerprint grew since, carries `inputs_recomputed`: what differs
+between `rev` and the recomputed inputs, and why the controls behave the
+same. Without that reason the record is rejected. The reviewer checks the
+reason. `test_committed_controls_records_are_current` fails on a stale or
+incomplete committed record.
 
 ### G2.gsm8k
 
@@ -502,7 +534,7 @@ local))`.
   outputs; gsm8k prompts), or later the baseline-measured `U`, exceeds
   `--pool-size` (`summary.pool_checks`).
 
-## G4 Performance (hard)
+## G4 Performance (gsm8k hard, replay judged)
 
 Every G4 reference is the in-run `native` arm. The gsm8k overhead check is
 hard (the regression floor); replay cold and warm vs `native` are reported
@@ -943,18 +975,19 @@ LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 
 ### Self-test at onboarding
 
-gsm8k, 128 questions per self-test arm, no PegaFlow, once per TP the model
-is gated at (`--tp N --gpu` with N devices), and again whenever the gate.json
-`controls` record of a TP goes stale ("Onboarding controls"). The `plain`
-arm here is where the onboarding controls run: when they pass, copy
-`summary.control_inputs` into gate.json `controls["tp<N>"].inputs` with
-`run`, `rev`, `gsm8k_limit`. Add `preempt` (on state-group models the honest
-arm fails without it) and `selftest:sync` there:
+gsm8k, 128 questions per self-test arm (`SELFTEST_LIMIT`), the full set for
+`plain` and `baseline`, no PegaFlow, once per TP the model is gated at
+(`--tp N --gpu` with N devices), and again whenever the gate.json `controls`
+record of a TP goes stale ("Onboarding controls"). The `plain` arm here is
+where the onboarding controls run: when they pass, copy
+`summary.controls_record` into gate.json `controls["tp<N>"]`. Add `preempt`
+(on state-group models the honest arm fails without it) and `selftest:sync`
+there:
 
 ```bash
 ... run_gate --model ... --tag <model>-selftest \
   --arms plain,baseline,selftest:honest,selftest:liar,selftest:bitflip,selftest:offbyone \
-  --workloads gsm8k,preempt --gsm8k-limit 128
+  --workloads gsm8k,preempt
 ```
 
 `preempt` needs the committed dump of `--tp`: for a TP without one, run

@@ -95,6 +95,12 @@ OFFICIAL = {
     "max_num_batched_tokens": 2048,
     "max_num_seqs": 256,
 }
+# Run defaults outside OFFICIAL that the onboarding controls record
+# (``control_inputs``): vLLM's GPU memory share, the wait before a warm pass
+# and the gsm8k dataset.
+GPU_MEM = 0.8
+SETTLE = 5.0
+GSM8K_DIR = Path.home() / "kexi" / "datasets" / "gsm8k-main"
 ACC_TOL = 0.01
 # Hit-rate levels are reported, never gated (GATES.md "Hit rate"). These are
 # reference points next to the numbers (``reported``); the onboarding agent
@@ -133,15 +139,43 @@ KILL_GRACE = 300
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 # Onboarding controls (G2.plain_equals_baseline, G2.split_control,
 # G2.batch_control) need the plain arm, which runs at the self-test, not in
-# routine official runs. gate.json ``controls["tp<N>"]`` names the control
-# run (``run``) and its ``inputs`` (``control_inputs``); an official run
-# without the plain arm needs them equal to the current inputs
-# (``official_problems``): a changed probe, workload driver, control code
-# or gate setting needs a new control run. vLLM's version is pinned by
-# G0.spec (committed dump).
+# routine official runs. gate.json ``controls["tp<N>"]`` is the control run's
+# ``controls_record``: ``run``, ``rev``, ``gsm8k_limit`` (0: records are
+# full-set), the three passing ``verdicts`` and the ``inputs``
+# (``control_inputs``). An official run without the plain arm needs the
+# record's inputs equal to its own (``controls_problem``): a changed probe,
+# workload driver, control code, gate setting, vLLM flag or dataset needs a
+# new control run. vLLM's version is pinned by G0.spec (committed dump).
 CONTROL_FILES = ("rsi/gates/rsi_probe.py", "rsi/gates/workloads.py")
+CONTROL_VERDICTS = ("G2.plain_equals_baseline", "G2.split_control", "G2.batch_control")
+# Everything between the plain / baseline gsm8k stage's arguments and the
+# three verdicts: the stage (``run_arm_workload``: warmup, settle, reset +
+# poison, pass order), the vLLM launch (command, env, kv-transfer config,
+# plugins, compile caches and their autotune seed), the pass plan and
+# per-pass request arguments, the output / token readers and the control and
+# verdict functions. Not hashed: process plumbing that reaches neither
+# vLLM's arguments nor its env (port leases, launch and teardown, the arm
+# under test's isolation, the bytecode cache path).
 CONTROL_CODE = (
+    "run_arm_workload",
     "vllm_server",
+    "kv_transfer_config",
+    "arm_kind",
+    "vllm_plugins",
+    "compile_cache",
+    "fresh_compile_cache",
+    "seed_autotune",
+    "autotune_file_problem",
+    "gsm8k_stage",
+    "stage_invariant",
+    "gsm8k_plan",
+    "run_gsm8k_pass",
+    "reset_prefix_cache",
+    "reset_and_poison",
+    "_outputs",
+    "_tokens",
+    "_differ",
+    "_hit_alignment",
     "split_control",
     "batch_control",
     "_plain_equals_baseline",
@@ -156,16 +190,31 @@ CONTROL_SETTINGS = (
     "vllm_args",
     "gsm8k_vllm_args",
 )
-# The control passes' constants (below) and the gsm8k part of the official
-# profile they ran at.
-CONTROL_CONSTANTS = ("SPLIT_PASSES", "MIN_PREWARMED", "BATCH_PASS", "BATCH_CONTROL_N", "ALONE_REF")
+# The control passes' constants (below) and the run arguments the plain and
+# baseline gsm8k stages ran with (the gsm8k limit is the record's own
+# ``gsm8k_limit``; the dataset is hashed from ``--gsm8k-dir``).
+CONTROL_CONSTANTS = (
+    "SPLIT_PASSES",
+    "MIN_PREWARMED",
+    "BATCH_PASS",
+    "BATCH_CONTROL_N",
+    "ALONE_REF",
+    "_ALONE",
+    "_REFERENCE",
+    "AUTOTUNE_SOURCE",
+)
 CONTROL_PROFILE = (
     "shots",
     "concurrency",
     "max_model_len",
     "max_num_batched_tokens",
     "max_num_seqs",
+    "gpu_mem",
+    "num_gpu_blocks",
+    "vllm_arg",
+    "settle",
 )
+GSM8K_FILES = ("train.jsonl", "test.jsonl")
 ONBOARDING_NA = "onboarding control: no plain arm in this run (gate.json controls)"
 # Split control (gsm8k, plain and baseline arms): ``split_ref`` repeats the
 # cold pass with logprobs, ``split`` pre-warms vLLM's prefix cache with each
@@ -1453,6 +1502,72 @@ def resume_check(plan: dict[str, Any], reqs: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def gsm8k_stage(workload: str) -> bool:
+    """A gsm8k stage, or the resume replay (judged like the gsm8k stage it
+    references): it gets gate.json's ``gsm8k_vllm_args``."""
+    return workload == "gsm8k" or workload.startswith(RESUME_PREFIX)
+
+
+def stage_invariant(gate: dict[str, Any], workload: str) -> bool:
+    """A gsm8k stage runs batch invariant on a batch-invariant model."""
+    return gsm8k_stage(workload) and bool(gate.get("batch_invariant"))
+
+
+def gsm8k_plan(args, kind: str, gate: dict[str, Any]) -> tuple[list[tuple[str, str]], list[str]]:
+    """An arm's gsm8k stage: its prompts and its passes."""
+    limit = SELFTEST_LIMIT if kind == "selftest" else args.gsm8k_limit
+    prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, limit)
+    names = ["cold", "warm"]
+    batch_inv = bool(gate.get("batch_invariant"))
+    split_inv = bool(gate.get("split_invariant", True))
+    if kind == "plain":
+        names += [*SPLIT_PASSES, BATCH_PASS]  # the split and batch controls
+        names += [] if batch_inv else [ALONE_REF]
+    elif kind == "baseline":
+        names += [] if split_inv else ["split"]  # same-split references
+        names += [] if batch_inv else [ALONE_REF]
+    elif not batch_inv:
+        # One request at a time, warm (after reset + poison): the batch
+        # composition every arm shares, where G2.gsm8k gates.
+        names += [ALONE_REF]
+    return prompts, names
+
+
+def run_gsm8k_pass(
+    url: str,
+    kind: str,
+    name: str,
+    prompts: list[tuple[str, str]],
+    concurrency: int,
+    gdir: Path,
+    preempt: bool = False,
+) -> dict[str, Any]:
+    """One gsm8k (or preempt) pass; its outputs and tokens go to ``gdir``."""
+    alone = name in _ALONE
+    res = asyncio.run(
+        workloads.run_gsm8k(
+            url,
+            "m",
+            prompts[:BATCH_CONTROL_N] if alone else prompts,
+            1 if alone else concurrency,
+            # Digest every request: under batch invariance every copy is a
+            # reference, so nothing a connector loads goes unjudged.
+            xargs={"rsi_pass": name, "rsi_digest": "full"},
+            # Logprobs only where they are compared (plain and baseline
+            # controls): a negative self-test arm's corrupted state gives
+            # non-finite logprobs, which vLLM cannot serialize (HTTP 400).
+            logprobs=(alone and kind in ("plain", "baseline"))
+            or (kind == "plain" and name in SPLIT_PASSES),
+            prewarm=name in (BATCH_PASS, "split"),
+            **({"max_tokens": PREEMPT_OUT, "free_run": True} if preempt else {}),
+        )
+    )
+    (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
+    if "tokens" in res:
+        (gdir / f"{name}-tokens.json").write_text(json.dumps(res.pop("tokens")))
+    return res
+
+
 def run_arm_workload(
     args,
     gate,
@@ -1489,8 +1604,7 @@ def run_arm_workload(
     if cap and capacity <= 0 and kind != "baseline":
         raise ValueError("cap workload needs a capacity")
     store_bytes = capacity if cap else parse_size(args.pool_size)
-    # The resume replay is judged like the gsm8k stage it references.
-    invariant = (gsm or resume) and bool(gate.get("batch_invariant"))
+    invariant = stage_invariant(gate, workload)
     split_inv = bool(gate.get("split_invariant", True))
     result: dict[str, Any] = {
         "arm": arm,
@@ -1517,7 +1631,7 @@ def run_arm_workload(
             out / "vllm.log",
             store_bytes if kind in _OFFLOAD else 0,
             args.preempt_blocks if pre else 0,
-            gsm8k=gsm or resume,
+            gsm8k=gsm8k_stage(workload),
         )
         stack.enter_context(cm)
         if kind == "lmcache":
@@ -1538,20 +1652,7 @@ def run_arm_workload(
             result["pool_capacity_bytes"] = int(sum(pool)) if pool else None
 
         if gsm:
-            limit = SELFTEST_LIMIT if kind == "selftest" else args.gsm8k_limit
-            prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, limit)
-            names = ["cold", "warm"]
-            batch_inv = bool(gate.get("batch_invariant"))
-            if kind == "plain":
-                names += [*SPLIT_PASSES, BATCH_PASS]  # the split and batch controls
-                names += [] if batch_inv else [ALONE_REF]
-            elif kind == "baseline":
-                names += [] if split_inv else ["split"]  # same-split references
-                names += [] if batch_inv else [ALONE_REF]
-            elif not batch_inv:
-                # One request at a time, warm (after reset + poison): the
-                # batch composition every arm shares, where G2.gsm8k gates.
-                names += [ALONE_REF]
+            prompts, names = gsm8k_plan(args, kind, gate)
         elif resume:
             assert resume_from is not None
             prompts = workloads.gsm8k_prompts(Path(args.gsm8k_dir), args.shots, resume_limit)
@@ -1597,30 +1698,7 @@ def run_arm_workload(
                 asyncio.run(workloads.scrape(pf_metrics, ("pegaflow",))) if pf_metrics else {}
             )
             if gsm or pre:
-                # Digest every request: under batch invariance every copy is a
-                # reference, so nothing a connector loads goes unjudged.
-                xargs = {"rsi_pass": name, "rsi_digest": "full"}
-                alone = name in _ALONE
-                res = asyncio.run(
-                    workloads.run_gsm8k(
-                        url,
-                        "m",
-                        prompts[:BATCH_CONTROL_N] if alone else prompts,
-                        1 if alone else args.concurrency,
-                        xargs=xargs,
-                        # Logprobs only where they are compared (plain and
-                        # baseline controls): a negative self-test arm's
-                        # corrupted state gives non-finite logprobs, which
-                        # vLLM cannot serialize (HTTP 400).
-                        logprobs=(alone and kind in ("plain", "baseline"))
-                        or (kind == "plain" and name in SPLIT_PASSES),
-                        prewarm=name in (BATCH_PASS, "split"),
-                        **({"max_tokens": PREEMPT_OUT, "free_run": True} if pre else {}),
-                    )
-                )
-                (gdir / f"{name}-outputs.json").write_text(json.dumps(res.pop("outputs")))
-                if "tokens" in res:
-                    (gdir / f"{name}-tokens.json").write_text(json.dumps(res.pop("tokens")))
+                res = run_gsm8k_pass(url, kind, name, prompts, args.concurrency, gdir, pre)
             elif resume:
                 res = asyncio.run(
                     workloads.run_resume(
@@ -3600,17 +3678,26 @@ def committed_spec(model_dir: Path, tp: int) -> Path:
     return model_dir / ("spec.json" if tp == 1 else f"spec-tp{tp}.json")
 
 
-def control_inputs(gate: dict[str, Any]) -> dict[str, Any]:
+def _sha256(b: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(b).hexdigest()
+
+
+def gsm8k_dataset(data_dir: Path) -> dict[str, str | None]:
+    """sha256 of the gsm8k files a run reads (None: missing)."""
+    return {f: _sha256((data_dir / f).read_bytes()) if (data_dir / f).is_file() else None for f in GSM8K_FILES}  # fmt: skip
+
+
+def control_inputs(gate: dict[str, Any], args) -> dict[str, Any]:
     """What the onboarding controls depend on (``CONTROL_*``): sha256 of the
     probe and workload driver and of each control function's AST
     (docstrings dropped, so comments and docs do not count), the control
-    constants, the gsm8k profile and the gate.json settings, JSON-shaped.
-    gate.json ``controls["tp<N>"]["inputs"]`` records it for the control run."""
+    constants, the run arguments the gsm8k stages ran with (the gsm8k
+    profile, ``--gpu-mem``, overrides), the gsm8k dataset and the gate.json
+    settings, JSON-shaped. The model and TP pick the record (gate.json of
+    the model, ``controls["tp<N>"]``), whose ``inputs`` hold it."""
     import ast
-    import hashlib
-
-    def sha(b: bytes) -> str:
-        return hashlib.sha256(b).hexdigest()
 
     funcs = {}
     for node in ast.parse(Path(__file__).read_text()).body:
@@ -3618,31 +3705,74 @@ def control_inputs(gate: dict[str, Any]) -> dict[str, Any]:
             body = node.body
             if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str):  # fmt: skip
                 node.body = body[1:] or [ast.Pass()]
-            funcs[node.name] = sha(ast.unparse(node).encode())
+            funcs[node.name] = _sha256(ast.unparse(node).encode())
     out = {
         # A missing file hashes to None (never equal to a recorded run's).
         "files": {
-            f: sha((REPO / f).read_bytes()) if (REPO / f).is_file() else None for f in CONTROL_FILES
+            f: _sha256((REPO / f).read_bytes()) if (REPO / f).is_file() else None
+            for f in CONTROL_FILES
         },
         "code": {name: funcs.get(name) for name in CONTROL_CODE},
         "constants": {k: globals()[k] for k in CONTROL_CONSTANTS},
-        "profile": {k: OFFICIAL[k] for k in CONTROL_PROFILE},
+        "profile": {k: getattr(args, k) for k in CONTROL_PROFILE},
+        "dataset": gsm8k_dataset(Path(args.gsm8k_dir).expanduser()),
         "settings": {k: gate.get(k) for k in CONTROL_SETTINGS},
     }
     return json.loads(json.dumps(out))  # tuples as gate.json holds them
 
 
-def controls_problem(gate: dict[str, Any], tp: int) -> str | None:
+def _control_passed(v: Any) -> bool:
+    """A measured, passing control verdict (``na`` is not a measurement)."""
+    return isinstance(v, dict) and v.get("pass") is True and "na" not in v
+
+
+def controls_record(
+    gate: dict[str, Any], args, run: str, rev: str, v: dict[str, Any], plain: bool
+) -> tuple[dict[str, Any] | None, str | None]:
+    """``summary.controls_record``: what gate.json ``controls["tp<N>"]``
+    takes from this run, or None and why. Only a full-set run with the plain
+    arm whose three controls passed yields one."""
+    if not plain:
+        return None, "no plain arm in this run"
+    verd = {k: (v.get("baseline") or {}).get(k) for k in CONTROL_VERDICTS}
+    bad = [k for k, x in verd.items() if not _control_passed(x)]
+    if bad:
+        return None, f"controls not passing: {', '.join(bad)}"
+    if args.gsm8k_limit != OFFICIAL["gsm8k_limit"]:
+        return None, f"gsm8k_limit={args.gsm8k_limit}: a controls record is full-set (0)"
+    rec = {"run": run, "rev": rev, "gsm8k_limit": args.gsm8k_limit, "verdicts": verd}
+    return rec | {"inputs": control_inputs(gate, args)}, None
+
+
+def controls_problem(gate: dict[str, Any], args) -> str | None:
     """An official run without the plain arm leans on the onboarding control
-    run recorded in gate.json for its TP; it must have measured the current
-    ``control_inputs``."""
+    run recorded in gate.json for its TP: a named full-set run whose three
+    controls passed, measured at this run's ``control_inputs``."""
+    tp = args.tp
     rec = (gate.get("controls") or {}).get(f"tp{tp}")
     if not rec:
         return (
             f"onboarding controls for --tp {tp} not recorded in gate.json "
             "(run the self-test with plain, or add the plain arm)"
         )
-    want = control_inputs(gate)
+    if not rec.get("run") or not rec.get("rev"):
+        return f"onboarding controls for --tp {tp} (gate.json) name no run and rev"
+    what = f"onboarding controls for --tp {tp} (gate.json, run {rec['run']})"
+    verd = rec.get("verdicts") or {}
+    bad = [k for k in CONTROL_VERDICTS if not _control_passed(verd.get(k))]
+    if bad:
+        return f"{what} record no passing {', '.join(bad)}"
+    if rec.get("gsm8k_limit") != OFFICIAL["gsm8k_limit"]:
+        # The split control judges every prompt the official run's warm
+        # passes start from; a subset leaves the rest unmeasured.
+        return f"{what} ran gsm8k_limit={rec.get('gsm8k_limit')}, not the full set (0)"
+    rc = rec.get("inputs_recomputed")
+    if rc is not None and not (isinstance(rc, str) and rc.strip()):
+        # ``inputs`` computed later than the run (its rev is off this
+        # lineage, or the fingerprint grew) carry why the controls behave
+        # as they did at ``rev``: what differs and why it does not matter.
+        return f"{what}: inputs_recomputed must say why the controls are unchanged"
+    want = control_inputs(gate, args)
     if rec.get("inputs") != want:
         got = rec.get("inputs") or {}
         stale = [
@@ -3652,8 +3782,8 @@ def controls_problem(gate: dict[str, Any], tp: int) -> str | None:
             if (got.get(part) or {}).get(k, "<missing>") != want[part][k]
         ]
         return (
-            f"onboarding controls for --tp {tp} (gate.json, run {rec.get('run')}) are stale: "
-            f"{', '.join(stale) or 'inputs'} changed (rerun the self-test with plain, or add the plain arm)"
+            f"{what} are stale: {', '.join(stale) or 'inputs'} changed "
+            "(rerun the self-test with plain, or add the plain arm)"
         )
     return None
 
@@ -3691,7 +3821,7 @@ def official_problems(
         if need not in kinds:
             out.append(f"arm {need} missing")
     if "plain" not in kinds:
-        bad = controls_problem(gate or {}, args.tp)
+        bad = controls_problem(gate or {}, args)
         if bad:
             out.append(bad)
     if set(wls) - {PREEMPT} != set(WORKLOADS):
@@ -4043,7 +4173,7 @@ def main(argv: list[str] | None = None) -> int:
         "--max-num-batched-tokens", type=int, default=OFFICIAL["max_num_batched_tokens"]
     )
     ap.add_argument("--max-num-seqs", type=int, default=OFFICIAL["max_num_seqs"])
-    ap.add_argument("--gpu-mem", type=float, default=0.8)
+    ap.add_argument("--gpu-mem", type=float, default=GPU_MEM)
     ap.add_argument("--num-gpu-blocks", type=int, default=0)
     ap.add_argument("--vllm-arg", action="append", default=[], help="extra vllm serve arg")
     ap.add_argument(
@@ -4073,8 +4203,8 @@ def main(argv: list[str] | None = None) -> int:
         "(e.g. another tree's python/); its rev (.rsi-rev / git) is recorded",
     )
     ap.add_argument("--concurrency", type=int, default=OFFICIAL["concurrency"])
-    ap.add_argument("--settle", type=float, default=5.0)
-    ap.add_argument("--gsm8k-dir", default=str(Path.home() / "kexi" / "datasets" / "gsm8k-main"))
+    ap.add_argument("--settle", type=float, default=SETTLE)
+    ap.add_argument("--gsm8k-dir", default=str(GSM8K_DIR))
     ap.add_argument("--shots", type=int, default=OFFICIAL["shots"])
     ap.add_argument("--gsm8k-limit", type=int, default=OFFICIAL["gsm8k_limit"], help="0 = full")
     ap.add_argument(
@@ -4311,6 +4441,7 @@ def main(argv: list[str] | None = None) -> int:
         # so the run cannot be official (G5 is then a flow + digest smoke).
         floor = capacity_floor(results.get("baseline", {}).get("cap"))
         problems += g5_problems(v, floor, getattr(args, "cap_plan", None))
+    ctl_rec, ctl_why = controls_record(gate, args, run_dir.name, git_rev(), v, "plain" in results)
     summary = {
         "tag": args.tag,
         "rev": git_rev(),
@@ -4326,9 +4457,10 @@ def main(argv: list[str] | None = None) -> int:
         "args": vars(args),
         "vllm_plugins": {arm_label(a): vllm_plugins(a) for a in arms},
         "gate": gate,
-        # A self-test run with the plain arm: copy into gate.json
-        # ``controls["tp<N>"]`` (with ``run``) when its controls pass.
-        "control_inputs": control_inputs(gate),
+        # A full-set run with the plain arm whose controls passed: copy
+        # into gate.json ``controls["tp<N>"]`` (else None and why).
+        "controls_record": ctl_rec,
+        "controls_record_withheld": ctl_why,
         "official": not problems,
         "held_out": args.replay_skip > 0,
         "replay_skip": args.replay_skip,

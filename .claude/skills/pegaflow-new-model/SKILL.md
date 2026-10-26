@@ -63,12 +63,15 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    `docs/rsi/models/<model>/gate.json` (batch / split invariance, backend,
    `vllm_args`, `gsm8k_vllm_args`, `lmcache_dist`). The self-test's `plain`
    arm runs the onboarding controls (`G2.plain_equals_baseline`,
-   `G2.split_control`, `G2.batch_control`); when they pass, the gate owner
-   copies `summary.control_inputs` into gate.json `controls["tp<N>"]`
-   (GATES.md "Onboarding controls"). Routine runs have no `plain` and are
-   official only while that record is current: a probe, workload-driver,
-   control-code or gate.json setting change makes it stale, and the
-   self-test with `plain` is rerun. Accept the model's gate only if the
+   `G2.split_control`, `G2.batch_control`) on the full gsm8k set; when they
+   pass, the gate owner copies `summary.controls_record` (run, rev,
+   `gsm8k_limit` 0, the three verdicts, `inputs`) into gate.json
+   `controls["tp<N>"]` (GATES.md "Onboarding controls"). A subset or failing
+   run writes no record (`summary.controls_record_withheld` says why).
+   Routine runs have no `plain` and are official only while that record is
+   current: a probe, workload-driver, control-code, flag, dataset or
+   gate.json setting change makes it stale, and the self-test with `plain`
+   is rerun. Accept the model's gate only if the
    baseline controls pass, honest passes and every negative arm is caught;
    otherwise the gate is blind on this model and must be fixed first. Note groups, spec classes, block sizes, page bytes, TP shard info.
    If `oracle.py` raises "no Kind mapping", or the self-test connector raises
