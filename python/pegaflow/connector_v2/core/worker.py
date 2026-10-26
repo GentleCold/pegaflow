@@ -13,7 +13,8 @@ the copy is done, so:
 
 - finished requests that had saves are held by vLLM (``request_finished``
   returns True) until ``poll`` reports them in ``finished_sending``, which
-  happens once every job submitted before vLLM told us they finished is done;
+  happens once the job of the request's last save (``StepPlan.finished``: its
+  plan step) and so every earlier job is done;
 - a step that reuses a preempted request's blocks first calls ``flush``.
 
 ``flush`` runs in vLLM's ``handle_preemptions``, which vLLM's V1 model runner
@@ -163,6 +164,12 @@ class Worker:
         self._completed = 0  # saver thread, under _cv
         # req -> (last job that may read its blocks, when vLLM finished it)
         self._finishing: dict[str, tuple[int, float]] = {}
+        # (plan step, _submitted after that step's save) for steps whose jobs
+        # are not known done, in step order; ``_done_seq`` is the newest
+        # sequence number dropped from the front (done). A finish fence on a
+        # step maps to that step's entry (``_fence_of``).
+        self._step_seqs: collections.deque[tuple[int, int]] = collections.deque()
+        self._done_seq = 0
         # Save batching (step thread only). Held jobs already own their
         # sequence numbers, so finish fences and flush cover them.
         self._batch_steps = batch_steps
@@ -259,15 +266,33 @@ class Worker:
     def start(self, plan: StepPlan) -> None:
         """Start this step's loads and track requests vLLM holds for our saves.
 
-        Called before ``save`` of the same step, so every job that can read a
-        finished request's blocks (it was scheduled at most in the previous
-        step) is already submitted: its fence is ``_submitted``.
+        Called before ``save`` of the same step. A finished request's last
+        save was planned in an earlier step (vLLM no longer schedules it), so
+        that save's job is already submitted; it is the request's fence.
         """
         if plan.finished:
             now = self._clock()
-            for req_id in plan.finished:
-                self._finishing[req_id] = (self._submitted, now)
+            for req_id, step in plan.finished.items():
+                self._finishing[req_id] = (self._fence_of(step), now)
         self._start_loads(plan)
+
+    def _fence_of(self, step: int) -> int:
+        """The sequence number of the last job submitted by the end of plan
+        ``step``'s ``save``: once it is done, so is every job of that step and
+        of the steps before it (one saver thread, jobs complete in order)."""
+        if step > self._last_step:
+            return self._submitted  # not seen yet (cannot happen in vLLM): wait for all
+        fence = self._done_seq
+        for s, seq in self._step_seqs:
+            if s > step:
+                break
+            fence = seq
+        return fence
+
+    def _forget_done_steps(self, completed: int) -> None:
+        steps = self._step_seqs
+        while steps and steps[0][1] <= completed:
+            self._done_seq = steps.popleft()[1]
 
     def _start_loads(self, plan: StepPlan) -> None:
         """One ``load`` RPC per request.
@@ -401,7 +426,9 @@ class Worker:
                 with self._cv:
                     self.save_stats.pressure_rpcs += 1
                 self._release_held()
-        self._last_step = max(self._last_step, plan.step)
+        if plan.step > self._last_step:
+            self._last_step = plan.step
+            self._step_seqs.append((plan.step, self._submitted))
         t1 = self._clock()
         with self._cv:
             stats = self.save_stats
@@ -447,8 +474,8 @@ class Worker:
         held step), so the server sees the same entries as unbatched saves.
         The server pins one region per entry, freed only once all of its
         blocks are evicted: folding steps into one entry per layer makes
-        regions span more requests and strands more evicted bytes (P4 batching
-        A/B, docs/rsi/models/DeepSeek-V2-Lite-Chat/ITERATIONS.md).
+        regions span more requests and strands more evicted bytes (measured
+        in the DeepSeek-V2-Lite batching A/B).
         """
         if not self._held:
             return
@@ -585,12 +612,14 @@ class Worker:
         """Returns (finished_sending, finished_recving, failed_recving).
 
         Failed receives are in both receive sets. A finished request is
-        reported as sent once every job that could read its blocks is done.
+        reported as sent once the job of its last save, and every earlier
+        job, is done (stored, failed or raised).
         """
         sending: set[str] = set()
+        with self._cv:
+            completed = self._submitted if self._saver_dead else self._completed
+        self._forget_done_steps(completed)
         if self._finishing:
-            with self._cv:
-                completed = self._submitted if self._saver_dead else self._completed
             sending = {r for r, (fence, _) in self._finishing.items() if fence <= completed}
             if sending:
                 now = self._clock()

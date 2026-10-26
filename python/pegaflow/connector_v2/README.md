@@ -81,8 +81,12 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   The step thread never waits on the GPU. Block lifetime:
   - a finished request with saves returns `True` from `request_finished`;
     vLLM keeps its blocks until every worker reports it in `finished_sending`,
-    i.e. until every save job submitted before its finish is done (stored or
-    failed);
+    i.e. until the job holding its last chosen save (and so, with one FIFO
+    saver per worker, every earlier job) is done (stored or failed). The
+    fence is per request: only the request's own saves read its blocks
+    (blocks it shares stay allocated by their other holder, and a
+    preemption flushed the saves made before it). A finished request with
+    no chosen save is not held;
   - a step whose plan has `flush` (vLLM preempted a request and freed its
     blocks, or the layout has window groups whose blocks are freed while the
     request runs) waits for all pending saves in `handle_preemptions`. That

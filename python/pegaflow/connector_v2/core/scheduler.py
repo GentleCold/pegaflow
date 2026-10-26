@@ -59,9 +59,10 @@ class StepPlan:
     """One step's work for every worker.
 
     Saves are asynchronous on the worker, so the plan also carries the block
-    lifecycle the worker must respect: ``finished`` lists requests whose blocks
-    vLLM holds for our saves (report them in ``finished_sending`` once every
-    save that may read them is done), and ``flush`` asks the worker to finish
+    lifecycle the worker must respect: ``finished`` maps each request whose
+    blocks vLLM holds for our saves to the plan step of its last chosen save
+    (report it in ``finished_sending`` once that step's save job, and so every
+    earlier one, is done), and ``flush`` asks the worker to finish
     every pending save before this step touches any KV (vLLM freed blocks a
     pending save may still read, e.g. on preemption). With pinned saves
     (``Scheduler(pin_saves=True)``) neither is used: the scheduler keeps every
@@ -75,7 +76,7 @@ class StepPlan:
 
     loads: list[LoadPlan] = field(default_factory=list)
     saves: list[GroupSave] = field(default_factory=list)
-    finished: list[str] = field(default_factory=list)
+    finished: dict[str, int] = field(default_factory=dict)  # req -> step of its last save
     flush: bool = False
     send_saves: bool = False
     kv_usage_unknown: bool = False  # vLLM's KV usage was unavailable (send_saves set)
@@ -162,7 +163,8 @@ class Scheduler:
         self._hits: dict[str, _Hit] = {}  # leased, waiting for allocation
         self._loading_since: dict[str, float] = {}
         self._saved_upto: dict[str, int] = {}  # token count already offered for saving
-        self._saving: set[str] = set()  # requests with saves since their blocks were last freed
+        # req -> plan step of its last chosen save: its finish fence.
+        self._saving: dict[str, int] = {}
         # vLLM frees window blocks that slide out while the request runs, which a
         # pending save may still read: such layouts flush before every step.
         # Pinned saves cover that too: a pinned block is never reallocated.
@@ -533,9 +535,10 @@ class Scheduler:
                     "blocks on this layout, saves disabled for this process"
                 )
         else:
-            for req_id in preempted:
+            # A preempted request keeps its fence entry: the flush finishes
+            # its older saves, so a later finish costs nothing extra.
+            if any(True for _ in preempted):
                 self._plan.flush = True
-                self._saving.discard(req_id)  # the flush covers its old blocks
         self._plan.flush |= self._flush_always
         if kv_usage is None:
             if not self._kv_usage_warned:
@@ -612,7 +615,7 @@ class Scheduler:
                 continue
             seen.add(item)
             if not self._pin_saves:
-                self._saving.add(item.req_id)
+                self._saving[item.req_id] = step
             sid = sid_of[item.group]
             save = by_key.setdefault((sid, item.req_id), GroupSave(sid, [], []))
             save.block_ids.append(item.block_id)
@@ -709,7 +712,13 @@ class Scheduler:
     # ------------------------------------------------------------- lifecycle
     def request_finished(self, req_id: str) -> bool:
         """True if vLLM must hold the request's blocks until the workers report
-        it in ``finished_sending`` (a save of its blocks may still be pending)."""
+        it in ``finished_sending`` (a save of its blocks may still be pending).
+
+        The fence is the request's own last save, not every save submitted so
+        far: a finished request's blocks are read only by its own saves (a
+        block it shares through the prefix cache stays allocated by vLLM for
+        the other request; a preempted request's freed blocks are covered by
+        the step's flush)."""
         self._drop_hit(req_id)
         self._loading_since.pop(req_id, None)
         self._saved_upto.pop(req_id, None)
@@ -717,10 +726,10 @@ class Scheduler:
         self._counted.pop(req_id, None)
         if self._hit_dirty and not self._requests:
             self.report_hit_stats()  # idle: the counters are final for now
-        if req_id not in self._saving:
+        last = self._saving.pop(req_id, None)
+        if last is None:
             return False
-        self._saving.discard(req_id)
-        self._plan.finished.append(req_id)
+        self._plan.finished[req_id] = last
         return True
 
     def shutdown(self) -> None:

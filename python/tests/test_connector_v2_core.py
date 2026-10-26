@@ -581,22 +581,38 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
 # turn: a new request whose prefix hit covers shared's blocks 10, 11, 20, 21.
 OK_NEXT = [[("r", 17, 1), ("shared", 17, 1)], [("X", 16, 5)]]
 FAIL_NEXT = [[("r", 4, 13), ("shared", 17, 1)], [("X", 16, 5)]]
+# Finish fences after a failed sync load: only "other" saved (step 0).
+ONLY_OTHER = ({"r": False, "shared": False, "other": True}, {"other": 0})
 
 
 @pytest.mark.parametrize(
-    "load_state,steps,preempted,expected",
+    "load_state,steps,preempted,expected,fences",
     [
-        pytest.param(1, OK_NEXT, (), [[13, 20, 21], [22]], id="sync-ok"),
+        pytest.param(
+            1,
+            OK_NEXT,
+            (),
+            [[13, 20, 21], [22]],
+            ({"r": True, "shared": True, "other": True}, {"r": 2, "shared": 2, "other": 0}),
+            id="sync-ok",
+        ),
         # vLLM (recompute policy) evicts nothing: r is rewound, but shared
         # (not rewound) built 20-21 on the bad block 11 and they stay cached
         # under correct hashes, so its next turn X would extend bad KV.
-        pytest.param(-1, FAIL_NEXT, (), [[], []], id="sync-failed-sharer-next-turn"),
+        pytest.param(-1, FAIL_NEXT, (), [[], []], ONLY_OTHER, id="sync-failed-sharer-next-turn"),
         # The rewound loader is preempted before recomputing past its failed
         # blocks: they stay hashed and freed; a later hit would reuse them.
-        pytest.param(-1, [[], [("X", 16, 5)]], ("r",), [[], []], id="sync-failed-loader-preempted"),
+        pytest.param(
+            -1,
+            [[], [("X", 16, 5)]],
+            ("r",),
+            [[], []],
+            ONLY_OTHER,
+            id="sync-failed-loader-preempted",
+        ),
     ],
 )
-def test_sync_load_outcome_gates_saves(load_state, steps, preempted, expected):
+def test_sync_load_outcome_gates_saves(load_state, steps, preempted, expected, fences):
     """M1: the server keeps the first copy of a key, so KV computed on a sync
     load is not saved before vLLM processed the load's outcome
     (``confirm_steps``: vLLM's max_concurrent_batches), and after a failed one
@@ -651,6 +667,10 @@ def test_sync_load_outcome_gates_saves(load_state, steps, preempted, expected):
             sched.on_new_request(_req(21, 6, "X"))
         later.append(step(scheduled, preempted if i == 0 else ()))
     assert (saved0, saved1, later) == ([30, 31, 32, 33], [], expected)
+    # A save held for an unconfirmed load is no fence: a request whose
+    # chosen saves were all held or disabled is not held at finish.
+    held = {rid: sched.request_finished(rid) for rid in ("r", "shared", "other")}
+    assert (held, sched.take_plan().finished) == fences
     worker.shutdown()
 
 
@@ -660,8 +680,8 @@ def test_sync_load_outcome_gates_saves(load_state, steps, preempted, expected):
         # "other" saved before the failure: its blocks may still be read by an
         # in-flight job, so a preemption must still flush and a finish must
         # still hold its blocks until finished_sending.
-        pytest.param("preempt", {"flush": True, "finished": []}, id="preempted-still-flushes"),
-        pytest.param("finish", {"held": True, "finished": ["other"]}, id="finished-still-held"),
+        pytest.param("preempt", {"flush": True, "finished": {}}, id="preempted-still-flushes"),
+        pytest.param("finish", {"held": True, "finished": {"other": 0}}, id="finished-still-held"),
         # S1: later short hits load async (a failed async load is never cached).
         pytest.param("new-hit", {"hit": (8, True)}, id="later-loads-async"),
     ],
@@ -1209,7 +1229,7 @@ def test_async_save_holds_blocks_until_copied(outcome):
 
     The step thread never waits on the GPU: the save RPC runs after the
     compute mark. A request that had saves is held at finish and reported in
-    finished_sending only once every job submitted before its finish is done,
+    finished_sending only once the job of its last save is done,
     whether or not the server stored the blocks. S4: a job that raises, or a
     saver thread that dies, still releases the blocks (a failed save is a
     future miss) instead of hanging flush; a dead saver drops later saves.
@@ -1238,7 +1258,7 @@ def test_async_save_holds_blocks_until_copied(outcome):
     assert sched.request_finished("saver") is True
     assert sched.request_finished("idle") is False
     step2 = sched.take_plan()
-    assert step2.finished == ["saver"]
+    assert step2.finished == {"saver": 0}
     worker.start(step2)
     worker.save(step2)
     assert worker.poll()[0] == set()  # the copy has not run: blocks stay held
@@ -1254,6 +1274,113 @@ def test_async_save_holds_blocks_until_copied(outcome):
         worker.save(step1)
         assert worker.flush(5) and len(calls) == 1
         assert worker.save_stats.failed == 2
+    worker.shutdown()
+
+
+def _fence_rig(outcomes=None, policy=None):
+    """Scheduler + worker on one full group; each save job waits for its own
+    compute mark (``gates[i]`` for the i-th job) and returns ``outcomes[i]``."""
+    import threading
+
+    gates = [threading.Event() for _ in range(4)]
+    marks = iter(gates)
+    outcomes = iter(outcomes or ["saved"] * 4)
+    rpc = FakeRpc()
+    rpc.save = lambda *args: _save_outcome(next(outcomes))([], args[-1])
+    layout = _layout(StubSemantics, StubFullSpec())
+    worker = _worker(StubSemantics, rpc, [], layout=layout, mark=lambda: FakeMark(next(marks)))
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    sched, _ = _sched(StubSemantics, {}, policy=policy, layout=layout)
+    tables = {"a": [10, 11, 12, 13], "b": [20, 21, 22, 23], "c": [30, 31, 32, 33]}
+    for rid in tables:
+        sched.on_new_request(_req(req_id=rid))
+
+    def step(scheduled, preempted=()):
+        sched.plan_saves(scheduled, lambda rid: (tables[rid],), preempted)
+        plan = sched.take_plan()
+        worker.start(plan)
+        if plan.flush:
+            worker.flush(5)  # handle_preemptions
+        worker.save(plan)
+        return plan
+
+    def done(n):  # wait until the saver completed n jobs
+        with worker._cv:
+            assert worker._cv.wait_for(lambda: worker._completed >= n, 5)
+
+    return sched, worker, gates, step, done
+
+
+@pytest.mark.parametrize(
+    "outcomes,release,expected",
+    [
+        # a's job is done, b's (submitted later) is not: a is released now.
+        # The old fence (every job submitted before the finish) held a too.
+        pytest.param(None, [[0], [1]], [{"a"}, {"b"}], id="own-job-done"),
+        # One saver thread completes jobs in submit order: b's mark firing
+        # first completes nothing, so a fence "job k done" means "all <= k".
+        pytest.param(None, [[1], [0]], [set(), {"a", "b"}], id="fifo"),
+        # A failed or raising save still releases the blocks (future miss).
+        pytest.param(["save-failed", "saved"], [[0], [1]], [{"a"}, {"b"}], id="own-job-failed"),
+        pytest.param(["raises", "raises"], [[0], [1]], [{"a"}, {"b"}], id="own-job-raises"),
+    ],
+)
+def test_finish_fences_on_the_requests_last_save(outcomes, release, expected):
+    """A finished request's blocks are read only by its own saves, so vLLM
+    gets them back once the job of its last chosen save is done, not every
+    job submitted before its finish. A request with no chosen save (c: the
+    policy dropped its blocks) is not held at all."""
+    policy = _Policy(choose=lambda items: [i for i in items if i.req_id != "c"])
+    sched, worker, gates, step, done = _fence_rig(outcomes, policy)
+    step([("a", 0, 13)])  # step 0: job 1 saves a
+    step([("a", 13, 1), ("b", 0, 13), ("c", 0, 13)])  # step 1: job 2 saves b only
+    held = {rid: sched.request_finished(rid) for rid in "abc"}
+    assert held == {"a": True, "b": True, "c": False}
+    plan = step([])
+    assert plan.finished == {"a": 0, "b": 1}
+    assert worker.poll()[0] == set()
+    got = []
+    for jobs in release:
+        for j in jobs:
+            gates[j].set()
+        # The saver can finish only jobs whose marks, and all earlier ones, fired.
+        done(next(i for i, g in enumerate(gates) if not g.is_set()))
+        got.append(worker.poll()[0])
+    assert got == expected
+    assert worker.save_stats.sent == 2
+    worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "resume,fence",
+    [
+        # Rescheduled after the preemption and saved again: fence on that save.
+        pytest.param(True, 2, id="saved-after-resume"),
+        # Finished (e.g. aborted) without saving again: fence on the save from
+        # before the preemption, which the preemption flush already finished.
+        pytest.param(False, 0, id="no-save-after-resume"),
+    ],
+)
+def test_preempted_request_fences_on_its_last_save(resume, fence):
+    sched, worker, gates, step, done = _fence_rig()
+    step([("a", 0, 13)])  # step 0: job 1
+    gates[0].set()  # lets the preemption flush finish
+    plan = step([("b", 0, 13)], preempted=("a",))  # step 1: flush, job 2 (b) pending
+    assert plan.flush and worker._completed == 1
+    if resume:
+        step([("a", 0, 13)])  # step 2: recompute, job 3
+    else:
+        step([])
+    assert sched.request_finished("a") is True
+    plan = step([])
+    assert plan.finished == {"a": fence}
+    assert worker.poll()[0] == (set() if resume else {"a"})
+    gates[1].set()
+    if resume:
+        assert worker.poll()[0] == set()  # b's job is done, a's is not
+        gates[2].set()
+        done(3)
+        assert worker.poll()[0] == {"a"}
     worker.shutdown()
 
 
@@ -1395,9 +1522,9 @@ def test_save_batching_flush_and_finish_fence():
     worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
     worker._batch_steps = 100  # never released by the bound in this test
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
-    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])]))
-    worker.start(StepPlan(finished=["r"]))
-    worker.save(StepPlan())
+    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])], step=0))
+    worker.start(StepPlan(finished={"r": 0}, step=1))
+    worker.save(StepPlan(step=1))
     assert worker.poll()[0] == set() and calls == []
     assert worker.flush(5)
     assert len(calls) == 1 and worker.poll()[0] == {"r"}
@@ -1444,8 +1571,10 @@ def test_save_flush_before_block_reuse(specs, preempted, flush):
     sched.take_plan()
     sched.plan_saves([], lambda rid: None, preempted)
     assert sched.take_plan().flush is flush
-    # A preempted request's saves are covered by the flush: no hold at finish.
-    assert sched.request_finished("r") is (not preempted)
+    # Preempted or not, the finish fences on the request's last save (step
+    # 0); after a preemption the flush has already finished it.
+    assert sched.request_finished("r") is True
+    assert sched.take_plan().finished == {"r": 0}
 
 
 class FakePool:
@@ -1490,7 +1619,7 @@ def test_pinned_saves_hold_blocks_until_every_worker_saved():
     sched.plan_saves([("r", 4, 4)], ids, ("r",), offers={"r": [(0, 32, 8)]})
     p1 = sched.take_plan()
     assert (p1.step, p1.flush, pool.refs) == (1, False, {10: 1, 31: 1, 11: 1, 32: 1})
-    assert sched.request_finished("r") is False and p1.finished == []
+    assert sched.request_finished("r") is False and p1.finished == {}
     sched.on_saved_through(0)
     assert pool.refs == {11: 1, 32: 1} and sched.has_pinned_saves()
     sched.on_saved_through(5)
