@@ -123,7 +123,7 @@ Official only if all hold:
 
 | Condition | Rule |
 |---|---|
-| Profile | `run_gate.OFFICIAL`: full gsm8k, 8 shots, replay 32 x 12 with 64 output tokens, 3 replay passes, digest every 4th conversation, `replay_skip` 0, concurrency 32, `max_model_len` 8192, pinned scheduler flags, cap `auto` x 12 at fraction 0.5 (or the curve 0.25 / 0.5 / 0.75, `--cap-curve`); lmcache chunk 256 |
+| Profile | `run_gate.OFFICIAL`: full gsm8k, 8 shots, replay 32 x 12 with 64 output tokens, 3 replay passes, digest every 4th conversation, `replay_skip` 0, concurrency 32 (cap: the plan's `workers`), `max_model_len` 8192, pinned scheduler flags, cap `auto` x 12 at fraction 0.5 (or the curve 0.25 / 0.5 / 0.75, `--cap-curve`); lmcache chunk 256 |
 | Arms | `baseline`, `native`, one connector under test; `plain`, `old`, `lmcache` optional |
 | Onboarding controls | with `plain`: its verdicts. Without: gate.json `controls["tp<N>"]` of `--tp` names a run and rev, holds three passing control verdicts, is full-set (`gsm8k_limit` 0), and its `inputs` = this run's `control_inputs` (`run_gate.controls_problem`; a missing, failing, subset or stale record is non-official, naming what is wrong) |
 | Workloads | `gsm8k`, `replay`, `cap`; plus `preempt` on a model with a Mamba state group (committed spec): there gsm8k loads a single prefix, and only `preempt` judges every resumed episode's state load |
@@ -635,8 +635,19 @@ Server fragmentation and headroom count against the connector/server.
   once) x the same copies.
 - `auto` (`summary.cap_plan`): spec from this run's baseline gsm8k dump (else
   replay; never preempt; else committed; `cap_plan.spec`); the floor reads
-  GPU KV from the cap stage's dump. Conversations from the file start (>= 64)
-  until estimated `U >= 1.1 x 2 x GPU KV / 0.5`. `UniqueEstimate` per Kind:
+  GPU KV from the cap stage's dump. Conversations from the file start (>= 64
+  and >= 2 x `workers`) until estimated `U >= 1.1 x 2 x GPU KV / 0.5`.
+  `workers` (`cap_workers`, every cap stage's concurrency, baseline
+  included) = `max(--concurrency, ceil(1.5 x GPU KV tokens / mean turn))`,
+  turn = prompt + `--replay-out-tokens`, GPU KV tokens = `num_blocks / Σ
+  1/block_size` over GPU groups. Fewer in-flight tokens than GPU KV and
+  vLLM's prefix cache keeps every live conversation: the store is reused
+  only across passes, in pass order, so `H_lru` gets nothing and a store
+  frozen after `cap_cold` nearly reaches `H*_C` (Qwen3-4B TP2 at 32
+  workers, 0.75 x GPU KV: local hit 0.85, `lru_vs_oracle_c` 0.003,
+  `freeze_vs_oracle_c` 0.92 at every fraction; TP1 at 32 is 2 x GPU KV:
+  0.39, 0.87, 0.62). Too few workers are not checked directly; they show
+  as freeze separation. `UniqueEstimate` per Kind:
   Full / Window = distinct prompt-prefix blocks + generated complete blocks;
   Checkpoint = only step ends on a boundary, with vLLM 0.32's align-mode
   prefill split (`prefill_step_ends`) and every decode boundary, assuming a

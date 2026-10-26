@@ -851,6 +851,61 @@ def test_unique_estimate_counts_only_saved_checkpoints():
     assert est.bytes == (6 + 2) * PAGE * LAYERS
 
 
+@pytest.mark.parametrize(
+    "spec,mean,workers",
+    [
+        # Recorded cap traces (cap_cold mean prompt + 64 out): TP1 already
+        # oversubscribes its GPU KV at 32 and keeps 32.
+        pytest.param("Qwen3-4B/spec.json", 4719, 32, id="qwen3-tp1"),
+        pytest.param("Qwen3.5-4B/spec.json", 4769, 32, id="qwen3.5-hybrid"),
+        # TP2: 32 workers held 0.75 x GPU KV (freeze 0.918, H_lru 0.003 of
+        # H*_C); 65 hold 1.5 x (simulated freeze 0.60, H_lru 0.85).
+        pytest.param("Qwen3-4B/spec-tp2.json", 4756, 65, id="qwen3-tp2"),
+        pytest.param("Qwen3-4B/spec-tp2.json", 0, 32, id="no-turns"),
+    ],
+)
+def test_cap_workers_oversubscribe_gpu_kv(spec, mean, workers):
+    """Cap workers scale with vLLM's GPU KV tokens: in-flight tokens of a
+    pass >= ``CAP_GPU_PRESSURE`` x GPU KV, never below ``--concurrency``."""
+    s = json.loads((run_gate.REPO / "docs/rsi/models" / spec).read_text())
+    assert run_gate.cap_workers(s, mean, 32) == workers
+    if mean:
+        assert workers * mean >= run_gate.CAP_GPU_PRESSURE * run_gate.gpu_kv_tokens(s)
+
+
+def test_gpu_kv_tokens_counts_every_group_per_token():
+    """Groups share ``num_blocks``; each takes one block per ``block_size``
+    tokens (host-resident groups have their own pool)."""
+    full = {"spec": {"block_size": 16}}
+    assert run_gate.gpu_kv_tokens({"kv_cache_config": {"num_blocks": 100, "groups": [full]}}) == 1600  # fmt: skip
+    hybrid = [{"spec": {"block_size": 528}}] * 4 + [full | {"host_resident": True}]
+    assert run_gate.gpu_kv_tokens({"kv_cache_config": {"num_blocks": 481, "groups": hybrid}}) == 481 * 132  # fmt: skip
+
+
+def test_cap_plan_workers_reach_every_cap_stage(tmp_path, monkeypatch):
+    """``plan_cap_convs`` picks ``workers`` and at least two conversations
+    per worker; the baseline and every store arm's cap stage run with them
+    (same load, so the reference local hits match), other stages keep
+    ``--concurrency``."""
+    spec = json.loads((run_gate.REPO / "docs/rsi/models/Qwen3-4B/spec-tp2.json").read_text())
+    replay = tmp_path / "convs.jsonl"
+    replay.write_text("{}\n" * 400)
+    tok = SimpleNamespace(from_pretrained=lambda *_a, **_k: None)
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=tok))
+    # One 4692-token turn per conversation: 66 workers, 132 conversations.
+    monkeypatch.setattr(run_gate.workloads, "conv_turns", lambda *_a: [[0] * 4628])
+    monkeypatch.setattr(run_gate, "UniqueEstimate", lambda *_a: SimpleNamespace(add=lambda _t: None, bytes=1 << 62))  # fmt: skip
+    args = _slim_args(tmp_path, replay_file=str(replay), model="m", max_model_len=8192)
+    plan = run_gate.plan_cap_convs(args, spec)
+    assert plan["workers"] == run_gate.cap_workers(spec, 4692, 32) == 66
+    assert plan["cap_convs"] == 2 * plan["workers"]
+    args.cap_plan = plan
+    assert run_gate.cap_stage_args(args).concurrency == 66
+    assert args.concurrency == 32  # not mutated
+    args.cap_plan = {"cap_convs": 8, "mode": "fixed"}
+    assert run_gate.cap_stage_args(args) is args
+
+
 def test_cap_only_run_sizes_from_the_committed_spec(tmp_path):
     """``--workloads cap`` has no earlier baseline stage: auto must size from
     the committed dump, not fall back to ``CAP_MIN_CONVS``."""

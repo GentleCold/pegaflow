@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
@@ -128,6 +129,11 @@ FREEZE_SEPARATION = 0.9
 MIN_CAPACITY_GPU_KV = 2.0  # official: gated C >= 2 x vLLM GPU KV bytes
 CAP_MIN_CONVS = 64
 CAP_FLOOR_MARGIN = 1.1  # the auto size aims 10% above the floor (estimate vs measured U)
+# Cap workers (``cap_workers``): in-flight tokens >= this x vLLM's GPU KV
+# tokens. Below about 1.2 the GPU prefix cache keeps every live conversation,
+# so a warm pass reuses the store only across passes, in the same order: LRU
+# gets nothing and a frozen store nearly reaches ``H*_C``.
+CAP_GPU_PRESSURE = 1.5
 # Cap digests every request: a loaded block may stay unjudged only when the
 # key's undigested computations are preempted episodes, at most this share.
 MAX_PREEMPTED_UNCERTAIN = 0.01
@@ -3527,12 +3533,44 @@ def unmodeled_spec(spec: dict[str, Any]) -> list[str]:
     return out
 
 
+def gpu_kv_tokens(spec: dict[str, Any]) -> int:
+    """Tokens vLLM's GPU KV holds per request stream: ``num_blocks`` shared by
+    every GPU group, each taking a block per ``block_size`` tokens (vLLM's
+    "GPU KV cache size" for one group). A lower bound where a group takes
+    fewer blocks (a window, a state group outside align mode)."""
+    kc = spec["kv_cache_config"]
+    per_token = sum(1 / g["spec"]["block_size"] for g in kc["groups"] if not g.get("host_resident"))
+    return int(kc["num_blocks"] / per_token) if per_token else 0
+
+
+def cap_workers(spec: dict[str, Any], mean_turn_tokens: float, concurrency: int) -> int:
+    """Concurrent conversations of a cap pass: at least ``--concurrency``, and
+    enough that their in-flight tokens (a turn's prompt + output) are
+    ``>= CAP_GPU_PRESSURE x`` GPU KV tokens. With fewer, vLLM's own prefix
+    cache serves every turn after a conversation's first (TP2 Qwen3-4B at 32
+    workers: 0.75 x GPU KV, local hit 0.85 in every pass, H_lru 0.003 of
+    ``H*_C``, freeze 0.92), and G5 measures nothing about the store."""
+    if mean_turn_tokens <= 0:
+        return concurrency
+    need = CAP_GPU_PRESSURE * gpu_kv_tokens(spec) / mean_turn_tokens
+    return max(concurrency, math.ceil(need))
+
+
+def cap_stage_args(args):
+    """``args`` of every cap stage (baseline and store arms alike, so the
+    reference local hits come from the same load): ``concurrency`` = the
+    plan's ``workers``. The gsm8k / replay stages keep ``--concurrency``."""
+    w = (getattr(args, "cap_plan", None) or {}).get("workers")
+    return argparse.Namespace(**(vars(args) | {"concurrency": w})) if w else args
+
+
 def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
     """Resolve ``--cap-convs auto``: the fewest conversations (from
     ``CAP_MIN_CONVS``, all turns up to ``--cap-turns``) whose estimated
-    ``C(0.5)`` is ``>= CAP_FLOOR_MARGIN x MIN_CAPACITY_GPU_KV x`` GPU KV.
-    Fails closed: if the whole file is not enough, all of it is used and the
-    measured floor marks the run not official."""
+    ``C(0.5)`` is ``>= CAP_FLOOR_MARGIN x MIN_CAPACITY_GPU_KV x`` GPU KV, and
+    ``workers`` (:func:`cap_workers`) from their mean turn. Fails closed: if
+    the whole file is not enough, all of it is used and the measured floor
+    marks the run not official; too few workers show as freeze separation."""
     if args.cap_convs != "auto":
         return {"cap_convs": int(args.cap_convs), "mode": "fixed"}
     if spec is None:
@@ -3544,12 +3582,19 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
     lines = Path(args.replay_file).read_text().splitlines()[args.replay_skip :]
     need = CAP_FLOOR_MARGIN * MIN_CAPACITY_GPU_KV * gpu_kv_bytes(spec) / CAPACITY_FRACTION
     est = UniqueEstimate(spec, args.replay_out_tokens, args.max_num_batched_tokens)
-    used = 0
+    used = turns = tokens = 0
+    workers = args.concurrency
     for line in lines:
         used += 1
-        est.add(workloads.conv_turns(tok, json.loads(line), budget, args.cap_turns))
-        if used >= CAP_MIN_CONVS and est.bytes >= need:
+        conv = workloads.conv_turns(tok, json.loads(line), budget, args.cap_turns)
+        est.add(conv)
+        turns += len(conv)
+        tokens += sum(len(ids) + args.replay_out_tokens for ids in conv)
+        workers = cap_workers(spec, tokens / turns if turns else 0.0, args.concurrency)
+        # Two conversations per worker: the pass is not a single wave.
+        if used >= max(CAP_MIN_CONVS, 2 * workers) and est.bytes >= need:
             break
+    mean_turn = tokens / turns if turns else 0.0
     plan = {
         "cap_convs": used,
         "mode": "auto",
@@ -3557,6 +3602,9 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
         "needed_unique_bytes": int(need),
         "enough": est.bytes >= need,
         "available_convs": len(lines),
+        "workers": workers,
+        "gpu_kv_tokens": gpu_kv_tokens(spec),
+        "mean_turn_tokens": round(mean_turn, 1),
     }
     if unmodeled := unmodeled_spec(spec):
         plan["unmodeled"] = unmodeled  # g5_problems: not official
@@ -4311,7 +4359,8 @@ def main(argv: list[str] | None = None) -> int:
 
     def stage(arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
         watch.check(f"{arm_label(arm)}/{out.name}")  # before every stage
-        return run_stage(args, gate, arm, wl, out, **kw)
+        a = cap_stage_args(args) if wl.startswith("cap") else args
+        return run_stage(a, gate, arm, wl, out, **kw)
 
     measured_u: dict[str, dict[str, Any]] = {}
     # Split-variant: every arm's gsm8k warm pass gets a baseline replay at its

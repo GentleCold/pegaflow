@@ -67,7 +67,8 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
     """``main`` with the stages stubbed: lmcache storing ranks, the
     unique-bytes estimate, the cap plan fallback, ``official_problems`` and
     the verdicts (G0.spec) all get this TP's file; the preempt pool is
-    sized from it (``preempt_gpu_blocks``). Without one: no estimate, no
+    sized from it (``preempt_gpu_blocks``); the cap stage runs with the
+    plan's ``workers``. Without one: no estimate, no
     storing ranks, and the run names the missing dump."""
     repo = _gate_repo(tmp_path)
     model_dir = repo / "docs/rsi/models/Qwen3-4B"
@@ -86,10 +87,16 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
     spy("preempt_gpu_blocks", run_gate.preempt_gpu_blocks)
     spy("estimate_unique", lambda _a, _s, w: {"workload": w, "unique_bytes": 0, "how": "stub"}, arg=1)  # fmt: skip
     spy("cap_plan_spec", run_gate.cap_plan_spec, arg=2)
-    spy("plan_cap_convs", ret={}, arg=1)
+    spy("plan_cap_convs", ret={"workers": 77}, arg=1)
     spy("official_problems", run_gate.official_problems, arg=4)
     spy("verdicts", ret={}, arg=2)
-    _stub_main(monkeypatch, repo, lambda _a, _g, arm, wl, _o, **_k: {"arm": arm, "workload": wl})  # fmt: skip
+    workers: dict[str, set[int]] = {}
+
+    def stage(a, _g, arm, wl, _o, **_k):
+        workers.setdefault(wl, set()).add(a.concurrency)
+        return {"arm": arm, "workload": wl}
+
+    _stub_main(monkeypatch, repo, stage)
     wls = "gsm8k,replay,cap" + (",preempt" if selected else "")
     argv = ["--model", "/m/Qwen3-4B", "--tag", "t", "--runs-root", str(tmp_path / "runs"),
             "--arms", "plain,baseline,old", "--workloads", wls,
@@ -102,6 +109,9 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
     assert seen["official_problems"] == [want]
     assert seen["verdicts"] == [want]
     assert seen["cap_plan_spec"] == [want]
+    # The cap plan's workers drive the cap stages only.
+    assert workers.pop("cap") == {77}
+    assert set().union(*workers.values()) == {run_gate.OFFICIAL["concurrency"]}
     if selected:
         assert seen["preempt_gpu_blocks"] == [want_spec]
         assert seen["estimate_unique"] == [want_spec, want_spec]  # gsm8k, replay
