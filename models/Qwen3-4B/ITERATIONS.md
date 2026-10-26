@@ -1018,3 +1018,122 @@ Verdicts:
 | v2 (required) | fails | `G5.replay_warm` only |
 | old | fails (not required) | `G4.gsm8k_warm.seconds`, `G2.digest_self.cap`, `G5` |
 | native | fails (not required) | `G0.spec` (LBNHC vs LBHNC layout), `G2.digest_vs_baseline.gsm8k`, G4 gsm8k, `G5` |
+
+## TP2 (2026-10-26): slice on GPU 0,1; official run blocked by the TP1 spec.json
+
+Run `~/kexi/rsi-runs/2026-10-26-qwen3-4b-tp2-slice-4bb7d8d` (.44 GPU 0,1,
+`--tp 2`, run_gate pgid 3819564, 03:54 to 05:29Z). Non-official by design:
+`gsm8k_limit 64`, replay 8 x 6, cap 8 x 6, so capacity is below 2x GPU KV
+and the trace does not separate freeze from H*_C.
+
+- Gate 1581c9b (`feat/rsi-gate-g4-noise`, tree `~/kexi/q4tp2-gate-1581c9b`).
+  The connector under test is 4bb7d8d (`~/kexi/q4tp2-ut-4bb7d8d`,
+  `--under-test-path`). Both are git archive trees with `.rsi-rev`, and
+  provenance verified all of them. The native .so (sha 9b6e99b0) is the
+  same for both revs. Base server d1970ead (056eb4b tree).
+- Arms: plain, baseline, old, native, lmcache (`lmcache-pr4467`, 2 storing
+  ranks, `G0.lmcache_build` passes), v2. Workloads: gsm8k, replay, cap,
+  preempt. vLLM log `from=` shows the snapshot overlay.
+- Other jobs on the host: the P5 agent's `qwen3-4b-p5-s1` on GPU 5 until
+  04:49Z, and `dsv2-lite-p5-s1` on GPU 4,5 from about 05:10Z. Timing
+  numbers here are a smoke test only.
+
+### Blocker for the official TP2 run (gate owner)
+
+`G0.spec` fails on every store arm because the committed
+`docs/rsi/models/Qwen3-4B/spec.json` is the TP1 dump. That holds on
+1581c9b and on `feat/semantics-rsi` d1b86c9 alike, and `gate.json` /
+`spec.json` are not per-TP. The diffs are exactly the TP shard (old, lmcache
+and v2 show the same 6 diffs):
+
+    committed.kv_cache_config.groups[0].spec.num_heads: 8 != 4
+    committed.kv_cache_config.groups[0].spec.num_kv_heads: 8 != 4
+    committed.kv_cache_config.groups[0].spec.page_size_bytes: 65536 != 32768
+    committed.kv_cache_config.groups[0].spec.real_page_size_bytes: 65536 != 32768
+    committed.kv_cache_config.tensors[0].block_stride: 65536 != 32768
+    committed.parallel.tp: 1 != 2
+
+Each arm's layout matches baseline's: arm-vs-baseline gives 0 diffs, apart
+from native's usual LBHNC diffs. G0.spec is a required verdict, so an
+official Qwen3-4B TP2 run cannot pass with the current files.
+
+Proposal: make the committed dump per TP, e.g. `spec.json` for TP1 plus
+`spec-tp2.json` (or `spec.tp<N>.json`), selected by `--tp` in `run_gate`
+`main()`. That selection feeds `committed`, which in turn feeds G0,
+`lmcache_storing_ranks`, `preempt_gpu_blocks`, `estimate_unique` and
+`official_problems`. Then commit the TP2 baseline dump from a self-test run
+at TP2. The alternative of letting G0 strip the TP-derived fields is weaker.
+
+`gate.json` itself holds at TP2. The slice measured `G2.split_control`
+pass (0 / 64 differ, measured_invariant true, 64 prewarmed, not vacuous),
+`G2.batch_control` pass (0 / 64), `G2.warm_equals_cold` pass and
+`G2.plain_equals_baseline` pass. So `batch_invariant: true` and the
+default split_invariant true stand at TP2 on FLASH_ATTN. The per-TP change
+is needed for spec.json only.
+
+Second point for the gate owner: cap `auto` at TP2 resolves to 155
+conversations. GPU KV at TP2 is 30.1 GB (2 x 15.1 GB, 12777 blocks per rank
+at gpu-mem 0.8), against 11.2 GB at TP1. So the floor needs U of about
+132.6 GB and C(0.5) of about 66 GB. That is 2.4x the TP1 cap trace, and
+the official run would take roughly 2x the TP1 wall time (about 6 h). The
+pool is fine: 1 TB host RAM, and `--pool-size 64gb` only bounds the
+uncapped stages.
+
+### Slice results (smoke, not official)
+
+Verdicts (failing only):
+- baseline: none.
+- v2: G0.spec (above); G4.replay_cold ttft / req/s (0.2063 vs 0.2005 s,
+  6.70 vs 6.86; old, native and lmcache fail the same way, so it is slice
+  noise on 48 requests); G2.digest_self.cap and G5.replay_warm.
+- The cap failure is a slice artifact. v2's cap stage (cap = 0.5, C = 2.4
+  GB, 0.08x GPU KV) loaded 0 external blocks, so the "loads something"
+  requirement for the arm under test fails. Every local block matched.
+  old also loaded nothing there (it is a reference arm, so vacuous is OK).
+- old, lmcache: G0.spec only (+ cold noise). native: G0.spec, its usual
+  `G2.digest_vs_baseline.gsm8k` (layout), and cold noise.
+
+G2 at TP2 is clean for v2: gsm8k 1554 ext matched, 0 mismatched; computed
+2004 / 2004 exact vs baseline; outputs 0 differ cold / warm; replay 1234
+ext matched; preempt 3922 ext matched, 0 mismatched. Both ranks are
+digested: `digest-pp0-tp0.jsonl` and `-tp1.jsonl` have 128 lines each.
+
+| arm | gsm8k warm local / ext / total, H*, E_ext | replay warm local / ext / total, H*, E_ext |
+|---|---|---|
+| v2 | 0.818 / 0.958 / 0.992, 0.992, 1.0 | 0.730 / 0.991 / 0.998, 0.998, 1.0 |
+| old | 0.832 / 0.960 / 0.993, 0.992, 1.0 | 0.730 / 0.993 / 0.998, 0.998, 1.0 |
+| native | 0.920 / 0.916 / 0.993, 0.992, 1.0 | 0.791 / 0.991 / 0.998, 0.998, 1.0 |
+| lmcache | 0.920 / 0.180 / 0.934, 0.992, 0.199 | 0.791 / 0.832 / 0.965, 0.998, 0.842 |
+
+(ext is the external hit rate H = ext / (prompt - local).)
+
+| arm | replay warm2 / warm3 TTFT p50 (s) | warm req/s | cold TTFT / req/s | gsm8k cold / warm (s) |
+|---|---|---|---|---|
+| baseline | 0.1875 / 0.1614 | 7.36 / 7.38 | 0.2005 / 6.86 | 6.44 / 6.28 |
+| v2 | 0.0716 / 0.0735 | 10.25 / 10.19 | 0.2063 / 6.70 | 6.46 / 6.04 |
+| native | 0.0765 / 0.0771 | 10.51 / 10.40 | 0.2069 / 6.68 | 6.44 / 6.20 |
+| old | 0.0855 / 0.0940 | 10.16 / 10.12 | 0.2349 / 6.51 | 6.47 / 6.38 |
+| lmcache | 0.1271 / 0.1272 | 10.07 / 10.10 | 0.2248 / 6.58 | 6.45 / 6.27 |
+
+`native_report`: v2 warm TTFT -5.5% vs native (faster), req/s -2.3%. That
+is 48 requests per pass on a host shared with another GPU job, so it means
+nothing for the official judgment.
+
+G5 at the slice's cap 0.5 (C = 0.08x GPU KV, no conclusion): v2 and old
+hit 0.791 (local only, E_C 0); native 0.823 and lmcache 0.822 (E_C 0.21 /
+0.20); H*_C 0.903, H_lru 0.84.
+
+TP observations:
+- Sharding is Heads: 4 of the 8 KV heads per rank, a 32 KiB page per
+  layer-block per rank, `kv_tp_replicas` 1, so the store holds 2 distinct
+  copies.
+- Both workers registered 36 layers in one namespace (d3b74b0d), with
+  `storage_rank` 0 and 1, both `writer=True`.
+- Save stats are symmetric per rank. Replay window: tp0 and tp1 each saved
+  3312 blocks / 108,527,616 B (= 3312 x 32 KiB), 9 RPCs, failed 0. gsm8k
+  window: 36720 blocks / 1,203,240,960 B each.
+- RPC and wait times differ by under 4% between ranks (rpc 183 vs 177 ms,
+  wait 343 vs 342 ms). No rank imbalance.
+
+Official TP2 run: not launched. G0.spec would fail every arm, and the run
+would also overlap the P5 DSV2 slice.
