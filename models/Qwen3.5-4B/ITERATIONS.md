@@ -1412,6 +1412,66 @@ order, pair2, lastsave, inv, kvcap and itl.
 - The Qwen3.5 pair (c8a8842 vs 02b6767, GPU5, replay + gsm8k) is running:
   `qwen3.5-4b-p5-it4-pair-{c8a8842,02b6767}`.
 
+### Target (a) attribution: TP2 warm step time (offline, TP2 pair 02b6767)
+
+- **The gap.**
+  - v2 warm runs at 17.13/17.27 ms/step against native's 16.08/16.21. That
+    is +1.05 ms/step, about 0.86 s per pass.
+  - Cold is 35.4 vs 34.4.
+  - At TP1, v2 leads in both cold (37.5 vs 41.2) and warm (23.4 vs 25.3).
+  - Warm ITL share in 25-50 ms is 7.4/6.3% for v2 against 3.4/5.0% for
+    native; c8a8842 had 16.7/18.3%.
+- **Saves are not the cause.**
+  - Saver submit costs about 0.05 ms/step.
+  - Server RPC totals per warm pass are load 0.10 s / 528, query
+    0.07 s / 264, and save 0.07 s / 52 (0.1 GB).
+  - The 258/274 ms hold at TP2 covers near-empty jobs.
+- **Sync-load stall** (serial FIFO loader model, s per pass, warm2/warm3):
+  - c8a8842: 0.15/0.18.
+  - 02b6767: 0.66/1.32, of which 0.22/0.35 is behind the step's own async
+    loads and 0.34/0.82 behind older ones.
+  - TP1: 0.34.
+  - At TP2, 84 of 264 warm loads per pass are sync.
+- **Loader-busy overlap.** Each ms the async loader is busy costs about
+  0.4-0.7 ms of step time: about 0.85 ms/step at TP2 and 2.6 ms/step at
+  TP1. This is a server limit (cross-context copies; PROGRESS "Server
+  limitations").
+
+H5 model, stall in s per pass (warm2/warm3, 02b6767):
+
+| variant | stall | demoted |
+|---|---|---|
+| base | 0.71 / 1.37 | 0 |
+| part 1: sync loads first within a step | 0.51 / 1.17 | 0 |
+| part 1 + demote after an async load in the previous step | 0.30 / 0.19 | 25/84, 31/84 |
+| part 1 + defer one step | 0.55 / 1.54 | no help |
+
+On TP1 e985938, part 1 gives 0.29 s and part 1 + demote gives 0.05 s, with
+7 of 16 loads demoted.
+
+### H5 (b8501b2): sync loads first, demote after an async load
+
+- **Main's conditions** (2026-10-26):
+  - Demotion costs an async round trip, about 7.6 steps on short-prefix
+    workloads, so the gate includes TP1 gsm8k warm (≤2% vs native, hard).
+  - Report the two parts separately. If demotion hurts gsm8k, ship part 1
+    only and record part 2 as rejected.
+- **Part 1, worker.** A step's sync load RPCs are sent before its async
+  ones.
+- **Part 2, scheduler.** A hit of at most `sync_load_tokens` loads async
+  when the previous step planned an async load. The current step's async
+  loads do not count, because part 1 sends them after the sync loads.
+- **Counters.**
+  - Save stats line: `sync_loads`, `sync_first_steps`, `sync_wait_ms`,
+    `max_sync_wait_ms`.
+  - Hit stats: `sync_demoted`.
+  - Per demoted load, `demoted sync load landed ... after_ms steps`.
+- **Part-1-only arm.** 7bc785a on `exp/rsi-qwen35-h5-part1`.
+- **Gate** (queued behind the Qwen3.5 pair):
+  - TP2 replay, `qwen3-4b-p5-h5-tp2-{02b6767,7bc785a,b8501b2}`.
+  - Then TP1 replay + full gsm8k, `qwen3-4b-p5-h5-tp1-{...}`.
+  - Each run includes native.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here

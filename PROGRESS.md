@@ -149,6 +149,31 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
     would fail every load in that step.
   Accepted by main 2026-10-26 (`models/Qwen3.5-4B/ITERATIONS.md`, it4
   attribution).
+- No priority for sync loads. A device's load worker copies tasks in
+  arrival (FIFO) order, so a sync load, which blocks the whole step before
+  its forward, waits behind every async copy issued before it.
+  - Measured with a serial-loader model on the Qwen3-4B TP2 pair at 02b6767:
+    warm2/warm3 sync stall is 0.66/1.32 s per pass. 0.22/0.35 s of that
+    comes from the step's own async loads, and 0.34/0.82 s from older
+    ones still copying.
+  - At TP2, 84 of 264 warm loads per pass are sync.
+  - The connector side mitigates this with H5: sync loads go first, and a
+    short hit after a step with an async load is demoted to async. The
+    real fix is a server-side priority (or a separate queue) for sync
+    loads.
+- Cross-context copy contention. The server copies from its own CUDA
+  context, which time-slices with vLLM's. Async load copies slow vLLM's
+  steps while they run.
+  - A window regression on the same pair gives about 0.4-0.7 ms of extra
+    step time per ms the loader is busy.
+  - That is about 0.85 ms/step at TP2: v2 warm runs at 17.13/17.27 ms/step
+    against native's 16.08/16.21. At TP1 it is about 2.6 ms/step, but v2
+    still leads native there (23.4 vs 25.3 ms/step warm).
+  - Saves are not the cause. A warm pass saves 0.1 GB in 52 RPCs (0.07 s on
+    the server), and saver submit costs about 0.05 ms/step.
+  - The connector cannot remove this cost, only shorten it, by copying
+    fewer bytes.
+  (`models/Qwen3.5-4B/ITERATIONS.md`, "target (a) attribution")
 
 ### Gate changes
 
