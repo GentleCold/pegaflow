@@ -1896,7 +1896,7 @@ def _replay(
     hit = {"efficiency": eff, "oracle_hit_rate": 0.9, "hit_rate": 0.9, "local_hit_tokens": 0, "prompt_tokens": 1, "external_hit_rate": 0.9, "excess_tokens": 0, "excess_limit": 1}  # fmt: skip
     passes = {"cold": {"ttft_p50": 1.0, "req_per_s": 1.0}, "warm": {"ttft_p50": 9.0, "req_per_s": 0.1}}  # fmt: skip
     passes |= {n: {"ttft_p50": ttft, "req_per_s": rps} for n in warm}
-    hits = {n: hit for n in ("warm", *warm)}
+    hits = dict.fromkeys(("warm", *warm), hit)
     return {"passes": passes, "hit": hits, "load_errors": [], "digest_self": _digest_ok()}
 
 
