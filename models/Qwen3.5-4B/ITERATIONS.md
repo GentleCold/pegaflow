@@ -1838,6 +1838,38 @@ one waits 72-125 ms on average (4-7 steps).
 
 ### Qwen3-4B TP1 TTFT p50 gap: convoy breakdown (offline, the three H5 TP1 runs)
 
+**Independent review verdict: PARTLY (2026-10-27).** The descriptive
+numbers below hold: the arrival counts, t3-4 TTFT in steps, and the t0
+spread (12 steps vs 4-6). The mechanism and the it5 conclusion do not.
+- **The hold numbers are from the wrong window.** "sent_wait up to 30 s,
+  max 1.06 s" is the first `save stats` window (steps 0-500: warmup and the
+  cold pass). In the warm passes the mean hold per finished request is
+  0.7-79 ms. In daa5e11 warm2's t3-4 window it is 1.0 ms (max 4.7), and
+  t3-4 still waited about 21 steps.
+- **Free KV.** Averaged over the t3-4 window, v2 has more visible free KV
+  than native (9.7-10.9k vs 6.7-7.0k tokens).
+- **There is still real exhaustion.** One t3 request was the queue head
+  for 37 consecutive failed lookups (steps 215 to 281). cf67695 and
+  daa5e11 had 2-3 preemptions per pass; native had 0. 8df70d5 had 0 and
+  still showed the full step gap.
+- **"Native admits 32-35 of them within 10 steps"** recomputes to 24-30.
+- **Reviewer's split.**
+  - The root cause is mostly the server: one serial load thread at about
+    15 GB/s spreads t0, which gives the lone arrivals.
+  - vLLM's strict FIFO head blocking, plus the blocks reserved for
+    in-flight async loads and prefills (`_inflight_prefill_reserved_blocks`),
+    turns that into the step gap.
+  - The hold is at most 10-20% of the gap, and about 0 in some passes.
+  - First-poll lag is at most 1-2 steps. Lookup cost is ruled out.
+- **Consequence.** it5 is no longer next. A probe-only rev comes first. Per
+  step it logs why vLLM's waiting loop stopped (allocation failed for
+  request X with its new and external tokens, skipped, or token budget),
+  free blocks, and blocks held by async-loading and by finished-not-sent
+  requests. Its data names the t3-4 head-of-line blocker. it5 stays a later
+  cheap A/B, only if that data shows the hold matters.
+
+The original entry follows unchanged.
+
 Question: does TP1's 15-30% p50 gap (v2 0.56-0.66 vs native 0.49-0.51 at
 equal or better rps) come from the same phase lock as Qwen3.5? **No: the
 phase lock is reversed.** Scripts: `tp1rt.py`, `q35wave.py`, `tp1hold.py`,
