@@ -221,6 +221,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   When a `*_vs_native` check fails, compare v2's and native's load path
   first (sync vs async load, load round trip in steps, per-request load
   size) before touching policy. The overhead checks stay vs baseline.
+  A native replay that loads nothing (load errors, timed-pass `E_ext <
+  0.9`) makes the run non-official: fix the native arm's setup or have the
+  gate owner list the model as "no working native" in GATES.md.
 - Async saves in vLLM 0.32 need three hooks, not one: `wait_for_save` only
   queues (CUDA event + saver thread); `request_finished` returns True and
   `get_transfer_results.finished_sending` releases the blocks after the copy;

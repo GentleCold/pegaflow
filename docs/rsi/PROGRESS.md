@@ -115,7 +115,25 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   run and its replay must produce every timed warm pass, else not
   official. Overhead checks (gsm8k, replay cold, 2% vs baseline) and G2
   references stay baseline's; native's own G0 / G2 failures do not
-  disqualify its timing. Branch `feat/rsi-gate-g4-native`.
+  disqualify its timing; a native replay that is not a working store
+  (load errors, warm excess, timed-pass `E_ext < 0.9`) makes the run
+  non-official. Branch `feat/rsi-gate-g4-native`, review
+  `reviews/g4-native.md`.
+  Effect on the current models: under this rule every accepted record
+  fails G4 vs native, so none of them is accepted under G4 any more; each
+  model needs a new official run that beats native (offline re-judge, the
+  records stay official, medians of warm2/warm3, TTFT p50 s / req/s):
+
+  | record | v2 | native | old | baseline | `ttft_vs_native` | `req_s_vs_native` |
+  |---|---|---|---|---|---|---|
+  | Qwen3-4B it7 (`2026-10-25-qwen3-4b-p4-it7-off-a59a254`) | 0.5640 / 9.646 | 0.5619 / 9.359 | 0.6608 / 9.730 | 3.6314 / 2.522 | fail (2.1 ms) | pass |
+  | DSV2 it7 (`2026-10-25-dsv2-lite-p4-it7-off-a59a254`) | 0.2996 / 12.346 | 0.2919 / 13.085 | 0.3643 / 12.350 | 0.9289 / 5.405 | fail | fail |
+  | Qwen3.5 it2 (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) | 0.2974 / 14.633 | 0.1729 / 13.155 | 0.3539 / 14.070 | 1.1158 / 3.731 | fail (125 ms) | pass |
+
+  Open for the user (review SHOULD-1): with 2 timed passes the Qwen3-4B
+  TTFT gap (2.1 ms) is below v2's own pass-to-pass range (25 ms), so that
+  verdict is not decidable from these data; pass count and tolerance are
+  unchanged pending the user's decision.
 
 ## Isolation (no reference to existing implementation)
 
@@ -154,9 +172,9 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
-| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge; under the lmcache gate's resume stage its it6 / it7 records fail `G2.resume_reference` (every arm): needs an official rerun with the resume stage |
-| P5 | onboard Qwen3.5-4B | todo |
+| P3 | onboard Qwen3-4B | G4 vs native (2026-10-26) fails on it7 (warm TTFT 0.5640 vs native 0.5619 s): the next official run fails G4 unless the load path improves; before that rule G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
+| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge; under the lmcache gate's resume stage its it6 / it7 records fail `G2.resume_reference` (every arm): needs an official rerun with the resume stage; it7 also fails G4 vs native (2026-10-26: warm TTFT 0.2996 vs 0.2919 s, req/s 12.35 vs 13.09) |
+| P5 | onboard Qwen3.5-4B | in progress; it2 (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) fails G4 vs native (2026-10-26: warm TTFT 0.2974 vs native 0.1729 s) |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ## Log

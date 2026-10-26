@@ -13,7 +13,8 @@ Arms:
   plain                    vLLM without any KV connector (gsm8k only; control)
   baseline                 vLLM + RsiProbe only (no PegaFlow)
   old                      reference connector (pegaflow.connector:PegaKVConnector), black box
-  native                   reference: vLLM's OffloadingConnector (CPU offload), record only
+  native                   reference: vLLM's OffloadingConnector (CPU offload); verdicts not
+                           required, but the arm and its replay timing are (G4 warm reference)
   lmcache                  reference: LMCache in-process connector, local CPU backend only, record only
   selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k and preempt only
   <module>:<Class>         connector under test
@@ -2617,6 +2618,13 @@ def _timed_warm(r: dict[str, Any] | None) -> tuple[str, ...]:
 # G4 keys the arm under test must also win against the native reference arm
 # (vLLM's OffloadingConnector) in the same run (user, 2026-10-26).
 G4_NATIVE_KEYS = (("ttft_p50", True), ("req_per_s", False))
+# Run validity, not a bar on any arm (hit levels stay reported, 2026-10-24):
+# a native replay whose timed warm passes serve less than this share of the
+# oracle's external hits is not a working store, so it is no G4 reference
+# and the run is not official (``g4_native_problems``). Native measured
+# E_ext 1.0 on every timed pass of the Qwen3-4B / DSV2 it7 and Qwen3.5 it2
+# records.
+NATIVE_MIN_EFFICIENCY = 0.9
 
 
 def _native_perf_verdicts(
@@ -2643,11 +2651,23 @@ def _native_perf_verdicts(
     return g
 
 
-def g4_native_problems(results: dict[str, dict[str, Any]]) -> list[str]:
-    """Why a run cannot be official for G4 vs native: the native arm's replay
-    stage is missing or crashed, or it lacks a timed warm pass (ttft_p50 and
-    req_per_s) that the baseline has. Native's G0 / G2 verdicts are not
-    looked at (it fails G0.spec by construction)."""
+def g4_native_problems(
+    results: dict[str, dict[str, Any]], arms: list[str], wls: list[str]
+) -> list[str]:
+    """Why a run cannot be official for G4 vs native (run validity, like
+    ``g5_problems``; nothing here gates the native arm itself). The native
+    replay stage must have run (crashed or absent: no reference), recorded
+    every timed warm pass the baseline has (ttft_p50 and req_per_s), and
+    worked as an offloading store, judged from its own replay data only:
+    no load errors, excess within ``excess_limit`` on the warm pass, and on
+    every timed warm pass its external hits cover at least
+    ``NATIVE_MIN_EFFICIENCY`` of the oracle's (``E_ext``). A native that
+    loads nothing times like baseline and would pass any arm that beats
+    baseline. Native's G0 / G2 verdicts are not looked at (it fails
+    G0.spec by construction). Without the native arm or the replay
+    workload ``official_problems`` already names the gap."""
+    if "native" not in arms or "replay" not in wls:
+        return []
     nat = results.get("native", {}).get("replay")
     if nat is None or "error" in nat:
         return ["native replay stage missing or failed (G4 vs native needs its warm numbers)"]
@@ -2655,6 +2675,19 @@ def g4_native_problems(results: dict[str, dict[str, Any]]) -> list[str]:
     have = {n for n in _timed_warm(nat) if all(k in nat["passes"][n] for k, _ in G4_NATIVE_KEYS)}
     if not want or set(want) - have:
         return [f"native replay timed warm passes {sorted(have)} != baseline's {sorted(want)}"]
+    hit = nat.get("hit") or {}
+    bad = []
+    if nat.get("load_errors"):
+        bad.append(f"{len(nat['load_errors'])} load errors")
+    w = hit.get("warm")
+    if w is None or w["excess_tokens"] > w["excess_limit"]:
+        bad.append("warm pass excess above one block per request (or no hit record)")
+    for n in sorted(want):
+        e = (hit.get(n) or {}).get("efficiency")
+        if e is None or e < NATIVE_MIN_EFFICIENCY:
+            bad.append(f"{n} E_ext {e} < {NATIVE_MIN_EFFICIENCY:g}")
+    if bad:
+        return [f"native replay is not a working store ({'; '.join(bad)}): no G4 reference"]
     return []
 
 
@@ -4025,8 +4058,7 @@ def main(argv: list[str] | None = None) -> int:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
     problems = official_problems(args, arms, wls, gate_file, committed, gate)
-    if "native" in arms and "replay" in wls:
-        problems += g4_native_problems(results)
+    problems += g4_native_problems(results, arms, wls)
     contaminated = contamination(results)
     problems += [
         f"contaminated: {c['arm']} replay/{c['pass']} p99 TTFT {c['ttft_p99']:.3g}s > "

@@ -1888,13 +1888,16 @@ def test_warmup_seconds_reported_not_gated():
     assert "pass" not in g["G4.warmup_seconds"]
 
 
-def _replay(ttft: float, rps: float, warm: tuple[str, ...] = ("warm2", "warm3")) -> dict:
+def _replay(
+    ttft: float, rps: float, warm: tuple[str, ...] = ("warm2", "warm3"), eff: float = 1.0
+) -> dict:
     """A replay stage result with correct KV whose timed warm passes all
-    have ``ttft`` (TTFT p50) and ``rps`` (req/s)."""
-    hit = {"efficiency": 1.0, "oracle_hit_rate": 0.9, "hit_rate": 0.9, "local_hit_tokens": 0, "prompt_tokens": 1, "external_hit_rate": 0.9, "excess_tokens": 0, "excess_limit": 1}  # fmt: skip
+    have ``ttft`` (TTFT p50), ``rps`` (req/s) and ``eff`` (E_ext)."""
+    hit = {"efficiency": eff, "oracle_hit_rate": 0.9, "hit_rate": 0.9, "local_hit_tokens": 0, "prompt_tokens": 1, "external_hit_rate": 0.9, "excess_tokens": 0, "excess_limit": 1}  # fmt: skip
     passes = {"cold": {"ttft_p50": 1.0, "req_per_s": 1.0}, "warm": {"ttft_p50": 9.0, "req_per_s": 0.1}}  # fmt: skip
     passes |= {n: {"ttft_p50": ttft, "req_per_s": rps} for n in warm}
-    return {"passes": passes, "hit": {"warm": hit}, "load_errors": [], "digest_self": _digest_ok()}
+    hits = {n: hit for n in ("warm", *warm)}
+    return {"passes": passes, "hit": hits, "load_errors": [], "digest_self": _digest_ok()}
 
 
 NATIVE_KEYS = ("G4.replay_warm.ttft_p50_vs_native", "G4.replay_warm.req_per_s_vs_native")
@@ -1944,34 +1947,46 @@ def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
 
 
 ARMS_N = ["plain", "baseline", "native", "pegaflow.m:C"]
+_NAT = _replay(0.3, 8.0)
 
 
 @pytest.mark.parametrize(
-    "arms,native,problem",
+    "arms,wls,native,problem",
     [
-        (ARMS_N, _replay(0.3, 8.0), None),
-        (["plain", "baseline", "pegaflow.m:C"], None, "arm native missing"),
-        (ARMS_N, None, "native replay stage missing"),
-        (ARMS_N, {"error": "RuntimeError: boom"}, "native replay stage missing"),
-        (ARMS_N, _replay(0.3, 8.0, ("warm2",)), "native replay timed warm passes"),
+        (ARMS_N, run_gate.WORKLOADS, _NAT, None),
+        (["plain", "baseline", "pegaflow.m:C"], run_gate.WORKLOADS, None, "arm native missing"),
+        (ARMS_N, ("gsm8k", "cap"), None, "workloads"),  # no replay: official_problems names it
+        (ARMS_N, run_gate.WORKLOADS, None, "native replay stage missing"),
+        (ARMS_N, run_gate.WORKLOADS, {"error": "RuntimeError: boom"}, "native replay stage missing"),
+        (ARMS_N, run_gate.WORKLOADS, _replay(0.3, 8.0, ("warm2",)), "native replay timed warm passes"),
+        # Ran, but served (almost) nothing: times like baseline, so no reference.
+        (ARMS_N, run_gate.WORKLOADS, _replay(5.0, 1.0, eff=0.0), "native replay is not a working store"),
+        (ARMS_N, run_gate.WORKLOADS, _NAT | {"load_errors": [{}]}, "native replay is not a working store"),
+        (ARMS_N, run_gate.WORKLOADS, _NAT | {"hit": {}}, "native replay is not a working store"),
+        (ARMS_N, run_gate.WORKLOADS, _replay(0.3, 8.0, eff=run_gate.NATIVE_MIN_EFFICIENCY), None),
     ],
-    ids=["present", "arm-missing", "no-replay", "replay-crashed", "warm-pass-missing"],
-)
-def test_official_needs_native_warm_replay(tmp_path, arms, native, problem):
-    """G4 vs native: a run without the native arm, or whose native replay
-    did not produce every timed warm pass, is not official."""
+    ids=["present", "arm-missing", "no-replay-workload", "no-replay", "replay-crashed",
+         "warm-pass-missing", "native-degenerate", "native-load-errors", "native-no-hit",
+         "native-at-floor"],
+)  # fmt: skip
+def test_official_needs_native_warm_replay(tmp_path, arms, wls, native, problem):
+    """G4 vs native: a run without the native arm, whose native replay did
+    not produce every timed warm pass, or whose native replay is not a
+    working store (judged from its replay data, not its G0 / G2), is not
+    official. ``main`` adds ``g4_native_problems`` unconditionally; the
+    arm / workload guard is inside it, so this covers the wiring's logic."""
     import argparse
 
     args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t"}))  # fmt: skip
-    probs = run_gate.official_problems(args, arms, list(run_gate.WORKLOADS), tmp_path, tmp_path)
     results = {"baseline": {"replay": _replay(5.0, 1.0)}}
     if native is not None:
         results["native"] = {"replay": native}
-    if "native" in arms:
-        probs += run_gate.g4_native_problems(results)
-    native_probs = [p for p in probs if "native" in p]
-    assert (native_probs == []) is (problem is None), probs
-    assert problem is None or native_probs[0].startswith(problem), probs
+    probs = run_gate.official_problems(args, arms, list(wls), tmp_path, tmp_path)
+    probs += run_gate.g4_native_problems(results, arms, list(wls))
+    gap = [p for p in probs if "native" in p or p.startswith("workloads")]
+    assert (gap == []) is (problem is None), probs
+    assert problem is None or gap[0].startswith(problem), probs
+    assert len([p for p in probs if p.startswith("native")]) <= 1, probs
 
 
 def test_warmup_shares_no_prefix_with_workload():
