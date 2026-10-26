@@ -1738,6 +1738,216 @@ is +12-36%.
   vs a ~40 ms step). If it does, the round trip is at vLLM's minimum and
   this item closes.
 
+### H5 gate result: `async_demote` deleted (2b, 2ab3ae9)
+
+Runs `2026-10-26-qwen3-4b-p5-h5-{tp1-cf67695,tp1-daa5e11,tp1-8df70d5,tp2-daa5e11,tp2-8df70d5}`.
+Each has its own native arm. The arms:
+
+- cf67695: send in plan order (stats arm);
+- daa5e11: sync loads first, knob off;
+- 8df70d5: sync loads first, `async_demote = true`.
+
+Base server. Script `~/kexi/tmp/p5-it3-attr/h5rep.py`. Each run's G4
+failures repeat in every arm and in native (same verdict set), so they come
+from the session, not the arm.
+
+**TP1** (warm2 / warm3; ms/step from the probe):
+
+| arm | v2 p50 | native p50 | v2/native | v2 rps | native rps | v2 ms/step | native ms/step |
+|---|---|---|---|---|---|---|---|
+| cf67695 | 0.629 / 0.598 | 0.488 / 0.486 | 1.29 / 1.23 | 9.73 / 9.76 | 9.25 / 9.17 | 23.5 | 25.6-25.8 |
+| daa5e11 | 0.570 / 0.657 | 0.495 / 0.505 | 1.15 / 1.30 | 9.84 / 9.74 | 9.22 / 9.16 | 23.4-23.5 | 25.7-25.8 |
+| 8df70d5 | 0.555 / 0.596 | 0.505 / 0.492 | 1.10 / 1.21 | 9.88 / 9.83 | 9.26 / 9.24 | 23.4 | 25.5-25.6 |
+
+TP1 gsm8k warm, all 0.8552 = native (0.8552): daa5e11 171.1 s vs 175.6 s
+native; 8df70d5 171.3 s vs 183.0 s. The ≤2% hard bar holds in every arm.
+
+Per-pass v2 worker and scheduler counters at TP1 (warm / warm2 / warm3):
+
+| arm | sync_wait_ms (max window) | load_issue ms/step (max) | sync_planned | sync_demoted |
+|---|---|---|---|---|
+| cf67695 | 127 / 135 / 141 (max 88) | 3.31 / 2.42 / 2.73 (94) | 16 / 19 / 17 | - |
+| daa5e11 | 77 / 42 / 172 (max 63) | 2.76 / 1.86 / 2.40 (64) | 17 / 16 / 18 | - |
+| 8df70d5 | 4 / 7 / 6 (max 3) | 1.99 / 1.24 / 1.36 (42) | 8 / 6 / 7 | 10 / 10 / 8 |
+
+TP1 8df70d5 demotion detail (per pass):
+
+| metric | warm / warm2 / warm3 |
+|---|---|
+| demoted share `sync_demoted/(sync_planned+sync_demoted)` | 0.56 / 0.62 / 0.53 |
+| `max_demoted_run` | 2 / 2 / 3 |
+| `demoted_ms/demoted_done` (max) | 111 / 125 / 123 ms (max 264) |
+| `demoted_steps/demoted_done` (max) | 2.4 / 5.2 / 5.3 (max 8) |
+| `deferred_demoted` | 0 in every pass |
+
+vLLM reports a load done one step late, so `demoted_steps` includes about
+one step of lag.
+
+**TP2** (warm2 / warm3):
+
+| arm | v2 p50 | native p50 | v2/native | v2 mean | native mean | v2 rps | native rps | v2 ms/step | native ms/step |
+|---|---|---|---|---|---|---|---|---|---|
+| daa5e11 | 0.142 / 0.149 | 0.167 / 0.157 | 0.85 / 0.95 | 0.135 / 0.148 | 0.169 / 0.165 | 18.96 / 18.84 | 19.12 / 19.30 | 17.0 | 16.1 |
+| 8df70d5 | 0.152 / 0.146 | 0.170 / 0.159 | 0.90 / 0.92 | 0.155 / 0.152 | 0.168 / 0.164 | 18.57 / 18.24 | 19.32 / 19.23 | 17.0-17.1 | 16.0-16.2 |
+
+TP2 counters (warm / warm2 / warm3):
+
+| arm | sync_wait_ms (max window) | load_issue ms/step (max) | sync_planned | sync_demoted |
+|---|---|---|---|---|
+| daa5e11 | 161 / 56 / 99 (max 68) | 4.22 / 2.24 / 3.18 (71) | 84 / 84 / 84 | - |
+| 8df70d5 | 15 / 23 / 26 (max 3) | 2.23 / 1.80 / 1.59 (14) | 47 / 40 / 46 | 37 / 44 / 38 |
+
+TP2 8df70d5 demotion detail (per pass):
+
+| metric | warm / warm2 / warm3 |
+|---|---|
+| demoted share | 0.44 / 0.52 / 0.45 |
+| `max_demoted_run` | 3 |
+| `demoted_ms/demoted_done` | 111 / 72 / 84 ms (max 200-214) |
+| `demoted_steps/demoted_done` | 3.1 / 3.5 / 4.5 (max 6-14) |
+| `deferred_demoted` | 0 |
+
+Probe gaps (arrival to first scheduled step) for sync-size hits, v2 vs
+native: TP2 daa5e11 1 vs 5-6 steps; TP2 8df70d5 3 vs 5 steps. A sync short
+hit loads in 1 step at about 17 ms, so it has TTFT about 1 step. A demoted
+one waits 72-125 ms on average (4-7 steps).
+
+**Decision: delete `async_demote` (2ab3ae9).**
+- Demotion does remove the stall it targets: sync_wait_ms falls from 42-172
+  to 4-26 per pass, and the max window from 37-68 ms to 3 ms. It also cuts
+  load_issue per step.
+- But the stall was small to begin with: at most about 0.25 ms/step, and
+  0.05-0.16 ms/step at TP1. Each demoted hit pays a 4-7 step async round
+  trip instead.
+- At TP2 sync-size hits get 2 steps slower (gap 1 to 3). Mean TTFT gets
+  worse (0.135/0.148 to 0.155/0.152), and so does rps relative to native
+  (0.99/0.98 to 0.96/0.95).
+- At TP1 p50 and rps move within the run-to-run spread of the two
+  knob-off arms (v2/native 1.15-1.30). Step time and gsm8k are unchanged.
+- No net gain, so per main's rule the knob is deleted, not left off. Gone:
+  the policy field, its toml entry and README text, `_long_loads` /
+  `_demoted` / `_deferred_demoted`, `_behind_demoted`, the demote
+  counters, and the demotion tests. Kept: part 1 (sync loads first) and
+  `sync_planned`. CI on a git-archive export: typos, ruff (python, rsi),
+  core tests 279 passed, source-only unit gate 531 passed, gate pytest 390
+  passed, cz.
+- Part 1 has no measurable effect either: cf67695 sends in plan order, and
+  only 1-4 steps per pass would have been reordered. It is kept because it
+  costs nothing and only matters when a sync load lands behind an async one
+  in the same step.
+
+### Qwen3-4B TP1 TTFT p50 gap: convoy breakdown (offline, the three H5 TP1 runs)
+
+Question: does TP1's 15-30% p50 gap (v2 0.56-0.66 vs native 0.49-0.51 at
+equal or better rps) come from the same phase lock as Qwen3.5? **No: the
+phase lock is reversed.** Scripts: `tp1rt.py`, `q35wave.py`, `tp1hold.py`,
+`tp1pair.py`, `tp1q.py`, `tp1t0.py`, `tp1turn.py`, `tp1tc.py`, `tp1occ.py`,
+`tp1lk2.py`, `tp1ahead.py` in `~/kexi/tmp/p5-it3-attr/`.
+
+1. **Arrivals per step.** Native has the convoys:
+
+   | per pass, t>0 | native | v2 |
+   |---|---|---|
+   | arrivals in the same step, mean | 3.8-5.1 | 1.7-2.1 |
+   | arrivals in the same step, p90 | 10-18 | 4-5 |
+   | steps with arrivals | 114-119 | 178-181 |
+   | max finishes in one step | 13-18 | 5-10 |
+   | requests arriving alone | 61-82 | 141-155 |
+
+   The source is t0. All TP1 t0 requests share 79 blocks (1264 tokens). The
+   first one loads the shared prefix, so native starts its 32 t0 requests
+   within 4-5 steps. v2 spreads them over 12 steps: the base server's
+   serial load worker plus the in-flight deferral (t0 gap 8 vs 2-4 steps,
+   a known server limit). Turn-1 convoys are 10-11 (native) vs 3.2-3.4
+   (v2) and decay by turn.
+2. **TTFT by convoy size** (TTFT steps, p50):
+   - Mixed. Convoy 1: native 17-64 vs v2 30-46. Convoy 2-3: v2 better in
+     5 of 6 passes. Convoy 4-7 and 8+: similar.
+   - Splitting by turn band shows where the gap is: in turns 3-4. There v2
+     is slower at equal convoy size:
+
+     | turns 3-4 | native p50 | v2 p50 |
+     |---|---|---|
+     | alone (c1) | 8-10 (one pass 67) | 21-25 |
+     | c2-3 | 10-12 | 20-66 |
+     | c4+ | 6-8 | 17-54 |
+
+   - Turns 1-2 (v2 4-5 vs native 5-8 steps) and turns 5+ (v2 50-60 vs
+     native 60-71) favour v2.
+3. **TTFT by turn** (p50 steps, native vs v2, every pass of the three
+   runs):
+
+   | turns | native | v2 |
+   |---|---|---|
+   | t1 | 5-8 | 4-5 |
+   | t2 | 4-6 | 5-6 |
+   | t3 | 7-8 | 18-22 |
+   | t4 | 10-11 | 22-52 |
+   | t5-t7 | 65-71 | 65-74 |
+   | t8 | 64-67 | 38-56 |
+
+   The p50 is set by t3-t4 (110 of 264 requests). In every v2 pass all 55
+   t3-4 requests wait more than 10 steps. Native admits 32-35 of them
+   within 10 steps.
+4. **Load round trip by class** (gap in steps, warm2/3, all three runs):
+
+   | class | native | v2 | note |
+   |---|---|---|---|
+   | sync-size ext (15-18 req) | 5 | 1 (daa5e11, cf67695); 4 with demotion | |
+   | long ext, alloc to first compute | - | about 0-3 | v2 load path itself is fast |
+   | long ext, total | p50 12-14, mean 34 | p50 25-31, mean 36-38 | |
+   | t0 | 2-4 | 8-9 | server limit |
+
+   The long-ext v2 wait is almost entirely before the first server query:
+   about 21-24 steps for t3-4. The "blocked retries" (first to last query)
+   take about 1.5 steps, and allocation to first compute about 0. (Query
+   times are mapped to steps by interpolating between sync-load anchors,
+   about 44 per run, so this split is approximate: some p50s come out
+   slightly negative.) vLLM's
+   KV-blocked FIFO holds the request: the head of the waiting queue fails
+   `allocate_slots`, so the loop breaks (`scheduler.py` line ~1283) and
+   requests behind it are not looked up.
+   - Native copy throughput: 20.6 ms/load, 22.3 GB/s. v2: 31.0 ms/load,
+     14.7 GB/s (pegaflow_load_duration). This is the server's
+     cross-context copy contention. It is off the critical path here,
+     since v2 loads land within about 1-2 steps of allocation.
+5. **Why t3-4 queue longer in v2.** At t3-4 arrival both arms have about
+   11-14 requests ahead in the FIFO. Native's slow t3-4 requests see about
+   57k need-tokens ahead, v2's about 40-45k. Native's are mostly t3-t4 from
+   the same convoy, and the convoy moves together. v2's arrivals are
+   staggered 1-2 per step, so each one waits behind the previous ones'
+   allocations one at a time. Occupancy computed from the probe (prompt +
+   generated tokens of running requests, 71,472-token pool):
+   - v2's slow t3-4 requests see about 18-22k free tokens at arrival.
+   - Native's fast ones see 20-27k.
+   - Native's slow ones see 28-35k (blocked behind a big head-of-line
+     request).
+   - Need p50 is 3.6-3.9k in both.
+
+   v2 also holds finished requests' blocks until finished_sending (save
+   batching), with sent_wait up to 30 s over 146 requests per window, max
+   1.06 s. That block-hold is not visible in probe occupancy, which counts
+   only running requests. vLLM's logged KV usage is 97-100% in both arms
+   at the 10 s samples.
+
+**Answer.** Not the Qwen3.5 phase lock. TP1's phase lock helps native: the
+fast shared-prefix t0 makes native's convoys, and those move through vLLM's
+FIFO as a block. v2's staggered arrivals queue one by one behind KV-blocked
+heads. At equal convoy size in turns 3-4, v2 is still 2-3× slower (21-25 vs
+8-12 steps alone), and v2's own load round trip is not the cause.
+
+**Connector headroom, next hypothesis (it5).** v2 keeps a finished
+request's blocks until its last batched save is sent and done. Native frees
+blocks at finish: its `request_finished` returns False, and its stores are
+fenced through `_block_id_to_pending_jobs` (deferred fences on block
+reuse). That leaves fewer free blocks for the FIFO head in v2.
+- Candidate: release at finish when saved_through ≥ the request's last
+  save step. Measure the per-request hold (finish to finished_sending in
+  steps).
+- Expected signal: t3-4 TTFT drops toward native's 8-12 steps, with
+  sent_wait_ms falling.
+- The t0 spread (server serial load worker) stays a server limitation.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
