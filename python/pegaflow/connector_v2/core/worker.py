@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 class _Batch:
     state: Any  # PyLoadState
     req_ids: list[str]
+    polls: int = 0  # poll() calls that saw it, the landing one included
 
 
 @dataclass
@@ -98,6 +99,10 @@ class SaveStats:
     load_steps: int = 0  # steps with any load plan
     load_issue_s: float = 0.0  # step thread: all of _start_loads (RPCs + sync wait)
     max_load_issue_s: float = 0.0
+    async_done: int = 0  # async load RPCs seen ready (landed or failed) by poll()
+    async_first_poll: int = 0  # of those, ready at the first poll (the issuing step's)
+    async_polls: int = 0  # their polls, the landing one included
+    max_async_polls: int = 0
     _since: float = field(default=0.0, repr=False)
 
 
@@ -608,7 +613,8 @@ class Worker:
             "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d rpcs=%d pressure_rpcs=%d "
             "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f kv_usage_unknown_steps=%d "
             "sync_loads=%d sync_first_steps=%d sync_wait_ms=%.1f max_sync_wait_ms=%.2f "
-            "load_steps=%d load_issue_ms=%.1f max_load_issue_ms=%.2f",
+            "load_steps=%d load_issue_ms=%.1f max_load_issue_ms=%.2f "
+            "async_done=%d async_first_poll=%d async_polls=%d max_async_polls=%d",
             self._par.tp_rank,
             now - s._since,
             s.steps,
@@ -636,6 +642,10 @@ class Worker:
             s.load_steps,
             s.load_issue_s * 1e3,
             s.max_load_issue_s * 1e3,
+            s.async_done,
+            s.async_first_poll,
+            s.async_polls,
+            s.max_async_polls,
         )
 
     def shutdown(self) -> None:
@@ -669,15 +679,25 @@ class Worker:
                     stats.max_sent_wait_s = max(stats.max_sent_wait_s, *waits)
         finished, self._done = self._done, set()
         pending: list[_Batch] = []
+        landed: list[int] = []
         for b in self._batches:
+            b.polls += 1
             if not b.state.is_ready():
                 pending.append(b)
                 continue
+            landed.append(b.polls)
             finished.update(b.req_ids)
             state = b.state.get_state()
             if state != 1:
                 logger.warning("[PegaKVConnectorV2] load state=%s reqs=%s", state, b.req_ids)
                 self._failed.update(b.req_ids)
         self._batches = pending
+        if landed:
+            with self._cv:
+                stats = self.save_stats
+                stats.async_done += len(landed)
+                stats.async_first_poll += landed.count(1)
+                stats.async_polls += sum(landed)
+                stats.max_async_polls = max(stats.max_async_polls, *landed)
         failed, self._failed = self._failed, set()
         return sending, finished | failed, failed

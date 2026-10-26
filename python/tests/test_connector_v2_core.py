@@ -1553,6 +1553,9 @@ def test_worker_loads_and_poll():
     pending.ready = True
     assert worker.poll() == (set(), {"later"}, set())
     assert worker.poll() == (set(), set(), set())
+    # Polls until each load RPC was ready: 1 for ok and gpu-error, 2 for later.
+    s = worker.save_stats
+    assert (s.async_done, s.async_first_poll, s.async_polls, s.max_async_polls) == (3, 2, 4, 2)
 
 
 @pytest.mark.parametrize(

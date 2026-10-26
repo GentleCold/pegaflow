@@ -185,7 +185,13 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     of an async one), `sync_wait_ms` / `max_sync_wait_ms` (waiting for the
     sync copies, per step), and `load_steps` / `load_issue_ms` /
     `max_load_issue_ms` (all of `start_load_kv`: every load RPC plus the
-    sync wait, over steps with a load plan).
+    sync wait, over steps with a load plan);
+  - async loads, in `get_finished`: `async_done` (load RPCs seen ready,
+    landed or failed), `async_first_poll` (of those, ready at the first
+    poll, the issuing step's), `async_polls` / `max_async_polls` (polls
+    until ready, the landing one included). vLLM promotes a request the
+    step after the poll that reports it, so 1 poll is its minimum round
+    trip.
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;
   - every TP rank's declarations must pass `semantics.seal_plan` (V0).
