@@ -2139,6 +2139,225 @@ table above.
   the GPU, or use the native pattern (`request_finished` returns False,
   the store is fenced against block reuse).
 
+## it5 (2026-10-27): fence reused blocks instead of holding finished requests
+
+### Hypothesis H7 (ebe69db, fix 5c3ab63)
+
+The baa8b49 probe found 126-135 exclusive blocks per step held in
+finished requests. They are held 3.2-3.4 steps each, and that alone
+covers the blocked head's shortfall in about 33% of t3-4 waiting steps.
+The hypothesis: use vLLM's native pattern. Return those blocks at finish
+and fence only the writes that reuse them. If it works, t3-4 TTFT steps
+and p50 move toward native.
+
+**Design (native pattern, main's correctness spec):**
+- `request_finished` always returns False. Nothing is held for
+  `finished_sending`.
+- The scheduler records, for each request, the block → plan step of the
+  last chosen save. At finish these move into a fence map, unless a
+  flush, a fence or `saved_through` already covers that step
+  (`_fence_floor`).
+- Every block this step writes is checked against the fence map
+  (`fence_writes`, before `plan_saves`):
+  - new requests' blocks past `num_computed_tokens` (positional groups);
+  - running requests' appended blocks;
+  - resumed requests' whole tables;
+  - zeroed blocks and copy-on-write targets;
+  - load targets (`update_state_after_alloc`).
+
+  A hit sets `StepPlan.fence_step`.
+- Worker: `handle_preemptions` runs before any KV write of the step. It
+  calls `wait_saved(fence_step)`, which releases held batched jobs up to
+  that step and waits until the saver has completed them. A job completes
+  after the save RPC returns, and the server replies after the D2H copy
+  and its sync. So a block is written only after every copy reading it is
+  done, as observed by the worker.
+- Fences clear when:
+  - every worker reports `saved_through` (min across ranks, reported
+    every step);
+  - a flush happens;
+  - a fence covers that step.
+- Pinned layouts (zeroing/COW, checkpoint) are unchanged.
+- Unit contract: `test_freed_block_is_not_written_while_a_save_reads_it`,
+  with outcomes saved, save-failed, raises and saver-dies.
+
+**Review (independent agent):**
+- **ebe69db: REQUEST CHANGES, one blocking item.** A sync load that fails
+  at planning time (`_recut` None, `_fill_targets` fail, or an exception)
+  skipped the fence. Under `kv_load_failure_policy=recompute`, vLLM
+  recomputes into those covered blocks. They lie below
+  `num_computed_tokens`, so `fence_writes` never sees them.
+- **Fix in 5c3ab63:** fence `plan.covered` and the targets on both
+  branches. New case `test_fence_sources[sync-load-plan-fail]`: it fails
+  on ebe69db and passes on 5c3ab63.
+- **The path never fired in the gate runs.** "load planning failed",
+  "not re-plannable" and "has no GPU block" each count 0 in the TP1,
+  preempt and diag runs of ebe69db, so ebe69db's TP1 numbers stand for
+  5c3ab63.
+- **Non-blocking items, recorded:**
+  - an RPC exception counts as "copy done", which is pre-existing pin
+    semantics;
+  - after the last finish, idle stepping lasts up to about 32 steps / 1 s
+    until held saves age out;
+  - the 0.2 s `_blocked` timing in tests.
+- **Re-check of 5c3ab63: APPROVE.**
+  - The fence runs on all three sync failure paths, and `covered`
+    matches the worker's invalid set (single group).
+  - Async planning failure stays safe: the retry goes back through
+    `fence_writes`.
+  - Fencing a failed plan is not premature: `handle_preemptions` waits
+    on every rank before writes.
+  - No new blocking issue.
+- **Follow-ups (non-blocking):**
+  1. An RPC exception counts as "copy done" (`_run_job` sets
+     `_completed` in `finally`). A cheap fix candidate: on an RPC
+     exception (not on `ok=False`), mark the saver dead, i.e. fail
+     closed. Saves stop and fences clear at once, but a later
+     reallocation could still race a server copy that is still running.
+     The real fix needs a server contract: an error reply only after no
+     copy for that request is in flight, or a drain RPC. That goes under
+     server limitations.
+  2. `has_pending_saves` keeps an idle engine stepping for about 32 steps
+     / 1 s at most.
+  3. `_blocked` relies on 0.2 s timing.
+  4. No test covers how `build_connector_meta` extracts its tables:
+     resumed vs running `computed`, and `ids is None`.
+
+**CI:**
+- ebe69db: source-only 542 passed, core 290, gate pytest 390.
+- 5c3ab63: source-only 543 passed, core 291 (3 runs), gate pytest 390.
+- Both: typos, ruff and format clean; cz ok.
+
+### it5 result: confirmed on Qwen3-4B TP1 (`2026-10-26-qwen3-4b-p5-it5-tp1-ebe69db`)
+
+Official run: GPU3, native + v2, replay and gsm8k, base server. Exit 1
+is structural only (no plain/baseline arms).
+
+| warm2 / warm3 | native | v2 ebe69db |
+|---|---|---|
+| ttft p50 (s) | 0.602 / 0.571 | 0.506 / 0.544 |
+| ttft mean (s) | 0.999 / 1.009 | 0.781 / 0.785 |
+| rps | 8.98 / 8.92 | 10.17 / 10.13 |
+| ms/step | 26.2-26.5 | 23.0-23.1 |
+| gsm8k acc cold / warm | 0.8552 / 0.8552 | 0.8552 / 0.8552 |
+
+- **G4 report.** ttft_p50 median is 0.525 vs native 0.587 (-10.5%); rps
+  is 10.15 vs 8.95 (+13.3%).
+- **Before it5** (baa8b49 probe): v2 p50 0.564 / 0.620 vs native
+  0.503 / 0.589, so v2 was behind. It is now ahead.
+- **gsm8k.** Accuracy equals native. Warm wall time is 169.2 s vs native
+  173.6 s.
+- **G2:**
+  - `digest_self.gsm8k`: 171348 local / 5473 external, 0 mismatched;
+  - `digest_self.replay`: 9270 local / 17910 external, 0 mismatched;
+  - `gsm8k_outputs` pass.
+- **G3.** `gsm8k_warm` / `replay_warm` efficiency 1.0 (hit
+  0.9925 / 0.9983); `no_eviction` 0.
+- **Preempt pass** (`...-it5-preempt-tp1-ebe69db`):
+  - G2.preempt PASS: 8917 local, 1552 external, 808 computed compared, 0
+    mismatched;
+  - `gsm8k_outputs` pass;
+  - about 34 flushes, 0 fences.
+- **Save stats, replay:**
+  - fences=6, fence_ms 179.8 total (max 151 ms) over 4627 steps;
+  - flushes=3 (43.5 ms);
+  - gsm8k had 0 fences and 0 flushes.
+
+  Fencing is rare because a freed block usually goes back to the end of
+  vLLM's free queue.
+
+**Diagnostic pass** (`2026-10-26-qwen3-4b-p5-diag-tp1-ebe69db`): same
+rev, diag hook, replay only, not official. Values are warm2 / warm3;
+"before" is the baa8b49 probe above.
+
+| | native | v2 before (baa8b49) | v2 it5 (ebe69db) |
+|---|---|---|---|
+| client ttft p50 (s) | 0.681 / 0.646 | 0.564 / 0.620 | 0.537 / 0.550 |
+| rps | 8.84 / 8.87 | 10.01 / 9.98 | 10.15 / 10.10 |
+| finished-not-freed excl blocks/step mean (max) | 0 | 126 (1553) / 135 (1553) | **0 (0) / 0 (0)** |
+| finished-not-freed hold, steps/request | 0 | 3.2 / 3.4 | **0** |
+| t3-4 TTFT steps p50 (mean) | 13 (31.1) / 12 (30.8) | 24 (37.9) / 25 (38.8) | 22 (34.1) / 22 (33.9) |
+| all t>0 TTFT steps p50 (mean) | 15 (33.4) / 14 (33.3) | 27 / 29 | 24 (33.8) / 24 (33.8) |
+| `alloc_fail` head episodes | 108 / 105 | 144 / 149 | 148 / 150 |
+| blocked steps in episodes | 824 / 823 | 833 / 865 | 803 / 803 |
+| episode len p50 / p90 | 1 / 52, 2 / 52 | 2 / 9, 2 / 8 | 2 / 12, 2 / 13 |
+| shortfall covered by finished-held blocks | 0 | 33% of t3-4 waiting steps | 0 / 1784, 0 / 1763 |
+| head shortfall p50 / mean (blocks) | 116 / 150 | 71 / 110, 86 / 100 | 106 / 125, 106 / 122 |
+| async-held blocks/step mean | 425 / 420 | 436 / 437 | 487 / 486 |
+| async admit→running steps p50 / mean / p90 | 5 / 4.6 / 6 | 5 / 5.8-6.0 / 9 | 5 / 5.7 / 9 |
+| lookup µs/call, ms/step | 306, 0.30 | 1173-1324, 1.1-1.3 | 1186-1210, 1.12-1.14 |
+| preempted requests | 0 | 0 | 2 / 2 |
+
+**Hold distribution.**
+- Before: 126-135 exclusive blocks per step, mean; 3.2-3.4 steps per
+  finished request; max 1553 blocks.
+- After: 0 at every step. The hook saw no finished-not-freed request in
+  any v2 step, the same as native.
+
+**Convoys** (official TP1 run, `tp1rt.py`). t>0 ttft_steps p50, native →
+v2:
+
+| convoy | warm2 | warm3 |
+|---|---|---|
+| 1 (lone) | 19 → 31 | 19 → 41 |
+| 2-3 | 18 → 16 | 69 → 14 |
+| 4-7 | 8 → 6 | 7 → 5 |
+| 8+ | 6 → 8 | 6 → 8 |
+
+v2 has 146 lone arrivals vs native's 76, because its higher rps spreads
+requests out. Means are about equal (34.4 vs 34.8 steps).
+
+**Reading.**
+- The finished-request hold is gone (0 blocks/step). v2's client p50
+  went from behind native to ahead (-10.5%), and rps is +13%.
+- In steps, t3-4 improved 24-25 → 22. That is the first-order share the
+  probe predicted for removing the hold (a median episode ending about 2
+  steps earlier).
+- The remaining step gap to native (22 vs 12-13) is not a hold:
+  - finished-held covers 0 of the shortfall;
+  - the blocker is the full-ISL check on an async head, the same as in
+    native;
+  - v2's steps are 13% shorter (23 vs 26.5 ms), so it takes more steps
+    for the same wall time;
+  - v2's async loads land 1-2 steps later (p90 9 vs 6), which is
+    base-server load-copy throughput (a server limitation).
+- Episodes are more frequent but shorter (p90 12-13 vs native 52).
+- The 2 preemptions per pass are new (0 before). They come from more
+  admitted work under the same KV budget. The preempt gate covers their
+  correctness (flush, 0 mismatched).
+
+### it5 TP2 (`2026-10-26-qwen3-4b-p5-it5-tp2-5c3ab63`)
+
+This is the official TP2 gate on the head: GPUs 3,4, native + v2,
+replay and gsm8k, base server. The ebe69db TP2 run was stopped in its
+native arm and superseded. Exit 1 is structural only (no
+plain/baseline arms).
+
+| | native | v2 5c3ab63 | v2/native |
+|---|---|---|---|
+| ttft p50 warm2 / warm3 (s) | 0.1638 / 0.1669 | 0.1410 / 0.1506 | 0.86 / 0.90 |
+| ttft mean warm2 / warm3 (s) | 0.1660 / 0.1731 | 0.1399 / 0.1502 | 0.84 / 0.87 |
+| rps warm2 / warm3 | 18.99 / 18.95 | 18.61 / 18.57 | 0.980 / 0.980 |
+| ms/step warm2 / warm3 | 16.40 / 16.33 | 17.35 / 17.38 | +0.95 / +1.05 |
+| gsm8k acc cold / warm | 0.8605 / 0.8605 | 0.8605 / 0.8605 | equal |
+| gsm8k warm s | 117.6 | 114.9 | |
+
+- **G4 report.** ttft_p50 median is -11.8% vs native; rps is -2.0%. The
+  rps gap is the same as before: 02b6767 was -1.9%, 7bc785a -3.4%.
+- **G2.** `digest_self.gsm8k`: 342696 local / 10946 external, 0
+  mismatched. `digest_self.replay`: 48996 local / 5364 external, 0
+  mismatched. `gsm8k_outputs` pass.
+- **G3.** gsm8k_warm and replay_warm efficiency 1.0 (hit
+  0.9925 / 0.9983, same as before); `no_eviction` pass.
+- **Save stats.** Replay had fences=0 and flushes=0; "load planning
+  failed" counts 0.
+- **Reading.** At TP2 the KV budget is twice as large and the t3-4 head
+  is rarely short, so the finished-request hold was not binding. TP2
+  stays where it was: p50 ahead of native, rps about 2% behind. The rps
+  gap is the per-step cost already attributed (target (a): ms/step +1 ms,
+  part of it lookup cost). It is not a hold. It5 neither costs nor buys
+  anything here.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
