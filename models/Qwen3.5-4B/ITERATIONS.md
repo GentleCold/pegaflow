@@ -1182,6 +1182,39 @@ warm requests, same replay content as it7):
   under-test 18607c1 (old fence), one with c8a8842. Judge v2-vs-native
   within each run.
 
+### it3 same-run A/B (2026-10-26): keep, neutral to slightly positive
+
+Runs `2026-10-26-qwen3-4b-p5-it3-ab-old-18607c1` and `-new-c8a8842`:
+GPU0, TP1, gate c8a8842, back-to-back, replay only, `--arms native,v2`.
+KV is 71,472 tokens in all four arms, so the pool is no longer a
+confound. Both runs exit 1 only because they are not official (no plain,
+baseline or gsm8k).
+
+| run | arm | warm2/3 TTFT p50 | mean | p90 | req/s |
+|---|---|---|---|---|---|
+| old 18607c1 | native | 0.565/0.469 | 0.975/0.937 | 2.16/2.12 | 9.288/9.220 |
+| old 18607c1 | v2 | 0.672/0.736 | 0.865/0.874 | 1.82/1.79 | 9.568/9.485 |
+| new c8a8842 | native | 0.505/0.537 | 0.959/0.973 | 2.14/2.15 | 9.133/9.185 |
+| new c8a8842 | v2 | 0.663/0.696 | 0.854/0.859 | 1.81/1.80 | 9.568/9.509 |
+
+- G4 medians vs native: p50 +36.1% (old) and +30.5% (new) behind; req/s
+  2.9% and 4.2% ahead.
+- v2 from old to new: p50 -1.3%/-5.4%, mean -1.3%/-1.7%, req/s equal.
+  - Hold (sent_wait/sent) falls from 107.7 to 67.2 ms (max 1521 to 1042).
+  - Job wait (33.8 ms) is unchanged, and so is the share of pressure
+    RPCs (2032/2066 and 2026/2063).
+- Noise: native's p50 moves by about 10% between the two runs (0.469 to
+  0.537 on warm3).
+- The v2 p50 gap is the same in both runs and is not caused by the fence.
+  - Turn 0 (`t0.py`): v2 gives convs 1-31 local=0 and loads 54,144
+    external tokens, admitting about one conv per step. Native gives
+    local=1264 and loads 14,990, admitting at steps 2-4. This is it4's
+    target.
+  - Turns > 0 that load: v2's queue p50 is 30-32 steps vs native's
+    10-12, while the load round trip is the same (p50 7 steps).
+  - ITL: v2 24.4-24.7 ms vs native 23.5-24.3 ms (within about 1 ms).
+- Decision: keep it3.
+
 ## it4 (2026-10-26): wait for in-flight async loads (e985938, not gated yet)
 
 ### Attribution (TP2 official, confirmed offline on TP1)
