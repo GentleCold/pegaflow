@@ -18,7 +18,7 @@ model regresses.
 | G1 Semantics vectors | `cargo test -p pegaflow-semantics`; each new Kind/Shard ships vectors for resolve / saveable / needed / seal_plan | hard (outside `run_gate`'s exit code) |
 | G2 Correctness | byte digests of every loaded block, output identity, gsm8k accuracy, controls | hard |
 | G3 Hit rate, unlimited store | `H`, `H*`, `E_ext`, excess, no eviction | excess, load errors, no eviction hard; levels reported |
-| G4 Performance | TTFT, req/s, wall time vs the in-run `native` | cold replay and gsm8k overhead hard; warm replay reported and judged |
+| G4 Performance | TTFT, req/s, wall time vs the in-run `native` | gsm8k overhead hard; replay cold and warm reported and judged |
 | G5 Capacity hit rate | `E_C` at a fixed store size `C` | correctness, load proof, run validity hard; `E_C` reported |
 
 G2 also requires, outside `run_gate`, greedy output identity with baseline vLLM
@@ -29,9 +29,10 @@ first); `|warm - baseline|` and `|cold - baseline| <= 1.0pp`.
 
 ## Hit rate
 
-No hit-rate level is a hard gate. The agent judges whether it is enough; it
-must not be far off. G4 warm replay vs `native` is judged the same way (G4,
-"Perf vs native judgment").
+No hit-rate level is a hard gate. The agent iterates until it judges that no
+connector-side headroom is left, with every remaining gap attributed. G4
+replay vs `native` is judged the same way (G4, "Perf vs native judgment").
+"Close enough" is not a stopping point.
 
 - Reported, never gated: `H`, `H*`, `E_ext`, `H*_C`, `H_lru`, `H_freeze`,
   `E_C`, oracle hit rate, per-group attribution. Each verdict carries a
@@ -49,8 +50,11 @@ must not be far off. G4 warm replay vs `native` is judged the same way (G4,
 - Hit-rate judgment, per accepted run, in
   `rsi-notes:models/<model>/ITERATIONS.md`: measured vs `H*` / `H*_C` and the
   reference arms (`H_lru`, `native`; `old`, `lmcache` when run), every gap explained
-  (Kind limits, retention, eviction, per-group misses), and whether it is
-  close enough. A warm gsm8k pass that loads little says little about loaded
+  (Kind limits, retention, eviction, per-group misses) and split into
+  connector-side headroom, server (GATES.md "Known server limits"), Kind /
+  vLLM structure and noise; the connector-side hypotheses tried (with
+  results) and why each remaining one is not worth trying, with numbers.
+  `H*_C` is a ceiling, not a target. A warm gsm8k pass that loads little says little about loaded
   KV; say so. The review agent checks the numbers against
   `summary.hit_report` and the explanation against the attribution, and can
   reject the run on it.
@@ -93,8 +97,7 @@ current gate.json `controls` record of `--tp` ("Onboarding controls").
 | `G2.caught_per_group` | negative self-tests | every sabotaged group caught in both gsm8k digest checks | Self-test arms |
 | `G3.gsm8k_warm`, `G3.replay_warm` | store arms | excess within one block per request, no load errors | G3 |
 | `G3.no_eviction` | store arms | no server eviction in any gsm8k / replay pass | G3 |
-| `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` | arm under test only | reported, never fails (no `pass` key); judged | G4 |
-| `G4.replay_cold.{ttft_p50,req_per_s}` | store arms but `native` | at most 2% worse than `native` cold | G4 |
+| `G4.replay_{cold,warm}.{ttft_p50,req_per_s}_vs_native` | arm under test only | reported, never fails (no `pass` key); judged | G4 |
 | `G4.gsm8k_{cold,warm}.seconds` | store arms but `native` | wall time at most 2% worse than `native`'s same pass | G4 |
 | `G4.warmup_seconds` | store arms but `native` | reported only | Passes |
 | `G5.replay_warm` | store arms | at `f = 0.5`: excess, load errors, refs, `G2.digest_self.cap`, pool and load proof | G5 verdicts |
@@ -501,10 +504,11 @@ local))`.
 
 ## G4 Performance (hard)
 
-Every G4 reference is the in-run `native` arm. The overhead checks are hard;
-warm replay vs `native` is reported and judged. Store arms other than
-`native` get the overhead checks (required only for the arm under test;
-`old` / `lmcache` record them); only the arm under test gets `*_vs_native`.
+Every G4 reference is the in-run `native` arm. The gsm8k overhead check is
+hard (the regression floor); replay cold and warm vs `native` are reported
+and judged. Store arms other than `native` get the gsm8k check (required
+only for the arm under test; `old` / `lmcache` record it); only the arm
+under test gets `*_vs_native`.
 Self-test arms, `plain`, `baseline` and `native` get no G4 verdict. Baseline
 has no perf role (its replay runs `cold` only).
 
@@ -517,14 +521,16 @@ p99 recorded, not gated.
 
 | Check | Rule |
 |---|---|
-| `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` | reported, not gated: `warm2..N` vs `native`'s `warm2..N`. Arm under test only. `reason` set when native has no replay stage (missing or crashed: run non-official), when native's replay or the arm's has no timed warm pass with the key |
-| `G4.replay_cold.ttft_p50`, `.req_per_s` | at most 2% worse than `native` cold (bounds the save cost) |
-| `G4.gsm8k_{cold,warm}.seconds` | at most 2% worse than `native`'s same pass (bounds per-step overhead); a missing or crashed native gsm8k stage fails it (no reference) |
+| `G4.gsm8k_{cold,warm}.seconds` | hard: at most 2% worse than `native`'s same pass (bounds per-step overhead); a missing or crashed native gsm8k stage fails it (no reference) |
+| `G4.replay_cold.{ttft_p50,req_per_s}_vs_native` | reported, not gated: `cold` vs `native`'s `cold` (the save cost). Arm under test only |
+| `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` | reported, not gated: `warm2..N` vs `native`'s `warm2..N`. Arm under test only |
 | last accepted iteration | no > 5% regression (by hand) |
 
-Every gated replay G4 check is void (fail) if `G2.digest_self.replay`
-fails; a `*_vs_native` record is marked `void` then. The overhead bar is
-relative to native, which carries its own save cost: an arm that costs as
+A `*_vs_native` record carries `reason` when native has no replay stage
+(missing or crashed: run non-official), or when native's replay or the
+arm's has no pass of that stage with the key; it is marked `void` when
+`G2.digest_self.replay` fails (the arm fails on that verdict). The gsm8k bar
+is relative to native, which carries its own save cost: an arm that costs as
 much as vLLM's own offloading passes; one that costs more than 2% beyond it
 fails. G2 references stay baseline's (native fails `G0.spec` by
 construction).
@@ -534,20 +540,35 @@ construction).
 Each `*_vs_native` record holds both arms' pass values, medians and
 pass-to-pass ranges, `gap` (median - native median), `gap_pct` (of native's
 median; TTFT positive = slower, req/s negative = slower), `noise` (the larger
-range) and `within_noise` (`|gap| <= noise`, a diagnostic); median, gap and
-noise are absent when either side has no timed warm pass with the key.
+range) and `within_noise` (`|gap| <= noise`, a diagnostic; `null` for
+`replay_cold`, one pass per side, so no range); median, gap and noise are
+absent when either side has no pass of that stage with the key.
 `summary.native_report` (the `[gate] perf vs native (reported, not gated)`
 line) lists median, native median, `gap_pct`, `behind_pct` (positive = the
 arm is slower than native, for either metric), `within_noise`, `void`,
 `reason` per arm and key.
 
-Per accepted run, in `rsi-notes:models/<model>/ITERATIONS.md` next to the
-hit-rate judgment: the gap in %, attributed (load path, save path,
-scheduling, server), and whether it is close enough. No numeric threshold: a
-gap within run noise or a few percent is close; a large gap needs attribution
-and a hypothesis before acceptance (compare the load paths first: sync vs
-async load, load round trip in steps, per-request load size). The review
-agent checks the judgment against `summary.native_report`.
+Stopping rule: a model is not done when it is close to native. The agent
+iterates, one hypothesis at a time, until it judges that no connector-side
+optimization is left. Per accepted run, in
+`rsi-notes:models/<model>/ITERATIONS.md` next to the hit-rate judgment:
+
+- the remaining gap in % for warm replay, cold replay and gsm8k, each split
+  into four parts with numbers: connector (load path, save path,
+  scheduling), server ("Known server limits": not ours to fix), vLLM /
+  native structural differences (e.g. native's in-process CPU copy vs a
+  server round trip, layouts), and noise (pass-to-pass ranges);
+- the connector-side hypotheses tried, each with its result, and why each
+  remaining one is not worth trying, with numbers (measured upper bound of
+  its gain, cost, or a guard below that rules it out).
+
+Compare the load paths first: sync vs async load, load round trip in steps,
+per-request load size. Guards stay: the server is out of scope, `H*_C` is a
+ceiling and not a target, no tuning to the trace (held-out slice), and the
+policy complexity budget (skill step 5). The review agent checks the
+numbers against `summary.native_report` and that the attribution holds (no
+connector-side part labeled server, structural or noise without evidence),
+and can reject the run on it.
 
 ## G5 Capacity hit rate
 
@@ -683,7 +704,7 @@ Preempt per-group counts and output deltas are reported only.
 `OffloadingConnector` via `--kv-offloading-size`,
 `kv_connector_extra_config = {"cpu_bytes_to_use": B}`, no server; `B` =
 `--pool-size` (gsm8k / replay) or `C` (cap). Required in every official run:
-it is every G4 reference (cold replay and gsm8k overhead hard, warm replay
+it is every G4 reference (gsm8k overhead hard, replay cold and warm
 judged); `E_C` reported. It switches `kv_cache_layout` to `LBHNC`, so `G0.spec` and
 `G2.digest_vs_baseline.gsm8k` fail by construction; `G2.digest_self.*` and
 `G2.gsm8k_outputs` are its correctness evidence.

@@ -100,18 +100,27 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    `not_official_because`). The connector under test must read
    `PEGAFLOW_PORT` and tolerate an empty `kv_connector_extra_config`; vLLM
    runs with `kv_load_failure_policy=recompute`.
-5. **Optimize**: hit-rate levels (E_ext, E_C) are reported, not gated
-   (GATES.md "Hit rate"). Write a "hit-rate judgment" in the notes'
-   ITERATIONS.md for every accepted run: measured hit rate vs H* / H*_C and
-   the reference arms (H_lru, native; old / lmcache only if run), every gap
-   explained, and whether it is close enough. Next to it write a "perf vs
-   native judgment" (GATES.md G4: warm gap vs `native` in %, attributed,
-   close enough or not; the cold replay and gsm8k overhead vs native is
-   hard). If either is not close enough, or perf is below target, form a
-   hypothesis from metrics (fallbacks per group, unused loads, write
-   amplification, stranded bytes per group, save/load time), change the
-   lowest layer that fixes it, rerun. One hypothesis per iteration, record
-   the result even if negative. Hypothesis checklist (extend it):
+5. **Optimize**: hit-rate levels (E_ext, E_C) and replay perf vs native
+   are reported, not gated (GATES.md "Hit rate", G4); gsm8k seconds within
+   2% of native is hard. Stopping rule: iterate until you judge that no
+   connector-side optimization is left, for hit rate and for perf; "close
+   enough to native" is not a stop. For every accepted run write, in the
+   notes' ITERATIONS.md:
+   - a "hit-rate judgment": measured hit rate vs H* / H*_C and the
+     reference arms (H_lru, native; old / lmcache only if run), every gap
+     split into connector headroom, server, Kind / vLLM structure and
+     noise;
+   - a "perf vs native judgment" (GATES.md G4): the remaining gap in % for
+     warm replay, cold replay and gsm8k, each split into connector, server
+     (known server limits, not ours to fix), vLLM / native structural
+     differences, and noise, with numbers;
+   - the connector-side hypotheses tried (results, negative ones too) and
+     why each remaining one is not worth trying, with numbers.
+   While connector-side headroom remains, form a hypothesis from metrics
+   (fallbacks per group, unused loads, write amplification, stranded bytes
+   per group, save/load time), change the lowest layer that fixes it,
+   rerun. One hypothesis per iteration, record the result even if
+   negative. Hypothesis checklist (extend it):
    - window groups: save only the trailing window, not every block;
    - checkpoint groups: save only at boundaries that requests resume from;
    - state that cannot be resumed (`prefix_cacheable=False`, ring buffers): never save;
@@ -144,8 +153,10 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
    gate integrity (nothing relaxed), the hit-rate and perf vs native
-   judgments (numbers against `summary.hit_report` / `native_report`, gaps
-   explained), copying from the old connector,
+   judgments (numbers against `summary.hit_report` / `native_report`; the
+   four-way attribution holds: nothing connector-side labeled server,
+   structural or noise without evidence; the reasons for stopping are
+   backed by numbers), copying from the old connector,
    regressions on earlier models, the policy complexity rules above (grep
    `policy.py` for model / spec class names, count knobs and lines, unused
    knobs), and that the connector does not touch the probe (GATES.md
@@ -160,9 +171,10 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    `baseline` for the correctness columns (gsm8k accuracy, preempt /
    resume, cap reference local hit). `old` and `lmcache` get a row only if
    run, else "not run (optional)" (or "not comparable" with the GATES.md
-   reason). The G4 table shows v2 next to `native`: cold replay TTFT p50 and
-   req/s and gsm8k seconds (hard, at most 2% worse), warm replay TTFT p50 and
-   req/s with the perf vs native judgment. Do not wait for the user: the
+   reason). The G4 table shows v2 next to `native`: gsm8k seconds (hard, at
+   most 2% worse), cold and warm replay TTFT p50 and req/s (reported), with
+   the perf vs native judgment and its attribution. Accept only once the
+   judgments say no connector-side optimization is left. Do not wait for the user: the
    review agent's pass is the acceptance; the user does one acceptance pass
    at the end. Compact the model's ITERATIONS.md (section "Notes and code
    branches").
@@ -227,15 +239,16 @@ Gate reading:
 - `rsi_poison` goes through `POST /collective_rpc`; kwargs arrive as strings
   over HTTP, so call methods without kwargs (or cast inside).
 - G4's reference is the in-run `native`, never baseline (baseline is the
-  correctness reference; its replay runs `cold` only). Hard: at most 2%
-  worse than native on cold replay (TTFT p50, req/s) and gsm8k seconds.
-  Read every `G4.*` verdict; the save path's cost shows in the cold and
-  gsm8k checks. A 64-question gsm8k slice cannot resolve 2% (~10 s): use
+  correctness reference; its replay runs `cold` only). Hard: gsm8k seconds
+  at most 2% worse than native (the regression floor). Read every `G4.*`
+  verdict; the save path's cost shows in gsm8k and in the reported cold
+  replay gap. A 64-question gsm8k slice cannot resolve 2% (~10 s): use
   the full 1319 when a G4 gsm8k check is the target.
-- G4 warm vs `native` is judged, not gated (`*_vs_native` reported,
-  `summary.native_report`). vLLM's OffloadingConnector is the bar
-  (Qwen3.5-4B: native warm TTFT p50 0.172 s, v2 0.300 s, vLLM without a
-  store 1.12 s): a large gap needs attribution and a hypothesis; compare v2's and native's load path
+- G4 replay cold and warm vs `native` are judged, not gated (`*_vs_native`
+  reported, `summary.native_report`). vLLM's OffloadingConnector is the
+  reference, not the finish line (Qwen3.5-4B: native warm TTFT p50 0.172
+  s, v2 0.300 s, vLLM without a store 1.12 s): keep iterating while the
+  connector-side part of the gap is not exhausted; compare v2's and native's load path
   first (sync vs async load, load round trip in steps, per-request load
   size) before touching policy. A native replay that loads nothing makes
   the run non-official: fix the native arm's setup or have the gate owner

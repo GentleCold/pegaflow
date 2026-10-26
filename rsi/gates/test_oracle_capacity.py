@@ -1899,7 +1899,7 @@ def test_warmup_seconds_reported_not_gated():
         return {"passes": {"_warmup": {"seconds": w}, "cold": {"ttft_p50": c, "req_per_s": 1.0}}}
 
     nat_gsm = {"passes": {"_warmup": {"seconds": 0.5}}}
-    g = run_gate._perf_verdicts(rep(3.0, 1.0), rep(1.0, 1.0), None, nat_gsm, True)
+    g = run_gate._perf_verdicts(rep(3.0, 1.0), rep(1.0, 1.0), None, nat_gsm)
     assert g["G4.warmup_seconds"] == {
         "replay": {"value": 3.0, "native": 1.0},
         "gsm8k": {"value": None, "native": 0.5},
@@ -1970,12 +1970,12 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
         assert x["gap"] == x["median"] - x["native_median"]
         assert x["noise"] == max(x["range"], x["native_range"])
         assert x["gap_pct"] == pytest.approx(pct, abs=0.01) and x["within_noise"] is w
-    assert g["G4.replay_cold.ttft_p50"]["pass"] and g["G4.replay_cold.req_per_s"]["pass"]
+    assert not any(k.startswith("G4.replay") and "pass" in x for k, x in g.items())
     rep = run_gate.native_report(v)["pegaflow.m:C"]
     for k, pct, lower in zip(NATIVE_KEYS, gap_pct, (True, False), strict=True):
         assert rep[k]["gap_pct"] == g[k]["gap_pct"]
         assert rep[k]["behind_pct"] == pytest.approx(pct if lower else -pct, abs=0.01)
-    # A wrong-KV replay marks the comparison void (the arm fails on G2 / G4.replay_cold).
+    # A wrong-KV replay marks the comparison void (the arm fails on G2.digest_self.replay).
     results["pegaflow.m:C"]["replay"]["digest_self"] = None
     g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
     assert all("void" in g[k] and "pass" not in g[k] for k in NATIVE_KEYS)
@@ -2024,7 +2024,7 @@ def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
     results |= {"old": rep, "lmcache": rep, "selftest-honest": rep, "pegaflow.m:C": rep}
     v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
     for label in ("native", "old", "lmcache", "selftest-honest"):
-        assert not any(k in v[label] for k in NATIVE_KEYS), label
+        assert not any(k.endswith("_vs_native") for k in v[label]), label
     assert all(v["pegaflow.m:C"][k]["status"] == "reported" for k in NATIVE_KEYS)
 
 
@@ -2185,22 +2185,23 @@ def _gsm(seconds: float) -> dict:
         ((100.0, 5.0), (100.0, 5.0), True),
         ((102.0, 4.9), (100.0, 5.0), True),  # exactly 2% worse on every key
         ((103.0, 5.0), (100.0, 5.0), False),  # gsm8k 3% slower than native
-        ((100.0, 4.85), (100.0, 5.0), False),  # replay cold req/s 3% lower
+        ((100.0, 4.5), (100.0, 5.0), True),  # replay cold 10% behind: reported only
         ((90.0, 6.0), (100.0, 5.0), True),  # faster than native
     ],
-    ids=["tie", "at-2pct", "gsm8k-3pct", "replay-cold-3pct", "faster"],
+    ids=["tie", "at-2pct", "gsm8k-3pct", "replay-cold-10pct-reported", "faster"],
 )
 def test_g4_overhead_is_vs_native(tmp_path, mine, native, ok):
-    """G4 is hard on overhead vs the in-run native arm: gsm8k seconds and
-    replay cold TTFT p50 / req/s at most MAX_OVERHEAD worse. The baseline has
-    no perf role: a baseline far faster than both arms changes nothing, and
-    the warm-vs-baseline checks are gone."""
+    """G4 is hard on gsm8k seconds only (the regression floor): at most
+    MAX_OVERHEAD worse than the in-run native arm. Replay cold TTFT p50 /
+    req/s vs native is reported (no ``pass`` key), like warm: a 10% gap does
+    not fail. The baseline has no perf role: a baseline far faster than both
+    arms changes nothing."""
     secs, rps = mine
     nsecs, nrps = native
 
     def rep(r):
         x = _replay(0.3, 8.0)
-        x["passes"]["cold"] = {"ttft_p50": 1.0, "req_per_s": r}
+        x["passes"]["cold"] = {"ttft_p50": 1.0 * nrps / r, "req_per_s": r}
         return x
 
     cap = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
@@ -2217,10 +2218,15 @@ def test_g4_overhead_is_vs_native(tmp_path, mine, native, ok):
     }
     g, _ = _resume_run(tmp_path, True, False, label="pegaflow.m:C", extra=extra, mirror=("native",))  # fmt: skip
     g4 = {k: x for k, x in g.items() if k.startswith("G4.") and isinstance(x, dict) and "pass" in x}
-    assert set(g4) == {"G4.replay_cold.ttft_p50", "G4.replay_cold.req_per_s", "G4.gsm8k_cold.seconds", "G4.gsm8k_warm.seconds"}  # fmt: skip
+    assert set(g4) == {"G4.gsm8k_cold.seconds", "G4.gsm8k_warm.seconds"}
     assert all("native" in x and "baseline" not in x for x in g4.values())
     assert all(x["pass"] for x in g4.values()) is ok, g4
     assert g["pass"] is ok, {k: x for k, x in g.items() if isinstance(x, dict) and x.get("pass") is False}  # fmt: skip
+    for key, lower in run_gate.G4_NATIVE_KEYS:
+        x = g[f"G4.replay_cold.{key}_vs_native"]
+        assert x["status"] == "reported" and "pass" not in x and x["within_noise"] is None
+        assert x["gap_pct"] == pytest.approx(100 * (nrps / rps - 1) if lower else 100 * (rps / nrps - 1))  # fmt: skip
+    assert run_gate.native_report({"a": g})["a"]["G4.replay_cold.req_per_s_vs_native"]["behind_pct"] == pytest.approx(100 * (1 - rps / nrps))  # fmt: skip
     # Native gsm8k crashed: no reference, fail closed.
     extra["native"]["gsm8k"] = {"error": "RuntimeError: boom"}
     g, _ = _resume_run(tmp_path / "n", True, False, label="pegaflow.m:C", extra=extra, mirror=("native",))  # fmt: skip
@@ -2244,8 +2250,8 @@ def test_optional_reference_arms_evaluated_when_present(tmp_path):
     for ref in ("old", "lmcache"):
         assert v[ref]["required"] is False
         assert {"G2.digest_self.replay", "G3.replay_warm", "G5.replay_warm"} <= set(v[ref])
-        assert "native" in v[ref]["G4.replay_cold.ttft_p50"]
-    assert "G4.replay_cold.ttft_p50" not in v["native"]  # the reference itself
+        assert "native" in v[ref]["G4.gsm8k_cold.seconds"]
+    assert "G4.gsm8k_cold.seconds" not in v["native"]  # the reference itself
 
 
 @pytest.mark.parametrize(

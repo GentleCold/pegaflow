@@ -102,11 +102,11 @@ ACC_TOL = 0.01
 MIN_EFFICIENCY = 0.95  # G3 E_ext reference
 ORACLE_FLOOR = {"gsm8k": 0.5, "replay": 0.5}  # warm oracle hit rate below it: E says little
 MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are judged
-# G4: every perf reference is the in-run ``native`` arm. Passes with little to
-# reuse from the store (replay cold: vLLM's own prefix cache serves the
-# earlier turns; gsm8k: the shared few-shot prefix) bound the connector's
-# overhead: at most MAX_OVERHEAD worse than native's. Warm replay vs native is
-# reported and judged (``_native_perf_verdicts``).
+# G4: every perf reference is the in-run ``native`` arm. gsm8k (little to
+# reuse from the store: the shared few-shot prefix) bounds the connector's
+# per-step overhead, hard: at most MAX_OVERHEAD worse than native's (the
+# regression floor). Replay cold and warm vs native are reported and judged
+# (``_native_perf_verdicts``).
 MAX_OVERHEAD = 0.02
 # G5: store capacity as a fraction of the cap trace's unique KV bytes; only
 # CAPACITY_FRACTION is gated (and run by default). ``--cap-curve`` adds the
@@ -2669,10 +2669,11 @@ def _timed_warm(r: dict[str, Any] | None) -> tuple[str, ...]:
     return tuple(n for n in ps if n.startswith("warm") and n != "warm")
 
 
-# G4 warm keys reported for the arm under test against the native reference
-# arm (vLLM's OffloadingConnector) in the same run: a judged comparison, not
-# a gate.
+# G4 replay keys reported for the arm under test against the native
+# reference arm (vLLM's OffloadingConnector) in the same run, per replay
+# stage (``cold``; timed warm ``warm2..N``): a judged comparison, not a gate.
 G4_NATIVE_KEYS = (("ttft_p50", True), ("req_per_s", False))
+G4_NATIVE_STAGES = ("replay_cold", "replay_warm")
 # Run validity, not a bar on any arm (hit levels stay reported):
 # a native replay whose timed warm passes serve less than this share of the
 # oracle's external hits is not a working store, so it is no G4 reference
@@ -2684,43 +2685,53 @@ NATIVE_MIN_EFFICIENCY = 0.9
 def _native_perf_verdicts(
     rep: dict[str, Any] | None, native_rep: dict[str, Any] | None, replay_ok: bool
 ) -> dict[str, Any]:
-    """G4 warm replay vs the in-run ``native`` arm, ``reported`` (no ``pass``
-    key: never fails the arm or the exit code). The onboarding agent judges
-    it in the "perf vs native judgment" (GATES.md G4). Per key: both arms'
-    timed warm pass values, medians, pass-to-pass ranges, ``gap`` (median -
-    native median), ``gap_pct`` (of native's median; for TTFT positive is
-    slower, for req/s negative is slower), ``noise`` (the larger range) and
-    ``within_noise`` (|gap| <= noise, a diagnostic). Only native's timing is
+    """G4 replay vs the in-run ``native`` arm, ``reported`` (no ``pass``
+    key: never fails the arm or the exit code), for ``cold`` and the timed
+    warm passes. The onboarding agent judges both in the "perf vs native
+    judgment" (GATES.md G4). Per stage and key: both arms' pass values,
+    medians, pass-to-pass ranges, ``gap`` (median - native median),
+    ``gap_pct`` (of native's median; for TTFT positive is slower, for
+    req/s negative is slower), ``noise`` (the larger range) and
+    ``within_noise`` (|gap| <= noise, a diagnostic; ``None`` for replay
+    ``cold``: one pass per side, so no range). Only native's timing is
     used. ``void`` when the arm's replay KV was wrong (its timing measures
     nothing then)."""
     g: dict[str, Any] = {}
-    for key, lower in G4_NATIVE_KEYS:
-        mine = _pass_values(rep, _timed_warm(rep), key)
-        theirs = _pass_values(native_rep, _timed_warm(native_rep), key)
-        v: dict[str, Any] = {"status": "reported", "lower_is_better": lower}
-        v |= {"value": mine, "native": theirs}
-        if mine and theirs:
-            a, b = _median(mine), _median(theirs)
-            rng, nrng = max(mine) - min(mine), max(theirs) - min(theirs)
-            v |= {
-                "median": a,
-                "native_median": b,
-                "range": rng,
-                "native_range": nrng,
-                "gap": a - b,
-                "gap_pct": 100 * (a - b) / b if b else None,
-                "noise": max(rng, nrng),
-                "within_noise": abs(a - b) <= max(rng, nrng),
-            }
-        if not replay_ok:
-            v["void"] = "G2.digest_self.replay fails: the timing is not comparable"
-        if native_rep is None:
-            v["reason"] = "no native replay stage in this run"
-        elif not theirs:
-            v["reason"] = f"native replay has no timed warm pass with {key}"
-        elif not mine:
-            v["reason"] = f"no timed warm pass with {key}"
-        g[f"G4.replay_warm.{key}_vs_native"] = v
+    for stage in G4_NATIVE_STAGES:
+        what = "cold pass" if stage == "replay_cold" else "timed warm pass"
+
+        def names(r: dict[str, Any] | None, stage: str = stage) -> tuple[str, ...]:
+            return ("cold",) if stage == "replay_cold" else _timed_warm(r)
+
+        for key, lower in G4_NATIVE_KEYS:
+            mine = _pass_values(rep, names(rep), key)
+            theirs = _pass_values(native_rep, names(native_rep), key)
+            v: dict[str, Any] = {"status": "reported", "lower_is_better": lower}
+            v |= {"value": mine, "native": theirs}
+            if mine and theirs:
+                a, b = _median(mine), _median(theirs)
+                rng, nrng = max(mine) - min(mine), max(theirs) - min(theirs)
+                # One cold pass per side: no range, so no noise estimate.
+                noise = None if stage == "replay_cold" else max(rng, nrng)
+                v |= {
+                    "median": a,
+                    "native_median": b,
+                    "range": rng,
+                    "native_range": nrng,
+                    "gap": a - b,
+                    "gap_pct": 100 * (a - b) / b if b else None,
+                    "noise": noise,
+                    "within_noise": abs(a - b) <= noise if noise is not None else None,
+                }
+            if not replay_ok:
+                v["void"] = "G2.digest_self.replay fails: the timing is not comparable"
+            if native_rep is None:
+                v["reason"] = "no native replay stage in this run"
+            elif not theirs:
+                v["reason"] = f"native replay has no {what} with {key}"
+            elif not mine:
+                v["reason"] = f"no {what} with {key}"
+            g[f"G4.{stage}.{key}_vs_native"] = v
     return g
 
 
@@ -2772,18 +2783,14 @@ def _perf_verdicts(
     nat_rep: dict[str, Any] | None,
     gsm: dict[str, Any] | None,
     nat_gsm: dict[str, Any] | None,
-    replay_ok: bool,
 ) -> dict[str, Any]:
-    """G4 overhead vs the in-run ``native`` arm, hard: replay ``cold`` and
-    gsm8k ``cold`` / ``warm`` at most ``MAX_OVERHEAD`` worse than native's
-    same pass (a missing native number fails: no reference). Replay numbers
-    only count when the replay KV was correct (``replay_ok``)."""
+    """G4 overhead vs the in-run ``native`` arm, hard: gsm8k ``cold`` /
+    ``warm`` seconds at most ``MAX_OVERHEAD`` worse than native's same pass
+    (a missing native number fails: no reference), the regression floor.
+    Replay vs native is reported (``_native_perf_verdicts``); ``rep`` /
+    ``nat_rep`` feed only the reported warmup."""
     passes = _pass_values
     g: dict[str, Any] = {}
-    for key, lower in (("ttft_p50", True), ("req_per_s", False)):
-        v = _cmp(passes(rep, ("cold",), key), passes(nat_rep, ("cold",), key), lower, MAX_OVERHEAD)
-        v["pass"] = v["pass"] and replay_ok
-        g[f"G4.replay_cold.{key}"] = v
     for name in ("cold", "warm"):
         g[f"G4.gsm8k_{name}.seconds"] = _cmp(
             passes(gsm, (name,), "seconds"),
@@ -3151,18 +3158,16 @@ def verdicts(
                 "evicted": evicted,
             }
         if kind != "native":
-            # Overhead vs native (hard for the arm under test; old / lmcache
-            # record it). Native is the reference, so it gets none.
+            # gsm8k overhead vs native (hard for the arm under test; old /
+            # lmcache record it). Native is the reference, so it gets none.
             nat = {
                 wl: r
                 for wl, r in results.get("native", {}).items()
                 if wl in ("replay", "gsm8k") and "error" not in r
             }
-            g |= _perf_verdicts(
-                rep, nat.get("replay"), gsm, nat.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
-            )
+            g |= _perf_verdicts(rep, nat.get("replay"), gsm, nat.get("gsm8k"))
         if kind not in _REFERENCE:
-            # The arm under test only: warm replay vs native's, reported.
+            # The arm under test only: replay cold / warm vs native's, reported.
             nat_rep = results.get("native", {}).get("replay")
             g |= _native_perf_verdicts(
                 rep,
