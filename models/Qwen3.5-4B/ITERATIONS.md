@@ -1182,6 +1182,45 @@ warm requests, same replay content as it7):
   under-test 18607c1 (old fence), one with c8a8842. Judge v2-vs-native
   within each run.
 
+## it4 (2026-10-26): wait for in-flight async loads (e985938, not gated yet)
+
+### Attribution (TP2 official, confirmed offline on TP1)
+- Qwen3-4B warm turn 0: convs 1-31 share a 1264-token prefix with conv0.
+  - TP2 official: all 32 lookups land within 33 ms (steps are ~18 ms).
+    Every lookup is a full hit planned before conv0's load lands.
+  - TP1 slice and it7 warm2, from `t0.py`: v2 gives convs 1-31 local=0,
+    admitted about one per step (steps 0-32), 54,144 external tokens.
+    Native admits them at steps 2-6 with local=1264, 14,990 external
+    tokens. Cold is identical in both arms (local=1264, steps 1-7).
+- Mechanism: vLLM caches an async load's blocks only once it lands
+  (`delay_cache_blocks`, `_update_waiting_for_remote_kv`). vLLM's
+  OffloadingConnector returns None while a hit chunk is in
+  `_chunks_being_loaded` (`offloading/scheduler.py` ~612-630, 920-943).
+  v2 had no such wait, so every sharer loads its own copy.
+- Qwen3.5-4B is different: warm2 turn 0 is local=0 in both arms (50,688
+  external tokens each). The 1056-token prefix (2 x 528 blocks) is local
+  only in cold. Native admits about one conv per 4 steps, v2 all 32
+  within steps 0-4. The gain from the wait there is open.
+
+### Hypothesis H4 (e985938)
+- When another request's async load writes blocks that, with vLLM's
+  local hit, give a resume point past it (`semantics.resolve`),
+  `get_num_new_matched_tokens` returns None. It does not query, so no
+  lease is held.
+- Tracking: (sid, hash) refcounts of the blocks each non-sync, non-failed
+  load plan writes. They are cleared on `finished_recving` /
+  `failed_recving` in `update_connector_output` (before vLLM caches the
+  blocks that pass) and on `request_finished`.
+- Bounds: `loading_wait_ms` per request; sync loads are never tracked;
+  off without prefix caching. No new knob. Counted as `deferred`.
+- Prediction: Qwen3-4B warm turn 0 gets local=1264 for convs 1-31,
+  external tokens fall toward native's, warm req/s returns to at least
+  native. Turns >= 1 and cold are unchanged. Qwen3.5: neutral or small.
+- Gate plan: after the it3 A/B and the Qwen3.5 plain self-test rerun
+  (stale controls record). Qwen3-4B TP1 and a TP2 slice, then Qwen3.5,
+  e985938 vs c8a8842. It replaces the 512-token async-start budget
+  hypothesis unless an admission-burst cost remains after it.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
