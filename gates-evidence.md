@@ -250,3 +250,7 @@ slice `2026-10-26-qwen3-4b-tp2-slice-4bb7d8d` has `G2.split_control` 0/64,
 0/128, batch 0/64, both output controls 0 differ. `spec-tp2.json` is the
 slice's baseline gsm8k dump; the self-test's fresh one has 0 `G0.spec` diffs
 against it.
+
+## KV pool size follows the compile cache
+
+Since fcd0534 every arm gets a fresh compile cache, and a fresh compile profiles 9.82 GiB of KV (71,472 tokens on Qwen3-4B TP1). An AOT load from the shared `~/.cache/vllm` profiles 10.4 GiB (75,696 tokens). Within a run all arms compile fresh, so v2 vs native stays fair. Cross-run comparisons with records whose logs show `Directly load AOT` (e.g. it7 `2026-10-25-qwen3-4b-p4-it7-off-a59a254`) need this caveat: the -5.6% pool shifted v2's warm p50 vs native from -1% to +17.5% in `2026-10-26-qwen3-4b-p5-it3-slice-c8a8842` (P5 it3).
