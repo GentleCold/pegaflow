@@ -535,10 +535,13 @@ class Scheduler:
                     "blocks on this layout, saves disabled for this process"
                 )
         else:
-            # A preempted request keeps its fence entry: the flush finishes
-            # its older saves, so a later finish costs nothing extra.
-            if any(True for _ in preempted):
+            for req_id in preempted:
                 self._plan.flush = True
+                # The flush finishes the saves of its freed blocks. Keeping
+                # the fence would hold a request that finishes (e.g. aborted)
+                # while re-loading: vLLM would free the load's blocks on our
+                # finished_sending before the load is done.
+                self._saving.pop(req_id, None)
         self._plan.flush |= self._flush_always
         if kv_usage is None:
             if not self._kv_usage_warned:

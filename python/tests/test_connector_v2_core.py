@@ -1351,36 +1351,60 @@ def test_finish_fences_on_the_requests_last_save(outcomes, release, expected):
     worker.shutdown()
 
 
-@pytest.mark.parametrize(
-    "resume,fence",
-    [
-        # Rescheduled after the preemption and saved again: fence on that save.
-        pytest.param(True, 2, id="saved-after-resume"),
-        # Finished (e.g. aborted) without saving again: fence on the save from
-        # before the preemption, which the preemption flush already finished.
-        pytest.param(False, 0, id="no-save-after-resume"),
-    ],
-)
-def test_preempted_request_fences_on_its_last_save(resume, fence):
+def test_preempted_request_fences_on_its_last_save():
+    """The preemption flush finishes a's older saves; after resuming, a fences
+    on its new save only, not on c's later job (the old fence waited for it)."""
     sched, worker, gates, step, done = _fence_rig()
     step([("a", 0, 13)])  # step 0: job 1
     gates[0].set()  # lets the preemption flush finish
-    plan = step([("b", 0, 13)], preempted=("a",))  # step 1: flush, job 2 (b) pending
+    plan = step([("b", 0, 13)], preempted=("a",))  # step 1: flush, job 2 (b)
     assert plan.flush and worker._completed == 1
-    if resume:
-        step([("a", 0, 13)])  # step 2: recompute, job 3
-    else:
-        step([])
+    step([("a", 0, 13)])  # step 2: recompute, job 3
+    step([("c", 0, 13)])  # step 3: job 4 (c)
     assert sched.request_finished("a") is True
-    plan = step([])
-    assert plan.finished == {"a": fence}
-    assert worker.poll()[0] == (set() if resume else {"a"})
+    assert step([]).finished == {"a": 2}
     gates[1].set()
-    if resume:
-        assert worker.poll()[0] == set()  # b's job is done, a's is not
-        gates[2].set()
-        done(3)
-        assert worker.poll()[0] == {"a"}
+    gates[2].set()
+    done(3)
+    assert worker.poll()[0] == {"a"}  # c's job 4 is still pending
+    gates[3].set()
+    worker.shutdown()
+
+
+def test_preempted_request_finishing_while_reloading_is_not_held():
+    """A preempted request re-admitted with an async load and then aborted must
+    not be reported in finished_sending: vLLM would free the blocks the load
+    still copies into, then fail on the load's finished_recving."""
+    layout = _layout(StubSemantics, StubFullSpec())
+    sched, _ = _sched(StubSemantics, {0: Ready(3, b"L0")}, layout=layout)
+    pending = FakeLoadState(ready=False)
+    worker = _worker(StubSemantics, FakeRpc(), [pending], layout=layout)
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    req = _req()
+    sched.on_new_request(req)
+    polls = []
+
+    def step(scheduled, tables=lambda rid: None, preempted=()):
+        sched.plan_saves(scheduled, tables, preempted)
+        plan = sched.take_plan()
+        worker.start(plan)
+        if plan.flush:
+            worker.flush(5)
+        worker.save(plan)
+        polls.append(worker.poll())
+
+    step([("r", 0, 13)], lambda rid: ([10, 11, 12, 13],))  # r saves
+    step([], preempted=("r",))
+    n, is_async = sched.get_num_new_matched_tokens(req, 0)
+    assert n and is_async
+    sched.update_state_after_alloc(req, ([20, 21, 22, 23],), n)
+    step([])  # the load is issued
+    assert sched.request_finished("r") is False  # aborted while loading
+    step([])
+    pending.ready = True
+    step([])
+    assert [sending for sending, _, _ in polls] == [set()] * 5
+    assert polls[-1][1] == {"r"}
     worker.shutdown()
 
 
@@ -1571,10 +1595,9 @@ def test_save_flush_before_block_reuse(specs, preempted, flush):
     sched.take_plan()
     sched.plan_saves([], lambda rid: None, preempted)
     assert sched.take_plan().flush is flush
-    # Preempted or not, the finish fences on the request's last save (step
-    # 0); after a preemption the flush has already finished it.
-    assert sched.request_finished("r") is True
-    assert sched.take_plan().finished == {"r": 0}
+    # A preempted request's saves are covered by the flush: no hold at finish.
+    assert sched.request_finished("r") is (not preempted)
+    assert sched.take_plan().finished == ({} if preempted else {"r": 0})
 
 
 class FakePool:

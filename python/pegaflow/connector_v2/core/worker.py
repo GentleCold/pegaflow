@@ -475,7 +475,7 @@ class Worker:
         The server pins one region per entry, freed only once all of its
         blocks are evicted: folding steps into one entry per layer makes
         regions span more requests and strands more evicted bytes (measured
-        in the DeepSeek-V2-Lite batching A/B).
+        in the full-only batching A/B, rsi-notes).
         """
         if not self._held:
             return
