@@ -5,5 +5,27 @@
  "vllm_args": [],
  "lmcache_dist": "lmcache-0.5.7.dev0+pr4467.e05c2ea",
  "gsm8k_vllm_args": ["--compilation-config", "{\"inductor_compile_config\":{\"deterministic\":true}}"],
+ "controls": {
+  "tp1": {
+   "run": "2026-10-26-qwen3-4b-p5-s1-4bb7d8d", "rev": "4bb7d8d59", "gsm8k_limit": 0,
+   "inputs": {
+    "files": {"rsi/gates/rsi_probe.py": "36e130a31c2ee83cae34ae50f8e5bad789d5e4d613fe7467249a8c4f2fff811b", "rsi/gates/workloads.py": "002df1520705878ee83d2f22a65d6cb3b48b0696bfbaaab772c240ad6c4cc28f"},
+    "code": {"vllm_server": "2345286eb4fe24957712b5c2ba2029b4b7fe0ce2f7fc19dd28c078e0d44a541b", "split_control": "7ac5ca1fc4134121c19ac7ecfed34a1289049ce6a502d950929cb39af2007ed9", "batch_control": "3b955111dded7291693e288c32093acfd5128ac25f17bfb00d6796365aa604c6", "_plain_equals_baseline": "a6e0529d613b7613cce6075bd1c7e6c232e8b9f6d73ac659f142a335a52bf1b1", "_split_control_verdict": "f0661c0cced8f92477b3274152f571e77363c504e488b395e70cd491921b3140", "_batch_control_verdict": "93ed972ebdb2a71c95e097b84fca2b8fe2185c00db54bcaddea1c32f68ab4d91"},
+    "constants": {"SPLIT_PASSES": ["split_ref", "split"], "MIN_PREWARMED": 0.9, "BATCH_PASS": "alone", "BATCH_CONTROL_N": 64, "ALONE_REF": "alone_ref"},
+    "profile": {"shots": 8, "concurrency": 32, "max_model_len": 8192, "max_num_batched_tokens": 2048, "max_num_seqs": 256},
+    "settings": {"attention_backend": null, "invariant_attention_backend": "FLASH_ATTN", "batch_invariant": true, "split_invariant": null, "vllm_args": [], "gsm8k_vllm_args": ["--compilation-config", "{\"inductor_compile_config\":{\"deterministic\":true}}"]}
+   }
+  },
+  "tp2": {
+   "run": "2026-10-26-qwen3-4b-tp2-selftest-478187e", "rev": "478187e", "gsm8k_limit": 128,
+   "inputs": {
+    "files": {"rsi/gates/rsi_probe.py": "36e130a31c2ee83cae34ae50f8e5bad789d5e4d613fe7467249a8c4f2fff811b", "rsi/gates/workloads.py": "002df1520705878ee83d2f22a65d6cb3b48b0696bfbaaab772c240ad6c4cc28f"},
+    "code": {"vllm_server": "2345286eb4fe24957712b5c2ba2029b4b7fe0ce2f7fc19dd28c078e0d44a541b", "split_control": "7ac5ca1fc4134121c19ac7ecfed34a1289049ce6a502d950929cb39af2007ed9", "batch_control": "3b955111dded7291693e288c32093acfd5128ac25f17bfb00d6796365aa604c6", "_plain_equals_baseline": "a6e0529d613b7613cce6075bd1c7e6c232e8b9f6d73ac659f142a335a52bf1b1", "_split_control_verdict": "f0661c0cced8f92477b3274152f571e77363c504e488b395e70cd491921b3140", "_batch_control_verdict": "93ed972ebdb2a71c95e097b84fca2b8fe2185c00db54bcaddea1c32f68ab4d91"},
+    "constants": {"SPLIT_PASSES": ["split_ref", "split"], "MIN_PREWARMED": 0.9, "BATCH_PASS": "alone", "BATCH_CONTROL_N": 64, "ALONE_REF": "alone_ref"},
+    "profile": {"shots": 8, "concurrency": 32, "max_model_len": 8192, "max_num_batched_tokens": 2048, "max_num_seqs": 256},
+    "settings": {"attention_backend": null, "invariant_attention_backend": "FLASH_ATTN", "batch_invariant": true, "split_invariant": null, "vllm_args": [], "gsm8k_vllm_args": ["--compilation-config", "{\"inductor_compile_config\":{\"deterministic\":true}}"]}
+   }
+  }
+ },
  "notes": "Dense full attention, one KV group. Batch invariance on FLASH_ATTN makes gsm8k outputs and KV bytes comparable across runs. gsm8k stages compile with deterministic inductor: with per-arm compile caches every arm compiles fresh, and two default compiles pick different reduction configs (plain, baseline and connector_v2 all differed on a slice; GATES.md, 'Compile determinism')."
 }

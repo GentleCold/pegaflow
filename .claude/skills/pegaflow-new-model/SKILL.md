@@ -61,10 +61,16 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    `--tp N` (the gate reads only the dump of the run's `--tp`; a TP without
    one is never official), and have the gate owner write
    `docs/rsi/models/<model>/gate.json` (batch / split invariance, backend,
-   `vllm_args`, `gsm8k_vllm_args`, `lmcache_dist`). Accept the model's gate
-   only if the baseline controls pass, honest passes and every negative arm
-   is caught; otherwise the gate is blind on this model and must be fixed
-   first. Note groups, spec classes, block sizes, page bytes, TP shard info.
+   `vllm_args`, `gsm8k_vllm_args`, `lmcache_dist`). The self-test's `plain`
+   arm runs the onboarding controls (`G2.plain_equals_baseline`,
+   `G2.split_control`, `G2.batch_control`); when they pass, the gate owner
+   copies `summary.control_inputs` into gate.json `controls["tp<N>"]`
+   (GATES.md "Onboarding controls"). Routine runs have no `plain` and are
+   official only while that record is current: a probe, workload-driver,
+   control-code or gate.json setting change makes it stale, and the
+   self-test with `plain` is rerun. Accept the model's gate only if the
+   baseline controls pass, honest passes and every negative arm is caught;
+   otherwise the gate is blind on this model and must be fixed first. Note groups, spec classes, block sizes, page bytes, TP shard info.
    If `oracle.py` raises "no Kind mapping", or the self-test connector raises
    NotImplementedError, stop: the gate owner maps the spec class first
    (gates are not the agent's to edit).
@@ -75,15 +81,17 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 3. **Adapter/policy**: add the minimum adapter code for unknown spec classes;
    put model knobs in `models/<model>`. Prefer policy changes over adapter changes.
 4. **Gates**: on the 4090 host (10.1.0.44) from the feature dir, run the
-   command in GATES.md "Usage" with `--arms
-   plain,baseline,old,native,lmcache,<module>:<Class>`, `--under-test-path`
-   and the model's lmcache overlay (gate.json `lmcache_dist`: Qwen3-4B
+   command in GATES.md "Usage" with `--arms baseline,native,<module>:<Class>`
+   and `--under-test-path`. `baseline` is the correctness reference, `native`
+   every perf reference (both required). `old` and `lmcache` are optional
+   reference arms: add them only when their numbers are wanted (lmcache then
+   needs the model's overlay, gate.json `lmcache_dist`: Qwen3-4B
    `~/kexi/overlays/lmcache-pr4467`, DeepSeek-V2-Lite `~/kexi/overlays/lmcache`
-   (0.5.6; PR #4467 crashes on MLA); a new model declares the build it
-   validated, else the run is not official). `native` is required (G4's warm
-   reference); drop `lmcache` only where GATES.md "lmcache status per model"
-   says it is not comparable (cite it), and never use a wrong-KV reference
-   number (e.g. a curve point whose `digest_self` fails). Add `,preempt` to
+   (0.5.6; PR #4467 crashes on MLA); a model without `lmcache_dist` cannot
+   run it officially). `--cap-curve` adds the reported G5 curve (0.25 / 0.75)
+   and stays official. Never use a wrong-KV reference number (e.g. a curve
+   point whose `digest_self` fails, or lmcache where GATES.md "lmcache
+   status per model" says not comparable). Add `,preempt` to
    `--workloads` on models with a Mamba state group. The run record lands in
    `~/kexi/rsi-runs/<date>-<tag>/summary.json`; put verdicts + hit table into
    the notes' ITERATIONS.md. Iterate on slices first (`--gsm8k-limit 64
@@ -95,10 +103,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 5. **Optimize**: hit-rate levels (E_ext, E_C) are reported, not gated
    (GATES.md "Hit rate"). Write a "hit-rate judgment" in the notes'
    ITERATIONS.md for every accepted run: measured hit rate vs H* / H*_C and
-   the reference arms (H_lru, old, native, lmcache), every gap explained, and
-   whether it is close enough. Next to it write a "perf vs native judgment"
-   (GATES.md G4: warm gap vs `native` in %, attributed, close enough or
-   not). If either is not close enough, or perf is below target, form a
+   the reference arms (H_lru, native; old / lmcache only if run), every gap
+   explained, and whether it is close enough. Next to it write a "perf vs
+   native judgment" (GATES.md G4: warm gap vs `native` in %, attributed,
+   close enough or not; the cold replay and gsm8k overhead vs native is
+   hard). If either is not close enough, or perf is below target, form a
    hypothesis from metrics (fallbacks per group, unused loads, write
    amplification, stranded bytes per group, save/load time), change the
    lowest layer that fixes it, rerun. One hypothesis per iteration, record
@@ -147,10 +156,13 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 7. **Accept**: mark the model done in the notes' PROGRESS.md with the
    accepted numbers: the hit-rate table (local / external / total hit,
    oracle H*, E_ext; at capacity H*_C, H_lru, E_C) next to the G4 perf
-   table, one row each for the arm under test (v2), `old`, `native` and
-   `lmcache` (or "not comparable" with the GATES.md reason). The G4 table
-   shows warm replay TTFT p50 and req/s of v2 next to `baseline` and
-   `native`, with the perf vs native judgment. Do not wait for the user: the
+   table, one row each for the arm under test (v2) and `native`, plus
+   `baseline` for the correctness columns (gsm8k accuracy, preempt /
+   resume, cap reference local hit). `old` and `lmcache` get a row only if
+   run, else "not run (optional)" (or "not comparable" with the GATES.md
+   reason). The G4 table shows v2 next to `native`: cold replay TTFT p50 and
+   req/s and gsm8k seconds (hard, at most 2% worse), warm replay TTFT p50 and
+   req/s with the perf vs native judgment. Do not wait for the user: the
    review agent's pass is the acceptance; the user does one acceptance pass
    at the end. Compact the model's ITERATIONS.md (section "Notes and code
    branches").
@@ -214,16 +226,16 @@ Gate reading:
   (`float('1e999')`).
 - `rsi_poison` goes through `POST /collective_rpc`; kwargs arrive as strings
   over HTTP, so call methods without kwargs (or cast inside).
-- G4 is hard: beat baseline on warm replay (TTFT p50 and req/s) and cost at
-  most 2% on cold replay and gsm8k. Read every `G4.*` verdict; the save
-  path's cost shows in the cold and gsm8k checks. A 64-question gsm8k slice
-  cannot resolve 2% (~10 s): use the full 1319 when a G4 gsm8k check is the
-  target.
+- G4's reference is the in-run `native`, never baseline (baseline is the
+  correctness reference; its replay runs `cold` only). Hard: at most 2%
+  worse than native on cold replay (TTFT p50, req/s) and gsm8k seconds.
+  Read every `G4.*` verdict; the save path's cost shows in the cold and
+  gsm8k checks. A 64-question gsm8k slice cannot resolve 2% (~10 s): use
+  the full 1319 when a G4 gsm8k check is the target.
 - G4 warm vs `native` is judged, not gated (`*_vs_native` reported,
-  `summary.native_report`). vLLM's OffloadingConnector beats baseline by a
-  wide margin (Qwen3.5-4B: native warm TTFT p50 0.172 s, v2 0.300 s,
-  baseline 1.12 s), so beating baseline alone is not the bar: a large gap
-  needs attribution and a hypothesis; compare v2's and native's load path
+  `summary.native_report`). vLLM's OffloadingConnector is the bar
+  (Qwen3.5-4B: native warm TTFT p50 0.172 s, v2 0.300 s, vLLM without a
+  store 1.12 s): a large gap needs attribution and a hypothesis; compare v2's and native's load path
   first (sync vs async load, load round trip in steps, per-request load
   size) before touching policy. A native replay that loads nothing makes
   the run non-official: fix the native arm's setup or have the gate owner

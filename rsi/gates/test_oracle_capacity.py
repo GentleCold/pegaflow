@@ -896,6 +896,10 @@ def test_unique_estimate_matches_the_measured_hybrid_trace():
 @pytest.mark.parametrize(
     "over,key,ok",
     [
+        pytest.param({"cap_fractions": "0.5"}, "cap_fractions", True, id="fractions-gated-only"),
+        pytest.param(
+            {"cap_fractions": run_gate.CAP_CURVE}, "cap_fractions", True, id="fractions-curve"
+        ),  # fmt: skip
         pytest.param(
             {"cap_fractions": "0.75,0.5,0.25"}, "cap_fractions", True, id="fractions-reordered"
         ),  # fmt: skip
@@ -903,8 +907,9 @@ def test_unique_estimate_matches_the_measured_hybrid_trace():
             {"cap_fractions": "0.5,0.25,0.75,0.5"}, "cap_fractions", True, id="fractions-dup"
         ),  # fmt: skip
         pytest.param(
-            {"cap_fractions": "0.25,0.5"}, "cap_fractions", False, id="fractions-missing"
+            {"cap_fractions": "0.25,0.5"}, "cap_fractions", False, id="fractions-partial-curve"
         ),  # fmt: skip
+        pytest.param({"cap_fractions": "0.25"}, "cap_fractions", False, id="fractions-no-gated"),
         pytest.param({"replay_skip": 0}, "replay_skip", True, id="replay-skip-0"),
         pytest.param({"replay_skip": 32}, "replay_skip=32 (held-out", False, id="held-out"),
         pytest.param(
@@ -925,7 +930,8 @@ def test_unique_estimate_matches_the_measured_hybrid_trace():
     ],
 )
 def test_official_args(tmp_path, over, key, ok):
-    """cap_fractions compare as sets; ``--replay-skip`` > 0 is a held-out
+    """cap_fractions compare as sets: the gated 0.5 alone or the whole
+    ``--cap-curve``; ``--replay-skip`` > 0 is a held-out
     slice of the trace, never official; the arm under test's module must be
     in the ``pegaflow`` package (M8: the only one the snapshot holds); the
     lmcache arm is official only with LMCache's default chunk size."""
@@ -1863,36 +1869,40 @@ def test_pool_check_fails_before_an_evicting_store(pool, fits):
 
 
 def test_contamination_marks_not_drops():
+    """Native is the reference (every G4 number is vs native); the baseline's
+    replay has no G4 role and is never looked at."""
     rep = lambda **p: {"replay": {"passes": {k: {"ttft_p99": v} for k, v in p.items()}}}  # noqa: E731
     results = {
-        "baseline": rep(cold=1.0, warm2=0.5, warm3=0.5),
+        "baseline": rep(cold=500.0),
+        "native": rep(cold=1.0, warm2=0.5, warm3=0.5),
         "old": rep(cold=9.0, warm2=6.0, warm3=0.4),
         "X": rep(cold=1.0, warm=50.0, warm2=0.5, warm3=5.0, _warmup=99.0),
     }
     got = {(c["arm"], c["pass"]) for c in run_gate.contamination(results)}
     # 9x and exactly 10x pass; 12x is flagged; untimed warm / _warmup ignored.
     assert got == {("old", "warm2")}
-    # S8: a baseline stall (p99 > 10x the arms' median for that pass).
-    results["baseline"] = rep(cold=1.0, warm2=0.5, warm3=40.0)
+    # A native stall (p99 > 10x the other arms' median for that pass).
+    results["native"] = rep(cold=1.0, warm2=0.5, warm3=40.0)
     got = {(c["arm"], c["pass"]) for c in run_gate.contamination(results)}
-    assert ("baseline", "warm3") in got  # median(0.4, 5.0) = 2.7; 40 > 27
-    results["baseline"] = rep(cold=1.0, warm2=0.5, warm3=27.0)
+    assert ("native", "warm3") in got  # median(0.4, 5.0) = 2.7; 40 > 27
+    results["native"] = rep(cold=1.0, warm2=0.5, warm3=27.0)
     got = {(c["arm"], c["pass"]) for c in run_gate.contamination(results)}
-    assert ("baseline", "warm3") not in got
+    assert ("native", "warm3") not in got
+    assert not any(c["arm"] == "baseline" for c in run_gate.contamination(results))
 
 
 def test_warmup_seconds_reported_not_gated():
-    """S9: ``passes._warmup.seconds`` per arm vs baseline, in the G4 verdicts
+    """S9: ``passes._warmup.seconds`` per arm vs native, in the G4 verdicts
     without a ``pass`` key (reported, not gated)."""
 
     def rep(w, c):
         return {"passes": {"_warmup": {"seconds": w}, "cold": {"ttft_p50": c, "req_per_s": 1.0}}}
 
-    base_gsm = {"passes": {"_warmup": {"seconds": 0.5}}}
-    g = run_gate._perf_verdicts(rep(3.0, 1.0), rep(1.0, 1.0), None, base_gsm, True)
+    nat_gsm = {"passes": {"_warmup": {"seconds": 0.5}}}
+    g = run_gate._perf_verdicts(rep(3.0, 1.0), rep(1.0, 1.0), None, nat_gsm, True)
     assert g["G4.warmup_seconds"] == {
-        "replay": {"value": 3.0, "baseline": 1.0},
-        "gsm8k": {"value": None, "baseline": 0.5},
+        "replay": {"value": 3.0, "native": 1.0},
+        "gsm8k": {"value": None, "native": 0.5},
     }
     assert "pass" not in g["G4.warmup_seconds"]
 
@@ -1945,7 +1955,7 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
     ("差不多就行了"), not a gate. ``*_vs_native`` is ``reported`` (no ``pass``
     key) and carries what the perf vs native judgment needs: per-arm pass
     values, medians, ranges, gap, gap %, noise, ``within_noise``. Native's
-    own G0 / G2 do not matter; G4 vs baseline stays hard."""
+    own G0 / G2 do not matter; the overhead bound vs native stays hard."""
     results = {"baseline": {"replay": _replay(5.0, 1.0)}}
     results |= {"pegaflow.m:C": {"replay": _replay(*mine)}}
     results |= {"native": {"replay": _replay(*native) | {"digest_self": None}}}
@@ -1960,12 +1970,12 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
         assert x["gap"] == x["median"] - x["native_median"]
         assert x["noise"] == max(x["range"], x["native_range"])
         assert x["gap_pct"] == pytest.approx(pct, abs=0.01) and x["within_noise"] is w
-    assert g["G4.replay_warm.ttft_p50"]["pass"] and g["G4.replay_warm.req_per_s"]["pass"]
+    assert g["G4.replay_cold.ttft_p50"]["pass"] and g["G4.replay_cold.req_per_s"]["pass"]
     rep = run_gate.native_report(v)["pegaflow.m:C"]
     for k, pct, lower in zip(NATIVE_KEYS, gap_pct, (True, False), strict=True):
         assert rep[k]["gap_pct"] == g[k]["gap_pct"]
         assert rep[k]["behind_pct"] == pytest.approx(pct if lower else -pct, abs=0.01)
-    # A wrong-KV replay marks the comparison void (the arm fails on G2 / G4 vs baseline).
+    # A wrong-KV replay marks the comparison void (the arm fails on G2 / G4.replay_cold).
     results["pegaflow.m:C"]["replay"]["digest_self"] = None
     g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
     assert all("void" in g[k] and "pass" not in g[k] for k in NATIVE_KEYS)
@@ -1985,6 +1995,10 @@ def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
     assert all(g[k]["reason"].startswith("no timed warm pass") and "gap" not in g[k] for k in NATIVE_KEYS)  # fmt: skip
 
 
+_NAT = _replay(0.3, 8.0)
+_NAT_GSM = {"passes": {p: {"accuracy": 1.0, "seconds": 1.0} for p in ("cold", "warm")}, "hit": _NAT["hit"], "load_errors": []}  # fmt: skip
+
+
 def test_g4_vs_native_never_fails_a_passing_arm(tmp_path):
     """An arm under test that passes every gated check still passes with its
     warm TTFT far behind native's, outside both pass-to-pass ranges
@@ -1995,8 +2009,8 @@ def test_g4_vs_native_never_fails_a_passing_arm(tmp_path):
     cap["digest_self"] |= {"external_compared": 1}
     gsm = {"hit": nat["hit"], "load_errors": []}
     arm = {"replay": _replay((0.2996, 0.2952), (14.6105, 14.6551)), "cap": cap, "gsm8k": gsm}
-    extra = {"baseline": {"replay": _replay(5.0, 1.0)}, "pegaflow.m:C": arm, "native": {"replay": nat}}  # fmt: skip
-    g, _ = _resume_run(tmp_path, True, False, label="pegaflow.m:C", extra=extra)
+    extra = {"baseline": {"replay": _replay(5.0, 1.0)}, "pegaflow.m:C": arm, "native": {"replay": nat, "gsm8k": _NAT_GSM}}  # fmt: skip
+    g, _ = _resume_run(tmp_path, True, False, label="pegaflow.m:C", extra=extra, mirror=("native",))  # fmt: skip
     assert g["pass"] is True, {k: x for k, x in g.items() if isinstance(x, dict) and x.get("pass") is False}  # fmt: skip
     t = g["G4.replay_warm.ttft_p50_vs_native"]
     assert t["gap_pct"] > 70 and abs(t["gap"]) > 10 * t["noise"]
@@ -2015,7 +2029,6 @@ def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
 
 
 ARMS_N = ["plain", "baseline", "native", "pegaflow.m:C"]
-_NAT = _replay(0.3, 8.0)
 
 
 @pytest.mark.parametrize(
@@ -2026,7 +2039,8 @@ _NAT = _replay(0.3, 8.0)
         (ARMS_N, ("gsm8k", "cap"), None, "workloads"),  # no replay: official_problems names it
         (ARMS_N, run_gate.WORKLOADS, None, "native replay stage missing"),
         (ARMS_N, run_gate.WORKLOADS, {"error": "RuntimeError: boom"}, "native replay stage missing"),
-        (ARMS_N, run_gate.WORKLOADS, _replay(0.3, 8.0, ("warm2",)), "native replay timed warm passes"),
+        (ARMS_N, run_gate.WORKLOADS, _replay(0.3, 8.0, ("warm2",)), "native replay passes"),
+        (ARMS_N, run_gate.WORKLOADS, _NAT | {"passes": {k: p for k, p in _NAT["passes"].items() if k != "cold"}}, "native replay passes"),  # no cold reference
         # Ran, but served (almost) nothing: times like baseline, so no reference.
         (ARMS_N, run_gate.WORKLOADS, _replay(5.0, 1.0, eff=0.0), "native replay is not a working store"),
         (ARMS_N, run_gate.WORKLOADS, _NAT | {"load_errors": [{}]}, "native replay is not a working store"),
@@ -2034,27 +2048,235 @@ _NAT = _replay(0.3, 8.0)
         (ARMS_N, run_gate.WORKLOADS, _replay(0.3, 8.0, eff=run_gate.NATIVE_MIN_EFFICIENCY), None),
     ],
     ids=["present", "arm-missing", "no-replay-workload", "no-replay", "replay-crashed",
-         "warm-pass-missing", "native-degenerate", "native-load-errors", "native-no-hit",
+         "warm-pass-missing", "cold-pass-missing", "native-degenerate", "native-load-errors", "native-no-hit",
          "native-at-floor"],
 )  # fmt: skip
 def test_official_needs_native_warm_replay(tmp_path, arms, wls, native, problem):
     """G4 vs native: a run without the native arm, whose native replay did
-    not produce every timed warm pass, or whose native replay is not a
+    not produce cold and every timed warm pass, or whose native replay is not a
     working store (judged from its replay data, not its G0 / G2), is not
     official. ``main`` adds ``g4_native_problems`` unconditionally; the
     arm / workload guard is inside it, so this covers the wiring's logic."""
     import argparse
 
     args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "tp": 1}))  # fmt: skip
-    results = {"baseline": {"replay": _replay(5.0, 1.0)}}
+    results = {"baseline": {"replay": {"passes": {"cold": {"ttft_p50": 5.0, "req_per_s": 1.0}}}}}
     if native is not None:
         results["native"] = {"replay": native}
     probs = run_gate.official_problems(args, arms, list(wls), *_official_files(tmp_path))
-    probs += run_gate.g4_native_problems(results, arms, list(wls))
+    probs += run_gate.g4_native_problems(results, arms, list(wls), args.replay_repeats)
     gap = [p for p in probs if "native" in p or p.startswith("workloads")]
     assert (gap == []) is (problem is None), probs
     assert problem is None or gap[0].startswith(problem), probs
     assert len([p for p in probs if p.startswith("native")]) <= 1, probs
+
+
+def _slim_args(tmp_path, **over):
+    import argparse
+
+    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "tp": 1, "lmcache_chunk_size": run_gate.LMCACHE_CHUNK, "lmcache_overlay": str(tmp_path)}  # fmt: skip
+    return argparse.Namespace(**(run_gate.OFFICIAL | fixed | over))
+
+
+def _controls_gate(gate: dict, tp: int = 1, **edit) -> dict:
+    """``gate`` with a controls record for ``tp`` measured at the current
+    inputs, then ``edit`` applied to the gate (a setting changed after)."""
+    rec = {"run": "r", "inputs": run_gate.control_inputs(gate)}
+    return gate | {"controls": {f"tp{tp}": rec}} | edit
+
+
+_SLIM = ["baseline", "native", "pegaflow.m:C"]
+_GATE = {"batch_invariant": True, "invariant_attention_backend": "FLASH_ATTN"}
+
+
+@pytest.mark.parametrize(
+    "arms,gate,tp,problem",
+    [
+        (_SLIM, _controls_gate(_GATE), 1, None),
+        (["plain", *_SLIM], {}, 1, None),  # plain measures the controls itself
+        ([*_SLIM, "old", "lmcache"], _controls_gate(_GATE | {"lmcache_dist": "lmcache-0.5.6"}), 1, None),  # fmt: skip
+        (_SLIM, _GATE, 1, "onboarding controls for --tp 1 not recorded"),
+        (_SLIM, _controls_gate(_GATE), 2, "onboarding controls for --tp 2 not recorded"),
+        (_SLIM, _controls_gate(_GATE, batch_invariant=False), 1, "onboarding controls for --tp 1 (gate.json, run r) are stale: settings.batch_invariant"),  # fmt: skip
+        (_SLIM, _controls_gate(_GATE, vllm_args=["--x"]), 1, "onboarding controls for --tp 1 (gate.json, run r) are stale: settings.vllm_args"),  # fmt: skip
+        (["native", "pegaflow.m:C"], _controls_gate(_GATE), 1, "arm baseline missing"),
+        (["baseline", "pegaflow.m:C"], _controls_gate(_GATE), 1, "arm native missing"),
+        (["baseline", "native"], _controls_gate(_GATE), 1, "arm under_test missing"),
+    ],
+    ids=["slim", "with-plain", "with-optional-refs", "no-controls-record", "other-tp-record",
+         "stale-setting", "stale-vllm-args", "no-baseline", "no-native", "no-arm-under-test"],
+)  # fmt: skip
+def test_official_arm_set(tmp_path, arms, gate, tp, problem):
+    """Official: baseline (correctness), native (perf) and the arm under
+    test; old, lmcache and plain are optional. Without plain the onboarding
+    controls come from gate.json ``controls["tp<N>"]``, which must have been
+    measured at the current ``control_inputs``."""
+    (tmp_path / "lmcache-0.5.6.dist-info").mkdir()
+    gate_file, committed = _official_files(tmp_path)
+    committed.write_text(json.dumps({"parallel": {"tp": tp}}))
+    probs = run_gate.official_problems(_slim_args(tmp_path, tp=tp), arms, list(run_gate.WORKLOADS), gate_file, committed, gate)  # fmt: skip
+    if problem is None:
+        assert probs == [], probs
+    else:
+        assert len(probs) == 1 and probs[0].startswith(problem), probs
+
+
+def _probe_edited(mp, tmp_path):
+    """A gate repo whose probe differs from this one's by one byte."""
+    for f in run_gate.CONTROL_FILES:
+        (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / f).write_bytes((run_gate.REPO / f).read_bytes())
+    probe = tmp_path / run_gate.CONTROL_FILES[0]
+    probe.write_bytes(probe.read_bytes() + b"\n")
+    mp.setattr(run_gate, "REPO", tmp_path)
+
+
+@pytest.mark.parametrize(
+    "part,mutate",
+    [
+        ("files.rsi/gates/rsi_probe.py", _probe_edited),
+        ("constants.BATCH_CONTROL_N", lambda mp, _t: mp.setattr(run_gate, "BATCH_CONTROL_N", 32)),
+        ("profile.shots", lambda mp, _t: mp.setitem(run_gate.OFFICIAL, "shots", 5)),
+    ],
+    ids=["probe", "constant", "profile"],
+)
+def test_onboarding_controls_go_stale(tmp_path, monkeypatch, part, mutate):
+    """A change to the probe, the workload driver, a control constant or the
+    gsm8k profile makes the recorded control run stale (rerun the self-test
+    with plain), and the problem names what changed."""
+    gate = _controls_gate(_GATE)
+    assert run_gate.controls_problem(gate, 1) is None
+    mutate(monkeypatch, tmp_path)
+    bad = run_gate.controls_problem(gate, 1)
+    assert bad and "stale" in bad and part in bad, bad
+
+
+def test_committed_controls_records_are_current():
+    """Every controls record committed in a gate.json was measured at the
+    current inputs: a gate change that touches the controls fails here, so
+    its PR carries a new self-test run (or drops the record)."""
+    for f in sorted((run_gate.REPO / "docs/rsi/models").glob("*/gate.json")):
+        gate = json.loads(f.read_text())
+        for tp in gate.get("controls", {}):
+            assert run_gate.controls_problem(gate, int(tp.removeprefix("tp"))) is None, f
+
+
+def test_without_plain_controls_are_onboarding_na(tmp_path):
+    """No plain arm: the three plain controls are ``na`` (they never fail or
+    pass vacuously on missing passes); with plain they are measured."""
+    keys = ("G2.plain_equals_baseline", "G2.split_control", "G2.batch_control")
+    base = {"baseline": {"gsm8k": {"vllm_cmd": ["vllm"], "passes": {"cold": {}, "warm": {}}}}}
+    v = run_gate.verdicts(base, tmp_path, tmp_path / "spec.json", {"batch_invariant": True})
+    for k in keys:
+        assert v["baseline"][k] == {"pass": True, "na": run_gate.ONBOARDING_NA}, k
+    plain = {"plain": {"gsm8k": {"vllm_cmd": ["vllm"], "passes": {"cold": {}, "alone": {}}}}}
+    v = run_gate.verdicts(base | plain, tmp_path, tmp_path / "spec.json", {"batch_invariant": True})
+    for k in keys:
+        assert "na" not in v["baseline"][k] and not v["baseline"][k]["pass"], k  # outputs missing
+
+
+def _gsm(seconds: float) -> dict:
+    return {"passes": {p: {"accuracy": 1.0, "seconds": seconds} for p in ("cold", "warm")}}
+
+
+@pytest.mark.parametrize(
+    "mine,native,ok",
+    [
+        ((100.0, 5.0), (100.0, 5.0), True),
+        ((102.0, 4.9), (100.0, 5.0), True),  # exactly 2% worse on every key
+        ((103.0, 5.0), (100.0, 5.0), False),  # gsm8k 3% slower than native
+        ((100.0, 4.85), (100.0, 5.0), False),  # replay cold req/s 3% lower
+        ((90.0, 6.0), (100.0, 5.0), True),  # faster than native
+    ],
+    ids=["tie", "at-2pct", "gsm8k-3pct", "replay-cold-3pct", "faster"],
+)
+def test_g4_overhead_is_vs_native(tmp_path, mine, native, ok):
+    """G4 is hard on overhead vs the in-run native arm: gsm8k seconds and
+    replay cold TTFT p50 / req/s at most MAX_OVERHEAD worse. The baseline has
+    no perf role: a baseline far faster than both arms changes nothing, and
+    the warm-vs-baseline checks are gone."""
+    secs, rps = mine
+    nsecs, nrps = native
+
+    def rep(r):
+        x = _replay(0.3, 8.0)
+        x["passes"]["cold"] = {"ttft_p50": 1.0, "req_per_s": r}
+        return x
+
+    cap = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    cap["digest_self"] |= {"external_compared": 1}
+    nat = rep(nrps)
+    arm = {"replay": rep(rps), "cap": cap, "gsm8k": _gsm(secs) | {"hit": nat["hit"], "load_errors": []}}  # fmt: skip
+    extra = {
+        "baseline": {
+            "replay": {"passes": {"cold": {"ttft_p50": 0.01, "req_per_s": 99.0}}},
+            "gsm8k": _gsm(1.0),
+        },  # fmt: skip
+        "pegaflow.m:C": arm,
+        "native": {"replay": nat, "gsm8k": _gsm(nsecs) | {"hit": nat["hit"], "load_errors": []}},
+    }
+    g, _ = _resume_run(tmp_path, True, False, label="pegaflow.m:C", extra=extra, mirror=("native",))  # fmt: skip
+    g4 = {k: x for k, x in g.items() if k.startswith("G4.") and isinstance(x, dict) and "pass" in x}
+    assert set(g4) == {"G4.replay_cold.ttft_p50", "G4.replay_cold.req_per_s", "G4.gsm8k_cold.seconds", "G4.gsm8k_warm.seconds"}  # fmt: skip
+    assert all("native" in x and "baseline" not in x for x in g4.values())
+    assert all(x["pass"] for x in g4.values()) is ok, g4
+    assert g["pass"] is ok, {k: x for k, x in g.items() if isinstance(x, dict) and x.get("pass") is False}  # fmt: skip
+    # Native gsm8k crashed: no reference, fail closed.
+    extra["native"]["gsm8k"] = {"error": "RuntimeError: boom"}
+    g, _ = _resume_run(tmp_path / "n", True, False, label="pegaflow.m:C", extra=extra, mirror=("native",))  # fmt: skip
+    assert not g["G4.gsm8k_cold.seconds"]["pass"] and not g["pass"]
+
+
+def test_optional_reference_arms_evaluated_when_present(tmp_path):
+    """old and lmcache are not run by default; when they are, they are
+    evaluated (G2 / G3 / G5, overhead vs native recorded) and never required."""
+    good = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    good["digest_self"] |= {"external_compared": 1}
+    results = {
+        "baseline": {},
+        "native": {"replay": _replay(0.3, 8.0), "cap": good},
+        "pegaflow.m:C": {"replay": _replay(0.3, 8.0), "cap": good},
+    }
+    v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
+    assert "old" not in v and "lmcache" not in v
+    results |= {ref: {"replay": _replay(0.3, 8.0), "cap": good} for ref in ("old", "lmcache")}
+    v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
+    for ref in ("old", "lmcache"):
+        assert v[ref]["required"] is False
+        assert {"G2.digest_self.replay", "G3.replay_warm", "G5.replay_warm"} <= set(v[ref])
+        assert "native" in v[ref]["G4.replay_cold.ttft_p50"]
+    assert "G4.replay_cold.ttft_p50" not in v["native"]  # the reference itself
+
+
+@pytest.mark.parametrize(
+    "argv,want",
+    [
+        ([], "0.5"),
+        (["--cap-curve"], run_gate.CAP_CURVE),
+        (["--cap-fractions", "0.5,0.75"], "0.5,0.75"),
+    ],
+    ids=["default-gated-only", "curve-flag", "explicit"],
+)
+def test_cap_curve_behind_flag(tmp_path, monkeypatch, argv, want):
+    """``main`` runs only the gated C = 0.5 by default; ``--cap-curve`` adds
+    0.25 / 0.75 (each point a full cap stage, still official), and
+    ``--cap-curve`` with ``--cap-fractions`` is an argument error."""
+
+    class Parsed(Exception):
+        pass
+
+    def parse(s):
+        raise Parsed(s)
+
+    monkeypatch.setattr(run_gate, "parse_fractions", parse)
+    monkeypatch.setattr(run_gate, "install_stop_handlers", lambda: None)
+    base = ["--model", "/m/X", "--tag", "t", "--runs-root", str(tmp_path)]
+    with pytest.raises(Parsed) as got:
+        run_gate.main(base + argv)
+    assert got.value.args == (want,)
+    with pytest.raises(SystemExit) as e:
+        run_gate.main(base + ["--cap-curve", "--cap-fractions", "0.5"])
+    assert e.value.code == 2
 
 
 def test_warmup_shares_no_prefix_with_workload():
@@ -2915,10 +3137,11 @@ def test_context_fingerprint_is_per_episode(tmp_path, ep0_byte, exact):
     assert run_gate._digest_verdict(d, None)["pass"] is (exact == 3)
 
 
-def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, resume_ok: bool = True, label: str = "selftest-honest", extra: dict | None = None):  # fmt: skip
+def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, resume_ok: bool = True, label: str = "selftest-honest", extra: dict | None = None, mirror: tuple[str, ...] = ()):  # fmt: skip
     """A gsm8k record of the baseline and arm ``label`` (an honest self-test
     arm by default); ``extra``: more stage fields per arm and workload,
-    merged into the record. Prompt 1
+    merged into the record; ``mirror``: more arms with the arm's gsm8k
+    probe and outputs (e.g. ``native``, the G4 reference). Prompt 1
     (``q``, 10 blocks) is computed from scratch in every pass: 10 judged warm
     blocks. Prompt 0 is 13 tokens (keys ``p:0..2``, not aligned to vLLM's
     16). Baseline
@@ -2964,6 +3187,7 @@ def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, re
     arm_digs.append(_blk_rec("xw", [(BT, "A1"), (2 * BT, "S2" if wrong else "A2"), (3 * BT, warm3)]))  # fmt: skip
     bp = probe("baseline", "gsm8k", base_reqs, base_digs)
     ap = probe(label, "gsm8k", arm_reqs, arm_digs)
+    mp = {m: probe(m, "gsm8k", arm_reqs, arm_digs) for m in mirror}
     committed.write_text(json.dumps(spec))
     acc = {p: {"accuracy": 1.0, "seconds": 1.0} for p in ("cold", "warm")}
     results: dict = {
@@ -2978,10 +3202,13 @@ def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, re
             "gsm8k": {"passes": acc, "digest_self": digest_compare.compare(ap, ap, True, split_inv)}
         },  # fmt: skip
     }
+    for m, d in mp.items():
+        results[m] = {"gsm8k": {"passes": acc, "digest_self": digest_compare.compare(d, d, True, split_inv)}}  # fmt: skip
     for lab, per in (extra or {}).items():
         results[lab] = results.get(lab, {}) | {wl: results.get(lab, {}).get(wl, {}) | r for wl, r in per.items()}  # fmt: skip
     two = ["ans", "ansq"]
     outs = {("baseline", "gsm8k", "cold"): two, (label, "gsm8k", "cold"): two, (label, "gsm8k", "warm"): two}  # fmt: skip
+    outs |= {(m, "gsm8k", p): two for m in mirror for p in ("cold", "warm")}
     if resume:
         rl = f"{run_gate.RESUME_PREFIX}{label}"
         pre = _ep_req("rp", "resume_prewarm", 0, [[2, 0, 0]], [[2, 2 * BT]], n=2)

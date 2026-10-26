@@ -9,26 +9,31 @@ Runs arms on one model and writes a run record:
       .gate/<arm>/<workload>/ what the gate writes and judges from: pass
                               outputs / tokens, result.json, stage-error.json
 
-Arms:
-  plain                    vLLM without any KV connector (gsm8k only; control)
-  baseline                 vLLM + RsiProbe only (no PegaFlow)
-  old                      reference connector (pegaflow.connector:PegaKVConnector), black box
+Arms (official: baseline, native and the connector under test):
+  baseline                 vLLM + RsiProbe only (no PegaFlow): the correctness reference
   native                   reference: vLLM's OffloadingConnector (CPU offload); verdicts not
-                           required, but the arm and its replay timing are (G4 warm reference)
-  lmcache                  reference: LMCache in-process connector, local CPU backend only, record only
-  selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k and preempt only
+                           required, but the arm and its timing are (G4 reference)
   <module>:<Class>         connector under test
+  plain                    vLLM without any KV connector (gsm8k only): the onboarding
+                           controls, run with the self-test (gate.json ``controls``)
+  old                      optional reference connector (pegaflow.connector:PegaKVConnector),
+                           black box, record only
+  lmcache                  optional reference: LMCache in-process connector, local CPU
+                           backend only, record only
+  selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k and preempt only
 
 Every arm/workload pair gets fresh servers. Passes: ``cold``, then before each
 warm pass ``/reset_prefix_cache`` (local only) and ``rsi_poison`` (every GPU KV
 byte overwritten), so warm reuse can only come from the connector. Replay runs
 ``--replay-repeats`` warm passes; the first carries digest tags (G2/G3), the
-others are timed for G4. The ``cap`` workload (G5) is its own, larger
+others are timed for G4 (the baseline runs replay ``cold`` only: it has no
+perf role). The ``cap`` workload (G5) is its own, larger
 replay (``--cap-convs`` x ``--cap-turns``): the baseline arm runs it first
 (``cap_cold``, ``cap_warm``) to fix ``U`` and the reference local hits, then
 every store arm runs ``cap_cold``, ``cap_warm``, ``cap_warm2..N`` per
-fraction ``f`` on a fresh store of ``C = f x U`` bytes; warm pass ``j``
-starts the conversations rotated by ``j/4`` of their count.
+fraction ``f`` on a fresh store of ``C = f x U`` bytes (``f`` = 0.5, or the
+curve with ``--cap-curve``); warm pass ``j`` starts the conversations
+rotated by ``j/4`` of their count.
 
 Per-model gate settings (attention backend, batch invariance, extra vLLM args)
 come from ``docs/rsi/models/<model>/gate.json``; the committed spec dump is
@@ -84,7 +89,7 @@ OFFICIAL = {
     "replay_digest_every": 4,
     "cap_convs": "auto",  # >= CAP_MIN_CONVS, grown until the capacity floor holds
     "cap_turns": 12,
-    "cap_fractions": "0.25,0.5,0.75",
+    "cap_fractions": "0.5",  # or CAP_CURVE (``--cap-curve``)
     "concurrency": 32,
     "max_model_len": 8192,
     "max_num_batched_tokens": 2048,
@@ -97,14 +102,18 @@ ACC_TOL = 0.01
 MIN_EFFICIENCY = 0.95  # G3 E_ext reference
 ORACLE_FLOOR = {"gsm8k": 0.5, "replay": 0.5}  # warm oracle hit rate below it: E says little
 MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are judged
-# G4: passes with nothing to reuse from PegaFlow (replay cold: vLLM's own
-# prefix cache serves the earlier turns; gsm8k: the shared few-shot prefix) can
-# only tie baseline, so they bound the connector's overhead; warm replay must win.
+# G4: every perf reference is the in-run ``native`` arm. Passes with little to
+# reuse from the store (replay cold: vLLM's own prefix cache serves the
+# earlier turns; gsm8k: the shared few-shot prefix) bound the connector's
+# overhead: at most MAX_OVERHEAD worse than native's. Warm replay vs native is
+# reported and judged (``_native_perf_verdicts``).
 MAX_OVERHEAD = 0.02
 # G5: store capacity as a fraction of the cap trace's unique KV bytes; only
-# CAPACITY_FRACTION is gated, the others are a reported curve. The bar is the
-# clairvoyant oracle at that capacity.
+# CAPACITY_FRACTION is gated (and run by default). ``--cap-curve`` adds the
+# other CAP_CURVE points, a reported curve; official either way. The bar is
+# the clairvoyant oracle at that capacity.
 CAPACITY_FRACTION = 0.5
+CAP_CURVE = "0.25,0.5,0.75"
 MIN_EFFICIENCY_C = 0.9  # G5 E_C reference (reported, not gated)
 # Workload validity, not a bar on the arm: a trace on which a store frozen
 # after its first fill reaches this share of ``H*_C`` cannot separate a policy
@@ -122,6 +131,42 @@ WORKLOADS = ("gsm8k", "replay", "cap")
 TERM_GRACE = 120
 KILL_GRACE = 300
 SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
+# Onboarding controls (G2.plain_equals_baseline, G2.split_control,
+# G2.batch_control) need the plain arm, which runs at the self-test, not in
+# routine official runs. gate.json ``controls["tp<N>"]`` names the control
+# run (``run``) and its ``inputs`` (``control_inputs``); an official run
+# without the plain arm needs them equal to the current inputs
+# (``official_problems``): a changed probe, workload driver, control code
+# or gate setting needs a new control run. vLLM's version is pinned by
+# G0.spec (committed dump).
+CONTROL_FILES = ("rsi/gates/rsi_probe.py", "rsi/gates/workloads.py")
+CONTROL_CODE = (
+    "vllm_server",
+    "split_control",
+    "batch_control",
+    "_plain_equals_baseline",
+    "_split_control_verdict",
+    "_batch_control_verdict",
+)
+CONTROL_SETTINGS = (
+    "attention_backend",
+    "invariant_attention_backend",
+    "batch_invariant",
+    "split_invariant",
+    "vllm_args",
+    "gsm8k_vllm_args",
+)
+# The control passes' constants (below) and the gsm8k part of the official
+# profile they ran at.
+CONTROL_CONSTANTS = ("SPLIT_PASSES", "MIN_PREWARMED", "BATCH_PASS", "BATCH_CONTROL_N", "ALONE_REF")
+CONTROL_PROFILE = (
+    "shots",
+    "concurrency",
+    "max_model_len",
+    "max_num_batched_tokens",
+    "max_num_seqs",
+)
+ONBOARDING_NA = "onboarding control: no plain arm in this run (gate.json controls)"
 # Split control (gsm8k, plain and baseline arms): ``split_ref`` repeats the
 # cold pass with logprobs, ``split`` pre-warms vLLM's prefix cache with each
 # whole prompt so the request starts at its last full prompt block (where a
@@ -1527,6 +1572,10 @@ def run_arm_workload(
                 skip=args.replay_skip,
             )
             names = ["cold", "warm"] + [f"warm{k}" for k in range(2, args.replay_repeats + 1)]
+            if kind == "baseline" and not cap:
+                # No perf role: cold fixes the measured U (pool check) and
+                # the cap plan fallback; the warm passes had only G4 readers.
+                names = ["cold"]
             if cap:
                 # Baseline: U (cold) and reference local hits (cold, warm).
                 names = cap_names(args.replay_repeats)[: 2 if kind == "baseline" else None]
@@ -2262,7 +2311,10 @@ def _outputs_verdict(
         return {"pass": all(d == 0 for d in diffs.values())} | out
     out["warm_differ_vs_split"], out["warm_differ_vs_split_aligned"] = split_diffs
     if split_diffs[0] is None or diffs.get("cold") is None:
-        return {"pass": False, "reason": "plain split outputs not comparable"} | out
+        return {
+            "pass": False,
+            "reason": "no same-split warm reference (baseline resume replay)",
+        } | out
     return {"pass": diffs["cold"] == 0 and split_diffs[0] == 0} | out
 
 
@@ -2593,8 +2645,8 @@ def _median(xs: list[float]) -> float | None:
 
 
 def _cmp(mine: list[float], theirs: list[float], lower: bool, slack: float) -> dict[str, Any]:
-    """Median of ``mine`` vs median of ``theirs``. ``slack`` 0: strictly better;
-    otherwise at most ``slack`` (fraction) worse."""
+    """Median of ``mine`` vs median of ``theirs`` (native's). ``slack`` 0:
+    strictly better; otherwise at most ``slack`` (fraction) worse."""
     a, b = _median(mine), _median(theirs)
     if a is None or b is None:
         ok = False
@@ -2602,7 +2654,7 @@ def _cmp(mine: list[float], theirs: list[float], lower: bool, slack: float) -> d
         ok = a < b if lower else a > b
     else:
         ok = a <= b * (1 + slack) if lower else a >= b * (1 - slack)
-    return {"pass": ok, "value": mine, "baseline": theirs, "slack": slack}
+    return {"pass": ok, "value": mine, "native": theirs, "slack": slack}
 
 
 def _pass_values(r: dict[str, Any] | None, names: tuple[str, ...], key: str) -> list[float]:
@@ -2673,29 +2725,32 @@ def _native_perf_verdicts(
 
 
 def g4_native_problems(
-    results: dict[str, dict[str, Any]], arms: list[str], wls: list[str]
+    results: dict[str, dict[str, Any]], arms: list[str], wls: list[str], repeats: int
 ) -> list[str]:
-    """Why a run cannot be official for G4 vs native (run validity, like
-    ``g5_problems``; nothing here gates the native arm itself). The native
-    replay stage must have run (crashed or absent: no reference), recorded
-    every timed warm pass the baseline has (ttft_p50 and req_per_s), and
+    """Why a run cannot be official for G4 (run validity, like
+    ``g5_problems``; nothing here gates the native arm itself). Native is
+    every G4 reference: its replay stage must have run (crashed or absent:
+    no reference), recorded ``cold`` and every timed warm pass of the
+    profile (``warm2..warm<repeats>``) with ttft_p50 and req_per_s, and
     worked as an offloading store, judged from its own replay data only:
     no load errors, excess within ``excess_limit`` on the warm pass, and on
     every timed warm pass its external hits cover at least
     ``NATIVE_MIN_EFFICIENCY`` of the oracle's (``E_ext``). A native that
-    loads nothing times like baseline and would pass any arm that beats
-    baseline. Native's G0 / G2 verdicts are not looked at (it fails
-    G0.spec by construction). Without the native arm or the replay
-    workload ``official_problems`` already names the gap."""
+    loads nothing times like vLLM without a store. A missing native gsm8k
+    stage fails the arm's ``G4.gsm8k_*`` checks (no reference: fail
+    closed). Native's G0 / G2 verdicts are not looked at (it fails G0.spec
+    by construction). Without the native arm or the replay workload
+    ``official_problems`` already names the gap."""
     if "native" not in arms or "replay" not in wls:
         return []
     nat = results.get("native", {}).get("replay")
     if nat is None or "error" in nat:
-        return ["native replay stage missing or failed (G4 vs native needs its warm numbers)"]
-    want = _timed_warm(results.get("baseline", {}).get("replay"))
-    have = {n for n in _timed_warm(nat) if all(k in nat["passes"][n] for k, _ in G4_NATIVE_KEYS)}
-    if not want or set(want) - have:
-        return [f"native replay timed warm passes {sorted(have)} != baseline's {sorted(want)}"]
+        return ["native replay stage missing or failed (G4 needs its numbers)"]
+    timed = {f"warm{k}" for k in range(2, repeats + 1)}
+    want = timed | {"cold"}
+    have = {n for n, p in nat.get("passes", {}).items() if all(k in p for k, _ in G4_NATIVE_KEYS)}
+    if not timed or want - have:
+        return [f"native replay passes {sorted(have & want)} lack {sorted(want - have)}"]
     hit = nat.get("hit") or {}
     bad = []
     if nat.get("load_errors"):
@@ -2703,7 +2758,7 @@ def g4_native_problems(
     w = hit.get("warm")
     if w is None or w["excess_tokens"] > w["excess_limit"]:
         bad.append("warm pass excess above one block per request (or no hit record)")
-    for n in sorted(want):
+    for n in sorted(timed):
         e = (hit.get(n) or {}).get("efficiency")
         if e is None or e < NATIVE_MIN_EFFICIENCY:
             bad.append(f"{n} E_ext {e} < {NATIVE_MIN_EFFICIENCY:g}")
@@ -2714,29 +2769,25 @@ def g4_native_problems(
 
 def _perf_verdicts(
     rep: dict[str, Any] | None,
-    base_rep: dict[str, Any] | None,
+    nat_rep: dict[str, Any] | None,
     gsm: dict[str, Any] | None,
-    base_gsm: dict[str, Any] | None,
+    nat_gsm: dict[str, Any] | None,
     replay_ok: bool,
 ) -> dict[str, Any]:
-    """G4 vs baseline vLLM. Replay numbers only count when the replay KV was
-    correct (``replay_ok``)."""
-    passes, timed = _pass_values, _timed_warm
+    """G4 overhead vs the in-run ``native`` arm, hard: replay ``cold`` and
+    gsm8k ``cold`` / ``warm`` at most ``MAX_OVERHEAD`` worse than native's
+    same pass (a missing native number fails: no reference). Replay numbers
+    only count when the replay KV was correct (``replay_ok``)."""
+    passes = _pass_values
     g: dict[str, Any] = {}
     for key, lower in (("ttft_p50", True), ("req_per_s", False)):
-        for name, names, slack in (
-            ("replay_warm", timed(rep), 0.0),
-            ("replay_cold", ("cold",), MAX_OVERHEAD),
-        ):
-            mine = passes(rep, names, key)
-            theirs = passes(base_rep, timed(base_rep) if name == "replay_warm" else names, key)
-            v = _cmp(mine, theirs, lower, slack)
-            v["pass"] = v["pass"] and replay_ok
-            g[f"G4.{name}.{key}"] = v
+        v = _cmp(passes(rep, ("cold",), key), passes(nat_rep, ("cold",), key), lower, MAX_OVERHEAD)
+        v["pass"] = v["pass"] and replay_ok
+        g[f"G4.replay_cold.{key}"] = v
     for name in ("cold", "warm"):
         g[f"G4.gsm8k_{name}.seconds"] = _cmp(
             passes(gsm, (name,), "seconds"),
-            passes(base_gsm, (name,), "seconds"),
+            passes(nat_gsm, (name,), "seconds"),
             True,
             MAX_OVERHEAD,
         )
@@ -2745,9 +2796,9 @@ def _perf_verdicts(
     g["G4.warmup_seconds"] = {
         wl: {
             "value": (passes(r, (workloads.WARMUP_PASS,), "seconds") or [None])[0],
-            "baseline": (passes(b, (workloads.WARMUP_PASS,), "seconds") or [None])[0],
+            "native": (passes(b, (workloads.WARMUP_PASS,), "seconds") or [None])[0],
         }
-        for wl, r, b in (("replay", rep, base_rep), ("gsm8k", gsm, base_gsm))
+        for wl, r, b in (("replay", rep, nat_rep), ("gsm8k", gsm, nat_gsm))
     }
     return g
 
@@ -2910,9 +2961,18 @@ def verdicts(
 
     # Controls: the probe changes nothing (plain == baseline), poisoning and
     # the local reset change nothing (baseline warm == cold), local hits are
-    # byte-identical to their computed copies.
+    # byte-identical to their computed copies. The plain-arm controls are
+    # onboarding controls: without the plain arm they are ``na`` here and
+    # ``official_problems`` requires gate.json's record of them.
+    plain = "plain" in results
+
+    def onboarding(v: dict[str, Any]) -> dict[str, Any]:
+        return v if plain else {"pass": True, "na": ONBOARDING_NA}
+
     v["baseline"] = {
-        "G2.plain_equals_baseline": _plain_equals_baseline(run_dir, ref_cold, batch_inv),
+        "G2.plain_equals_baseline": onboarding(
+            _plain_equals_baseline(run_dir, ref_cold, batch_inv)
+        ),
         # Output equality needs batch invariance; gate.json declares when a
         # model cannot have it, and then only accuracy and digests count.
         "G2.warm_equals_cold": {
@@ -2930,11 +2990,13 @@ def verdicts(
             else {}
         ),
         # gate.json's split_invariant is established here, not declared.
-        "G2.split_control": _split_control_verdict(ctrl, split_inv),
+        "G2.split_control": onboarding(_split_control_verdict(ctrl, split_inv)),
         # Likewise batch_invariant (it decides whether outputs are compared).
-        "G2.batch_control": _predates(
-            _batch_control_verdict(batch_control(run_dir), batch_inv),
-            _ran_without(results, "plain", BATCH_PASS),
+        "G2.batch_control": onboarding(
+            _predates(
+                _batch_control_verdict(batch_control(run_dir), batch_inv),
+                _ran_without(results, "plain", BATCH_PASS),
+            )
         ),
         "G2.digest_self.cap": _digest_verdict(
             base.get("cap", {}).get("digest_self"), None, exhaustive=True
@@ -3088,15 +3150,23 @@ def verdicts(
                 "pass": bool(evicted) and not any(evicted.values()),
                 "evicted": evicted,
             }
-        g |= _perf_verdicts(
-            rep, base.get("replay"), gsm, base.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
-        )
+        if kind != "native":
+            # Overhead vs native (hard for the arm under test; old / lmcache
+            # record it). Native is the reference, so it gets none.
+            nat = {
+                wl: r
+                for wl, r in results.get("native", {}).items()
+                if wl in ("replay", "gsm8k") and "error" not in r
+            }
+            g |= _perf_verdicts(
+                rep, nat.get("replay"), gsm, nat.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
+            )
         if kind not in _REFERENCE:
             # The arm under test only: warm replay vs native's, reported.
-            nat = results.get("native", {}).get("replay")
+            nat_rep = results.get("native", {}).get("replay")
             g |= _native_perf_verdicts(
                 rep,
-                nat if nat is not None and "error" not in nat else None,
+                nat_rep if nat_rep is not None and "error" not in nat_rep else None,
                 g["G2.digest_self.replay"]["pass"],
             )
         cap = per_wl.get("cap")
@@ -3479,23 +3549,25 @@ def g5_problems(v: dict[str, Any], floor: dict[str, Any], plan: dict[str, Any] |
     return out
 
 
-CONTAMINATION_P99 = 10.0  # x the baseline's p99 TTFT of the same pass
+CONTAMINATION_P99 = 10.0  # x the native arm's p99 TTFT of the same pass
 
 
 def contamination(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """G4-timed replay passes with a stall from outside the arm (another
-    process's pinned-pool allocation, JIT, a shared GPU), both ways:
-    - an arm's p99 TTFT above ``CONTAMINATION_P99`` x the in-run baseline's
-      p99 for the same pass;
-    - the baseline's p99 above ``CONTAMINATION_P99`` x the median of the
-      arms' p99 for that pass (a baseline stall inflates every arm's G4
+    process's pinned-pool allocation, JIT, a shared GPU), both ways, against
+    the in-run ``native`` arm (every G4 reference):
+    - another arm's p99 TTFT above ``CONTAMINATION_P99`` x native's p99 for
+      the same pass;
+    - native's p99 above ``CONTAMINATION_P99`` x the median of the other
+      arms' p99 for that pass (a native stall inflates every arm's G4
       margin).
-    Nothing is dropped: the run becomes non-official."""
-    base = results.get("baseline", {}).get("replay", {}).get("passes", {})
+    The baseline's replay (``cold`` only) has no G4 role and is not
+    looked at. Nothing is dropped: the run becomes non-official."""
+    ref = results.get("native", {}).get("replay", {}).get("passes", {})
     out = []
     arms: dict[str, list[float]] = {}
     for label, per in results.items():
-        if label == "baseline":
+        if label in ("baseline", "native"):
             continue
         for name, p in per.get("replay", {}).get("passes", {}).items():
             mine = p.get("ttft_p99") if isinstance(p, dict) else None
@@ -3503,14 +3575,14 @@ def contamination(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
             if name.startswith("_") or name == "warm" or mine is None:
                 continue
             arms.setdefault(name, []).append(mine)
-            b = base.get(name, {}).get("ttft_p99")
+            b = ref.get(name, {}).get("ttft_p99")
             if b and mine > CONTAMINATION_P99 * b:
-                out.append({"arm": label, "pass": name, "ttft_p99": mine, "baseline_p99": b})
+                out.append({"arm": label, "pass": name, "ttft_p99": mine, "native_p99": b})
     for name, ps in sorted(arms.items()):
-        b = base.get(name, {}).get("ttft_p99")
+        b = ref.get(name, {}).get("ttft_p99")
         med = statistics.median(ps)
         if b and med and b > CONTAMINATION_P99 * med:
-            out.append({"arm": "baseline", "pass": name, "ttft_p99": b, "arms_median_p99": med})
+            out.append({"arm": "native", "pass": name, "ttft_p99": b, "arms_median_p99": med})
     return out
 
 
@@ -3521,6 +3593,64 @@ def committed_spec(model_dir: Path, tp: int) -> Path:
     the preempt GPU pool, the unique-bytes estimate, the cap plan fallback,
     ``official_problems``) reads this file; a missing one is never official."""
     return model_dir / ("spec.json" if tp == 1 else f"spec-tp{tp}.json")
+
+
+def control_inputs(gate: dict[str, Any]) -> dict[str, Any]:
+    """What the onboarding controls depend on (``CONTROL_*``): sha256 of the
+    probe and workload driver and of each control function's AST
+    (docstrings dropped, so comments and docs do not count), the control
+    constants, the gsm8k profile and the gate.json settings, JSON-shaped.
+    gate.json ``controls["tp<N>"]["inputs"]`` records it for the control run."""
+    import ast
+    import hashlib
+
+    def sha(b: bytes) -> str:
+        return hashlib.sha256(b).hexdigest()
+
+    funcs = {}
+    for node in ast.parse(Path(__file__).read_text()).body:
+        if isinstance(node, ast.FunctionDef) and node.name in CONTROL_CODE:
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str):  # fmt: skip
+                node.body = body[1:] or [ast.Pass()]
+            funcs[node.name] = sha(ast.unparse(node).encode())
+    out = {
+        # A missing file hashes to None (never equal to a recorded run's).
+        "files": {
+            f: sha((REPO / f).read_bytes()) if (REPO / f).is_file() else None for f in CONTROL_FILES
+        },
+        "code": {name: funcs.get(name) for name in CONTROL_CODE},
+        "constants": {k: globals()[k] for k in CONTROL_CONSTANTS},
+        "profile": {k: OFFICIAL[k] for k in CONTROL_PROFILE},
+        "settings": {k: gate.get(k) for k in CONTROL_SETTINGS},
+    }
+    return json.loads(json.dumps(out))  # tuples as gate.json holds them
+
+
+def controls_problem(gate: dict[str, Any], tp: int) -> str | None:
+    """An official run without the plain arm leans on the onboarding control
+    run recorded in gate.json for its TP; it must have measured the current
+    ``control_inputs``."""
+    rec = (gate.get("controls") or {}).get(f"tp{tp}")
+    if not rec:
+        return (
+            f"onboarding controls for --tp {tp} not recorded in gate.json "
+            "(run the self-test with plain, or add the plain arm)"
+        )
+    want = control_inputs(gate)
+    if rec.get("inputs") != want:
+        got = rec.get("inputs") or {}
+        stale = [
+            f"{part}.{k}"
+            for part in want
+            for k in want[part]
+            if (got.get(part) or {}).get(k, "<missing>") != want[part][k]
+        ]
+        return (
+            f"onboarding controls for --tp {tp} (gate.json, run {rec.get('run')}) are stale: "
+            f"{', '.join(stale) or 'inputs'} changed (rerun the self-test with plain, or add the plain arm)"
+        )
+    return None
 
 
 def official_problems(
@@ -3534,8 +3664,9 @@ def official_problems(
     def same(k: str, v: Any) -> bool:
         got = getattr(args, k)
         if k == "cap_fractions":
+            # The gated point alone, or the whole curve (``--cap-curve``).
             try:
-                return parse_fractions(got) == parse_fractions(v)
+                return parse_fractions(got) in (parse_fractions(v), parse_fractions(CAP_CURVE))
             except ValueError:
                 return False
         return got == v
@@ -3548,10 +3679,16 @@ def official_problems(
         if not same(k, v)
     ]
     kinds = {arm_kind(a) for a in arms}
-    # native: G4's warm replay reference next to baseline.
-    for need in ("plain", "baseline", "native", "under_test"):
+    # baseline: the correctness reference; native: every G4 reference. plain,
+    # old and lmcache are optional; without plain the onboarding controls
+    # come from gate.json's record, which must be current.
+    for need in ("baseline", "native", "under_test"):
         if need not in kinds:
             out.append(f"arm {need} missing")
+    if "plain" not in kinds:
+        bad = controls_problem(gate or {}, args.tp)
+        if bad:
+            out.append(bad)
     if set(wls) - {PREEMPT} != set(WORKLOADS):
         out.append(f"workloads {wls} != {','.join(WORKLOADS)}")
     if PREEMPT not in wls and committed.is_file() and has_state_group(json.loads(committed.read_text())):  # fmt: skip
@@ -3884,8 +4021,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tag", required=True, help="<model>-<iter>, used in the run dir name")
     ap.add_argument(
         "--arms",
-        default="plain,baseline,old",
-        help="comma list; selftest arms: selftest:honest,selftest:liar,...",
+        default="baseline,native",
+        help="comma list (official: baseline,native,<module>:<Class>; optional plain, "
+        "old, lmcache); selftest arms: selftest:honest,selftest:liar,...",
     )
     ap.add_argument(
         "--workloads",
@@ -3958,10 +4096,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cap-turns", type=int, default=OFFICIAL["cap_turns"])
     ap.add_argument(
         "--cap-fractions",
-        default=OFFICIAL["cap_fractions"],
-        help=f"C/U list; {CAPACITY_FRACTION} is gated, the rest are reported",
+        default=None,
+        help=f"C/U list (default {OFFICIAL['cap_fractions']}); {CAPACITY_FRACTION} is gated, "
+        "the rest are reported; official: the gated point alone or --cap-curve",
+    )
+    ap.add_argument(
+        "--cap-curve",
+        action="store_true",
+        help=f"run the reported capacity curve {CAP_CURVE} (each point a full cap stage)",
     )
     args = ap.parse_args(argv)
+    if args.cap_curve and args.cap_fractions is not None:
+        ap.error("--cap-curve and --cap-fractions are exclusive")
+    if args.cap_fractions is None:
+        args.cap_fractions = CAP_CURVE if args.cap_curve else OFFICIAL["cap_fractions"]
     install_stop_handlers()
     try:
         fractions = parse_fractions(args.cap_fractions)
@@ -4118,13 +4266,13 @@ def main(argv: list[str] | None = None) -> int:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
     problems = official_problems(args, arms, wls, gate_file, committed, gate)
-    problems += g4_native_problems(results, arms, wls)
+    problems += g4_native_problems(results, arms, wls, args.replay_repeats)
     contaminated = contamination(results)
     problems += [
         f"contaminated: {c['arm']} replay/{c['pass']} p99 TTFT {c['ttft_p99']:.3g}s > "
         + (
-            f"{CONTAMINATION_P99:g}x baseline {c['baseline_p99']:.3g}s"
-            if "baseline_p99" in c
+            f"{CONTAMINATION_P99:g}x native {c['native_p99']:.3g}s"
+            if "native_p99" in c
             else f"{CONTAMINATION_P99:g}x the arms' median {c['arms_median_p99']:.3g}s"
         )
         for c in contaminated
@@ -4173,6 +4321,9 @@ def main(argv: list[str] | None = None) -> int:
         "args": vars(args),
         "vllm_plugins": {arm_label(a): vllm_plugins(a) for a in arms},
         "gate": gate,
+        # A self-test run with the plain arm: copy into gate.json
+        # ``controls["tp<N>"]`` (with ``run``) when its controls pass.
+        "control_inputs": control_inputs(gate),
         "official": not problems,
         "held_out": args.replay_skip > 0,
         "replay_skip": args.replay_skip,
