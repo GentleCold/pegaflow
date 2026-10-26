@@ -1137,3 +1137,215 @@ TP observations:
 
 Official TP2 run: not launched. G0.spec would fail every arm, and the run
 would also overlap the P5 DSV2 slice.
+
+## TP2 official (2026-10-26): off2-4bb7d8d, gate 48e6493, non-official (freeze separation)
+
+Run `~/kexi/rsi-runs/2026-10-26-qwen3-4b-tp2-off2-4bb7d8d` (.44 GPU 0,1,
+`--tp 2`, run_gate pgid 3982990, 08:36 to 11:37Z). Gate 48e6493
+(`feat/semantics-rsi`, per-TP spec fix included), connector 4bb7d8d via
+`--under-test-path`. Server v0.25.1, 64 GiB pool. Arms (slim gate):
+plain, baseline, native, v2. No old and no lmcache; `official_problems` at
+48e6493 does not require them. Nothing else ran on GPU 0,1. The first
+official launch with all six arms (`2026-10-26-qwen3-4b-tp2-off-4bb7d8d`,
+baseline done, plain partial) was stopped with SIGTERM to its pgid and is
+kept as evidence. run_gate has no stage reuse, so off2 started from scratch.
+
+- `official: false`. `not_official_because`: `G5 trace does not separate
+  freeze from H*_C`. freeze_vs_oracle_c at f=0.5 is 0.918 for v2 and native
+  (bar 0.9). At TP2 the GPU KV is 30 GB, and the cap trace replays in order,
+  so a store frozen after its first fill already sits near H*_C (H_freeze
+  0.926 vs H*_C 0.932). The rule is the same in 74a4ec0, so the run would
+  not be official there either. This is a gate/trace issue at TP2, not a
+  connector one.
+- capacity_floor passes: U 132.7 GB, C(0.5) 66.3 GB, 2.21x GPU KV (cap auto
+  = 155 conversations). contamination [].
+
+### Failing verdicts
+
+- baseline: none. G2 controls (plain_equals_baseline, warm_equals_cold,
+  split_control, batch_control) pass.
+- native: G0.spec and G2.digest_vs_baseline.gsm8k (LBHNC layout, expected);
+  G4.replay_cold.req_per_s (9.409 vs 9.742); G4.gsm8k_cold.seconds
+  (122.24 vs 117.94).
+- v2: G4.replay_cold.ttft_p50 (0.3312 vs 0.3101, +6.8%) and
+  G4.replay_cold.req_per_s (9.153 vs 9.742, -6.0%). Nothing else fails:
+  G0.spec 0 diffs against the TP2 dump, G0.provenance, G2 digest_self
+  (gsm8k / replay / cap), digest_vs_baseline 341396 / 341396 local and
+  12246 / 12246 ext, preempt, gsm8k outputs, gsm8k acc 0.8605 (delta 0), G3,
+  G3.no_eviction (0 everywhere), G5.replay_warm.
+
+### G4 under both rules
+
+| check | v2 | ref | 48e6493 (vs baseline, hard) | 74a4ec0 (vs native) |
+|---|---|---|---|---|
+| gsm8k cold s | 118.55 | base 117.94 / native 122.24 | pass (+0.5%) | hard PASS (-3.0%) |
+| gsm8k warm s | 112.64 | base 117.75 / native 117.87 | pass | hard PASS (-4.4%) |
+| replay cold TTFT p50 | 0.3312 | base 0.3101 / native 0.3144 | FAIL (+6.8%) | reported: +5.3% |
+| replay cold req/s | 9.153 | base 9.742 / native 9.409 | FAIL (-6.0%) | reported: -2.7% |
+| replay warm TTFT (warm2, warm3) | 0.1352, 0.1302 | base 0.2445, 0.2483 / native 0.1661, 0.1612 | pass | reported: median -18.9% (better) |
+| replay warm req/s (warm2, warm3) | 17.57, 17.02 | base 10.57, 10.50 / native 19.05, 19.39 | pass | reported: median -10.0%, outside noise (ranges 0.55 / 0.34) |
+
+Under 74a4ec0 v2 passes the hard gsm8k check. Judged: cold replay is
+slightly worse than native (+5% TTFT, -3% req/s); warm TTFT is clearly
+better; warm req/s is clearly worse (-10%). Connector headroom is left.
+
+| arm | gsm8k cold / warm s | replay cold TTFT / req/s | warm | warm2 | warm3 |
+|---|---|---|---|---|---|
+| plain | 98.62 / 98.64 | | | | |
+| baseline | 117.94 / 117.75 | 0.3101 / 9.742 | 0.3082 / 9.708 | 0.2445 / 10.566 | 0.2483 / 10.504 |
+| native | 122.24 / 117.87 | 0.3144 / 9.409 | 0.3089 / 16.52 | 0.1661 / 19.05 | 0.1612 / 19.39 |
+| v2 | 118.55 / 112.64 | 0.3312 / 9.153 | 0.1574 / 14.98 | 0.1352 / 17.57 | 0.1302 / 17.02 |
+
+Accuracy: gsm8k is 0.8605 on every arm. Preempt cold / warm: baseline
+0.844 / 0.844, native 0.875 / 0.813, v2 0.875 / 0.844. Baseline was 0.875
+in the killed run, so preempt accuracy moves between runs; G2.preempt is
+judged on digests and passes.
+
+### Hit rates
+
+ext = external hit rate over (prompt - local).
+
+| arm | stage | local | ext | total | H* | E_ext |
+|---|---|---|---|---|---|---|
+| v2 | gsm8k warm | 0.9258 | 0.0667 | 0.9925 | 0.9925 | 1.0 |
+| v2 | replay cold | 0.8641 | 0 | 0.8641 | 0.8641 | n/a |
+| v2 | replay warm / warm2 / warm3 | 0.8334 | 0.1649 | 0.9983 | 0.9983 | 1.0 |
+| v2 | preempt warm | 0.7309 | 0.2613 | 0.9923 | 0.9923 | 1.0 |
+| native | gsm8k warm | 0.9329 | 0.0604 | 0.9933 | 0.9925 | 1.0 |
+| native | replay warm (all) | 0.8641 | 0.1343 | 0.9984 | 0.9983 | 1.0 |
+| native | preempt warm | 0.9064 | 0.0876 | 0.9940 | 0.9923 | 1.0 |
+| baseline | replay / gsm8k | 0.8641 / 0.9329 | 0 | same | 0.9983 / 0.9925 | 0 |
+
+(In this table ext is the share of prompt tokens; G3 hit_report's
+external_hit_rate is v2 gsm8k 0.8986 / replay 0.9896, native 0.8998 /
+0.9883.)
+
+G5 (hit / E_C / H_lru / H*_C):
+
+| arm | f=0.25 | f=0.5 | f=0.75 |
+|---|---|---|---|
+| v2 | 0.8529 / 0.0000 / 0.8529 / 0.8927 | 0.8530 / 0.0005 / 0.8529 / 0.9323 | 0.9318 / 0.6611 / 0.9574 / 0.9720 |
+| native | 0.8529 / 0.0000 / 0.8529 / 0.8927 | 0.8535 / 0.0076 / 0.8529 / 0.9323 | 0.9600 / 0.8963 / 0.9572 / 0.9720 |
+
+- At f <= 0.5, H_lru equals the GPU-local hit (0.8529), so an LRU store gets
+  nothing over GPU-local and E_C near 0 is structural.
+- At f=0.75, v2's E_C is 0.661 vs native's 0.896. That is a v2 gap.
+  - Per pass, v2's cap075 ext is 0.060 / 0.098 / 0.073 (E_ext 0.39 / 0.65 /
+    0.48); native's is 0.108 (about 0.74).
+  - v2 evicts 16k-37k blocks per pass at cap075; native evicts 0.
+  - Cap075 warm: v2 7.81 / 8.55 / 7.95 req/s vs native 9.05 / 9.22 / 9.01.
+- At f <= 0.5 cap perf is equal: about 6.9 req/s for both arms.
+
+### Attribution of the replay gaps (probe + vLLM metrics, no extra runs)
+
+- Warm req/s -10% vs native. This is per-step decode time, not scheduling.
+  - Step counts per pass are equal (warm2 831 vs 853), load-wait steps are
+    equal (mean 7.6, max 15), and prefill time per request is equal (0.049
+    vs 0.048 s).
+  - Decode ITL is 18.95-19.55 ms for v2 vs 16.45-16.64 ms for native (+15%).
+  - Split:
+    - connector (most of it): per-step async-save submit and wait work, which
+      continues through the warm passes (replay 2287 save steps per rank),
+      and 23% more external load volume (210,240 vs 171,264 ext tokens per
+      pass, about 2.9 GB more per rank).
+    - server: secondary; load bandwidth for that extra volume.
+    - vLLM-native structural: none found.
+    - noise: below 3% (warm ranges 0.55 / 0.34 req/s).
+- Warm TTFT -19% (better): v2 admits each turn-0 request as soon as its own
+  load lands instead of deferring the cohort.
+- Cold: -6% req/s vs baseline, -2.7% vs native. This is save-path overhead:
+  cold ITL is 36.04 ms (v2) vs 34.73 (native) vs 33.61 (baseline). Native
+  pays about half of it too. Split: connector (save submit / wait) plus
+  server (save ingest); noise is about 1-2%.
+- The extra external volume is lost local hit: 31 x 1264 = 39,184 tokens
+  per warm pass. That is the shared 1264-token turn-0 prefix on convs 1-31.
+  - Turn >= 1 local hits are identical in both arms (32 / 32 with local >=
+    1600, mean 1693). So blocks that were loaded do get cached.
+  - The held-blocks / late-release theory is refuted: there are no
+    preemptions, the loss is not on later turns, and finish-to-release
+    (sent_wait) is a mean of 0.47 s, max 1.65 s.
+
+### Cohort admission (why a conv admitted 20+ steps after conv0 has local 0)
+
+Warm2, turn 0. Steps are relative to conv0's scheduled step, s0 = 1752.
+Lookup times come from pegaflow.log `Prefetch local-hit timing`. The probe
+has no lookup step, and each request had exactly one lookup, all full
+external hits.
+
+| conv | lookup (wall, vs conv0) | keys hit | scheduled (load landed) step | local | first compute step |
+|---|---|---|---|---|---|
+| 0 | +0.0 ms | 102 / 102 | 0 | 0 | 14 |
+| 1 | +6.0 ms | 106 / 106 | 0 | 0 | 11 |
+| 2 | +7.4 ms | 102 / 102 | 1 | 0 | 15 |
+| 3 | +8.3 ms | 106 / 106 | 2 | 0 | 5 |
+| 4 | +9.5 ms | 102 / 102 | 4 | 0 | 12 |
+| 5 | +10.7 ms | 110 / 110 | 6 | 0 | 20 |
+| 15 | +18.1 ms | 105 / 105 | 16 | 0 | 18 |
+| 24 | +26.8 ms | 102 / 102 | 24 | 0 | 24 |
+| 31 | +32.6 ms | 106 / 106 | 29 | 0 | 33 |
+
+- conv0's load starts at its lookup (+0 ms). It lands at step 0, and that is
+  when its blocks enter the GPU prefix cache.
+- All 32 lookups fall in a 33 ms window, about 2 steps at 18 ms per step,
+  and all of them run before step 0.
+- Each request planned a full external load once. vLLM re-admits it after
+  `finished_recving` without a new lookup.
+- The later convs are scheduled at steps 8-29 only because their own loads
+  land one after another. Their plan was fixed before conv0's prefix
+  existed on the GPU, so they reload the 1264-token prefix.
+- Native warm2: conv0 is scheduled at step 0 with local 0. Convs 1-27 are
+  scheduled at step 2 and convs 28-31 at steps 3-4, all with local 1264.
+  The OffloadingConnector returns None (defer) while any hit chunk is in
+  `_chunks_being_loaded`, so their lookups re-run after conv0's KV lands.
+- The same pattern shows at TP1 it7 (replay warm local: v2 0.3475 vs
+  native 0.3778), but at TP2 the larger external share made it cost more.
+
+Next connector-side hypothesis (model-agnostic, handed to the P5 track as
+"cohort admission"): in the scheduler lookup, return None (defer) while any
+of the request's hit keys is in flight for another request, then re-look-up
+once it lands. Expected effect: replay warm local goes from 0.833 to about
+0.864, ext volume drops 19%, and the warm req/s gap shrinks. The save-path
+ITL part (cold and warm) is the second target. The cap075 E_C gap
+(0.66 vs 0.90) is a third, separate one.
+
+### TP observations
+
+Sharding is Heads: 4 of 8 KV heads per rank, 203,616 GPU KV tokens (13.98
+GiB) per rank. Both workers registered 36 layers in namespace d3b74b0d,
+with storage_rank 0 / 1, both `writer=True`, and one group `full(16)`. The
+policy used defaults (there is no Qwen3ForCausalLM profile): async saves,
+batch_steps 32, max_kv_usage 0.9.
+
+Per-rank v2 save stats (tp0 / tp1):
+
+| workload | save steps | blocks per rank | GB per rank | rpc ms | failed |
+|---|---|---|---|---|---|
+| gsm8k | 7442 | 793,980 | 26.02 | 3435 / 3974 | 0 |
+| replay | 2287 | 534,924 | 17.53 | 3425 / 3060 | 0 |
+| preempt | | 100,044 | 3.28 | | 0 |
+| cap025 | | 8,078,652 | 264.72 | 60362 / 56885 | 0 |
+| cap | | | 264.69 | | 0 |
+| cap075 | | | 176.89 | | 0 |
+
+- Blocks and bytes are identical per rank. RPC time differs by up to about
+  15%, with no fixed slow rank.
+- Per-rank digests have identical line counts: gsm8k 2638, replay 102,
+  preempt 153, cap* 4820.
+- Per-rank spec dumps are `spec-pp0-tp{0,1}.json`. No rank imbalance.
+
+### vs TP1 it7 (`2026-10-25-qwen3-4b-p4-it7-off-a59a254`, official)
+
+| | TP1 v2 / native | TP2 v2 / native |
+|---|---|---|
+| replay warm TTFT | 0.551-0.577 / 0.561-0.563 | 0.130-0.135 / 0.161-0.166 |
+| replay warm req/s | 9.66 / 9.43 (gap -3.1% per PROGRESS) | 17.3 / 19.2 (-10%) |
+| replay cold TTFT / req/s | 1.383 / 6.31 vs 1.387 / 5.92 | 0.331 / 9.15 vs 0.314 / 9.41 |
+| gsm8k cold s | 170.5 / 179.7 | 118.6 / 122.2 |
+| replay warm local (v2 / native) | 0.348 / 0.378 | 0.833 / 0.864 |
+| G5 E_C f=0.5 (v2 / native) | 0.701 / 0.715 | 0.0005 / 0.0076 (structural) |
+| G5 E_C f=0.75 (v2 / native) | 0.741 / 0.776 | 0.661 / 0.896 |
+| capacity_floor | 2.44x | 2.21x |
+
+At TP2, v2's warm TTFT advantage grows, its warm req/s gap vs native grows
+(-3% to -10%), and the f=0.75 E_C gap widens. The cohort-admission local
+loss is present at both TPs.
