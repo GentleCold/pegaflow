@@ -336,10 +336,10 @@ def _req(num_tokens=13, n_hashes=3, req_id="r"):
     return types.SimpleNamespace(request_id=req_id, num_tokens=num_tokens, block_hashes=hashes)
 
 
-def _sched(sem, answers, policy=None, layout=None):
+def _sched(sem, answers, policy=None, layout=None, **kw):
     rpc = FakeRpc(answers)
     layout = layout or _layout(sem)
-    sched = Scheduler(layout, policy or Policy(), rpc, "inst", clock=Clock(), semantics=sem)
+    sched = Scheduler(layout, policy or Policy(), rpc, "inst", clock=Clock(), semantics=sem, **kw)
     return sched, rpc
 
 
@@ -1529,6 +1529,8 @@ def test_fence_writes(computed, blocks, fence):
     [
         pytest.param("zeroed", 0, id="zeroed-or-copy-target"),
         pytest.param("load-target", 0, id="load-target"),
+        # vLLM recomputes into a failed sync load's blocks (recompute policy).
+        pytest.param("sync-load-plan-fail", 0, id="sync-load-plan-fail"),
         # A block shared through the prefix cache stays fenced whoever frees it.
         pytest.param("still-shared", 0, id="still-shared"),
         pytest.param("saved-through", -1, id="reported-saved"),
@@ -1537,11 +1539,13 @@ def test_fence_writes(computed, blocks, fence):
     ],
 )
 def test_fence_sources(event, fence):
+    sync = event == "sync-load-plan-fail"
     sched, _ = _sched(
         StubSemantics,
         {0: Ready(3, b"L0")},
-        policy=Policy(sync_load_tokens=0),
+        policy=Policy(sync_load_tokens=256 if sync else 0),
         layout=_layout(StubSemantics, StubFullSpec()),
+        sync_loads=sync,
     )
     tables = {"a": [10, 11, 12, 13], "b": [10, 11, 40, 41]}
     for rid in ("a", "b"):
@@ -1563,6 +1567,13 @@ def test_fence_sources(event, fence):
         sched.on_new_request(req)
         assert sched.get_num_new_matched_tokens(req, 0) == (12, True)
         sched.update_state_after_alloc(req, ([30, 11, 31, 32],), 12)
+    elif sync:
+        req = _req(req_id="c")
+        sched.on_new_request(req)
+        assert sched.get_num_new_matched_tokens(req, 0) == (12, False)
+        # A null target block fails the plan; 10 is still in the covered range.
+        sched.update_state_after_alloc(req, ([0, 10, 31, 32],), 12)
+        assert sched._plan.loads[-1].fail
     else:
         # b keeps 10-11 (shared with a, read only); then 10 is reused.
         sched.fence_writes([(([42],), 0), (([10, 11, 40, 41],), 8)])

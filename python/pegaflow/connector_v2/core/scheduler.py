@@ -544,10 +544,16 @@ class Scheduler:
                 self._count("sync_planned")
             else:  # a sync load's blocks are cached at once
                 self._track_load(request, leases or [])
-            # The load writes its target blocks this step.
-            self._fence_blocks(
-                b for _, targets in plan.loads for row in targets for b in row if b is not None
-            )
+        # The load writes its target blocks this step. A failed sync load,
+        # planned or not, leaves its covered blocks to be recomputed by the
+        # running request (kv_load_failure_policy=recompute): no later table
+        # shows those writes, so they are fenced now too.
+        self._fence_blocks(
+            [
+                *plan.covered,
+                *(b for _, targets in plan.loads for row in targets for b in row if b is not None),
+            ]
+        )
         self._plan.loads.append(plan)
 
     def _recut(self, hit: _Hit, num_external_tokens: int) -> list[_Lease] | None:
