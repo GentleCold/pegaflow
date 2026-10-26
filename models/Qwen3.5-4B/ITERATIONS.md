@@ -1117,7 +1117,70 @@ Target: G4 warm replay TTFT p50 and req/s no worse than `native` (judged).
     `finished == {}` (`test_layouts_that_zero_or_copy_blocks`,
     `test_pinned_saves_hold_blocks_until_every_worker_saved`).
 - Slices: Qwen3-4B TP1 GPU5 `baseline,native,v2` replay, then DSV2 TP2 if
-  confirmed. Results pending.
+  confirmed.
+- Review: ACCEPT on c8a8842. The blocker was fixed in c8a8842: a
+  preempted request's fence is dropped, else an abort during an async
+  re-load frees the load's blocks. The should-fix items and nits are fixed.
+- DSV2 S1 (`2026-10-26-dsv2-lite-p5-s1-4bb7d8d`, pre-fence) shows no
+  regression vs it7 m2off: G5 E_C 0.621 (it7 0.631), gsm8k E 1.000.
+
+### it3 result: not confirmed, inconclusive (confounded)
+
+Slice `2026-10-26-qwen3-4b-p5-it3-slice-c8a8842` (GPU5, 32 convs, 264
+warm requests, same replay content as it7):
+
+| run | arm | warm2/3 TTFT p50 | mean | p90 | req/s |
+|---|---|---|---|---|---|
+| it7 (GPU0, KV 75,696 tok) | native | 0.561/0.563 | 0.907/0.901 | 2.16/2.17 | 9.29/9.43 |
+| it7 | v2 (old fence) | 0.551/0.577 | 0.788/0.789 | 1.85/1.83 | 9.66/9.63 |
+| slice (GPU5, KV 71,472 tok) | native | 0.564/0.543 | 0.984/0.978 | 2.18/2.18 | 9.17/9.12 |
+| slice | v2 (it3 fence) | 0.645/0.655 | 0.819/0.817 | 1.72/1.72 | 9.94/9.94 |
+
+- Hold (`sent_wait_ms/sent`): mean 123.6 -> 68.5 ms, max 1516 -> 1080.
+  gsm8k: 565 ms; there, pressure_rpcs is 0 and KV is not short.
+- vs native, slice: p50 +17.5%, mean -16.6%, p90 -21%, req/s +8.7%. In it7
+  the same numbers were p50 -0.9%/+2.5%, mean -13%, p90 -15%, req/s +3%.
+  Only the p50 moved against v2.
+- Not comparable with it7:
+  - The gate's fresh per-arm compile cache (fcd0534, in the slice's gate
+    9e2111f, not in it7's ce645d7) makes every arm compile from scratch.
+    A fresh compile profiles 9.82 GiB of KV (71,472 tokens); an AOT load
+    from `~/.cache/vllm` profiles 10.4 GiB (75,696). The difference is not
+    the GPU: in every run checked, KV size follows `Directly load AOT`.
+    So every run under the current gate has -5.6% KV.
+  - Host: GPU0 runs (it6, it7, mf2) have a baseline p50 of 3.5-3.9 s, the
+    GPU4-7 runs 2.5-2.8 s, and the slice 2.98 s. ms/step for v2 is 24.1
+    on GPU0 and 23.0 on GPU5.
+  - KV model on it7's own timing (`kvcap.py`, hold 2 steps, R 2):
+    shrinking the pool from 4731 to 4467 blocks raises v2's KV-blocked
+    loaded requests 95 -> 146 (steps 11.9 -> 16.7), and native's
+    75 -> 109 (15.1 -> 18.8). The smaller pool hurts v2 more, independent
+    of the fence.
+- Queue/load split (probe, steps, turn>0 loaded requests, n=232):
+  - Load round trip is identical everywhere (p50 7, mean 7.6-7.8, both
+    arms, both runs), so the whole gap is queue.
+  - vLLM's prefill time is lower for v2 (56 vs 89 ms).
+  - Queue histogram, buckets [0,3) [3,8) [8,16) [16,32) [32,64) [64,inf):
+    - native is bimodal: 0/68-89/43-87/2-10/2-3/72-89;
+    - v2 in it7: 22/50/25-33/47-53/23-25/55-57;
+    - v2 in the slice: 16/47/15-17/35-39/71-72/43-46.
+  - The smaller pool moves about 48 v2 requests from [16,32) into
+    [32,64), right where the p50 is. That raises the p50, while the mean
+    and the >64 tail improve. Native has almost nothing in that range, so
+    its p50 is insensitive to it.
+- Residual hold: the saver's compute-event wait averages 32 ms/job
+  (~1.4 steps), plus the RPC. In warm replay 98% of RPCs are already
+  pressure sends (2021/2054), so flushing the held batch earlier on a
+  fence in it would gain little there. On gsm8k it would multiply RPCs
+  (2635 releases vs 313 RPCs), which risks the 2% bound.
+- Decision: keep it3. It is correct (review ACCEPT), the hold is -45%,
+  and req/s, mean and p90 are better than native. The p50 change is
+  confounded by the KV pool and the host. No revert unless same-run
+  evidence says it hurts.
+- Next, once the GPU is cleared: a same-run A/B on one GPU under one gate
+  rev, back-to-back, replay only, `--arms native,<v2>`. One run with
+  under-test 18607c1 (old fence), one with c8a8842. Judge v2-vs-native
+  within each run.
 
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
