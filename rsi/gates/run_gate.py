@@ -5,7 +5,7 @@ Runs arms on one model and writes a run record:
     RUN_DIR/
       summary.json            numbers, verdicts, ``official`` flag
       <arm>/<workload>/       what the stage's processes write: probe dir,
-                              vllm.log, pegaflow.log (untrusted, M9)
+                              vllm.log, pegaflow.log (untrusted)
       .gate/<arm>/<workload>/ what the gate writes and judges from: pass
                               outputs / tokens, result.json, stage-error.json
 
@@ -13,7 +13,8 @@ Arms:
   plain                    vLLM without any KV connector (gsm8k only; control)
   baseline                 vLLM + RsiProbe only (no PegaFlow)
   old                      reference connector (pegaflow.connector:PegaKVConnector), black box
-  native                   reference: vLLM's OffloadingConnector (CPU offload), record only
+  native                   reference: vLLM's OffloadingConnector (CPU offload); verdicts not
+                           required, but the arm and its replay timing are (G4 warm reference)
   lmcache                  reference: LMCache in-process connector, local CPU backend only, record only
   selftest:<mode>          gate self-test connector (rsi.gates.selftest), gsm8k and preempt only
   <module>:<Class>         connector under test
@@ -89,10 +90,9 @@ OFFICIAL = {
     "max_num_seqs": 256,
 }
 ACC_TOL = 0.01
-# Hit-rate levels are reported, never gated (user, 2026-10-24: "命中率那块，不要
-# 设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多"). These are the
-# former bars, kept as reference points next to the numbers (``reported``);
-# the onboarding agent judges the hit rate in ITERATIONS.md (GATES.md).
+# Hit-rate levels are reported, never gated (GATES.md "Hit rate"). These are
+# reference points next to the numbers (``reported``); the onboarding agent
+# judges the hit rate in the model's iteration notes (rsi-notes branch).
 MIN_EFFICIENCY = 0.95  # G3 E_ext reference
 ORACLE_FLOOR = {"gsm8k": 0.5, "replay": 0.5}  # warm oracle hit rate below it: E says little
 MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are judged
@@ -162,7 +162,7 @@ MIN_COMPUTED_COVERAGE = 0.9  # split-variant: computed blocks judged, per pass
 # same-split, same-context reference, and the arm's warm completions have a
 # same-split reference (``resume_differ``).
 RESUME_PASS = "resume"
-# A later episode of a request the arm's vLLM preempted (S6, ``resume_plan``).
+# A later episode of a request the arm's vLLM preempted (``resume_plan``).
 RESUME_EP_PASS = f"{RESUME_PASS}_ep"
 RESUME_PREFIX = "resume-"
 
@@ -377,7 +377,7 @@ def launched(
 ):
     """``lease``: the stage's ports, released once its group is gone.
 
-    N5: a stop signal from just before ``Popen`` until the group is in
+    A stop signal from just before ``Popen`` until the group is in
     ``_LIVE`` is deferred (``_STOP["teardown"]``), then honored inside the
     ``try``. One landing after that but before ``stop`` owns the group (a
     few bytecodes before ``try:`` or into ``finally:``) cannot be deferred
@@ -387,7 +387,7 @@ def launched(
         with log.open("w") as fh:
             fh.write(" ".join(cmd) + "\n\n")
             fh.flush()
-            # S11: an isolated arm's helper waits after its unshare until the
+            # An isolated arm's helper waits after its unshare until the
             # gate holds the new mount namespace (``_record_mnt_ns``).
             gate_r = gate_w = None
             if str(ISOLATE) in cmd:
@@ -441,7 +441,7 @@ def launched(
 _STOP: dict[str, Any] = {"signal": None, "teardown": 0}
 # Every launched process group not yet stopped (pid -> (proc, name)).
 _LIVE: dict[int, tuple[subprocess.Popen, str]] = {}
-# S11: isolated leader pid -> an open fd of the private mount namespace
+# Isolated leader pid -> an open fd of the private mount namespace
 # isolate.py unshared (None until read). A root arm can setsid() out of its
 # process group, but not out of this namespace (setns / unshare need
 # CAP_SYS_ADMIN, which isolate.py drops), so every process in it is the
@@ -528,7 +528,7 @@ def stop(proc: subprocess.Popen, name: str, fh) -> None:
     pegaflow-server can take minutes after SIGKILL to unpin a large pool, so
     the wait is on the group, with a generous bound; the exit time is logged.
 
-    S11: for an isolated arm the same signals and wait also cover every
+    For an isolated arm the same signals and wait also cover every
     process in its mount namespace (``_MNT_NS``), so one that setsid()'d out
     of the group is stopped too."""
     t0 = time.monotonic()
@@ -564,7 +564,7 @@ def stop(proc: subprocess.Popen, name: str, fh) -> None:
 
 def stop_live() -> None:
     """At exit: stop every group a stop signal kept ``launched`` from
-    stopping (N5); a no-op on every ordinary path."""
+    stopping; a no-op on every ordinary path."""
     for proc, name in list(_LIVE.values()):
         print(f"[gate] {name} group {proc.pid} left by a signal window: stopping it", flush=True)
         with suppress(SystemExit, TeardownError):
@@ -603,7 +603,7 @@ def pycache_env(env: dict[str, str], log: Path) -> None:
 
 
 PYCACHE_DIR = ".pycache"
-# M10: one bytecode cache per stage, made fresh before the stage and outside
+# One bytecode cache per stage, made fresh before the stage and outside
 # every arm dir (<run>/.pycache-stages/<label>/<wl>): a stage cannot plant a
 # ``.pyc`` that a later stage runs.
 STAGE_PYCACHE_DIR = ".pycache-stages"
@@ -614,7 +614,7 @@ def stage_pycache(stage: Path) -> Path:
     return stage.parents[1] / STAGE_PYCACHE_DIR / stage.parent.name / stage.name
 
 
-# S5: one vLLM cache root (torch compile artifacts, the Inductor and Triton
+# One vLLM cache root (torch compile artifacts, the Inductor and Triton
 # caches vLLM keeps next to them) per arm: <run>/.compile-cache/<label>, made
 # fresh before the arm's first stage and bound rw into that arm only. No arm
 # loads an artifact another arm (or an earlier run) wrote, except a copy of
@@ -629,7 +629,7 @@ def compile_cache(stage: Path) -> Path:
     return stage.parents[1] / COMPILE_CACHE_DIR / stage.parent.name
 
 
-# N2: what a seeded Triton autotune entry may hold: a tile config. Triton's
+# What a seeded Triton autotune entry may hold: a tile config. Triton's
 # format also carries ``pre_hook`` and ``ir_override`` (a path to IR Triton
 # compiles instead of the kernel); both must be null.
 _TILE_FIELDS = {"kwargs", "num_warps", "num_ctas", "num_stages", "maxnreg"}
@@ -711,7 +711,7 @@ def fresh_compile_cache(stage: Path) -> Path:
     return d
 
 
-# M9: everything the gate judges from that the gate itself writes (pass
+# Everything the gate judges from that the gate itself writes (pass
 # outputs and tokens, result.json, stage-error.json) lives here, never in a
 # dir an arm gets: <run>/.gate/<label>/<workload>. The runs root is under the
 # arm's tmpfs and only its current stage dir is bound back.
@@ -765,7 +765,7 @@ def isolation_available() -> bool:
 
 
 def isolation(args, stage: Path) -> dict[str, Any]:
-    """M7(a), M9, M10: what the arm under test sees of the runs root: only
+    """What the arm under test sees of the runs root: only
     the current stage's dir and that stage's bytecode cache (rw) and its
     snapshot (ro). Every other arm's outputs, digests and requests (the
     baseline's included), its own earlier stages and their caches, and the
@@ -878,7 +878,7 @@ def lmcache_dists(overlay: Path) -> list[str]:
 
 
 def lmcache_storing_ranks(spec: dict[str, Any] | None, tp: int) -> int | None:
-    """LMCache CPU backends a TP group creates (S1). LMCache sizes its local
+    """LMCache CPU backends a TP group creates. LMCache sizes its local
     CPU backend per worker; on an MLA model (one latent KV, the same on
     every rank) only the first rank stores ("save only first rank"), else
     every rank stores its own shard. None: unknown (no spec dump at TP > 1)."""
@@ -922,7 +922,7 @@ def lmcache_config(
 
 
 def lmcache_size_problem(cfg: dict[str, Any]) -> str | None:
-    """S1, fail-closed: LMCache must have created exactly the storing ranks'
+    """Fail-closed: LMCache must have created exactly the storing ranks'
     backends, so its total CPU store is ``backends * per_rank_bytes <= C``."""
     n, per, c = cfg["backends"], cfg["per_rank_bytes"], cfg["cpu_bytes"]
     if n != cfg["storing_ranks"] or n * per > c:
@@ -934,7 +934,7 @@ def lmcache_size_problem(cfg: dict[str, Any]) -> str | None:
 
 
 def lmcache_build_problem(gate: dict[str, Any], dists: list[str]) -> str | None:
-    """S2: the lmcache build of a model's reference numbers is declared in
+    """The lmcache build of a model's reference numbers is declared in
     its gate.json (``lmcache_dist``: ``<name>-<version>`` of the overlay's
     dist, e.g. PR #4467 on Qwen3-4B, 0.5.6 on DeepSeek-V2-Lite where #4467
     crashes on MLA). The overlay must hold exactly that dist; a model
@@ -1108,7 +1108,7 @@ def vllm_server(
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONPATH"] = ":".join(x for x in (str(REPO), env.get("PYTHONPATH")) if x)
     env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
-    # S5: every compiled-code cache the stage loads lives in its arm's root:
+    # Every compiled-code cache the stage loads lives in its arm's root:
     # torch compile + Inductor (vLLM puts them under VLLM_CACHE_ROOT), Triton
     # (kernels JIT-compiled before vLLM's compile sets it, e.g. GDN's FLA
     # ops) and FlashInfer's JIT ops.
@@ -1143,7 +1143,7 @@ def vllm_server(
         # LMCache lives in an overlay (its pins would downgrade the shared
         # venv); only this arm's vLLM sees it.
         env["PYTHONPATH"] = f"{env['PYTHONPATH']}:{args.lmcache_overlay}"
-        # S1: LMCache sizes each storing rank's CPU backend; together they hold C.
+        # LMCache sizes each storing rank's CPU backend; together they hold C.
         env |= lmcache_env(cpu_bytes // args.lmcache_ranks, args.lmcache_chunk_size)
     cmd = [
         "vllm",
@@ -1320,7 +1320,7 @@ def resume_plan(reqs: list[dict[str, Any]], n: int) -> dict[str, Any]:
     the arm's schedule order (same ``step`` = same wave). Wave rows:
     ``[prompt, pre-warm R, start, prompt_len]``.
 
-    A request vLLM preempted has later episodes ``k`` (S6): ``chains[prompt]``
+    A request vLLM preempted has later episodes ``k``: ``chains[prompt]``
     lists ``[k, R_k, start_k, tokens_k]`` (``tokens_k``: the request's length
     when episode ``k`` was scheduled, ``episode_tokens``; ``R_k`` the
     pre-warm point, by the same rule). The replay runs each right after the
@@ -1372,7 +1372,7 @@ def resume_check(plan: dict[str, Any], reqs: list[dict[str, Any]]) -> dict[str, 
     replayed ``resume`` request's prompt length and first-episode start vs
     the arm's (a differing start leaves that request's computed blocks
     without a same-split reference: unjudged, never matched). Per planned
-    later episode (``chains``, S6): the ``resume_ep`` request of that
+    later episode (``chains``): the ``resume_ep`` request of that
     episode (``turn``), its prompt length vs the arm's episode length and its
     start vs the arm's episode start (``episode_*``, ``[prompt, episode]``)."""
     got = {
@@ -1427,7 +1427,7 @@ def run_arm_workload(
     if probe.exists():
         shutil.rmtree(probe)
     gdir = gate_dir(out)
-    for d in (gdir, stage_pycache(out), out / SABOTAGE_DIR):  # fresh per stage (M9, M10)
+    for d in (gdir, stage_pycache(out), out / SABOTAGE_DIR):  # fresh per stage
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
@@ -1726,7 +1726,7 @@ def spec_diff(a: Any, b: Any, path: str = "") -> list[str]:
     return [] if a == b else [f"{path}: {a!r} != {b!r}"]
 
 
-# R1: spec dump fields added after the first committed dumps, with the probe
+# Spec dump fields added after the first committed dumps, with the probe
 # schema that first wrote them (``rsi_probe.SPEC_SCHEMA``). A dump at an older
 # schema lacks them because its gate rev did not know them: not judged.
 SPEC_FIELDS: dict[tuple[str, ...], int] = {
@@ -1781,7 +1781,7 @@ def g0(run_dir: Path, label: str, committed: Path) -> dict[str, Any]:
         schema = dump_schema(raw)
         want, got = _strip(json.loads(committed.read_text())), _strip(raw)
         for path, since in SPEC_FIELDS.items():
-            # S1/R1: a field the record's probe did not write yet is not
+            # A field the record's probe did not write yet is not
             # judged; one it wrote is judged in full (missing or different
             # fails).
             if since > schema and _get(got, path) is _MISSING and _pop(want, path):
@@ -1885,7 +1885,7 @@ def expected_connector(arm: str) -> str | None:
 
 
 def connector_root(arm: str, pegaflow_dir: Path | None) -> Path | None:
-    """Where an arm's connector module must resolve, by arm kind (M8), never
+    """Where an arm's connector module must resolve, by arm kind, never
     by module name: the declared self-test arms -> the gate tree; every other
     arm (the arm under test whatever its module, ``old``) -> its expected
     ``pegaflow`` dir (the snapshot for the arm under test)."""
@@ -1993,7 +1993,7 @@ def split_control(run_dir: Path, batch_invariant: bool = True) -> dict[str, Any]
     # prompt_len % align == 0: vLLM's own hit stops one block short of the
     # prompt (it must compute the last token), a connector's need not, so the
     # split differs from a connector's warm request on exactly these prompts.
-    # A missing token record is not aligned: it is never exempted (S7).
+    # A missing token record is not aligned: it is never exempted.
     aligned = [b is not None and bool(b.get("prompt_tokens")) and b["prompt_tokens"] % al == 0 for b in gt]  # fmt: skip
     basis = _outputs(run_dir, *(("plain", "cold") if batch_invariant else ("baseline", ALONE_REF)))
     # Requests whose two passes started at the same point: the pair compares
@@ -2069,7 +2069,7 @@ def _split_control_verdict(ctrl: dict[str, Any] | None, claim: bool) -> dict[str
     n = ctrl["n"]
     differ, lp = sum(ctrl["differ"]), sum(ctrl["logprob_differ"])
     measured = differ == 0 and lp == 0
-    # N2: pairs that started at the same point compare no split. When nearly
+    # Pairs that started at the same point compare no split. When nearly
     # all do, an invariant measurement says nothing: it is flagged
     # ``vacuous`` (the verdict is unchanged: ``true``, the strict claim,
     # judges computed blocks across splits and can only fail a right load).
@@ -2189,13 +2189,13 @@ def resume_differ(
     0``) whose replay could not resume where the arm did (a connector's hit
     may end inside the last block, vLLM's prefix cache cannot). Every other
     prompt is checked; one without a replayed completion (missing, or not
-    resumed at the arm's point) counts as differing (fail closed, S7)."""
+    resumed at the arm's point) counts as differing (fail closed)."""
     if got is None or ref is None or plan["problems"]:
         return None, None
     plen = {i: p for w in plan["waves"] for i, _, _, p in w}
     unreplayed = set(check["missing"]) | set(check["start_differs"]) | set(check["prompt_len_differs"])  # fmt: skip
     for k in ("episode_missing", "episode_start_differs", "episode_prompt_len_differs"):
-        unreplayed |= {i for i, _ in check.get(k, [])}  # a later episode replayed elsewhere (S6)
+        unreplayed |= {i for i, _ in check.get(k, [])}  # a later episode replayed elsewhere
     checked = exempt = 0
     for i, out in enumerate(got):
         p = plen.get(i)
@@ -2275,7 +2275,7 @@ def _coverage_verdict(
     REF, or REF never computed the key). In ``exact`` passes every unjudged
     block must sit in an aligned prompt (``prompt_len % align == 0``, where
     the plain split stops one block short of a connector's hit): zero
-    unjudged computed blocks on non-aligned prompts (S7)."""
+    unjudged computed blocks on non-aligned prompts."""
     if d is None or d.get("split_invariant") is not False:
         return
     cov, ok = {}, True
@@ -2494,7 +2494,7 @@ def _capacity_verdict(r: dict[str, Any] | None, pegaflow: bool, gated: bool) -> 
     if r is None or "capacity" not in r:
         reason = (r or {}).get("error", "not evaluated")
         return {"pass": False, "reason": reason}
-    # S13: a record without a field this verdict needs (e.g. written before
+    # A record without a field this verdict needs (e.g. written before
     # the field existed) cannot be evaluated, which is a fail, not a crash
     # that loses every other verdict of the run.
     missing = _missing_fields(r, _CAPACITY_FIELDS)
@@ -2602,6 +2602,113 @@ def _cmp(mine: list[float], theirs: list[float], lower: bool, slack: float) -> d
     return {"pass": ok, "value": mine, "baseline": theirs, "slack": slack}
 
 
+def _pass_values(r: dict[str, Any] | None, names: tuple[str, ...], key: str) -> list[float]:
+    """``key`` of each named pass of stage result ``r`` that recorded it."""
+    ps = (r or {}).get("passes", {})
+    return [ps[n][key] for n in names if n in ps and key in ps[n]]
+
+
+def _timed_warm(r: dict[str, Any] | None) -> tuple[str, ...]:
+    """G4-timed warm replay passes (warm2..N; ``warm`` carries the digests)."""
+    ps = (r or {}).get("passes", {})
+    return tuple(n for n in ps if n.startswith("warm") and n != "warm")
+
+
+# G4 warm keys reported for the arm under test against the native reference
+# arm (vLLM's OffloadingConnector) in the same run: a judged comparison, not
+# a gate.
+G4_NATIVE_KEYS = (("ttft_p50", True), ("req_per_s", False))
+# Run validity, not a bar on any arm (hit levels stay reported):
+# a native replay whose timed warm passes serve less than this share of the
+# oracle's external hits is not a working store, so it is no G4 reference
+# and the run is not official (``g4_native_problems``). Measured native
+# values: rsi-notes:gates-evidence.md, "Working native".
+NATIVE_MIN_EFFICIENCY = 0.9
+
+
+def _native_perf_verdicts(
+    rep: dict[str, Any] | None, native_rep: dict[str, Any] | None, replay_ok: bool
+) -> dict[str, Any]:
+    """G4 warm replay vs the in-run ``native`` arm, ``reported`` (no ``pass``
+    key: never fails the arm or the exit code). The onboarding agent judges
+    it in the "perf vs native judgment" (GATES.md G4). Per key: both arms'
+    timed warm pass values, medians, pass-to-pass ranges, ``gap`` (median -
+    native median), ``gap_pct`` (of native's median; for TTFT positive is
+    slower, for req/s negative is slower), ``noise`` (the larger range) and
+    ``within_noise`` (|gap| <= noise, a diagnostic). Only native's timing is
+    used. ``void`` when the arm's replay KV was wrong (its timing measures
+    nothing then)."""
+    g: dict[str, Any] = {}
+    for key, lower in G4_NATIVE_KEYS:
+        mine = _pass_values(rep, _timed_warm(rep), key)
+        theirs = _pass_values(native_rep, _timed_warm(native_rep), key)
+        v: dict[str, Any] = {"status": "reported", "lower_is_better": lower}
+        v |= {"value": mine, "native": theirs}
+        if mine and theirs:
+            a, b = _median(mine), _median(theirs)
+            rng, nrng = max(mine) - min(mine), max(theirs) - min(theirs)
+            v |= {
+                "median": a,
+                "native_median": b,
+                "range": rng,
+                "native_range": nrng,
+                "gap": a - b,
+                "gap_pct": 100 * (a - b) / b if b else None,
+                "noise": max(rng, nrng),
+                "within_noise": abs(a - b) <= max(rng, nrng),
+            }
+        if not replay_ok:
+            v["void"] = "G2.digest_self.replay fails: the timing is not comparable"
+        if native_rep is None:
+            v["reason"] = "no native replay stage in this run"
+        elif not theirs:
+            v["reason"] = f"native replay has no timed warm pass with {key}"
+        elif not mine:
+            v["reason"] = f"no timed warm pass with {key}"
+        g[f"G4.replay_warm.{key}_vs_native"] = v
+    return g
+
+
+def g4_native_problems(
+    results: dict[str, dict[str, Any]], arms: list[str], wls: list[str]
+) -> list[str]:
+    """Why a run cannot be official for G4 vs native (run validity, like
+    ``g5_problems``; nothing here gates the native arm itself). The native
+    replay stage must have run (crashed or absent: no reference), recorded
+    every timed warm pass the baseline has (ttft_p50 and req_per_s), and
+    worked as an offloading store, judged from its own replay data only:
+    no load errors, excess within ``excess_limit`` on the warm pass, and on
+    every timed warm pass its external hits cover at least
+    ``NATIVE_MIN_EFFICIENCY`` of the oracle's (``E_ext``). A native that
+    loads nothing times like baseline and would pass any arm that beats
+    baseline. Native's G0 / G2 verdicts are not looked at (it fails
+    G0.spec by construction). Without the native arm or the replay
+    workload ``official_problems`` already names the gap."""
+    if "native" not in arms or "replay" not in wls:
+        return []
+    nat = results.get("native", {}).get("replay")
+    if nat is None or "error" in nat:
+        return ["native replay stage missing or failed (G4 vs native needs its warm numbers)"]
+    want = _timed_warm(results.get("baseline", {}).get("replay"))
+    have = {n for n in _timed_warm(nat) if all(k in nat["passes"][n] for k, _ in G4_NATIVE_KEYS)}
+    if not want or set(want) - have:
+        return [f"native replay timed warm passes {sorted(have)} != baseline's {sorted(want)}"]
+    hit = nat.get("hit") or {}
+    bad = []
+    if nat.get("load_errors"):
+        bad.append(f"{len(nat['load_errors'])} load errors")
+    w = hit.get("warm")
+    if w is None or w["excess_tokens"] > w["excess_limit"]:
+        bad.append("warm pass excess above one block per request (or no hit record)")
+    for n in sorted(want):
+        e = (hit.get(n) or {}).get("efficiency")
+        if e is None or e < NATIVE_MIN_EFFICIENCY:
+            bad.append(f"{n} E_ext {e} < {NATIVE_MIN_EFFICIENCY:g}")
+    if bad:
+        return [f"native replay is not a working store ({'; '.join(bad)}): no G4 reference"]
+    return []
+
+
 def _perf_verdicts(
     rep: dict[str, Any] | None,
     base_rep: dict[str, Any] | None,
@@ -2611,15 +2718,7 @@ def _perf_verdicts(
 ) -> dict[str, Any]:
     """G4 vs baseline vLLM. Replay numbers only count when the replay KV was
     correct (``replay_ok``)."""
-
-    def passes(r: dict[str, Any] | None, names: tuple[str, ...], key: str) -> list[float]:
-        ps = (r or {}).get("passes", {})
-        return [ps[n][key] for n in names if n in ps and key in ps[n]]
-
-    def timed(r: dict[str, Any] | None) -> tuple[str, ...]:
-        ps = (r or {}).get("passes", {})
-        return tuple(n for n in ps if n.startswith("warm") and n != "warm")
-
+    passes, timed = _pass_values, _timed_warm
     g: dict[str, Any] = {}
     for key, lower in (("ttft_p50", True), ("req_per_s", False)):
         for name, names, slack in (
@@ -2638,7 +2737,7 @@ def _perf_verdicts(
             True,
             MAX_OVERHEAD,
         )
-    # S9: the untimed warmup moves one-time costs (first save, gRPC setup)
+    # The untimed warmup moves one-time costs (first save, gRPC setup)
     # out of the cold passes; reported per workload, never gated.
     g["G4.warmup_seconds"] = {
         wl: {
@@ -2651,7 +2750,7 @@ def _perf_verdicts(
 
 
 def _predates(v: dict[str, Any], predates: bool) -> dict[str, Any]:
-    """S1: a record is judged by the gate rev it ran under. A check added
+    """A record is judged by the gate rev it ran under. A check added
     after a record was made (its inputs are absent from the gate-written
     record) is ``na`` for it, never a retroactive failure."""
     if not predates:
@@ -2735,7 +2834,7 @@ def _bad_loads(d: dict[str, Any] | None, gid: int) -> int | None:
 
 
 def _caught(bad: int | None, uncertain: int | None, n: int | None) -> bool:
-    """R3: one digest check catches a group when its bad loads cover every
+    """One digest check catches a group when its bad loads cover every
     sabotaged load it could judge (``n - uncertain``), at least one; ``n``
     None = the record predates the count (one bad load suffices)."""
     if not bad:
@@ -2750,7 +2849,7 @@ def caught_per_group(
     sabotage: dict[str, int] | None,
     d_preempt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """M2/R3: a negative self-test arm is caught only if every group it
+    """A negative self-test arm is caught only if every group it
     corrupts (``targets``), each judged on its own, has in both gsm8k
     digest checks at least as many loads equal to no reference as the
     connector sabotaged there, less the external loads that check left
@@ -2938,7 +3037,7 @@ def verdicts(
                     "G2.digest_groups",
                     *(("G2.preempt",) if "G2.preempt" in g else ()),
                     # Split-variant: warm computed KV and outputs are judged
-                    # against the replay at the arm's resume points (S5).
+                    # against the replay at the arm's resume points.
                     *(("G2.resume_reference",) if not split_inv else ()),
                 )
                 g["pass"] = all(g[k]["pass"] for k in need)
@@ -2989,6 +3088,14 @@ def verdicts(
         g |= _perf_verdicts(
             rep, base.get("replay"), gsm, base.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
         )
+        if kind not in _REFERENCE:
+            # The arm under test only: warm replay vs native's, reported.
+            nat = results.get("native", {}).get("replay")
+            g |= _native_perf_verdicts(
+                rep,
+                nat if nat is not None and "error" not in nat else None,
+                g["G2.digest_self.replay"]["pass"],
+            )
         cap = per_wl.get("cap")
         pegaflow = kind not in _OFFLOAD
         # The arm under test must load in the cap passes (a passing G5 needs
@@ -3058,7 +3165,8 @@ _HIT_KEYS = {
 def hit_report(v: dict[str, Any]) -> dict[str, Any]:
     """Every hit-rate number per arm (H, H*, E_ext, H*_C, H_lru, freeze, E_C),
     marked ``reported``: no hit-rate level is gated; the onboarding agent
-    judges them in ITERATIONS.md and the review agent checks that judgment."""
+    judges them in the model's iteration notes (rsi-notes branch) and the
+    review agent checks that judgment."""
     out: dict[str, Any] = {}
     for label, g in v.items():
         if label == "baseline" or not isinstance(g, dict):
@@ -3072,6 +3180,28 @@ def hit_report(v: dict[str, Any]) -> dict[str, Any]:
         }  # fmt: skip
         if arm:
             out[label] = {"status": "reported"} | arm
+    return out
+
+
+def _behind_pct(x: dict[str, Any]) -> float | None:
+    pct = x.get("gap_pct")
+    return None if pct is None else (pct if x["lower_is_better"] else -pct)
+
+
+def native_report(v: dict[str, Any]) -> dict[str, Any]:
+    """Per arm judged against native: median, native median, gap %,
+    ``behind_pct`` (positive = slower than native, whatever the direction of
+    the key), within noise per ``*_vs_native`` key (full verdicts stay in
+    ``verdicts``)."""
+    out: dict[str, Any] = {}
+    for label, g in v.items():
+        keys = [k for k in g if k.endswith("_vs_native")] if isinstance(g, dict) else []
+        if keys:
+            out[label] = {
+                k: {f: g[k].get(f) for f in ("median", "native_median", "gap_pct", "within_noise", "void", "reason")}
+                | {"behind_pct": _behind_pct(g[k])}
+                for k in keys
+            }  # fmt: skip
     return out
 
 
@@ -3356,7 +3486,7 @@ def contamination(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
       p99 for the same pass;
     - the baseline's p99 above ``CONTAMINATION_P99`` x the median of the
       arms' p99 for that pass (a baseline stall inflates every arm's G4
-      margin, S8).
+      margin).
     Nothing is dropped: the run becomes non-official."""
     base = results.get("baseline", {}).get("replay", {}).get("passes", {})
     out = []
@@ -3406,13 +3536,14 @@ def official_problems(
         if not same(k, v)
     ]
     kinds = {arm_kind(a) for a in arms}
-    for need in ("plain", "baseline", "under_test"):
+    # native: G4's warm replay reference next to baseline.
+    for need in ("plain", "baseline", "native", "under_test"):
         if need not in kinds:
             out.append(f"arm {need} missing")
     if set(wls) - {PREEMPT} != set(WORKLOADS):
         out.append(f"workloads {wls} != {','.join(WORKLOADS)}")
     if PREEMPT not in wls and committed.is_file() and has_state_group(json.loads(committed.read_text())):  # fmt: skip
-        # S3: gsm8k loads one state key per group; preempt judges resumed
+        # gsm8k loads one state key per group; preempt judges resumed
         # episodes' state loads, which no other official stage exhausts.
         out.append(f"workload {PREEMPT} missing (required on models with a Mamba state group)")
     if args.num_gpu_blocks or args.vllm_arg:
@@ -3426,7 +3557,7 @@ def official_problems(
     for a in arms:
         mod = a.split(":")[0]
         if arm_kind(a) == "under_test" and not (mod == "pegaflow" or mod.startswith("pegaflow.")):
-            # M8: the snapshot holds only ``pegaflow``; a module elsewhere
+            # The snapshot holds only ``pegaflow``; a module elsewhere
             # (e.g. ``rsi.*`` in the gate tree) is never staged or scanned.
             out.append(f"arm under test {a}: module {mod} is outside the pegaflow package")
     if "under_test" in kinds and not args.under_test_path:
@@ -3559,7 +3690,7 @@ def record_provenance(args, run_dir: Path) -> dict[str, Any]:
             else {"verified": False, "reason": "pegaflow not importable"}
         )
         if args.under_test_path:
-            # The arm imports this snapshot, not the tree (M5).
+            # The arm imports this snapshot, not the tree.
             out["under_test"] = provenance.stage(
                 Path(args.under_test_path), Path(args.under_test_overlay), trees
             )
@@ -3581,7 +3712,7 @@ def record_provenance(args, run_dir: Path) -> dict[str, Any]:
 
 
 class ProvenanceWatch:
-    """M10: what ``record_provenance`` verified must stay as it was. The gate
+    """What ``record_provenance`` verified must stay as it was. The gate
     tree (``rsi/``, ``python/pegaflow``, the model's committed
     ``docs/rsi/models/<model>``), the venv ``pegaflow`` tree, the snapshot
     the arm under test imports and the pegaflow-server binary are
@@ -3645,7 +3776,7 @@ _PROVENANCE_ROLES = {
 
 
 def scan_record(args, allow: list[dict[str, str]] | None = None) -> dict[str, Any]:
-    """M7(b): static scan of the snapshot the arm under test imports; hits
+    """Static scan of the snapshot the arm under test imports; hits
     on ``provenance.SCAN_ALLOWLIST`` are recorded with their reason."""
     if not getattr(args, "under_test_path", ""):
         return {"scanned": None, "allowlisted": [], "flagged": []}
@@ -3668,7 +3799,7 @@ def scan_record(args, allow: list[dict[str, str]] | None = None) -> dict[str, An
 def provenance_problems(prov: dict[str, Any]) -> list[str]:
     """Official only if every tree the run imports is verified: the gate
     tree, the venv's ``pegaflow`` and, with ``--under-test-path``, the
-    snapshot of the tree under test (M6)."""
+    snapshot of the tree under test."""
     out = []
     for key, role in _PROVENANCE_ROLES.items():
         rec = prov.get(key)
@@ -3826,7 +3957,7 @@ def main(argv: list[str] | None = None) -> int:
     model_dir = REPO / "docs" / "rsi" / "models" / Path(args.model).name
     gate_file, committed = model_dir / "gate.json", model_dir / "spec.json"
     gate = json.loads(gate_file.read_text()) if gate_file.exists() else {}
-    # S1: LMCache's storing ranks (MLA: the first only), from the committed
+    # LMCache's storing ranks (MLA: the first only), from the committed
     # dump; None at TP > 1 without one fails the lmcache arm's stages.
     args.lmcache_ranks = lmcache_storing_ranks(
         json.loads(committed.read_text()) if committed.exists() else None, args.tp
@@ -3844,7 +3975,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None and sys.pycache_prefix != str(gate_pyc):
         # Re-exec (same pid) with a fresh bytecode cache: the gate and the
         # oracle never read an in-tree ``__pycache__`` of the gate or venv
-        # ``pegaflow`` trees (M5). Nothing ran yet but argument parsing.
+        # ``pegaflow`` trees. Nothing ran yet but argument parsing.
         if gate_pyc.exists():
             shutil.rmtree(gate_pyc)
         gate_pyc.mkdir(parents=True)
@@ -3877,7 +4008,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[pool] no committed {committed}: estimate skipped", flush=True)
 
     def stage(arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
-        watch.check(f"{arm_label(arm)}/{out.name}")  # M10: before every stage
+        watch.check(f"{arm_label(arm)}/{out.name}")  # before every stage
         return run_stage(args, gate, arm, wl, out, **kw)
 
     measured_u: dict[str, dict[str, Any]] = {}
@@ -3962,12 +4093,13 @@ def main(argv: list[str] | None = None) -> int:
                     (gate_dir(out) / "result.json").write_text(json.dumps(r, indent=1))
                 results.setdefault(label, {})[name] = r
 
-    watch.check("verdicts")  # ... and after the last one (M10)
+    watch.check("verdicts")  # ... and after the last one
 
     def strip(r: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
     problems = official_problems(args, arms, wls, gate_file, committed, gate)
+    problems += g4_native_problems(results, arms, wls)
     contaminated = contamination(results)
     problems += [
         f"contaminated: {c['arm']} replay/{c['pass']} p99 TTFT {c['ttft_p99']:.3g}s > "
@@ -4031,6 +4163,8 @@ def main(argv: list[str] | None = None) -> int:
         "results": {a: {w: strip(r) for w, r in per.items()} for a, per in results.items()},
         "verdicts": v,
         "hit_report": hit_report(v),
+        # Reported, not gated: input to the "perf vs native judgment".
+        "native_report": native_report(v),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
     print(
@@ -4040,6 +4174,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"[gate] hit rates (reported, not gated) {json.dumps(summary['hit_report'], default=str)}"
+    )
+    print(
+        f"[gate] perf vs native (reported, not gated) "
+        f"{json.dumps(summary['native_report'], default=str)}"
     )
     print(f"run record: {run_dir}")
     required = [x for x in v.values() if x.get("required", True)]

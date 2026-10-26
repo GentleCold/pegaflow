@@ -263,7 +263,7 @@ class Trees:
 
 
 def fingerprint(root: Path, subpaths: tuple[str, ...], pycache_ok: bool = False) -> dict[str, str]:
-    """M10: ``path -> blob id`` of every file under ``root/subpaths`` (a
+    """``path -> blob id`` of every file under ``root/subpaths`` (a
     symlink as ``symlink -> <target>``; a subpath may be one file). With
     ``pycache_ok``, in-tree ``__pycache__/*.pyc`` are skipped: no process
     reads them (every one runs with PYTHONPYCACHEPREFIX)."""
@@ -345,7 +345,7 @@ def stage(under_test: Path, dest: Path, trees: Trees) -> dict[str, Any]:
     return rec
 
 
-# M7(b): instrument / run-artifact access a connector has no reason for
+# Instrument / run-artifact access a connector has no reason for
 # (GATES.md, "Boundary"). A hit is not a verdict: the run is non-official
 # unless the hit is on ``SCAN_ALLOWLIST``. ``rsi`` matches the gate package
 # as code (``import rsi``, ``from rsi``, ``"rsi.``, ``rsi.gates``,

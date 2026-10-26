@@ -1,20 +1,42 @@
 ---
 name: pegaflow-new-model
-description: Onboard a new model to the PegaFlow vLLM connector in RSI mode (spec dump -> adapter/policy -> gates -> review). Use when adding support for a new model or KV layout, or when resuming the RSI effort in docs/rsi/.
+description: Onboard a new model to the PegaFlow vLLM connector in RSI mode (spec dump -> adapter/policy -> gates -> review). Use when adding support for a new model or KV layout, or when resuming the RSI effort (working memory on the rsi-notes branch, gates in docs/rsi/GATES.md).
 ---
 
 # PegaFlow new-model onboarding (RSI loop)
 
 This skill is the main process for supporting a model. Keep improving it: when a
-step was missing, wrong, or slow, edit this file in the same iteration and log
-the change in `docs/rsi/PROGRESS.md`.
+step was missing, wrong, or slow, edit this file in the same iteration and add
+one line to `PROGRESS.md` on the `rsi-notes` branch.
 
 ## 0. Resume first
 
-1. Read `docs/rsi/PROGRESS.md` (state, last iteration, open questions).
-2. Read `docs/rsi/GATES.md` (what "done" means). Never relax a gate.
-3. Read `docs/rsi/models/<model>/ITERATIONS.md` if it exists.
-4. Write what you are about to do into PROGRESS.md before doing it.
+1. `git -C .worktrees/rsi-notes pull --rebase` (create the worktree with
+   `git worktree add .worktrees/rsi-notes rsi-notes` if missing).
+2. Read the notes' `PROGRESS.md` (state, last iteration, open questions,
+   decisions) and `models/<model>/ITERATIONS.md` if it exists.
+3. Read `docs/rsi/GATES.md` (what "done" means). Never relax a gate.
+4. Write what you are about to do into the notes' `PROGRESS.md`, commit and
+   push it before doing it.
+
+## Notes and code branches
+
+- Working memory (progress, plans, iteration journals, hit-rate judgments,
+  review outcomes, run tags, dated user decisions) lives only on the
+  orphan branch `rsi-notes`, never in a code branch. Commit there in small
+  `docs(rsi): ...` commits; `git pull --rebase` before every push, never
+  force-push (several agents share it).
+- Code branches carry current-state docs only (`docs/rsi/GATES.md`,
+  `docs/rsi/models/<model>/{spec.json,gate.json}`, this skill, package
+  READMEs): no dated history, change logs, journals or review files. State
+  a decision as a rule; its date and quote go to the notes' "Decisions".
+- Compaction (notes `README.md`): `PROGRESS.md` <= 300 lines, each
+  `ITERATIONS.md` <= 400, `gates-evidence.md` <= 300. When over budget, and
+  at every model acceptance, rewrite instead of appending: current state
+  first, each closed iteration one table row (iteration, hypothesis, result,
+  run tag, commit), dead ends one line each, superseded numbers dropped. A
+  review file on the notes branch lives only until its findings are
+  resolved, then becomes one line in the model's `ITERATIONS.md`.
 
 ## 1. Isolation
 
@@ -32,50 +54,52 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 
 1. **Spec dump + gate self-test** (G0): any gate run writes the dump (the
    `RsiProbe` stacked in every arm). Run the self-test command from GATES.md
-   ("Self-test at onboarding"): plain, baseline and the four `selftest:` arms on
+   ("Self-test at onboarding"): plain, baseline and the `selftest:` arms on
    128 gsm8k questions. Copy `RUN_DIR/baseline/gsm8k/probe/spec.json` to
    `docs/rsi/models/<model>/spec.json`, and have the gate owner write
-   `docs/rsi/models/<model>/gate.json` (batch invariance, backend,
-   `mamba_cache_mode`). Accept the model's gate only if the baseline controls
-   pass, honest passes and every negative arm fails both digest checks;
-   otherwise the gate is blind on this model and must be fixed first. Note
-   groups, spec classes, block sizes, page bytes, TP shard info. If
-   `oracle.py` raises "no Kind mapping", or the self-test connector raises
-   NotImplementedError (non-full groups), stop: the gate owner maps the spec
-   class first (gates are not the agent's to edit).
+   `docs/rsi/models/<model>/gate.json` (batch / split invariance, backend,
+   `vllm_args`, `gsm8k_vllm_args`, `lmcache_dist`). Accept the model's gate
+   only if the baseline controls pass, honest passes and every negative arm
+   is caught; otherwise the gate is blind on this model and must be fixed
+   first. Note groups, spec classes, block sizes, page bytes, TP shard info.
+   If `oracle.py` raises "no Kind mapping", or the self-test connector raises
+   NotImplementedError, stop: the gate owner maps the spec class first
+   (gates are not the agent's to edit).
 2. **Map to semantics**: each group -> (Kind, Shard, unit). If no existing Kind
    fits, propose a new one in `pegaflow-semantics` with V1 vectors, log it in
-   PROGRESS.md "Semantics changelog" (no need to ask the user), and have the
+   the notes' "Semantics changelog" (no need to ask the user), and have the
    review agent audit it.
 3. **Adapter/policy**: add the minimum adapter code for unknown spec classes;
    put model knobs in `models/<model>`. Prefer policy changes over adapter changes.
-4. **Gates**: on .3 from `~/kexi/pegaflow-semantics-rsi`, run
-   `python -m rsi.gates.run_gate --model ... --tag <model>-it<N> --arms plain,baseline,old,native,lmcache,<module>:<Class>`
-   with the model's lmcache overlay (gate.json `lmcache_dist`: Qwen3-4B
+4. **Gates**: on the 4090 host (10.1.0.44) from the feature dir, run the
+   command in GATES.md "Usage" with `--arms
+   plain,baseline,old,native,lmcache,<module>:<Class>`, `--under-test-path`
+   and the model's lmcache overlay (gate.json `lmcache_dist`: Qwen3-4B
    `~/kexi/overlays/lmcache-pr4467`, DeepSeek-V2-Lite `~/kexi/overlays/lmcache`
    (0.5.6; PR #4467 crashes on MLA); a new model declares the build it
-   validated in its gate.json, else the run is not official; full command in
-   GATES.md "Implementation"; always include `plain`). Official runs carry
-   the reference arms `native` and `lmcache` next to `old`; drop `lmcache`
-   only where GATES.md G5 "lmcache status per model" says it is not
-   comparable on this model (cite it), and never use a wrong-KV
-   reference number (e.g. a curve point whose `digest_self` fails). Run
-   record lands in `~/kexi/rsi-runs/<date>-<tag>/summary.json`; paste verdicts +
-   hit table into ITERATIONS.md. Iterate on small slices first
-   (`--gsm8k-limit 64 --replay-convs 8 --replay-turns 6`); such runs are
-   `official: false` and exit 1 by design. Accept only an official run
-   (`summary.json` "official": true, empty `not_official_because`).
-   The connector under test must read `PEGAFLOW_PORT` and tolerate an empty
-   `kv_connector_extra_config`; vLLM is started with
-   `kv_load_failure_policy=recompute`.
-5. **Optimize**: hit-rate levels (E_ext, E_C) are reported, not gated (user,
-   2026-10-24; GATES.md "Hit rate"). Write a "hit-rate judgment" in
+   validated, else the run is not official). `native` is required (G4's warm
+   reference); drop `lmcache` only where GATES.md "lmcache status per model"
+   says it is not comparable (cite it), and never use a wrong-KV reference
+   number (e.g. a curve point whose `digest_self` fails). Add `,preempt` to
+   `--workloads` on models with a Mamba state group. The run record lands in
+   `~/kexi/rsi-runs/<date>-<tag>/summary.json`; put verdicts + hit table into
+   the notes' ITERATIONS.md. Iterate on slices first (`--gsm8k-limit 64
+   --replay-convs 8 --replay-turns 6`); they are `official: false` and exit 1
+   by design. Accept only an official run (`"official": true`, empty
+   `not_official_because`). The connector under test must read
+   `PEGAFLOW_PORT` and tolerate an empty `kv_connector_extra_config`; vLLM
+   runs with `kv_load_failure_policy=recompute`.
+5. **Optimize**: hit-rate levels (E_ext, E_C) are reported, not gated
+   (GATES.md "Hit rate"). Write a "hit-rate judgment" in the notes'
    ITERATIONS.md for every accepted run: measured hit rate vs H* / H*_C and
-   the reference arms (H_lru, old, native, lmcache), every gap explained, and whether
-   it is close enough. If it is not, or perf is below target, form a hypothesis from metrics (fallbacks per group, unused
-   loads, write amplification, stranded bytes per group, save/load time), change
-   the lowest layer that fixes it, rerun. One hypothesis per iteration, record
-   result even if negative. Hypothesis checklist (extend it when you find more):
+   the reference arms (H_lru, old, native, lmcache), every gap explained, and
+   whether it is close enough. Next to it write a "perf vs native judgment"
+   (GATES.md G4: warm gap vs `native` in %, attributed, close enough or
+   not). If either is not close enough, or perf is below target, form a
+   hypothesis from metrics (fallbacks per group, unused loads, write
+   amplification, stranded bytes per group, save/load time), change the
+   lowest layer that fixes it, rerun. One hypothesis per iteration, record
+   the result even if negative. Hypothesis checklist (extend it):
    - window groups: save only the trailing window, not every block;
    - checkpoint groups: save only at boundaries that requests resume from;
    - state that cannot be resumed (`prefix_cacheable=False`, ring buffers): never save;
@@ -84,157 +108,161 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    - scan resistance: one-pass sweeps must not flush reused prefixes;
    - save cost: no synchronous wait on the model step.
    Do not block a model on hit-rate level alone; correctness checks stay hard.
-   Do not chase the highest hit rate: no eviction policy is globally optimal,
-   so H*_C is a ceiling, not a target.
-   The server is out of scope (user, 2026-10-24): gates run on the base
-   pegaflow-server built from `feat/semantics-rsi`, and agents do not change
-   or tune it. When the evidence points at the server (eviction, admission,
-   pools, allocator, query), attribute the gap with numbers, add it to
-   PROGRESS.md "Server limitations" and go on; a gap the server causes is
-   explained, not fixed, and never blocks a model. Connector code
-   stays model-agnostic too: per-model differences live only in
-   `connector_v2/models/<model>.toml` (see PROGRESS.md "PR policy").
+   Do not chase the highest hit rate: H*_C is a ceiling, not a target.
+   The server is out of scope: gates run on the base pegaflow-server built
+   from `feat/semantics-rsi`, and agents do not change or tune it. When the
+   evidence points at the server (eviction, admission, pools, allocator,
+   query), attribute the gap with numbers (GATES.md "Known server limits";
+   new ones go to the notes' "Server limitations") and go on: explained,
+   not fixed, never blocking. Connector code stays model-agnostic: per-model
+   differences live only in `connector_v2/models/<model>.toml`.
    Policy complexity rules (keep policy growing with Kinds, not with models):
    - no model names and no vLLM spec class names in `policy.py`; decide only
      on Kind and numbers (block tokens, window, sizes);
    - every knob needs gate evidence that it helps; a toml sets only values
      that differ from `default.toml`; a knob no accepted model uses is deleted;
    - budget: about 150 lines of policy per Kind and at most 12 knobs in
-     total; past that, refactor first (a refactor-only iteration) before
-     adding behaviour;
+     total; past that, refactor first (a refactor-only iteration);
    - a simplification is a valid iteration: accept it when every accepted
      model's gate numbers do not regress;
    - no tuning to the trace: report the accepted numbers on a held-out replay
-     slice too (`skip` past the conversations you tuned on);
+     slice too (`--replay-skip` past the conversations you tuned on);
    - if policy logic keeps growing, it is in the wrong layer: propose a Kind
      (semantics, human-reviewed) or a server change (separate PR) instead.
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
-   gate integrity (nothing relaxed), the hit-rate judgment (numbers against
-   `summary.hit_report`, gaps explained), copying from the old connector, regressions
-   on earlier models, the policy complexity rules above (grep `policy.py`
-   for model / spec class names, count knobs and lines, unused knobs), and
-   that the connector does not touch the probe (no instrument or run-artifact
-   access: `RsiProbe`, `RsiWorkerExt`, `rsi_poison`, `sys.modules`, digests,
-   outputs; GATES.md "Boundary"). It reads every `summary.scan` hit (flagged
-   and allowlisted). Fix or justify every finding in ITERATIONS.md.
-7. **Accept**: mark the model done in PROGRESS.md with the accepted numbers:
-   the hit-rate table (local / external / total hit, oracle H*, E_ext; at
-   capacity H*_C, H_lru, E_C) next to the G4 perf table, one row each for
-   the arm under test (v2), `old`, `native` and `lmcache` (or "not
-   comparable" with the GATES.md reason). Do not wait for the user: the review agent's
-   pass is the acceptance; the user does one acceptance pass at the end.
+   gate integrity (nothing relaxed), the hit-rate and perf vs native
+   judgments (numbers against `summary.hit_report` / `native_report`, gaps
+   explained), copying from the old connector,
+   regressions on earlier models, the policy complexity rules above (grep
+   `policy.py` for model / spec class names, count knobs and lines, unused
+   knobs), and that the connector does not touch the probe (GATES.md
+   "Boundary", review checklist). It reads every `summary.scan` hit (flagged
+   and allowlisted). The reviewer returns its report to you; it writes no
+   review file in a code branch. Fix or justify every finding, then add one
+   line to the notes' ITERATIONS.md (verdict, key findings, fix commits).
+7. **Accept**: mark the model done in the notes' PROGRESS.md with the
+   accepted numbers: the hit-rate table (local / external / total hit,
+   oracle H*, E_ext; at capacity H*_C, H_lru, E_C) next to the G4 perf
+   table, one row each for the arm under test (v2), `old`, `native` and
+   `lmcache` (or "not comparable" with the GATES.md reason). The G4 table
+   shows warm replay TTFT p50 and req/s of v2 next to `baseline` and
+   `native`, with the perf vs native judgment. Do not wait for the user: the
+   review agent's pass is the acceptance; the user does one acceptance pass
+   at the end. Compact the model's ITERATIONS.md (section "Notes and code
+   branches").
 
-## 3. Lessons (append)
+## 3. Lessons
 
-- A tree for `--under-test-path` must hold no `.pyc` (the snapshot check
-  rejects it, fail-closed): extract with `git archive <rev> | tar -x` or sync
-  with `tar --exclude=__pycache__ --exclude='*.pyc'`, never import from it
-  before the run.
+Keep this list current-state and short: when it passes ~40 items, condense
+it (merge related items, drop ones the gate or code now enforces).
+
+Host and build:
+- 4090 host: 10.1.0.44 (jump host route), shared venv
+  `~/kexi/pegaflow/python/.venv`. Export `CUDA_HOME=~/kexi/cuda13`, the venv
+  `bin` and `~/kexi/cuda13/bin` on `PATH`, `LD_LIBRARY_PATH=~/kexi/cuda13-lib`
+  (unversioned symlinks to the venv's `nvidia/cu13/lib`): the system toolkit
+  is 12.x, a cuda-13 server build aborts when `libcudart.so` resolves to
+  12.x, and FlashInfer JIT needs a 13.0 nvcc matching the 13.0 headers
+  (`~/kexi/cuda13` comes from the venv wheels `nvidia-cuda-nvcc`,
+  `nvidia-cuda-crt` and `nvidia-nvvm`, pinned to 13.0.x).
+- A tree for `--under-test-path`, and the gate / feature tree the run
+  starts from, must hold no `.pyc` and carry `.rsi-rev` (else provenance is
+  unverified and the run not official): extract with `git archive <rev> | tar -x` (+ `echo <rev> > .rsi-rev`) or
+  sync with `tar --exclude=__pycache__ --exclude='*.pyc'`; never import from
+  it before the run.
 - vLLM 0.32 + flashinfer-python 0.7.0.post1: remove stale `flashinfer-cubin`
-  (version check aborts startup; no 0.7 cubin on PyPI).
-- A cuda-13 server build aborts in preflight when the unversioned
-  `libcudart.so` resolves to CUDA 12.x (cudarc dlopens it by that name). On
-  .44 (current 4090 host, system toolkit 12.2) export
-  `LD_LIBRARY_PATH=~/kexi/cuda13-lib` (symlinks to the venv's
-  `nvidia/cu13/lib` with unversioned names); on the old .3 it was
-  `/usr/local/cuda-13.0/targets/x86_64-linux/lib`.
-- vLLM's flashinfer JIT needs a CUDA 13.0 toolchain matching the 13.0
-  headers. On a host whose system toolkit is 12.x use the venv wheels
-  (`nvidia-cuda-nvcc`, `nvidia-cuda-crt`, `nvidia-nvvm` pinned to 13.0.x) with
-  `CUDA_HOME=~/kexi/cuda13` and the venv `bin` (ninja) on PATH.
-- Build pegaflow-server with `PYO3_PYTHON` = the venv python, else it links
-  the system libpython; a uv venv has no pip, so use `maturin develop --uv`.
-- `pegaflow-server` (PyO3-linked) needs the venv's libpython: `run_gate` adds
-  `sysconfig LIBDIR` to `LD_LIBRARY_PATH` and sets `PYO3_PYTHON`/`PYTHONHOME`.
-  Start it by hand the same way.
-- No `uv`/`ruff` on the local Mac: sync with
-  `COPYFILE_DISABLE=1 tar czf - rsi | ssh ... 'cd ~/kexi/pegaflow-semantics-rsi && tar xzf -'`
-  (without COPYFILE_DISABLE macOS ships `._*` files that break ruff), run
-  `uvx --index-url https://pypi.tuna.tsinghua.edu.cn/simple ruff format/check --config python/pyproject.toml`
-  remotely, tar the result back.
-- The feature dir on .3 is not a git repo: write `.rsi-rev` before a gate run so
-  the run record has a revision.
-- Long ssh commands: launch gate runs with `setsid nohup ... < /dev/null &` so
-  the ssh session returns; poll the log instead of `sleep` > 2 min in one call.
-- Cross-run byte equality of computed KV only holds with
-  `VLLM_BATCH_INVARIANT=1` + FLASH_ATTN (default for gsm8k in `run_gate`).
-  Without it ~2.5% of layer-blocks differ by rounding.
-- Pegaflow-server NUMA split: by default the pool is divided across NUMA
-  nodes, so one GPU sees `pool_size / nodes` (7.5 GiB on .3) and evicts.
-  `run_gate` passes `--disable-numa-affinity --pool-size 160gb`; G3.no_eviction
-  fails any run that evicts (the oracle assumes unlimited capacity).
-- G3 scores only what the connector can add over vLLM's local cache (`E_ext`).
-  Total hit rate looks fine for a connector that only serves the first wave.
-- Digest references must be exhaustive to call a mismatch: gsm8k digests every
-  request; replay digests every 4th conversation, so many replay loads are
-  `uncertain`, which is expected.
-- 4090 / Qwen3-4B defaults (gpu-mem 0.8, 8192 len): 4745 GPU blocks of 16
-  tokens; gsm8k warm oracle hit rate 0.99, local 0.93, so E_ext is decided by
-  the ~7% the connector must serve.
-- `rsi_poison` runs through `POST /collective_rpc`; kwargs arrive as strings over
-  HTTP, so call methods without kwargs (or cast inside).
-- Garbage KV produces garbage text: workload parsers must not crash on it (the
-  liar arm hit `float('1e999')`).
-- Self-test arm signatures on Qwen3-4B (use them to judge a new model's
-  self-test): liar = all external blocks unreferenced in self and mismatched vs
-  baseline, acc 0; bitflip = exactly one mismatched block per request, outputs
-  only partly differ (accuracy alone would miss it); offbyone = most external
-  blocks mismatched, acc ~0.2.
-- The local vLLM checkouts are not 0.32 (no `transfer_group_ids`,
-  `KVCacheTensor.layer_stride`, `KVConnectorBlockState`). Read the real source
-  with `curl https://raw.githubusercontent.com/vllm-project/vllm/v0.32.0/<path>`
-  into `/tmp`. Key files: `v1/kv_cache_interface.py` (specs,
-  `create_kv_cache_views`), `v1/worker/utils.py` (`allocate_kv_cache`),
-  `v1/core/sched/scheduler.py`, `distributed/kv_transfer/kv_connector/v1/{base,multi_connector}.py`.
+  (its version check aborts startup).
+- Build pegaflow-server with `PYO3_PYTHON` = the venv python (a uv venv has
+  no pip: `maturin develop --uv`). `run_gate` adds the venv's libpython dir
+  to `LD_LIBRARY_PATH` and sets `PYO3_PYTHON` / `PYTHONHOME`; start the
+  server by hand the same way.
+- No `uv` / `ruff` on the local Mac: sync with `COPYFILE_DISABLE=1 tar czf -`
+  (else `._*` files break ruff), run `uvx --index-url
+  https://pypi.tuna.tsinghua.edu.cn/simple ruff format/check --config
+  python/pyproject.toml` remotely, tar the result back. Local tests without uv:
+  `python3 -m venv /tmp/rsi-venv && /tmp/rsi-venv/bin/pip install pytest
+  ruff`; that runs the stub cases only, the native cases need the remote
+  venv.
+- Long ssh commands: launch gate runs with `setsid nohup ... < /dev/null &`
+  and poll the log instead of sleeping > 2 min in one call.
+- The local vLLM checkouts are not 0.32. Read the real source with
+  `curl https://raw.githubusercontent.com/vllm-project/vllm/v0.32.0/<path>`:
+  `v1/kv_cache_interface.py`, `v1/worker/utils.py`,
+  `v1/core/sched/scheduler.py`,
+  `distributed/kv_transfer/kv_connector/v1/{base,multi_connector}.py`.
+
+Gate reading:
+- G3 scores only what the connector adds over vLLM's local cache (`E_ext`);
+  a total hit rate looks fine for a connector that only serves the first
+  wave. Qwen3-4B on the 4090 (gpu-mem 0.8, 8192 len): 4745 GPU blocks of 16
+  tokens, gsm8k warm oracle 0.99, local 0.93, so E_ext is decided by the ~7%
+  the connector must serve.
+- The server pool is per NUMA node by default; `run_gate` passes
+  `--disable-numa-affinity --pool-size 64gb`, and any eviction fails
+  `G3.no_eviction`.
+- Replay digests every 4th conversation, so many replay loads are
+  `uncertain`; that is expected.
+- Self-test signatures on Qwen3-4B: liar = all external blocks unreferenced
+  in self and mismatched vs baseline, acc 0; bitflip = one mismatched block
+  per request, outputs only partly differ (accuracy alone would miss it); offbyone = most external blocks
+  mismatched, acc ~0.2.
+- Garbage KV produces garbage text: workload parsers must not crash on it
+  (`float('1e999')`).
+- `rsi_poison` goes through `POST /collective_rpc`; kwargs arrive as strings
+  over HTTP, so call methods without kwargs (or cast inside).
+- G4 is hard: beat baseline on warm replay (TTFT p50 and req/s) and cost at
+  most 2% on cold replay and gsm8k. Read every `G4.*` verdict; the save
+  path's cost shows in the cold and gsm8k checks. A 64-question gsm8k slice
+  cannot resolve 2% (~10 s): use the full 1319 when a G4 gsm8k check is the
+  target.
+- G4 warm vs `native` is judged, not gated (`*_vs_native` reported,
+  `summary.native_report`). vLLM's OffloadingConnector beats baseline by a
+  wide margin (Qwen3.5-4B: native warm TTFT p50 0.172 s, v2 0.300 s,
+  baseline 1.12 s), so beating baseline alone is not the bar: a large gap
+  needs attribution and a hypothesis; compare v2's and native's load path
+  first (sync vs async load, load round trip in steps, per-request load
+  size) before touching policy. A native replay that loads nothing makes
+  the run non-official: fix the native arm's setup or have the gate owner
+  list the model under "native" in GATES.md.
+
+Adapter and connector:
 - Derive segments from the spec dump's `kv_cache_layout` and the layer view
   stride, not from "K then V". In vLLM 0.32 the page is `[H|N, N|H, C]` with
-  `C = K | V`, so K and V are interleaved and a page is ONE segment. The
-  server's gRPC register path has no block stride: block `b` sits at
-  `data_ptr + b * (segments * bytes_per_block)`. Only layer-compact layouts
-  (block stride == page) can be registered as is.
-- The worker gets manager-block views (vLLM keeps `kv_caches` for connectors),
-  but with kernel-block splitting dim 0 counts kernel blocks. Divide by
-  `block_size / N`.
-- Local default gate without uv: `python3 -m venv /tmp/rsi-venv && /tmp/rsi-venv/bin/pip install pytest ruff`.
-  This runs the stub cases only; the native cases need the remote venv.
-- Adapter declarations carry sizes, not byte order. Two layouts with equal
+  `C = K | V`, so a page is ONE segment. The server's register path has no
+  block stride (block `b` at `data_ptr + b * segments * bytes_per_block`):
+  only layer-compact layouts register as is.
+- With kernel-block splitting the worker's views count kernel blocks in
+  dim 0: divide by `block_size / N`.
+- Adapter declarations carry sizes, not byte order: two layouts with equal
   sizes share a namespace unless something names the difference. The core
-  hashes `kv_cache_layout`; an adapter must reject any other byte-order
-  variation it accepts but cannot name (e.g. kernel-split HNC pages). Add a
-  "different bytes give a different namespace" test with each new adapter.
-- Make costs you defer observable in the first gate run (e.g. the worker
+  hashes `kv_cache_layout`; reject any other byte-order variation you cannot
+  name (e.g. kernel-split HNC pages), and add a "different bytes give a
+  different namespace" test with each new adapter.
+- Make deferred costs observable in the first gate run (e.g. the worker
   `save stats` line), so the next iteration decides from data.
-- G4 is hard (user, 2026-10-23): a model is not accepted unless the connector
-  beats baseline vLLM on warm replay (TTFT p50 and req/s) and costs at most 2%
-  on cold replay and gsm8k. Read every `G4.*` verdict, not only warm TTFT;
-  the save path's cost shows up in the cold and gsm8k checks.
-- Async saves in vLLM 0.32 need three hooks, not one: `wait_for_save` only
-  queues (CUDA event + saver thread); `request_finished` returns True and
+- Async saves need three hooks: `wait_for_save` only queues (CUDA event +
+  saver thread); `request_finished` returns True and
   `get_transfer_results.finished_sending` releases the blocks after the copy;
-  `handle_preemptions` (runs before the forward) flushes when the plan saw
-  `preempted_req_ids`. On vLLM's V2 model runner it runs after block zeroing
-  and copy-on-write, so layouts with `needs_kv_cache_zeroing` or
+  `handle_preemptions` (before the forward) flushes when the plan saw
+  `preempted_req_ids`. On the V2 model runner it runs after block zeroing and
+  copy-on-write, so layouts with `needs_kv_cache_zeroing` or
   `hash_block_size < block_size` must finish saves inside `wait_for_save`.
-  Report a request in `finished_sending` even when its save failed, raised or
-  the saver thread died (complete jobs in `finally`), or vLLM leaks its blocks.
+  Report a request in `finished_sending` even when its save failed or the
+  saver died (complete jobs in `finally`), or vLLM leaks its blocks.
 - On short-prefix workloads the async load round trip, not the copy, is the
-  cost: a warm gsm8k request waited ~7.6 steps from admission to its first
-  computed step for a ~1 ms load. Read the probe's `episodes` vs first
-  `progress` step and vLLM's TTFT sum before blaming saves. A sync load
-  (`load_kv_async=False`, wait in `start_load_kv`) fixes it, but vLLM only
-  recovers failed sync loads via `invalid_block_ids` with one KV cache group
-  and no block zeroing. A failed sync load has already fed the forward, and
-  the server keeps the first copy of a key: hold every save of a request
-  touching sync-loaded blocks until vLLM processed that step's output
-  (`max_concurrent_batches` plans), and after any reported failure stop all
-  saves for the process: under the recompute policy vLLM evicts nothing, so
-  KV computed on the bad blocks stays prefix-cached under correct hashes and
-  any later request can extend it (tracking "tainted" requests misses a
-  sharer's next turn and a preempted loader's freed blocks).
-  Never give a sync load a deadline: the server's copy may still land.
-- A 64-question gsm8k slice cannot resolve a 2% bound (~10 s of wall time);
-  use the full 1319 questions in slices when a G4 gsm8k check is the target.
+  cost (a warm gsm8k request waited ~7.6 steps for a ~1 ms load): read the
+  probe's `episodes` vs first `progress` step before blaming saves. A sync
+  load (`load_kv_async=False`, wait in `start_load_kv`) fixes it, but vLLM
+  only recovers failed sync loads via `invalid_block_ids` with one KV cache
+  group and no block zeroing. A failed sync load has already fed the forward and the server keeps a key's first
+  copy: hold every save of a request touching sync-loaded blocks until vLLM
+  processed that step's output (`max_concurrent_batches` plans), and after
+  any reported failure stop all saves for the process: under the recompute
+  policy vLLM evicts nothing, so KV computed on the bad blocks stays
+  prefix-cached under correct hashes and any later request can extend it
+  (tracking "tainted" requests misses sharers and preempted loaders). Never
+  give a sync load a deadline: the server's copy may still land.
 - Mamba align mode (vLLM 0.32): the block table holds only the running
   state block, so checkpoint saves must come from
   `kv_connector_block_state.boundary_state_offloads`. Offers exist only for
@@ -247,17 +275,10 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   while blocks wait for `finished_sending`: step the engine with 1-token
   requests until it succeeds. Use natural text prompts; random tokens make
   greedy outputs diverge on rounding alone.
-- The shared venv's `pegaflow_llm.pth` points at
-  `~/kexi/pegaflow-semantics-rsi/python`, and `run_gate` only prepends the
-  repo root (for `rsi`) to vLLM's PYTHONPATH. Launch every gate from a
-  feature tree with `PYTHONPATH=<tree>/python`, or the run tests the shared
-  tree's connector under your `.rsi-rev`. Once feat/rsi-g5 is merged, use
-  the gate's `--under-test-path <tree>/python` instead. Before trusting a
-  run, check `/proc/<vllm pid>/environ` or the connector's `from=` line in
-  the arm's vllm.log.
-- PR CI must pass (user, 2026-10-24). Before reporting a branch done, run
-  `./scripts/check.sh` (fmt, typos, clippy, cargo check) on the remote and
-  the default Python unit gate. CI runs `cz check` on every commit of the PR,
-  merge commits included: name a merge `Merge branch '<src>' into <dst>`
-  (git's default) or use a commitizen type (`chore(rsi): merge ...`), never
-  `merge(...)`. Locally: `typos` and `cz` install from PyPI into a temp venv.
+
+PR:
+- PR CI must pass. Before reporting a branch done, run `./scripts/check.sh`
+  (fmt, typos, clippy, cargo check) on the remote and the default Python unit
+  gate. CI runs `cz check` on every commit, merges included: use git's
+  default merge message or `chore(rsi): merge ...`, never `merge(...)`.
+  Locally, `typos` and `commitizen` install from PyPI into a temp venv.
