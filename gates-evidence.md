@@ -83,7 +83,7 @@ Old GATES.md lines 200-378 (G5 summary), verbatim:
     lookup hit was retrieved, 128/128 external matched). The fix, for every
     arm (gate `b05e507`): the split key also fingerprints the context bytes
     an episode starts from, and a baseline stage `resume-<label>` replays
-    each arm's warm pass at that arm's own resume points (Implementation,
+    each arm's warm pass at that arm's own resume points (GATES.md, G2
     "Split-variant references").
   - Rerun with it (`2026-10-24-dsv2-lite-lmcache-056-resume-b05e507`,
     0.5.6, 64 questions): `G2.resume_reference` 64/64 requests resumed
@@ -158,8 +158,8 @@ Old GATES.md lines 200-378 (G5 summary), verbatim:
   venv), plus the pure deps the venv lacks (aiofile, aiofiles, caio, redis,
   sortedcontainers, as in the 0.5.6 overlay). No local patch: PR #4467 is
   upstream's fix for #4463 and is used as published (validated upstream on
-  vLLM 0.32.0, A100, by the issue reporter). Rebuild recipe: below
-  ("lmcache overlay").
+  vLLM 0.32.0, A100, by the issue reporter). Rebuild recipe: section
+  "lmcache overlay build (PR #4467)" below.
 - Known server limit (slice 2026-10-23, `old` and connector_v2 on the same
   build): reclaim evicts `RECLAIM_BATCH_SIZE = 512` blocks per round
   (`pegaflow-core/src/storage/mod.rs`), so on a small pool each eviction
@@ -204,6 +204,16 @@ cd ~/kexi/tmp/lmcache-src && CUDA_HOME=~/kexi/cuda13 PATH=~/kexi/pegaflow/python
 <any pip> install --no-deps --target ~/kexi/overlays/lmcache-pr4467 dist/lmcache-*.whl
 # + aiofile aiofiles caio redis sortedcontainers (copied from the 0.5.6 overlay)
 ```
+
+## Unlimited-store pool size (G3)
+
+`run_gate` starts the server for gsm8k / replay with `--pool-size 64gb
+--disable-numa-affinity` (per-NUMA pools give one GPU only
+`pool_size / numa_nodes`). 64gb, not the earlier 160gb: on .44 a 160 GiB
+pinned pool took 2-3 minutes to allocate and 60-95 s to free, and stalled
+other processes' JIT builds. Measured `U` fits: Qwen3-4B gsm8k 30.3 GiB,
+replay ~26 GiB, DeepSeek-V2-Lite TP2 <= 7.8 GiB; `PoolTooSmall` guards
+models that do not.
 
 ## Split invariance: DeepSeek-V2-Lite evidence
 

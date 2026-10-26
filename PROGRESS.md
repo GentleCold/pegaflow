@@ -22,6 +22,10 @@ state the rule only; the date and quote live here.
 | 2026-10-23 | G4 hard ("性能需要达标才行，需要比基准快"): warm replay strictly better than baseline, cold / gsm8k within 2% | GATES.md G4 |
 | 2026-10-23 | G5 added: actual hit rate must approach the theoretical one at a fixed capacity | GATES.md G5 |
 | 2026-10-23 | Replay workload: R2EGym until "agentx" is provided | GATES.md G4 |
+| 2026-10-23 | Host move: .3/.2 unreachable, the 4090 host is 10.1.0.44; everything rebuilt under `~/kexi/` | GATES.md "Usage", skill Lessons "Host and build" |
+| 2026-10-23 | `native` reference arm: baseline also includes vLLM's own offload (`OffloadingConnector` + RsiProbe, CPU bytes = pool size, `C` at G5); first recorded only, warm G4 / `E_C` "at least as good" planned for later (see the 2026-10-26 rows) | GATES.md "Reference arms" |
+| 2026-10-23 | Policy complexity rules (user worried policy would grow too complex): no model / spec class names in `policy.py`, knobs need gate evidence, toml overrides only, ~150 lines per Kind and <= 12 knobs, simplification is a valid iteration, held-out replay slice, growing logic goes to semantics or the server | skill step 5, checked in step 6 |
+| 2026-10-23 | `lmcache` reference arm: LMCache with the same config as the other reference arms (local CPU only, capacity = pool size / `C`), installed as a per-arm overlay, not into the shared venv | GATES.md "lmcache" |
 | 2026-10-24 | Hit rate not gated ("命中率那块，不要设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多"); agent writes a hit-rate judgment, reviewer checks | GATES.md "Hit rate" |
 | 2026-10-24 | Server stays at the base version ("server还是保持原始版本，把server的局限问题汇报给人就行，gate不要被server受限，命中率不用过度追求最高"); limits are reported, not fixed | GATES.md "Known server limits", skill step 5 |
 | 2026-10-24 | PR CI must pass (cz on every commit, typos, clippy) | skill Lessons "PR" |

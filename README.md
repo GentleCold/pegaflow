@@ -43,7 +43,9 @@ every push, never force-push. Commit messages follow commitizen
   Then it is deleted and replaced by one line in the model's `ITERATIONS.md`
   (verdict, key findings, fix commits). A reviewer may also just return its
   report to the orchestrator without writing a file.
-- Not yet applied to the imported files: the model branches
-  `feat/rsi-deepseek-v2-lite` and `feat/rsi-qwen3.5-4b` still carry
-  unmerged journal edits; they are migrated here when those branches fold
-  in, and the compaction happens after that.
+- Not yet applied to the imported files, because model agents are still
+  appending. Trigger: as soon as the model branches
+  `feat/rsi-deepseek-v2-lite` and `feat/rsi-qwen3.5-4b` are folded into
+  `feat/semantics-rsi` (their journal edits migrated here first), compact
+  `PROGRESS.md` to <= 300 lines and each `ITERATIONS.md` to <= 400; in any
+  case before the user's final acceptance.
