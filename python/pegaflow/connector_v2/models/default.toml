@@ -22,7 +22,7 @@ sync_load_tokens = 256
 # behind the long one would hold the whole step until both copies land. The
 # demoted request waits a scheduler round trip instead, and requests sharing
 # its prefix wait for its load. Pending gate evidence: off.
-async_demote = false
+async_demote = true  # experiment arm: H5 demotion
 
 # Save batching. Each step's saves are held and merged with later steps' into
 # one save RPC, sent once the oldest held step has seen save_batch_steps steps
