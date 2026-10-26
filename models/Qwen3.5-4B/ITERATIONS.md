@@ -1412,6 +1412,38 @@ order, pair2, lastsave, inv, kvcap and itl.
 - The Qwen3.5 pair (c8a8842 vs 02b6767, GPU5, replay + gsm8k) is running:
   `qwen3.5-4b-p5-it4-pair-{c8a8842,02b6767}`.
 
+### Qwen3.5-4B pair: c8a8842 vs 02b6767 (GPU5, TP1, native in each run)
+
+Runs: `2026-10-26-qwen3.5-4b-p5-it4-pair-{c8a8842,02b6767}`. Both exit 1,
+because there are no plain/baseline arms.
+
+| rev | arm | gsm8k cold acc / s | gsm8k warm acc / s | replay warm2/3 TTFT p50 | mean | req/s | ms/step |
+|---|---|---|---|---|---|---|---|
+| c8a8842 | native | 0.7824 / 97.40 | 0.7885 / 98.74 | 0.210 / 0.204 | 0.350 / 0.351 | 10.77 / 10.80 | 26.2 / 26.0 |
+| c8a8842 | v2 | 0.7877 / 94.74 | 0.7885 / 94.29 | 0.285 / 0.293 | 0.295 / 0.293 | 14.73 / 14.68 | 21.0 / 21.1 |
+| 02b6767 | native | 0.7824 / 97.59 | 0.7824 / 99.03 | 0.170 / 0.195 | 0.281 / 0.338 | 13.13 / 11.61 | 20.8 / 24.2 |
+| 02b6767 | v2 | 0.7824 / 94.62 | 0.7824 / 94.22 | 0.284 / 0.295 | 0.297 / 0.292 | 14.71 / 14.64 | 21.0 / 21.1 |
+
+- **gsm8k.** Within 2% of native: pass on both revs. v2 warm is 4.5% and
+  4.9% faster than native.
+- **02b6767 vs c8a8842.** Neutral. v2 changes by less than 0.1%. The
+  deferral never fires here: hit stats show no `deferred`.
+- **Native noise.** Native varies across runs (02b6767 run: warm2 19.19 s
+  vs warm3 21.71 s), so the G4 percentages move:
+  - c8a8842: TTFT p50 +39.4% (behind), req/s +36.3% (ahead).
+  - 02b6767: TTFT p50 +58.6% (behind), req/s +18.6% (ahead).
+- **TTFT p50.** The gap is structural. The hybrid layout has 4 KV groups,
+  so loads are never sync and every external hit pays the async round
+  trip. v2's mean and p90 match or beat native.
+- **Hit rates** (G3 warm, both revs, both arms):
+  - replay: hit 0.9462, local 0.7776, ext 0.7582, oracle 0.9462, E 1.0.
+  - gsm8k: hit 0.9255, oracle 0.9255, E 1.0. Local is 0.9248 and ext
+    0.0093, except c8a8842 v2 at 0.9192 local and 0.0782 ext.
+- **Turn 0** (32 conversations, 57407 prompt tokens): identical in every
+  arm and rev. Cold is local 31680, ext 0; warm2/3 is local 0, ext 50688.
+- **02b6767 v2 replay hit stats:** lookups 1011, lost_tokens 1056,
+  `missing=1,2,3` 1.
+
 ### Target (a) attribution: TP2 warm step time (offline, TP2 pair 02b6767)
 
 - **The gap.**
