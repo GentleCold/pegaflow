@@ -1066,6 +1066,59 @@ adding them back gives 0.920 / 0.851 / 0.944, old's E_C within 0.002
 - `PegaWorkerMetadata` keeps its name (a rename touches the vLLM-facing
   metadata class and buys only log clarity).
 
+## it3 (2026-10-26): per-request finish fence
+
+Target: G4 warm replay TTFT p50 and req/s no worse than `native` (judged).
+
+### Attribution (accepted by main)
+
+- On the full-only models (Qwen3-4B it7, DSV2 it7 m2off) the warm gap vs
+  native is queue time, not load time. v2 holds more KV: DSV2 warm KV
+  usage 94% vs native 65%.
+- The cause is the finish fence. A finished request was held until every
+  save job submitted before its finish was done (`_finishing[req] =
+  _submitted`). With batched saves (`save_batch_steps=32`, hold up to
+  1 s) that is a mean hold of 123.6 ms (max 1516) on Qwen3-4B it7 and
+  127.4 ms (max 1371) on DSV2 m2off (`save stats` `sent_wait_ms/sent`).
+- 86-90% of requests finish 3 or more steps after their last save, so their
+  own saves are long done when they finish.
+- KV model (probe replay, `p5-it3-kv.py`): mean KV-blocked admission steps
+  for DSV2 loaded requests are 7.3 at the measured hold, 4.8 at a 1-step
+  hold, and 5.1 for native.
+- Qwen3.5-4B (pinned saves, no finish hold) has a separate cohort-admission
+  gap. It is a later candidate and is not addressed here.
+
+### Hypothesis H3 (d201ac3): fence a finished request on its own last save
+
+- Mechanism: the scheduler records the plan step of each request's last
+  chosen save (`StepPlan.finished: {req: step}`). The worker maps the step
+  to the last job sequence number submitted by the end of that step's
+  `save`, and releases the request once that job is done.
+- Why it is safe:
+  - Only the request's own saves read its blocks. A block it shares through
+    the prefix cache stays allocated by vLLM for the other holder.
+  - A preempted request's freed blocks are covered by the step's flush, so
+    it keeps its fence entry across the preemption.
+  - The saver is one thread with a FIFO queue, so "job k done" implies every
+    earlier job is done. `_completed` advances in `finally`, so failed,
+    raised and dead-saver jobs still release.
+- Prediction:
+  - most holds drop below one step;
+  - DSV2 and Qwen3-4B warm TTFT p50 at or better than native, and req/s no
+    worse than native;
+  - Qwen3.5-4B unchanged (pinned layout, the code path is not used).
+- Unit coverage (`tests/test_connector_v2_core.py`, 242 passed natively):
+  - (a) sync-load fail-closed hold: `test_sync_load_outcome_gates_saves`
+    now also asserts the fences;
+  - (b) preemption: `test_preempted_request_fences_on_its_last_save`;
+  - (c) no chosen save, no hold, and (d) FIFO / failed / raised jobs:
+    `test_finish_fences_on_the_requests_last_save`;
+  - (e) zeroing / COW / checkpoint layouts: they are pinned, with
+    `finished == {}` (`test_layouts_that_zero_or_copy_blocks`,
+    `test_pinned_saves_hold_blocks_until_every_worker_saved`).
+- Slices: Qwen3-4B TP1 GPU5 `baseline,native,v2` replay, then DSV2 TP2 if
+  confirmed. Results pending.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
