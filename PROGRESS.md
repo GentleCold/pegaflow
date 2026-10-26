@@ -1005,6 +1005,18 @@ names, magic constants that only exist in the old code).
   superseded the same day by the judged comparison above. The re-judge
   table under "Gate changes" now shows gap % with the hard-rule verdicts
   as history.
+- Committed spec dump per TP (`feat/rsi-gate-per-tp-spec`, 478187e + 12a9dd4,
+  awaiting review). A Qwen3-4B TP2 run could never be official: G0.spec
+  compared every arm to the TP1 `spec.json` (6 per-rank diffs: heads 8/4,
+  page bytes and block stride 65536/32768, `parallel.tp`). `run_gate`
+  now reads `spec.json` at `--tp 1` and `spec-tp<N>.json` otherwise for
+  every consumer; a missing dump, or one whose `parallel.tp` differs, is
+  non-official. gate.json stays per model. Committed `Qwen3-4B/spec-tp2.json`
+  = baseline gsm8k dump of `2026-10-26-qwen3-4b-tp2-slice-4bb7d8d` (sha256
+  8dfb4296...). Confirmed by the TP2 self-test
+  `2026-10-26-qwen3-4b-tp2-selftest-478187e` (GPUs 0,1): fresh baseline dump
+  0 diffs vs the committed one, honest passes, liar / bitflip / offbyone
+  caught, all G0.spec 0 diffs, controls 0 differ.
 
 ## Semantics changelog
 
