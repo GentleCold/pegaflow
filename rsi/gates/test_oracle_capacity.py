@@ -1888,6 +1888,107 @@ def test_warmup_seconds_reported_not_gated():
     assert "pass" not in g["G4.warmup_seconds"]
 
 
+def _replay(
+    ttft: float, rps: float, warm: tuple[str, ...] = ("warm2", "warm3"), eff: float = 1.0
+) -> dict:
+    """A replay stage result with correct KV whose timed warm passes all
+    have ``ttft`` (TTFT p50), ``rps`` (req/s) and ``eff`` (E_ext)."""
+    hit = {"efficiency": eff, "oracle_hit_rate": 0.9, "hit_rate": 0.9, "local_hit_tokens": 0, "prompt_tokens": 1, "external_hit_rate": 0.9, "excess_tokens": 0, "excess_limit": 1}  # fmt: skip
+    passes = {"cold": {"ttft_p50": 1.0, "req_per_s": 1.0}, "warm": {"ttft_p50": 9.0, "req_per_s": 0.1}}  # fmt: skip
+    passes |= {n: {"ttft_p50": ttft, "req_per_s": rps} for n in warm}
+    hits = dict.fromkeys(("warm", *warm), hit)
+    return {"passes": passes, "hit": hits, "load_errors": [], "digest_self": _digest_ok()}
+
+
+NATIVE_KEYS = ("G4.replay_warm.ttft_p50_vs_native", "G4.replay_warm.req_per_s_vs_native")
+
+
+@pytest.mark.parametrize(
+    "mine,native,ok",
+    [
+        ((0.2, 9.0), (0.3, 8.0), (True, True)),
+        ((0.3, 9.0), (0.172, 8.0), (False, True)),  # Qwen3.5 it2: v2 0.300 s vs native 0.172 s
+        ((0.2, 8.0), (0.3, 9.0), (True, False)),
+        ((0.3, 8.0), (0.3, 8.0), (False, False)),  # a tie is not "no worse": strict, as vs baseline
+        ((0.2, 9.0), None, (False, False)),  # no native replay: fail closed
+    ],
+    ids=["wins", "ttft-worse", "req-s-worse", "tie", "native-missing"],
+)
+def test_g4_warm_replay_vs_native(tmp_path, mine, native, ok):
+    """User, 2026-10-26: the arm under test's timed warm replay TTFT p50 and
+    req/s must beat the in-run native arm's, by the warm-vs-baseline rule
+    (medians over warm2..N, slack 0). Native's own G0 / G2 do not matter."""
+    base = {"replay": _replay(5.0, 1.0)}
+    results = {"baseline": base, "pegaflow.m:C": {"replay": _replay(*mine)}}
+    if native:
+        results["native"] = {"replay": _replay(*native) | {"digest_self": None}}
+    v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
+    g = v["pegaflow.m:C"]
+    assert (g[NATIVE_KEYS[0]]["pass"], g[NATIVE_KEYS[1]]["pass"]) == ok
+    assert g["G4.replay_warm.ttft_p50"]["pass"] and g["G4.replay_warm.req_per_s"]["pass"]
+    if native:
+        assert not v["native"]["G2.digest_self.replay"]["pass"]  # its KV verdicts fail ...
+        assert g[NATIVE_KEYS[0]]["native"] == [native[0]] * 2  # ... its timing still counts
+    # Void like every replay G4 check when the arm's replay KV is wrong.
+    results["pegaflow.m:C"]["replay"]["digest_self"] = None
+    v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
+    assert not any(v["pegaflow.m:C"][k]["pass"] for k in NATIVE_KEYS)
+
+
+def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
+    """Reference and self-test arms are not judged against native."""
+    rep = {"replay": _replay(0.5, 2.0)}
+    results = {"baseline": {"replay": _replay(5.0, 1.0)}, "native": {"replay": _replay(0.1, 9.0)}}
+    results |= {"old": rep, "lmcache": rep, "selftest-honest": rep, "pegaflow.m:C": rep}
+    v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
+    for label in ("native", "old", "lmcache", "selftest-honest"):
+        assert not any(k in v[label] for k in NATIVE_KEYS), label
+    assert all(k in v["pegaflow.m:C"] and not v["pegaflow.m:C"][k]["pass"] for k in NATIVE_KEYS)
+
+
+ARMS_N = ["plain", "baseline", "native", "pegaflow.m:C"]
+_NAT = _replay(0.3, 8.0)
+
+
+@pytest.mark.parametrize(
+    "arms,wls,native,problem",
+    [
+        (ARMS_N, run_gate.WORKLOADS, _NAT, None),
+        (["plain", "baseline", "pegaflow.m:C"], run_gate.WORKLOADS, None, "arm native missing"),
+        (ARMS_N, ("gsm8k", "cap"), None, "workloads"),  # no replay: official_problems names it
+        (ARMS_N, run_gate.WORKLOADS, None, "native replay stage missing"),
+        (ARMS_N, run_gate.WORKLOADS, {"error": "RuntimeError: boom"}, "native replay stage missing"),
+        (ARMS_N, run_gate.WORKLOADS, _replay(0.3, 8.0, ("warm2",)), "native replay timed warm passes"),
+        # Ran, but served (almost) nothing: times like baseline, so no reference.
+        (ARMS_N, run_gate.WORKLOADS, _replay(5.0, 1.0, eff=0.0), "native replay is not a working store"),
+        (ARMS_N, run_gate.WORKLOADS, _NAT | {"load_errors": [{}]}, "native replay is not a working store"),
+        (ARMS_N, run_gate.WORKLOADS, _NAT | {"hit": {}}, "native replay is not a working store"),
+        (ARMS_N, run_gate.WORKLOADS, _replay(0.3, 8.0, eff=run_gate.NATIVE_MIN_EFFICIENCY), None),
+    ],
+    ids=["present", "arm-missing", "no-replay-workload", "no-replay", "replay-crashed",
+         "warm-pass-missing", "native-degenerate", "native-load-errors", "native-no-hit",
+         "native-at-floor"],
+)  # fmt: skip
+def test_official_needs_native_warm_replay(tmp_path, arms, wls, native, problem):
+    """G4 vs native: a run without the native arm, whose native replay did
+    not produce every timed warm pass, or whose native replay is not a
+    working store (judged from its replay data, not its G0 / G2), is not
+    official. ``main`` adds ``g4_native_problems`` unconditionally; the
+    arm / workload guard is inside it, so this covers the wiring's logic."""
+    import argparse
+
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t"}))  # fmt: skip
+    results = {"baseline": {"replay": _replay(5.0, 1.0)}}
+    if native is not None:
+        results["native"] = {"replay": native}
+    probs = run_gate.official_problems(args, arms, list(wls), tmp_path, tmp_path)
+    probs += run_gate.g4_native_problems(results, arms, list(wls))
+    gap = [p for p in probs if "native" in p or p.startswith("workloads")]
+    assert (gap == []) is (problem is None), probs
+    assert problem is None or gap[0].startswith(problem), probs
+    assert len([p for p in probs if p.startswith("native")]) <= 1, probs
+
+
 def test_warmup_shares_no_prefix_with_workload():
     from rsi.gates import workloads
 
