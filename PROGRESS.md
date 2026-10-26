@@ -1076,6 +1076,18 @@ names, magic constants that only exist in the old code).
   recorded keys (`gates-evidence.md`). No GPU run: hardware confirmation
   comes from the next TP2 run on the merged gate, after P5's TP2 and
   Qwen3.5 pairs finish.
+- Slim review fixes (`feat/rsi-gate-slim` b0ae133, on 1f7414e): the
+  control glue (arm/workload/args routing, verdict assembly) is hashed;
+  `control_inputs.identity` binds a record to model, TP and that TP's
+  dump; recorded verdicts are re-judged on their own counts against the
+  current claims (not sealed to the run: a forged, self-consistent record
+  is caught only by comparing it with the run's summary.json); unclean
+  runs get no record; `gsm8k_limit` must be the integer 0; the cap plan
+  flags convs < 2 x workers and workers > `--max-num-seqs`. Both Qwen3-4B
+  records (tp1, tp2) are stale under the new fingerprint, as expected:
+  official Qwen3-4B runs need `plain` until the post-merge TP1 / TP2
+  plain refreshes replace them (`_AWAITING_REFRESH` in the tests lists
+  them until then).
 
 ## Semantics changelog
 
