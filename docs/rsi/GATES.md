@@ -1041,6 +1041,9 @@ there:
   --workloads gsm8k,preempt
 ```
 
+`selftest:sync` applies only to models with a state group; drop it for
+pure-attention models, where the connector refuses to start.
+
 `preempt` needs the committed dump of `--tp`: for a TP without one, run
 `--workloads gsm8k` first, commit its `baseline/gsm8k/probe/spec.json` as
 `spec.json` (TP 1) or `spec-tp<N>.json`, then rerun with `preempt`.
