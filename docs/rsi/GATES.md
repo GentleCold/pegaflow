@@ -1211,12 +1211,16 @@ the last accepted run record by hand until `--accepted` exists.
     reference. A missing or crashed native replay stage fails both checks
     and makes the run non-official (Official run, above). Void (fail) when
     the arm's `G2.digest_self.replay` fails, like every replay G4 check.
-    Noise (open, pending the user's decision; review `g4-native.md`
-    SHOULD-1): official runs time 2 warm passes (`replay_repeats` 3), and
-    with 2 passes a gap smaller than either arm's pass-to-pass range is not
-    decidable (Qwen3-4B it7: v2 behind native by 2.1 ms with a 25 ms
-    warm2-warm3 range of its own). The check stays as stated (no tolerance,
-    same pass count) until the user decides.
+    Noise (user, 2026-10-26): still 2 timed passes and no tolerance, but
+    a check whose |median gap| is below the larger of the two arms'
+    pass-to-pass ranges (max - min over warm2..N) is `inconclusive`
+    (`pass` null, neither pass nor fail; `|gap| == range` is decidable).
+    Each verdict records both arms' pass values, medians, ranges, the gap
+    and its status; summary `g4_inconclusive` lists them per arm. Process:
+    rerun once on the same rev; a decidable rerun's verdict counts. Still
+    inconclusive: a tie with native within noise, which does not block
+    acceptance and is listed in the acceptance entry for the user's final
+    pass.
     Records made before this check (gate revs before 2026-10-26) are
     re-judged with it like any other input the record has: native was an
     optional arm, not an input the gate failed to produce, so S1's `na` does

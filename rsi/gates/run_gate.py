@@ -2634,21 +2634,57 @@ def _native_perf_verdicts(
     rule (``_cmp`` slack 0: median over the timed warm passes, strictly
     better). ``native_rep`` None (arm missing or its replay stage crashed)
     fails closed. Only the timing is used: native's own G0 / G2 verdicts do
-    not matter here. Void (fail) when the arm's replay KV was wrong."""
+    not matter here. Void (fail) when the arm's replay KV was wrong.
+
+    Noise (user, 2026-10-26, option B): with |gap| between the medians below
+    the larger of the two arms' pass-to-pass ranges (max - min over the timed
+    passes) the check is ``inconclusive`` (``pass`` None, neither pass nor
+    fail; rerun once on the same rev, GATES.md). ``|gap| == noise`` is
+    decidable. Missing data and a void replay stay fails."""
     g: dict[str, Any] = {}
     for key, lower in G4_NATIVE_KEYS:
-        v = _cmp(
-            _pass_values(rep, _timed_warm(rep), key),
-            _pass_values(native_rep, _timed_warm(native_rep), key),
-            lower,
-            0.0,
-        )
+        mine = _pass_values(rep, _timed_warm(rep), key)
+        theirs = _pass_values(native_rep, _timed_warm(native_rep), key)
+        v = _cmp(mine, theirs, lower, 0.0)
         v["native"] = v.pop("baseline")
         v["pass"] = v["pass"] and replay_ok
+        if mine and theirs:
+            a, b = _median(mine), _median(theirs)
+            rng, nrng = max(mine) - min(mine), max(theirs) - min(theirs)
+            v |= {
+                "median": a,
+                "native_median": b,
+                "range": rng,
+                "native_range": nrng,
+                "gap": a - b,
+                "noise": max(rng, nrng),
+            }
+            if replay_ok and abs(a - b) < max(rng, nrng):
+                v["pass"] = None
+        v["status"] = {True: "pass", False: "fail", None: INCONCLUSIVE}[v["pass"]]
         if native_rep is None:
             v["reason"] = "no native replay stage in this run"
         g[f"G4.replay_warm.{key}_vs_native"] = v
     return g
+
+
+INCONCLUSIVE = "inconclusive"
+
+
+def _all_pass(g: dict[str, Any]) -> bool:
+    """Every verdict of ``g`` passes; an ``inconclusive`` one neither passes
+    nor fails, so it does not block (listed by ``_inconclusive``)."""
+    return all(
+        x["pass"]
+        for x in g.values()
+        if isinstance(x, dict) and "pass" in x and x.get("status") != INCONCLUSIVE
+    )
+
+
+def _inconclusive(g: dict[str, Any]) -> list[str]:
+    return sorted(
+        k for k, x in g.items() if isinstance(x, dict) and x.get("status") == INCONCLUSIVE
+    )
 
 
 def g4_native_problems(
@@ -3122,16 +3158,13 @@ def verdicts(
         errors = {wl: r["error"] for wl, r in per_all.items() if "error" in r}
         if errors:
             g["errors"] = errors
-        g["pass"] = not errors and all(
-            x["pass"] for x in g.values() if isinstance(x, dict) and "pass" in x
-        )
+        g["pass"] = not errors and _all_pass(g)
+        g["inconclusive"] = _inconclusive(g)
         if kind in _RECORD_ONLY:
             # Reference arms: every number is recorded, nothing is gated.
             g["required"] = False
         v[label] = g
-    v["baseline"]["pass"] = not base_errors and all(
-        x["pass"] for x in v["baseline"].values() if isinstance(x, dict) and "pass" in x
-    )
+    v["baseline"]["pass"] = not base_errors and _all_pass(v["baseline"])
     return v
 
 
@@ -4122,6 +4155,9 @@ def main(argv: list[str] | None = None) -> int:
         "results": {a: {w: strip(r) for w, r in per.items()} for a, per in results.items()},
         "verdicts": v,
         "hit_report": hit_report(v),
+        # Rerun once on the same rev; inconclusive twice is a tie with native
+        # within noise, listed in the acceptance entry (GATES.md G4).
+        "g4_inconclusive": {a: g["inconclusive"] for a, g in v.items() if g.get("inconclusive")},
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
     print(
@@ -4132,6 +4168,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"[gate] hit rates (reported, not gated) {json.dumps(summary['hit_report'], default=str)}"
     )
+    if summary["g4_inconclusive"]:
+        print(f"[gate] inconclusive (rerun once): {json.dumps(summary['g4_inconclusive'])}")
     print(f"run record: {run_dir}")
     required = [x for x in v.values() if x.get("required", True)]
     return 0 if not problems and all(x["pass"] for x in required) else 1

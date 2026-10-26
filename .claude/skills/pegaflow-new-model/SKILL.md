@@ -221,6 +221,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   When a `*_vs_native` check fails, compare v2's and native's load path
   first (sync vs async load, load round trip in steps, per-request load
   size) before touching policy. The overhead checks stay vs baseline.
+  An `inconclusive` `*_vs_native` (|gap| below either arm's warm2-warm3
+  range; summary `g4_inconclusive`) is not a fail: rerun the gate once on
+  the same rev and use that verdict. Inconclusive twice is a tie with
+  native within noise: it does not block acceptance; list it in the
+  acceptance entry for the user's final pass.
   A native replay that loads nothing (load errors, timed-pass `E_ext <
   0.9`) makes the run non-official: fix the native arm's setup or have the
   gate owner list the model as "no working native" in GATES.md.

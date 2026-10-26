@@ -1889,13 +1889,24 @@ def test_warmup_seconds_reported_not_gated():
 
 
 def _replay(
-    ttft: float, rps: float, warm: tuple[str, ...] = ("warm2", "warm3"), eff: float = 1.0
+    ttft: float | tuple[float, ...],
+    rps: float | tuple[float, ...],
+    warm: tuple[str, ...] = ("warm2", "warm3"),
+    eff: float = 1.0,
 ) -> dict:
-    """A replay stage result with correct KV whose timed warm passes all
-    have ``ttft`` (TTFT p50), ``rps`` (req/s) and ``eff`` (E_ext)."""
+    """A replay stage result with correct KV whose timed warm passes have
+    ``ttft`` (TTFT p50), ``rps`` (req/s) and ``eff`` (E_ext); a tuple gives
+    one value per timed pass, a number the same value on every pass."""
+
+    def per_pass(x):
+        return x if isinstance(x, tuple) else (x,) * len(warm)
+
     hit = {"efficiency": eff, "oracle_hit_rate": 0.9, "hit_rate": 0.9, "local_hit_tokens": 0, "prompt_tokens": 1, "external_hit_rate": 0.9, "excess_tokens": 0, "excess_limit": 1}  # fmt: skip
     passes = {"cold": {"ttft_p50": 1.0, "req_per_s": 1.0}, "warm": {"ttft_p50": 9.0, "req_per_s": 0.1}}  # fmt: skip
-    passes |= {n: {"ttft_p50": ttft, "req_per_s": rps} for n in warm}
+    passes |= {
+        n: {"ttft_p50": t, "req_per_s": r}
+        for n, t, r in zip(warm, per_pass(ttft), per_pass(rps), strict=True)
+    }
     hits = dict.fromkeys(("warm", *warm), hit)
     return {"passes": passes, "hit": hits, "load_errors": [], "digest_self": _digest_ok()}
 
@@ -1933,6 +1944,52 @@ def test_g4_warm_replay_vs_native(tmp_path, mine, native, ok):
     results["pegaflow.m:C"]["replay"]["digest_self"] = None
     v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
     assert not any(v["pegaflow.m:C"][k]["pass"] for k in NATIVE_KEYS)
+
+
+@pytest.mark.parametrize(
+    "mine,native,status",
+    [
+        # Qwen3-4B it7: TTFT gap 2.1 ms < v2's own 25.2 ms warm2-warm3 range;
+        # req/s gap 0.287 > both ranges (0.028, 0.135).
+        (
+            ((0.5514, 0.5766), (9.6597, 9.6319)),
+            ((0.5612, 0.5626), (9.2913, 9.4260)),
+            ("inconclusive", "pass"),
+        ),
+        # DSV2 it7: TTFT gap 7.7 ms < native's 24 ms range; req/s 0.739 behind.
+        (
+            ((0.2957, 0.3035), (12.4927, 12.1985)),
+            ((0.2799, 0.3039), (13.0061, 13.1634)),
+            ("inconclusive", "fail"),
+        ),
+        # |gap| == the larger range is decidable (exact binary fractions).
+        (((0.5, 1.0), (2.0, 3.0)), ((0.25, 0.25), (1.5, 1.5)), ("fail", "pass")),
+        (((0.25, 0.25), (1.5, 1.5)), ((0.5, 1.0), (2.0, 3.0)), ("pass", "fail")),
+    ],
+    ids=["qwen3-4b-it7", "dsv2-it7", "boundary-a", "boundary-b"],
+)
+def test_g4_vs_native_noise(tmp_path, mine, native, status):
+    """User, 2026-10-26 (option B): |median gap| below the larger pass-to-pass
+    range of the two arms is ``inconclusive``: neither pass nor fail, so it
+    does not fail the arm but is listed; otherwise strict pass / fail."""
+    results = {"baseline": {"replay": _replay(5.0, 1.0)}}
+    results |= {"pegaflow.m:C": {"replay": _replay(*mine)}, "native": {"replay": _replay(*native)}}
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert tuple(g[k]["status"] for k in NATIVE_KEYS) == status
+    flagged = [k for k, s in zip(NATIVE_KEYS, status, strict=True) if s == "inconclusive"]
+    assert g["inconclusive"] == flagged
+    for k, lo, hi in zip(NATIVE_KEYS, mine, native, strict=True):
+        v = g[k]  # self-explanatory: per-arm pass values, ranges, gap
+        assert (v["value"], v["native"]) == (list(lo), list(hi))
+        assert v["range"] == max(lo) - min(lo) and v["native_range"] == max(hi) - min(hi)
+        assert v["gap"] == v["median"] - v["native_median"]
+        assert v["noise"] == max(v["range"], v["native_range"])
+    # Inconclusive does not block; a decidable fail does.
+    assert run_gate._all_pass({k: g[k] for k in NATIVE_KEYS}) == ("fail" not in status)
+    # A void replay stays a fail, never inconclusive.
+    results["pegaflow.m:C"]["replay"]["digest_self"] = None
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert [g[k]["status"] for k in NATIVE_KEYS] == ["fail", "fail"] and not g["inconclusive"]
 
 
 def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
