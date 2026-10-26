@@ -171,7 +171,9 @@ Wall time on the 4090 host (`gsm8k,replay,cap` at the official profile):
 default arm set `baseline,native,<arm>` about 1 h on Qwen3-4B, about 2 h on
 Qwen3.5-4B (with `preempt`). Each optional store arm (`old`, `lmcache`)
 adds about 40 min (Qwen3-4B) / 80 min (Qwen3.5-4B); `--cap-curve` adds about
-25 / 40 min per store arm; `plain` about 10 min.
+25 / 40 min per store arm; `plain` about 10 min. These are TP 1 numbers.
+At TP 2 the cap stages are larger (Qwen3-4B: 65 workers, at least 130
+conversations, against 32 x 64 at TP 1), so each cap stage takes longer.
 
 `old`, `native`, `lmcache` and the arm under test run as
 `MultiConnector[arm, RsiProbe]`. The arm under test gets
@@ -331,9 +333,12 @@ with `batch_invariant=false` they follow the batch-variant rule below.
 
 `G2.plain_equals_baseline`, `G2.split_control` and `G2.batch_control` need
 the `plain` arm. They run at onboarding, in a full-set self-test with
-`plain` at each TP the model is gated at. A run with `plain` whose three
-controls pass at `--gsm8k-limit 0` writes `summary.controls_record`; any
-other run writes None there and the reason in
+`plain` at each TP the model is gated at. A clean run with `plain` whose
+three controls pass at `--gsm8k-limit 0` writes `summary.controls_record`.
+Clean means verified, unchanged gate and connector trees (provenance and the
+provenance watch), a sane CUDA env, this TP's committed dump, and no
+`--num-gpu-blocks` / `--vllm-arg` override: a dirty tree never yields a
+pasteable record. Any other run writes None there and the reason in
 `summary.controls_record_withheld`. The record goes into gate.json
 `controls["tp<N>"]` unchanged:
 
@@ -342,40 +347,57 @@ other run writes None there and the reason in
   full-set: the split control judges every prompt whose warm pass the
   official run judges, and a subset leaves the rest unmeasured;
 - `verdicts`: the three control verdicts, each a measured pass (`na` is not
-  one);
+  one) with its counts (`CONTROL_MEASURED`);
 - `inputs` = `control_inputs` of that run.
 
 A run without `plain` reports the three `na`. It is official only if the
 record of `--tp` names a run and rev, holds three passing verdicts, has
-`gsm8k_limit` 0, and its `inputs` equal this run's `control_inputs`
-(`run_gate.controls_problem`). Any gap is non-official and names what is
-missing or changed. `control_inputs` holds:
+`gsm8k_limit` exactly the integer 0, its verdicts hold when re-judged, and
+its `inputs` equal this run's `control_inputs`
+(`run_gate.controls_problem`). Re-judged: each verdict carries its counts,
+plain equals baseline with 0 differing, the split and batch controls
+measured gate.json's current `split_invariant` / `batch_invariant` claims
+and found them, pre-warmed at least `MIN_PREWARMED` of a non-empty set, the
+split reference equals cold, and the batch control compared
+`BATCH_CONTROL_N`. A pasted `{"pass": true}` is rejected. The verdicts are
+not sealed to the run: a forged but self-consistent record passes these
+checks, and the reviewer compares it with the run's `summary.json`. Any
+gap is non-official and names what is missing or changed. `control_inputs`
+holds:
 
+- `identity`: the model (dir name), `--tp`, and sha256 of that TP's
+  committed spec dump. A record copied under another TP's key or into
+  another model's gate.json is rejected;
 - sha256 of `rsi_probe.py` and `workloads.py`;
 - sha256 of the AST (docstrings dropped) of every function between the
-  control stages' arguments and the verdicts (`CONTROL_CODE`): the vLLM
-  launch (`vllm_server`, `kv_transfer_config`, `vllm_plugins`, the compile
-  cache and its autotune seed), the gsm8k pass plan and per-pass request
-  arguments (`gsm8k_plan`, `run_gsm8k_pass`: passes, prompt subset,
-  concurrency, logprobs, pre-warm), batch invariance per stage, reset +
-  poison, the output and token readers (`_outputs`, `_tokens`, `_differ`,
-  `_hit_alignment`), the control functions and the three verdict functions.
-  Process plumbing that reaches neither vLLM's arguments nor its env (port
-  leases, launch and teardown, isolation of the arm under test) is not
-  hashed;
+  control stages' arguments and the verdicts (`CONTROL_CODE`): which arm
+  runs which workload with which args (`runs_workload`, `stage_args`,
+  `cap_stage_args`, `run_stage`, `arm_label`), the stage
+  (`run_arm_workload`), the vLLM launch (`vllm_server`,
+  `kv_transfer_config`, `vllm_plugins`, the compile cache and its autotune
+  seed), the gsm8k pass plan and per-pass request arguments (`gsm8k_plan`,
+  `run_gsm8k_pass`: passes, prompt subset, concurrency, logprobs,
+  pre-warm), batch invariance per stage, reset + poison, the output and
+  token readers (`_outputs`, `_tokens`, `_differ`, `_hit_alignment`), the
+  control functions, the three verdict functions and their assembly
+  (`control_verdicts`: which arm's outputs and which claims each verdict
+  reads; `_predates`, `_ran_without`). Not hashed: process plumbing that
+  reaches neither vLLM's arguments nor its env (port leases, launch and
+  teardown, isolation of the arm under test), and `main`'s one-line calls
+  into these functions;
 - the constants `SPLIT_PASSES`, `MIN_PREWARMED`, `BATCH_PASS`,
   `BATCH_CONTROL_N`, `ALONE_REF`, `_ALONE`, `_REFERENCE`, `AUTOTUNE_SOURCE`;
 - the run arguments of the gsm8k stages: `shots`, `concurrency`,
   `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `gpu_mem`,
-  `num_gpu_blocks`, `vllm_arg`;
+  `num_gpu_blocks`, `vllm_arg`, `settle`;
 - sha256 of the gsm8k dataset (`train.jsonl`, `test.jsonl` under
   `--gsm8k-dir`);
 - gate.json `attention_backend`, `invariant_attention_backend`,
   `batch_invariant`, `split_invariant`, `vllm_args`, `gsm8k_vllm_args`.
 
 The model and TP select the record (the model's gate.json,
-`controls["tp<N>"]`). vLLM and the model are pinned by `G0.spec`
-(committed dump). Any change to these makes the record stale: rerun the
+`controls["tp<N>"]`) and `identity` ties it to them. vLLM and the model
+are pinned by `G0.spec` (committed dump). Any change to these makes the record stale: rerun the
 self-test with `plain` (or add `plain` to the run, which then judges the
 controls itself) and replace the record. A record whose `inputs` were
 computed later than its run, because the run's rev is off this lineage or
@@ -646,8 +668,9 @@ Server fragmentation and headroom count against the connector/server.
   frozen after `cap_cold` nearly reaches `H*_C` (Qwen3-4B TP2 at 32
   workers, 0.75 x GPU KV: local hit 0.85, `lru_vs_oracle_c` 0.003,
   `freeze_vs_oracle_c` 0.92 at every fraction; TP1 at 32 is 2 x GPU KV:
-  0.39, 0.87, 0.62). Too few workers are not checked directly; they show
-  as freeze separation. `UniqueEstimate` per Kind:
+  0.39, 0.87, 0.62). Fewer conversations than `2 x workers` (the whole file
+  used) or more workers than `--max-num-seqs` are `cap_plan.problems`,
+  non-official; too few workers otherwise show as freeze separation. `UniqueEstimate` per Kind:
   Full / Window = distinct prompt-prefix blocks + generated complete blocks;
   Checkpoint = only step ends on a boundary, with vLLM 0.32's align-mode
   prefill split (`prefill_step_ends`) and every decode boundary, assuming a

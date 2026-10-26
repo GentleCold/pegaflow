@@ -66,8 +66,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    `G2.split_control`, `G2.batch_control`) on the full gsm8k set; when they
    pass, the gate owner copies `summary.controls_record` (run, rev,
    `gsm8k_limit` 0, the three verdicts, `inputs`) into gate.json
-   `controls["tp<N>"]` (GATES.md "Onboarding controls"). A subset or failing
-   run writes no record (`summary.controls_record_withheld` says why).
+   `controls["tp<N>"]` (GATES.md "Onboarding controls"). A subset, failing
+   or unclean run (dirty or changed tree, bad CUDA env, override) writes no
+   record (`summary.controls_record_withheld` says why).
    Routine runs have no `plain` and are official only while that record is
    current: a probe, workload-driver, control-code, flag, dataset or
    gate.json setting change makes it stale, and the self-test with `plain`

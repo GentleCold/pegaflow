@@ -783,6 +783,7 @@ def test_capacity_floor_fails_closed_and_g5_problems():
     assert run_gate.g5_problems({"X": {}}, high, None)  # freeze not evaluated: not official
     assert run_gate.g5_problems({"X": sep}, low, {"enough": False}) == ["capacity below 2x GPU KV (whole replay file used)"]  # fmt: skip
     assert run_gate.g5_problems({"X": sep}, high, {"unmodeled": ["x"]}) == ["cap plan sized from an unmodeled spec: x"]  # fmt: skip
+    assert run_gate.g5_problems({"X": sep}, high, {"problems": ["y"]}) == ["cap plan: y"]
 
 
 def test_unmodeled_spec_only_flags_checkpoint_models():
@@ -862,12 +863,19 @@ def test_unique_estimate_counts_only_saved_checkpoints():
         # H*_C); 65 hold 1.5 x (simulated freeze 0.60, H_lru 0.85).
         pytest.param("Qwen3-4B/spec-tp2.json", 4756, 65, id="qwen3-tp2"),
         pytest.param("Qwen3-4B/spec-tp2.json", 0, 32, id="no-turns"),
+        # DeepSeek-V2-Lite TP2 (MLA, one 16-token group, 6074 blocks in the
+        # recorded cap probe; cap_cold mean 4980): 32 workers already hold
+        # 1.64 x GPU KV, the rule gives 30 and the floor keeps 32.
+        pytest.param({"kv_cache_config": {"num_blocks": 6074, "groups": [{"spec": {"block_size": 16}}]}}, 4980, 32, id="dsv2-lite-tp2"),
     ],
-)
+)  # fmt: skip
 def test_cap_workers_oversubscribe_gpu_kv(spec, mean, workers):
     """Cap workers scale with vLLM's GPU KV tokens: in-flight tokens of a
     pass >= ``CAP_GPU_PRESSURE`` x GPU KV, never below ``--concurrency``."""
-    s = json.loads((run_gate.REPO / "docs/rsi/models" / spec).read_text())
+    if isinstance(spec, dict):
+        s = spec
+    else:
+        s = json.loads((run_gate.REPO / "docs/rsi/models" / spec).read_text())
     assert run_gate.cap_workers(s, mean, 32) == workers
     if mean:
         assert workers * mean >= run_gate.CAP_GPU_PRESSURE * run_gate.gpu_kv_tokens(s)
@@ -904,6 +912,15 @@ def test_cap_plan_workers_reach_every_cap_stage(tmp_path, monkeypatch):
     assert args.concurrency == 32  # not mutated
     args.cap_plan = {"cap_convs": 8, "mode": "fixed"}
     assert run_gate.cap_stage_args(args) is args
+    assert "problems" not in plan
+    # The whole file is under 2 x workers, or vLLM runs fewer sequences at
+    # once than the workers: the plan says so (g5_problems: not official).
+    replay.write_text("{}\n" * 100)
+    short = run_gate.plan_cap_convs(args, spec)
+    assert short["problems"] == ["100 conversations < 2 x 66 workers (whole replay file used)"]
+    replay.write_text("{}\n" * 400)
+    args.max_num_seqs = 64
+    assert run_gate.plan_cap_convs(args, spec)["problems"] == ["66 workers > --max-num-seqs 64"]
 
 
 def test_cap_only_run_sizes_from_the_committed_spec(tmp_path):
@@ -2139,11 +2156,16 @@ def _slim_args(tmp_path, **over):
         data.mkdir()
         for f in run_gate.GSM8K_FILES:
             (data / f).write_text(f"{f}\n")
-    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "tp": 1, "lmcache_chunk_size": run_gate.LMCACHE_CHUNK, "lmcache_overlay": str(tmp_path), "gpu_mem": run_gate.GPU_MEM, "settle": 5.0, "gsm8k_dir": str(data)}  # fmt: skip
+    fixed = {"model": "/m/Qwen3-4B", "num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "tp": 1, "lmcache_chunk_size": run_gate.LMCACHE_CHUNK, "lmcache_overlay": str(tmp_path), "gpu_mem": run_gate.GPU_MEM, "settle": 5.0, "gsm8k_dir": str(data)}  # fmt: skip
     return argparse.Namespace(**(run_gate.OFFICIAL | fixed | over))
 
 
-_PASSED = {k: {"pass": True} for k in run_gate.CONTROL_VERDICTS}
+# What a passing full-set control run records (the Qwen3-4B records' shape).
+_PASSED = {
+    "G2.plain_equals_baseline": {"pass": True, "differ": 0},
+    "G2.split_control": {"pass": True, "split_invariant": True, "measured_invariant": True, "n": 1319, "differ": 0, "logprob_differ": 0, "prewarmed": 1319, "ref_equals_cold": True},
+    "G2.batch_control": {"pass": True, "batch_invariant": True, "measured_invariant": True, "n": run_gate.BATCH_CONTROL_N, "differ": 0, "logprob_differ": 0, "prewarmed": run_gate.BATCH_CONTROL_N},
+}  # fmt: skip
 
 
 def _controls_gate(tmp_path, gate: dict, tp: int = 1, rec: dict | None = None, **edit) -> dict:
@@ -2171,7 +2193,6 @@ _REC = "onboarding controls for --tp 1 (gate.json, run r)"
         (_SLIM, (_GATE, {"inputs_recomputed": "only an error message changed"}), 1, None),
         (_SLIM, _GATE, 1, "onboarding controls for --tp 1 not recorded"),
         (_SLIM, (_GATE, {}), 2, "onboarding controls for --tp 2 not recorded"),
-        (_SLIM, (_GATE, {}, {"batch_invariant": False}), 1, f"{_REC} are stale: settings.batch_invariant"),
         (_SLIM, (_GATE, {}, {"vllm_args": ["--x"]}), 1, f"{_REC} are stale: settings.vllm_args"),
         (_SLIM, (_GATE, {"run": ""}), 1, "onboarding controls for --tp 1 (gate.json) name no run and rev"),
         (_SLIM, (_GATE, {"rev": None}), 1, "onboarding controls for --tp 1 (gate.json) name no run and rev"),
@@ -2180,14 +2201,23 @@ _REC = "onboarding controls for --tp 1 (gate.json, run r)"
         (_SLIM, (_GATE, {"verdicts": None}), 1, f"{_REC} record no passing G2.plain_equals_baseline, G2.split_control, G2.batch_control"),
         (_SLIM, (_GATE, {"gsm8k_limit": 128}), 1, f"{_REC} ran gsm8k_limit=128, not the full set (0)"),
         (_SLIM, (_GATE, {"gsm8k_limit": None}), 1, f"{_REC} ran gsm8k_limit=None"),
+        (_SLIM, (_GATE, {"gsm8k_limit": False}), 1, f"{_REC} ran gsm8k_limit=False"),
+        (_SLIM, (_GATE, {"gsm8k_limit": 0.0}), 1, f"{_REC} ran gsm8k_limit=0.0"),
+        (_SLIM, (_GATE, {"verdicts": {k: {"pass": True} for k in run_gate.CONTROL_VERDICTS}}), 1, f"{_REC}: recorded verdicts do not hold: G2.plain_equals_baseline lacks differ"),
+        (_SLIM, (_GATE, {"verdicts": _PASSED | {"G2.batch_control": _PASSED["G2.batch_control"] | {"measured_invariant": False}}}), 1, f"{_REC}: recorded verdicts do not hold: G2.batch_control measured batch_invariant=False"),
+        (_SLIM, (_GATE, {"verdicts": _PASSED | {"G2.split_control": _PASSED["G2.split_control"] | {"prewarmed": 3}}}), 1, f"{_REC}: recorded verdicts do not hold: G2.split_control pre-warmed 3/1319"),
+        (_SLIM, (_GATE, {"verdicts": _PASSED | {"G2.plain_equals_baseline": {"pass": True, "differ": 2}}}), 1, f"{_REC}: recorded verdicts do not hold: G2.plain_equals_baseline differs"),
+        (_SLIM, (_GATE, {}, {"batch_invariant": False}), 1, f"{_REC} are stale: settings.batch_invariant"),
         (_SLIM, (_GATE, {"inputs_recomputed": ""}), 1, f"{_REC}: inputs_recomputed must say why"),
         (["native", "pegaflow.m:C"], (_GATE, {}), 1, "arm baseline missing"),
         (["baseline", "pegaflow.m:C"], (_GATE, {}), 1, "arm native missing"),
         (["baseline", "native"], (_GATE, {}), 1, "arm under_test missing"),
     ],
     ids=["slim", "with-plain", "with-optional-refs", "recomputed-with-why", "no-controls-record",
-         "other-tp-record", "stale-setting", "stale-vllm-args", "no-run", "no-rev", "failed-verdict",
-         "na-verdict", "no-verdicts", "subset-record", "no-limit", "recomputed-without-why",
+         "other-tp-record", "stale-vllm-args", "no-run", "no-rev", "failed-verdict",
+         "na-verdict", "no-verdicts", "subset-record", "no-limit", "false-limit", "float-limit",
+         "pasted-verdicts", "verdict-contradicts-claim", "verdict-not-prewarmed", "verdict-differs",
+         "claim-changed-after", "recomputed-without-why",
          "no-baseline", "no-native", "no-arm-under-test"],
 )  # fmt: skip
 def test_official_arm_set(tmp_path, arms, gate, tp, problem):
@@ -2235,6 +2265,17 @@ def _code_edited(name: str, old: str, new: str):
     return mutate
 
 
+def _spec_edited(mp, tmp_path):
+    """A gate repo whose committed TP 1 dump differs by one byte."""
+    for f in run_gate.CONTROL_FILES:
+        (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / f).write_bytes((run_gate.REPO / f).read_bytes())
+    spec = tmp_path / "docs/rsi/models/Qwen3-4B/spec.json"
+    spec.parent.mkdir(parents=True)
+    spec.write_bytes((run_gate.REPO / "docs/rsi/models/Qwen3-4B/spec.json").read_bytes() + b"\n")
+    mp.setattr(run_gate, "REPO", tmp_path)
+
+
 def _dataset_edited(mp, tmp_path):
     (tmp_path / "gsm8k" / "test.jsonl").write_text("other\n")
 
@@ -2254,16 +2295,26 @@ def _dataset_edited(mp, tmp_path):
         ("code.gsm8k_plan", _code_edited("gsm8k_plan", "[*SPLIT_PASSES, BATCH_PASS]", "[*SPLIT_PASSES]"), {}),
         ("code.run_arm_workload", _code_edited("run_arm_workload", "reset_and_poison(url)", "{}"), {}),
         ("profile.settle", lambda mp, _t: None, {"settle": 0.0}),
+        ("code.control_verdicts", _code_edited("control_verdicts", '_outputs(run_dir, "baseline", "cold")', '_outputs(run_dir, "plain", "cold")'), {}),
+        ("code.control_verdicts", _code_edited("control_verdicts", "_split_control_verdict(split_control(run_dir, batch_inv), split_inv)", "_split_control_verdict(split_control(run_dir, batch_inv), True)"), {}),
+        ("code.runs_workload", _code_edited("runs_workload", 'return wl == "gsm8k"\n', 'return wl in ("gsm8k", "replay")\n'), {}),
+        ("code.stage_args", _code_edited("stage_args", 'wl.startswith("cap")', 'wl.startswith(("cap", "gsm8k"))'), {}),
+        ("code._predates", _code_edited("_predates", '"would_be": v.get("pass")', '"would_be": True'), {}),
+        ("code._ran_without", _code_edited("_ran_without", "name not in r", "name in r"), {}),
+        ("identity.spec_sha256", _spec_edited, {}),
     ],
     ids=["probe", "constant", "profile", "gpu-mem", "dataset", "outputs-reader", "differ",
-         "kv-transfer-config", "logprobs-condition", "plain-passes", "poison-before-warm", "settle"],
+         "kv-transfer-config", "logprobs-condition", "plain-passes", "poison-before-warm", "settle",
+         "ref-cold-from-plain", "split-claim-forced", "plain-runs-replay", "gsm8k-gets-cap-args",
+         "predates", "ran-without", "spec-dump"],
 )  # fmt: skip
 def test_onboarding_controls_go_stale(tmp_path, monkeypatch, part, mutate, args):
     """A change to anything between the control stages' arguments and the
     three verdicts (probe, workload driver, control code incl. the plain
-    pass plan and logprobs condition, constants, gsm8k profile, --gpu-mem,
-    dataset) makes the recorded control run stale (rerun the self-test with
-    plain), and the problem names what changed."""
+    pass plan and logprobs condition, the verdict assembly and the arm /
+    workload / args routing, constants, gsm8k profile, --gpu-mem, dataset,
+    the committed dump) makes the recorded control run stale (rerun the
+    self-test with plain), and the problem names what changed."""
     gate = _controls_gate(tmp_path, _GATE)
     assert run_gate.controls_problem(gate, _slim_args(tmp_path)) is None
     mutate(monkeypatch, tmp_path)
@@ -2275,7 +2326,7 @@ def test_control_code_is_hashed():
     """Every CONTROL_CODE name is a module-level function the fingerprint
     finds (a rename would hash None and pass silently between records), and
     run_arm_workload reaches the gsm8k plan and pass through them."""
-    inputs = run_gate.control_inputs({}, argparse.Namespace(**(run_gate.OFFICIAL | {"gpu_mem": 0.8, "num_gpu_blocks": 0, "vllm_arg": [], "settle": 5.0, "gsm8k_dir": "/nonexistent"})))  # fmt: skip
+    inputs = run_gate.control_inputs({}, argparse.Namespace(**(run_gate.OFFICIAL | {"model": "/m/Qwen3-4B", "tp": 1, "gpu_mem": 0.8, "num_gpu_blocks": 0, "vllm_arg": [], "settle": 5.0, "gsm8k_dir": "/nonexistent"})))  # fmt: skip
     assert all(inputs["code"][k] for k in run_gate.CONTROL_CODE), inputs["code"]
     src = Path(run_gate.__file__).read_text()
     body = src[src.index("\ndef run_arm_workload(") : src.index("\ndef ", src.index("\ndef run_arm_workload(") + 1)]  # fmt: skip
@@ -2290,35 +2341,40 @@ def test_control_code_is_hashed():
     assert "logprobs" not in body and "SPLIT_PASSES" not in body
 
 
-def _control_verdicts(ok: bool = True, na: bool = False) -> dict:
-    x = {"pass": True, "na": run_gate.ONBOARDING_NA} if na else {"pass": ok}
-    return {"baseline": dict.fromkeys(run_gate.CONTROL_VERDICTS, x)}
+def _control_verdicts(na: bool = False) -> dict:
+    if na:
+        return {"baseline": dict.fromkeys(run_gate.CONTROL_VERDICTS, {"pass": True, "na": run_gate.ONBOARDING_NA})}  # fmt: skip
+    return {"baseline": dict(_PASSED)}
 
 
 @pytest.mark.parametrize(
-    "v,plain,limit,why",
+    "v,plain,limit,unclean,why",
     [
-        (_control_verdicts(), True, 0, None),
-        (_control_verdicts(), False, 0, "no plain arm"),
-        (_control_verdicts(na=True), True, 0, "controls not passing"),
+        (_control_verdicts(), True, 0, [], None),
+        (_control_verdicts(), False, 0, [], "no plain arm"),
+        (_control_verdicts(), True, 0, ["gate tree /g at an unverified rev (tree differs from rev)"], "run not clean: gate tree /g"),
+        (_control_verdicts(), True, 0, ["provenance: gate tree changed before plain/gsm8k: rsi/x"], "run not clean: provenance"),
+        (_control_verdicts(na=True), True, 0, [], "controls not passing"),
         (
             {"baseline": _control_verdicts()["baseline"] | {"G2.batch_control": {"pass": False}}},
             True,
             0,
+            [],
             "controls not passing: G2.batch_control",
         ),
-        ({}, True, 0, "controls not passing"),
-        (_control_verdicts(), True, 128, "gsm8k_limit=128"),
+        ({}, True, 0, [], "controls not passing"),
+        (_control_verdicts(), True, 128, [], "gsm8k_limit=128"),
     ],
-    ids=["passed", "no-plain", "na", "failed", "no-verdicts", "subset"],
-)
-def test_controls_record_only_from_passing_full_set_runs(tmp_path, v, plain, limit, why):
+    ids=["passed", "no-plain", "dirty-tree", "tree-changed", "na", "failed", "no-verdicts", "subset"],
+)  # fmt: skip
+def test_controls_record_only_from_clean_passing_full_set_runs(tmp_path, v, plain, limit, unclean, why):  # fmt: skip
     """``summary.controls_record`` (what gate.json takes) exists only for a
-    full-set run with the plain arm whose three controls passed; it carries
-    run, rev, limit, the verdicts and the inputs, and a record pasted from it
-    is accepted. Otherwise it is None with the reason."""
+    clean (verified, unchanged trees; sane CUDA env; this TP's dump; no
+    override), full-set run with the plain arm whose three controls passed;
+    it carries run, rev, limit, the verdicts and the inputs, and a record
+    pasted from it is accepted. Otherwise it is None with the reason."""
     args = _slim_args(tmp_path, gsm8k_limit=limit)
-    rec, got = run_gate.controls_record(_GATE, args, "run-x", "abc", v, plain)
+    rec, got = run_gate.controls_record(_GATE, args, "run-x", "abc", v, plain, unclean)
     if why is None:
         assert got is None and rec["verdicts"] == v["baseline"], got
         assert (rec["run"], rec["rev"], rec["gsm8k_limit"]) == ("run-x", "abc", 0)
@@ -2328,21 +2384,53 @@ def test_controls_record_only_from_passing_full_set_runs(tmp_path, v, plain, lim
         assert rec is None and why in got, got
 
 
+@pytest.mark.parametrize(
+    "key,args,problem",
+    [
+        ("tp4", {"tp": 4}, "measured Qwen3-4B --tp 1, not Qwen3-4B --tp 4"),
+        ("tp1", {"model": "/m/Qwen3.5-4B"}, "measured Qwen3-4B --tp 1, not Qwen3.5-4B --tp 1"),
+    ],
+    ids=["other-tp", "other-model"],
+)
+def test_controls_record_is_bound_to_model_and_tp(tmp_path, key, args, problem):
+    """``control_inputs.identity`` (model, TP, that TP's committed dump)
+    ties a record to where it ran: a TP 1 record copied under another TP's
+    key, or another model's gate.json, is rejected."""
+    rec = _controls_gate(tmp_path, _GATE)["controls"]["tp1"]
+    assert rec["inputs"]["identity"]["model"] == "Qwen3-4B"
+    gate = _GATE | {"controls": {key: rec}}
+    bad = run_gate.controls_problem(gate, _slim_args(tmp_path, **args))
+    assert bad and problem in bad, bad
+
+
+# Records measured before the fingerprint hashed the control glue and
+# ``identity``: stale until the next plain run of that model and TP replaces
+# them (official runs there need the plain arm until then). Drop an entry
+# with its refresh; an entry that is current fails, so the list cannot rot.
+_AWAITING_REFRESH = {("Qwen3-4B", "tp1"), ("Qwen3-4B", "tp2")}
+
+
 def test_committed_controls_records_are_current(monkeypatch):
     """Every controls record committed in a gate.json is accepted at the
     current inputs, for the official args with the dataset its run read: a
     gate change that touches the controls fails here, so its PR carries a
-    new self-test run (or drops the record). The dataset hash is the
-    record's (the files live on the GPU host); ``controls_problem`` checks
-    it against ``--gsm8k-dir`` in every real run."""
+    new self-test run (or drops the record, or lists it in
+    ``_AWAITING_REFRESH``, where it must be stale and nothing else). The
+    dataset hash is the record's (the files live on the GPU host);
+    ``controls_problem`` checks it against ``--gsm8k-dir`` in every real
+    run."""
     for f in sorted((run_gate.REPO / "docs/rsi/models").glob("*/gate.json")):
         gate = json.loads(f.read_text())
         for tp, rec in gate.get("controls", {}).items():
             monkeypatch.setattr(
                 run_gate, "gsm8k_dataset", lambda _d, ds=rec["inputs"]["dataset"]: ds
             )
-            args = argparse.Namespace(**(run_gate.OFFICIAL | {"tp": int(tp.removeprefix("tp")), "gpu_mem": run_gate.GPU_MEM, "num_gpu_blocks": 0, "vllm_arg": [], "settle": run_gate.SETTLE, "gsm8k_dir": str(run_gate.GSM8K_DIR)}))  # fmt: skip
-            assert run_gate.controls_problem(gate, args) is None, (f, tp)
+            args = argparse.Namespace(**(run_gate.OFFICIAL | {"model": f"/m/{f.parent.name}", "tp": int(tp.removeprefix("tp")), "gpu_mem": run_gate.GPU_MEM, "num_gpu_blocks": 0, "vllm_arg": [], "settle": run_gate.SETTLE, "gsm8k_dir": str(run_gate.GSM8K_DIR)}))  # fmt: skip
+            got = run_gate.controls_problem(gate, args)
+            if (f.parent.name, tp) in _AWAITING_REFRESH:
+                assert got and "are stale: identity.model" in got, (f, tp, got)
+            else:
+                assert got is None, (f, tp, got)
             assert all(rec["inputs"]["dataset"].values()), (f, tp)
 
 

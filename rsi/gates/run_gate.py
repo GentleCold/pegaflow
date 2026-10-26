@@ -155,14 +155,23 @@ SELFTEST_LIMIT = 128  # gsm8k questions per self-test arm
 CONTROL_FILES = ("rsi/gates/rsi_probe.py", "rsi/gates/workloads.py")
 CONTROL_VERDICTS = ("G2.plain_equals_baseline", "G2.split_control", "G2.batch_control")
 # Everything between the plain / baseline gsm8k stage's arguments and the
-# three verdicts: the stage (``run_arm_workload``: warmup, settle, reset +
+# three verdicts: which arm runs which workload and with which args
+# (``runs_workload``, ``stage_args``, ``cap_stage_args``, ``run_stage``,
+# ``arm_label``), the stage (``run_arm_workload``: warmup, settle, reset +
 # poison, pass order), the vLLM launch (command, env, kv-transfer config,
 # plugins, compile caches and their autotune seed), the pass plan and
-# per-pass request arguments, the output / token readers and the control and
-# verdict functions. Not hashed: process plumbing that reaches neither
-# vLLM's arguments nor its env (port leases, launch and teardown, the arm
-# under test's isolation, the bytecode cache path).
+# per-pass request arguments, the output / token readers, the control
+# functions, the verdict functions and their assembly (``control_verdicts``,
+# ``_predates``, ``_ran_without``). Not hashed: process plumbing that reaches
+# neither vLLM's arguments nor its env (port leases, launch and teardown, the
+# arm under test's isolation, the bytecode cache path), and ``main``'s call
+# lines into these.
 CONTROL_CODE = (
+    "runs_workload",
+    "stage_args",
+    "cap_stage_args",
+    "run_stage",
+    "arm_label",
     "run_arm_workload",
     "vllm_server",
     "kv_transfer_config",
@@ -187,7 +196,17 @@ CONTROL_CODE = (
     "_plain_equals_baseline",
     "_split_control_verdict",
     "_batch_control_verdict",
+    "control_verdicts",
+    "_predates",
+    "_ran_without",
 )
+# What a recorded control verdict must carry besides ``pass``: a bare
+# ``{"pass": true}`` measured nothing.
+CONTROL_MEASURED = {
+    "G2.plain_equals_baseline": ("differ",),
+    "G2.split_control": ("n", "prewarmed", "split_invariant", "measured_invariant"),
+    "G2.batch_control": ("n", "prewarmed", "batch_invariant", "measured_invariant"),
+}
 CONTROL_SETTINGS = (
     "attention_backend",
     "invariant_attention_backend",
@@ -3027,6 +3046,29 @@ def caught_per_group(
     return out
 
 
+def control_verdicts(
+    results: dict[str, dict[str, Any]], run_dir: Path, gate: dict[str, Any] | None
+) -> dict[str, dict[str, Any]]:
+    """The three onboarding control verdicts (``CONTROL_VERDICTS``), from
+    the plain and baseline gsm8k passes and gate.json's two claims, which
+    they establish (not declare). Without the plain arm: ``na``. Hashed into
+    ``control_inputs`` with everything it reads."""
+    split_inv = bool((gate or {}).get("split_invariant", True))
+    batch_inv = bool((gate or {}).get("batch_invariant"))
+    if "plain" not in results:
+        return dict.fromkeys(CONTROL_VERDICTS, {"pass": True, "na": ONBOARDING_NA})
+    ref_cold = _outputs(run_dir, "baseline", "cold")
+    return {
+        "G2.plain_equals_baseline": _plain_equals_baseline(run_dir, ref_cold, batch_inv),
+        "G2.split_control": _split_control_verdict(split_control(run_dir, batch_inv), split_inv),
+        # batch_invariant decides whether outputs are compared.
+        "G2.batch_control": _predates(
+            _batch_control_verdict(batch_control(run_dir), batch_inv),
+            _ran_without(results, "plain", BATCH_PASS),
+        ),
+    }
+
+
 def verdicts(
     results: dict[str, dict[str, Any]],
     run_dir: Path,
@@ -3053,17 +3095,11 @@ def verdicts(
     # Controls: the probe changes nothing (plain == baseline), poisoning and
     # the local reset change nothing (baseline warm == cold), local hits are
     # byte-identical to their computed copies. The plain-arm controls are
-    # onboarding controls: without the plain arm they are ``na`` here and
-    # ``official_problems`` requires gate.json's record of them.
-    plain = "plain" in results
-
-    def onboarding(v: dict[str, Any]) -> dict[str, Any]:
-        return v if plain else {"pass": True, "na": ONBOARDING_NA}
-
+    # onboarding controls (``control_verdicts``): without the plain arm they
+    # are ``na`` here and ``official_problems`` requires gate.json's record.
+    ctl = control_verdicts(results, run_dir, gate)
     v["baseline"] = {
-        "G2.plain_equals_baseline": onboarding(
-            _plain_equals_baseline(run_dir, ref_cold, batch_inv)
-        ),
+        "G2.plain_equals_baseline": ctl["G2.plain_equals_baseline"],
         # Output equality needs batch invariance; gate.json declares when a
         # model cannot have it, and then only accuracy and digests count.
         "G2.warm_equals_cold": {
@@ -3080,15 +3116,8 @@ def verdicts(
             if pegaflow_dirs is not None
             else {}
         ),
-        # gate.json's split_invariant is established here, not declared.
-        "G2.split_control": onboarding(_split_control_verdict(ctrl, split_inv)),
-        # Likewise batch_invariant (it decides whether outputs are compared).
-        "G2.batch_control": onboarding(
-            _predates(
-                _batch_control_verdict(batch_control(run_dir), batch_inv),
-                _ran_without(results, "plain", BATCH_PASS),
-            )
-        ),
+        "G2.split_control": ctl["G2.split_control"],
+        "G2.batch_control": ctl["G2.batch_control"],
         "G2.digest_self.cap": _digest_verdict(
             base.get("cap", {}).get("digest_self"), None, exhaustive=True
         )
@@ -3564,13 +3593,36 @@ def cap_stage_args(args):
     return argparse.Namespace(**(vars(args) | {"concurrency": w})) if w else args
 
 
+def stage_args(args, wl: str):
+    """The ``args`` a stage of workload ``wl`` runs with: every cap stage
+    (``cap``, ``cap<NNN>``) the plan's workers, the rest the run's own."""
+    return cap_stage_args(args) if wl.startswith("cap") else args
+
+
+def runs_workload(arm: str, wl: str) -> bool:
+    """Whether ``arm`` runs workload ``wl``: plain gsm8k only, the self-test
+    arms gsm8k and preempt, every other arm all of them."""
+    kind = arm_kind(arm)
+    if kind == "plain":
+        return wl == "gsm8k"
+    if kind == "selftest":
+        # vLLM 0.32's scheduler dies on synchronous Mamba loads in the small
+        # preempt pool (allocate_slots: "Cannot get 1 free blocks"); the
+        # sync arm is judged by the gsm8k digests.
+        return wl == "gsm8k" or (wl == PREEMPT and arm != "selftest:sync")
+    return True
+
+
 def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
     """Resolve ``--cap-convs auto``: the fewest conversations (from
     ``CAP_MIN_CONVS``, all turns up to ``--cap-turns``) whose estimated
     ``C(0.5)`` is ``>= CAP_FLOOR_MARGIN x MIN_CAPACITY_GPU_KV x`` GPU KV, and
     ``workers`` (:func:`cap_workers`) from their mean turn. Fails closed: if
     the whole file is not enough, all of it is used and the measured floor
-    marks the run not official; too few workers show as freeze separation."""
+    marks the run not official; fewer conversations than ``2 x workers`` or
+    more workers than vLLM runs at once (``--max-num-seqs``) are ``problems``
+    (``g5_problems``), and too few workers otherwise show as freeze
+    separation."""
     if args.cap_convs != "auto":
         return {"cap_convs": int(args.cap_convs), "mode": "fixed"}
     if spec is None:
@@ -3606,6 +3658,13 @@ def plan_cap_convs(args, spec: dict[str, Any] | None) -> dict[str, Any]:
         "gpu_kv_tokens": gpu_kv_tokens(spec),
         "mean_turn_tokens": round(mean_turn, 1),
     }
+    problems = []
+    if used < 2 * workers:
+        problems.append(f"{used} conversations < 2 x {workers} workers (whole replay file used)")
+    if workers > args.max_num_seqs:
+        problems.append(f"{workers} workers > --max-num-seqs {args.max_num_seqs}")
+    if problems:
+        plan["problems"] = problems  # g5_problems: not official
     if unmodeled := unmodeled_spec(spec):
         plan["unmodeled"] = unmodeled  # g5_problems: not official
     return plan
@@ -3669,6 +3728,7 @@ def g5_problems(v: dict[str, Any], floor: dict[str, Any], plan: dict[str, Any] |
     if not floor["pass"]:
         why = " (whole replay file used)" if (plan or {}).get("enough") is False else ""
         out.append(f"capacity below {MIN_CAPACITY_GPU_KV:g}x GPU KV{why}")
+    out += [f"cap plan: {p}" for p in (plan or {}).get("problems", [])]
     if (plan or {}).get("unmodeled"):
         out.append(f"cap plan sized from an unmodeled spec: {'; '.join(plan['unmodeled'])}")
     for label, g in v.items():
@@ -3744,7 +3804,9 @@ def control_inputs(gate: dict[str, Any], args) -> dict[str, Any]:
     constants, the run arguments the gsm8k stages ran with (the gsm8k
     profile, ``--gpu-mem``, overrides), the gsm8k dataset and the gate.json
     settings, JSON-shaped. The model and TP pick the record (gate.json of
-    the model, ``controls["tp<N>"]``), whose ``inputs`` hold it."""
+    the model, ``controls["tp<N>"]``); ``identity`` (model, TP, sha256 of
+    that TP's committed spec dump) ties ``inputs`` to it, so a record
+    copied under another TP or model is stale."""
     import ast
 
     funcs = {}
@@ -3754,7 +3816,14 @@ def control_inputs(gate: dict[str, Any], args) -> dict[str, Any]:
             if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str):  # fmt: skip
                 node.body = body[1:] or [ast.Pass()]
             funcs[node.name] = _sha256(ast.unparse(node).encode())
+    model = Path(args.model).name
+    spec = committed_spec(REPO / "docs" / "rsi" / "models" / model, args.tp)
     out = {
+        "identity": {
+            "model": model,
+            "tp": args.tp,
+            "spec_sha256": _sha256(spec.read_bytes()) if spec.is_file() else None,
+        },
         # A missing file hashes to None (never equal to a recorded run's).
         "files": {
             f: _sha256((REPO / f).read_bytes()) if (REPO / f).is_file() else None
@@ -3774,19 +3843,67 @@ def _control_passed(v: Any) -> bool:
     return isinstance(v, dict) and v.get("pass") is True and "na" not in v
 
 
+def _full_set(limit: Any) -> bool:
+    """``--gsm8k-limit`` 0, the int (not False, 0.0 or None)."""
+    return type(limit) is int and limit == OFFICIAL["gsm8k_limit"]
+
+
+def _control_rejudge(verd: dict[str, Any], gate: dict[str, Any]) -> list[str]:
+    """What the recorded verdicts' own measurements contradict: each must
+    carry its counts (``CONTROL_MEASURED``), have measured gate.json's
+    current claims, compared something and found what it passed on."""
+    bad = [
+        f"{k} lacks {', '.join(m)}"
+        for k, keys in CONTROL_MEASURED.items()
+        if (m := [x for x in keys if x not in (verd.get(k) or {})])
+    ]
+    if bad:
+        return bad
+    out = []
+    peb = verd["G2.plain_equals_baseline"]
+    if peb["differ"] != 0 or peb.get("logprob_differ", 0) != 0:
+        out.append("G2.plain_equals_baseline differs")
+    for k, claim in (
+        ("G2.split_control", bool(gate.get("split_invariant", True))),
+        ("G2.batch_control", bool(gate.get("batch_invariant"))),
+    ):
+        x = verd[k]
+        name = k.split(".")[1].replace("_control", "_invariant")
+        got = x["measured_invariant"]
+        # None: an invariant measurement flagged vacuous (split control).
+        if not (x[name] is claim and (got is claim or (claim and got is None))):
+            out.append(f"{k} measured {name}={got} under claim {x[name]}, gate.json {claim}")
+        if not (x["n"] > 0 and x["prewarmed"] >= MIN_PREWARMED * x["n"]):
+            out.append(f"{k} pre-warmed {x['prewarmed']}/{x['n']}")
+    if verd["G2.split_control"].get("ref_equals_cold") is not True:
+        out.append("G2.split_control reference differs from cold")
+    if verd["G2.batch_control"]["n"] != BATCH_CONTROL_N:
+        out.append(f"G2.batch_control compared {verd['G2.batch_control']['n']}, not {BATCH_CONTROL_N}")  # fmt: skip
+    return out
+
+
 def controls_record(
-    gate: dict[str, Any], args, run: str, rev: str, v: dict[str, Any], plain: bool
+    gate: dict[str, Any],
+    args,
+    run: str,
+    rev: str,
+    v: dict[str, Any],
+    plain: bool,
+    unclean: list[str],
 ) -> tuple[dict[str, Any] | None, str | None]:
     """``summary.controls_record``: what gate.json ``controls["tp<N>"]``
-    takes from this run, or None and why. Only a full-set run with the plain
-    arm whose three controls passed yields one."""
+    takes from this run, or None and why. Only a clean (``unclean`` empty:
+    setup, provenance, provenance watch and CUDA env), full-set run with the
+    plain arm whose three controls passed yields one."""
     if not plain:
         return None, "no plain arm in this run"
+    if unclean:
+        return None, f"run not clean: {'; '.join(unclean)}"
     verd = {k: (v.get("baseline") or {}).get(k) for k in CONTROL_VERDICTS}
     bad = [k for k, x in verd.items() if not _control_passed(x)]
     if bad:
         return None, f"controls not passing: {', '.join(bad)}"
-    if args.gsm8k_limit != OFFICIAL["gsm8k_limit"]:
+    if not _full_set(args.gsm8k_limit):
         return None, f"gsm8k_limit={args.gsm8k_limit}: a controls record is full-set (0)"
     rec = {"run": run, "rev": rev, "gsm8k_limit": args.gsm8k_limit, "verdicts": verd}
     return rec | {"inputs": control_inputs(gate, args)}, None
@@ -3810,10 +3927,14 @@ def controls_problem(gate: dict[str, Any], args) -> str | None:
     bad = [k for k in CONTROL_VERDICTS if not _control_passed(verd.get(k))]
     if bad:
         return f"{what} record no passing {', '.join(bad)}"
-    if rec.get("gsm8k_limit") != OFFICIAL["gsm8k_limit"]:
+    if not _full_set(rec.get("gsm8k_limit")):
         # The split control judges every prompt the official run's warm
         # passes start from; a subset leaves the rest unmeasured.
-        return f"{what} ran gsm8k_limit={rec.get('gsm8k_limit')}, not the full set (0)"
+        return f"{what} ran gsm8k_limit={rec.get('gsm8k_limit')!r}, not the full set (0)"
+    ident = (rec.get("inputs") or {}).get("identity") or {}
+    # A record without ``identity`` predates it: stale below, by name.
+    if ident and (ident.get("model"), ident.get("tp")) != (Path(args.model).name, tp):
+        return f"{what} measured {ident.get('model')} --tp {ident.get('tp')}, not {Path(args.model).name} --tp {tp}"  # fmt: skip
     rc = rec.get("inputs_recomputed")
     if rc is not None and not (isinstance(rc, str) and rc.strip()):
         # ``inputs`` computed later than the run (its rev is off this
@@ -3833,6 +3954,9 @@ def controls_problem(gate: dict[str, Any], args) -> str | None:
             f"{what} are stale: {', '.join(stale) or 'inputs'} changed "
             "(rerun the self-test with plain, or add the plain arm)"
         )
+    # Current inputs: the verdicts must also hold on their own counts.
+    if bad := _control_rejudge(verd, gate):
+        return f"{what}: recorded verdicts do not hold: {'; '.join(bad)}"
     return None
 
 
@@ -3896,16 +4020,18 @@ def official_problems(
         # Without it the arm imports the venv's (unverified, unsnapshotted)
         # pegaflow tree: G0.provenance would accept any file there.
         out.append("--under-test-path missing: the connector under test has no verified snapshot")
-    if not gate_file.exists():
-        out.append(f"{gate_file} missing")
+    return out + model_files_problems(gate_file, committed, args.tp)
+
+
+def model_files_problems(gate_file: Path, committed: Path, tp: int) -> list[str]:
+    """gate.json and this TP's committed spec dump exist, and the dump is of
+    ``tp`` (``official_problems``, and a controls record's run)."""
+    out = [] if gate_file.exists() else [f"{gate_file} missing"]
     if not committed.exists():
-        out.append(f"committed spec dump {committed} missing (no dump for --tp {args.tp})")
-    else:
-        got = (json.loads(committed.read_text()).get("parallel") or {}).get("tp")
-        if got != args.tp:
-            out.append(
-                f"committed spec dump {committed} records parallel.tp={got}, not --tp {args.tp}"
-            )
+        return out + [f"committed spec dump {committed} missing (no dump for --tp {tp})"]
+    got = (json.loads(committed.read_text()).get("parallel") or {}).get("tp")
+    if got != tp:
+        out.append(f"committed spec dump {committed} records parallel.tp={got}, not --tp {tp}")
     return out
 
 
@@ -4359,8 +4485,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def stage(arm: str, wl: str, out: Path, **kw) -> dict[str, Any]:
         watch.check(f"{arm_label(arm)}/{out.name}")  # before every stage
-        a = cap_stage_args(args) if wl.startswith("cap") else args
-        return run_stage(a, gate, arm, wl, out, **kw)
+        return run_stage(stage_args(args, wl), gate, arm, wl, out, **kw)
 
     measured_u: dict[str, dict[str, Any]] = {}
     # Split-variant: every arm's gsm8k warm pass gets a baseline replay at its
@@ -4371,14 +4496,7 @@ def main(argv: list[str] | None = None) -> int:
         kind = arm_kind(arm)
         label = arm_label(arm)
         for wl in wls:
-            if kind == "plain" and wl != "gsm8k":
-                continue
-            if kind == "selftest" and wl not in ("gsm8k", PREEMPT):
-                continue
-            if arm == "selftest:sync" and wl == PREEMPT:
-                # vLLM 0.32's scheduler dies on synchronous Mamba loads in the
-                # small preempt pool (allocate_slots: "Cannot get 1 free
-                # blocks"); the arm is judged by the gsm8k digests.
+            if not runs_workload(arm, wl):
                 continue
             if wl != "cap":
                 if kind in _STORES and wl not in measured_u:
@@ -4490,7 +4608,21 @@ def main(argv: list[str] | None = None) -> int:
         # so the run cannot be official (G5 is then a flow + digest smoke).
         floor = capacity_floor(results.get("baseline", {}).get("cap"))
         problems += g5_problems(v, floor, getattr(args, "cap_plan", None))
-    ctl_rec, ctl_why = controls_record(gate, args, run_dir.name, git_rev(), v, "plain" in results)
+    # A controls record needs a clean run, not an official one (the self-test
+    # never is: no native arm, gsm8k and preempt only): what it measured is
+    # verified, unchanged during the run, on a sane CUDA env, against this
+    # TP's committed dump, at no vLLM override.
+    unclean = (
+        provenance_problems(prov)
+        + watch.problems()
+        + cuda_bad
+        + model_files_problems(gate_file, committed, args.tp)
+    )
+    if args.num_gpu_blocks or args.vllm_arg:
+        unclean.append("--num-gpu-blocks / --vllm-arg override")
+    ctl_rec, ctl_why = controls_record(
+        gate, args, run_dir.name, git_rev(), v, "plain" in results, unclean
+    )
     summary = {
         "tag": args.tag,
         "rev": git_rev(),
