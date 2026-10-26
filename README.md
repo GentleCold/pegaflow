@@ -4,7 +4,10 @@ This orphan branch holds the agents' working memory for the RSI effort
 (vLLM connector_v2 + PegaFlow, model onboarding in RSI mode):
 
 - `PROGRESS.md`: progress log, scope, phases, open questions, server
-  limitations, and the dated user decisions behind the gate rules.
+  limitations, and the dated user decisions behind the gate rules
+  ("Decisions").
+- `gates-evidence.md`: evidence behind GATES.md rules (probe numbers, run
+  tags, the lmcache overlay build), moved out of GATES.md.
 - `models/<model>/ITERATIONS.md`: per-model iteration journal (hypotheses,
   run tags, hit-rate judgments, review outcomes).
 - `reviews/*.md`: review reports that still have unresolved findings.
@@ -26,7 +29,8 @@ every push, never force-push. Commit messages follow commitizen
 
 ## Compaction rules
 
-- Budgets: `PROGRESS.md` <= 300 lines, each `ITERATIONS.md` <= 400 lines.
+- Budgets: `PROGRESS.md` <= 300 lines, each `ITERATIONS.md` <= 400 lines,
+  `gates-evidence.md` <= 300 lines.
 - When a file is over budget, and at every model acceptance, rewrite it
   instead of appending:
   - current state first;

@@ -1,11 +1,45 @@
 # RSI: vLLM connector + PegaFlow — progress log
 
 This file is the source of truth for the RSI effort. Any session (human or agent)
-that resumes this work MUST read this file first, then `docs/rsi/GATES.md`, then
-the skill `.claude/skills/pegaflow-new-model/SKILL.md`. Append, do not rewrite history.
+that resumes this work MUST read this file first, then `docs/rsi/GATES.md` (on
+the code branch), then the skill `.claude/skills/pegaflow-new-model/SKILL.md`.
+Compaction rules: README.md.
 
 Design doc: Feishu "Offloading rsi"
 https://ppio-cloud.feishu.cn/wiki/XRmWwEfWjiIUHok6coIcz34fnpf (rev 62 at start).
+
+## Decisions
+
+Dated user decisions behind the current rules. Code-branch docs
+(`docs/rsi/GATES.md`, the `pegaflow-new-model` skill, run_gate comments)
+state the rule only; the date and quote live here.
+
+| Date | Decision | Rule now in |
+|---|---|---|
+| 2026-10-23 | Scope: build the vLLM connector + PegaFlow path; models in order Qwen3-4B, DeepSeek-V2-Lite-Chat, Qwen3.5-4B, gemma-4-E4B-it; vLLM 0.32.0; PD out of scope | "Scope" below |
+| 2026-10-23 | PR policy: one model-agnostic `connector_v2`, per-model knobs only in `models/<model>.toml`; one branch / PR per model, stacked | "PR policy" below, skill step 5 |
+| 2026-10-23 | Reviews by independent agents, nothing waits on the user ("这些评审都不要等我"); one user acceptance pass at the end | skill steps 6-7 |
+| 2026-10-23 | G4 hard ("性能需要达标才行，需要比基准快"): warm replay strictly better than baseline, cold / gsm8k within 2% | GATES.md G4 |
+| 2026-10-23 | G5 added: actual hit rate must approach the theoretical one at a fixed capacity | GATES.md G5 |
+| 2026-10-23 | Replay workload: R2EGym until "agentx" is provided | GATES.md G4 |
+| 2026-10-24 | Hit rate not gated ("命中率那块，不要设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多"); agent writes a hit-rate judgment, reviewer checks | GATES.md "Hit rate" |
+| 2026-10-24 | Server stays at the base version ("server还是保持原始版本，把server的局限问题汇报给人就行，gate不要被server受限，命中率不用过度追求最高"); limits are reported, not fixed | GATES.md "Known server limits", skill step 5 |
+| 2026-10-24 | PR CI must pass (cz on every commit, typos, clippy) | skill Lessons "PR" |
+| 2026-10-24 | Store pool for unlimited runs 64gb, NUMA affinity off (technical, after the .44 move) | GATES.md G3 |
+| 2026-10-26 | G4 warm must also beat vLLM native offload (`*_vs_native`); overhead checks stay vs baseline | GATES.md G4 |
+| 2026-10-26 | Process / incremental docs (PROGRESS, ITERATIONS, reviews, sha-map) out of the PR, onto this branch, with compaction ("还有很多文档，都是增量进行的，我觉得这些都不要进入pr，另外这些增量文档后面都需要重新优化下不然会一直增长") | README.md, skill "Notes and code branches" |
+| 2026-10-26 | G4 vs native noise rule B: 2 timed passes; \|gap\| below the larger pass-to-pass range of v2 / native is `inconclusive`, rerun once, inconclusive twice is a tie that does not block. Superseded the same day (next row) | (superseded) |
+| 2026-10-26 | G4 vs native "close enough" ("不一定和native保持一致，差不多就行了"): `*_vs_native` is a judged comparison, reported and never failing; the onboarding agent writes a "perf vs native judgment", the reviewer checks it. G4 vs baseline stays hard | GATES.md G4 (once `feat/rsi-gate-g4-noise` lands) |
+
+Open for the user's final acceptance: GATES.md is a draft; the lmcache arm
+on Qwen3-4B pins unmerged LMCache PR #4467 (`e05c2ea`); the official DSV2
+records predate the resume stage and need an official TP2 rerun with it
+(`gates-evidence.md`); `rsi/gates` tests are not in PR CI; the
+`split_invariant=false` rule and the untimed warmup (see "Open questions").
+
+Pre-fix G5 reference (`2026-10-23-qwen3-4b-g5-official`, gate 369b253, not
+comparable to later runs): `warm_timed` E_C connector_v2 0.216, old 0.124,
+native 0.558; full table in `gates-evidence.md`.
 
 ## Scope (fixed by the user, 2026-10-23)
 
@@ -134,6 +168,10 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   TTFT gap (2.1 ms) is below v2's own pass-to-pass range (25 ms), so that
   verdict is not decidable from these data; pass count and tolerance are
   unchanged pending the user's decision.
+  Resolved 2026-10-26 (see "Decisions"): first rule B (inconclusive within
+  noise), then replaced by "close enough": `*_vs_native` is reported, the
+  agent writes a perf vs native judgment (`feat/rsi-gate-g4-noise`), so the
+  "fail" cells above are gaps to judge, not failed gates.
 
 ## Isolation (no reference to existing implementation)
 
