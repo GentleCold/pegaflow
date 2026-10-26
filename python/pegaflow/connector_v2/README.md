@@ -127,10 +127,15 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     `ref_cnt`; vLLM 0.32 reads `ref_cnt == 1` (`is_block_writable`) only for
     speculative Mamba blocks, so check this before enabling spec decode on a
     checkpoint layout;
-  - a save that fails, raises, or whose saver thread died still releases its
-    blocks (a failed save is a future miss). A save RPC that hangs blocks
-    `flush` and fences for good (logged every 10 s): the client has no
-    per-call deadline, and the server may still be copying.
+  - a save the server reports failed still releases its blocks (a failed
+    save is a future miss). A save RPC that raises, or a saver thread that
+    dies, stops the saver for good (fail closed): fences and holds are
+    released, later saves are dropped, and no other copy runs. The one job
+    whose RPC raised may still be copying on the server; closing that needs
+    a server reply only once no copy is in flight (a server limitation). A
+    save RPC that hangs blocks `flush` and fences for good (logged every
+    10 s): the client has no per-call deadline, and the server may still be
+    copying.
 - **Checkpoint groups** (Mamba / GDN state, vLLM `mamba_cache_mode="align"`).
   vLLM's block table for such a group is null except the running state
   block, so positions do not say which block holds which state. Saves come

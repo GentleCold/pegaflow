@@ -1435,9 +1435,11 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
 
     The step thread never waits on the GPU for a save: the save RPC runs
     after the compute mark. The fence clears once the save is done, stored
-    or not. S4: a job that raises, or a saver thread that dies, still
-    releases the fence (a failed save is a future miss) instead of hanging;
-    a dead saver drops later saves.
+    or not (a reported failure is a future miss). S4: a save RPC that
+    raises is not a finished copy (the server may still copy): like a dying
+    saver thread it stops the saver (fail closed). The fence is released
+    instead of hanging, the job is not counted done, and later saves are
+    dropped, so no further copy reads a reused block.
     """
     import threading
 
@@ -1482,8 +1484,11 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     worker.save(step1)
     sched.on_saved_through(worker.saved_through())
     assert not sched.has_pending_saves()
-    if outcome == "saver-dies":
+    stopped = outcome in ("raises", "saver-dies")
+    assert worker._completed == (0 if stopped else 1)
+    if stopped:
         worker._saver.join(5)
+        assert not worker._saver.is_alive()
         worker.save(step0)
         assert worker.flush(5) and len(calls) == 1
         assert worker.save_stats.failed == 2
@@ -1609,9 +1614,9 @@ def _fence_rig(outcomes=None, policy=None):
         worker.save(plan)
         return plan
 
-    def done(n):  # wait until the saver completed n jobs
+    def done(n):  # wait until the saver completed n jobs (or stopped)
         with worker._cv:
-            assert worker._cv.wait_for(lambda: worker._completed >= n, 5)
+            assert worker._cv.wait_for(lambda: worker._settled(n), 5)
 
     return sched, worker, gates, step, done
 
@@ -1627,9 +1632,11 @@ A_FENCED, B_FENCED = {10: 0, 11: 0, 12: 0}, {20: 1, 21: 1, 22: 1}
         # One saver thread completes jobs in submit order: b's mark firing
         # first completes nothing, so "job k done" means "all <= k".
         pytest.param(None, [[1], [0]], [{**A_FENCED, **B_FENCED}, {}], id="fifo"),
-        # A failed or raising save still clears the fence (future miss).
+        # A failed save still clears the fence (future miss).
         pytest.param(["save-failed", "saved"], [[0], [1]], [B_FENCED, {}], id="own-job-failed"),
-        pytest.param(["raises", "raises"], [[0], [1]], [B_FENCED, {}], id="own-job-raises"),
+        # A raising save RPC stops the saver (fail closed): every fence clears
+        # and b's job never sends a copy.
+        pytest.param(["raises", "saved"], [[0], [1]], [{}, {}], id="raise-fails-closed"),
     ],
 )
 def test_finish_fences_on_the_requests_last_save(outcomes, release, expected):

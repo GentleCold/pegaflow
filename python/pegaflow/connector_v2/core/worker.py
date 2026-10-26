@@ -575,16 +575,30 @@ class Worker:
     def _save_loop(self) -> None:
         try:
             while (job := self._jobs.get()) is not None:
-                self._run_job(job)
+                if not self._run_job(job):
+                    break
         finally:
             with self._cv:
                 self._saver_dead = True
                 self._cv.notify_all()
 
-    def _run_job(self, job: _SaveJob) -> None:
+    def _run_job(self, job: _SaveJob) -> bool:
+        """Run one save job; False if the saver must stop (fail closed).
+
+        A save RPC that raises (transport error, no reply) is not a finished
+        copy: the server may still be copying the job's blocks. Its fences
+        cannot wait for a copy nobody will report, so the saver stops
+        instead: the job is not counted as completed, no later job sends an
+        RPC (no other copy reads a block that gets reused), and every fence
+        and hold is released through ``_saver_dead``. Only that one job's
+        copy may race a reuse; closing that needs the server to reply only
+        once no copy of the request is in flight (a server limitation).
+        A server reply that the save failed, or a failed compute wait (no
+        RPC sent), means no copy is running: the job is done.
+        """
         t0 = self._clock()
         t1 = t2 = t0
-        ok = False
+        ok = raised = False
         try:
             try:
                 job.ready.synchronize()
@@ -601,9 +615,13 @@ class Worker:
                         job.saves,
                     )
                 except Exception as e:
-                    ok, msg = False, repr(e)
+                    ok, raised, msg = False, True, repr(e)
             t2 = self._clock()
-            if not ok:
+            if raised:
+                logger.error(
+                    "[PegaKVConnectorV2] save RPC raised, saves stop (fail closed): %s", msg
+                )
+            elif not ok:
                 # Best effort: a dropped save is a future miss, not a wrong hit.
                 logger.warning("[PegaKVConnectorV2] save failed: %s", msg)
         finally:
@@ -613,9 +631,13 @@ class Worker:
                 stats.rpc_s += t2 - t1
                 stats.max_job_s = max(stats.max_job_s, t2 - t0)
                 stats.failed += not ok
-                # Always advance, failed or not: held blocks must be released.
-                self._completed = job.seq
+                if raised:
+                    self._saver_dead = True
+                else:
+                    # Failed or not, the copy is over: held blocks are released.
+                    self._completed = job.seq
                 self._cv.notify_all()
+        return not raised
 
     def report_save_stats(self) -> None:
         """Log and reset the save-cost window (grep "save stats" in vllm.log)."""
