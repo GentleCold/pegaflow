@@ -91,16 +91,22 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   asynchronous: `wait_for_save` records a CUDA event on the compute stream and
   queues the job; a saver thread waits on the event, then issues the save RPC.
   The step thread never waits on the GPU. Block lifetime:
-  - a finished request with saves returns `True` from `request_finished`;
-    vLLM keeps its blocks until every worker reports it in `finished_sending`,
-    i.e. until the job holding its last chosen save (and so, with one FIFO
-    saver per worker, every earlier job) is done (stored or failed). The
-    fence is per request: only the request's own saves read its blocks
-    (blocks it shares stay allocated by their other holder, and a
-    preemption's flush finished the saves made before it). A finished
-    request with no chosen save since its last preemption is not held. A
-    fence on a batched (held) job waits for the batch to be sent (see
-    `save_batch_steps`);
+  - `request_finished` always returns `False`: vLLM frees the blocks at
+    once, as with its own `OffloadingConnector`. Each block of the request's
+    chosen saves (since its last preemption) is fenced on the plan step of
+    its last save. The scheduler sees every block a step writes before the
+    forward: new requests' tables past their prefix hit, blocks appended to
+    running requests, resumed requests' tables, zeroed and copy-on-write
+    target blocks, and load targets. If one is fenced, the plan's
+    `fence_step` asks every worker to wait in `handle_preemptions` until the
+    saves of plans up to that step are done. A save is done once its RPC
+    returned (the server replies after the GPU->CPU copy completed) or
+    failed; with one FIFO saver per worker that covers every earlier job.
+    A fence clears once every worker reports that step saved
+    (`PegaWorkerMetadata.saved_through`, min over ranks), or once a planned
+    fence or flush covers it. A block the request shares through the prefix
+    cache stays fenced whoever frees it. A fence on a batched (held) job
+    sends the batch first (see `save_batch_steps`);
   - a step whose plan has `flush` (vLLM preempted a request and freed its
     blocks, or the layout has window groups whose blocks are freed while the
     request runs) waits for all pending saves in `handle_preemptions`. That
@@ -113,17 +119,18 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     drops it (`free_blocks`) once every worker reports that step's saves
     done (`PegaWorkerMetadata.saved_through`, min over ranks). A pinned block
     is never handed out again, so vLLM cannot zero, copy into or reuse it
-    while it is read. Such layouts need no flush and no finish hold, and
-    their saves are not batched (pins stay short). `has_pending_push_work`
-    keeps vLLM stepping until the pins are released. Without a bound block
+    while it is read. Such layouts need no flush and no fence, and their
+    saves are not batched (pins stay short). `has_pending_push_work` keeps
+    vLLM stepping until every planned save is reported done (pins released,
+    held batches sent). Without a bound block
     pool these layouts save nothing (fail closed). A pin raises the block's
     `ref_cnt`; vLLM 0.32 reads `ref_cnt == 1` (`is_block_writable`) only for
     speculative Mamba blocks, so check this before enabling spec decode on a
     checkpoint layout;
   - a save that fails, raises, or whose saver thread died still releases its
     blocks (a failed save is a future miss). A save RPC that hangs blocks
-    `flush` and held requests for good (logged every 10 s): the client has
-    no per-call deadline, and the server may still be copying.
+    `flush` and fences for good (logged every 10 s): the client has no
+    per-call deadline, and the server may still be copying.
 - **Checkpoint groups** (Mamba / GDN state, vLLM `mamba_cache_mode="align"`).
   vLLM's block table for such a group is null except the running state
   block, so positions do not say which block holds which state. Saves come
@@ -167,7 +174,9 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   logs `save stats`:
   - steps, and steps with a save;
   - blocks and bytes;
-  - on the step thread: `submit_ms` and preemption `flushes` / `flush_ms`;
+  - on the step thread: `submit_ms`, preemption `flushes` / `flush_ms`, and
+    `fences` / `fence_ms` / `max_fence_ms` (steps that waited for a save
+    before writing a freed block, and that wait);
   - on the saver thread: `wait_ms` (compute event), `rpc_ms`, `max_job_ms`,
     `max_pending` jobs;
   - failed saves;

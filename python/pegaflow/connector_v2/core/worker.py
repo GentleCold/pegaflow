@@ -8,16 +8,16 @@ with fakes.
 
 Saves are asynchronous: ``save`` only marks the compute stream and queues the
 job; a saver thread waits for the mark and then issues the save RPC (the server
-copies GPU->CPU on its own stream). The source blocks must stay untouched until
-the copy is done, so:
+copies GPU->CPU on its own stream and replies once the copy is done). The
+source blocks must stay untouched until the copy is done, so before a step
+writes any KV:
 
-- finished requests that had saves are held by vLLM (``request_finished``
-  returns True) until ``poll`` reports them in ``finished_sending``, which
-  happens once the job of the request's last save (``StepPlan.finished``: its
-  plan step) and so every earlier job is done;
+- a step that writes a block vLLM freed while a save may still read it
+  (``StepPlan.fence_step``) first calls ``wait_saved``: every save of plans up
+  to that step is done;
 - a step that reuses a preempted request's blocks first calls ``flush``.
 
-``flush`` runs in vLLM's ``handle_preemptions``, which vLLM's V1 model runner
+Both run in vLLM's ``handle_preemptions``, which vLLM's V1 model runner
 calls before it zeroes or copies (copy-on-write) any block, but the V2 runner
 calls after. Layouts where vLLM may zero or copy blocks, or free a checkpoint
 state block right after offering it, use pinned saves instead: the scheduler
@@ -90,9 +90,9 @@ class SaveStats:
     rpcs: int = 0  # save RPCs issued (one per released batch)
     pressure_rpcs: int = 0  # of those, sent early on KV pressure (StepPlan.send_saves)
     kv_usage_unknown_steps: int = 0  # steps without vLLM's KV usage (batching off)
-    sent: int = 0  # finished requests reported in finished_sending
-    sent_wait_s: float = 0.0  # their total time held between finish and report
-    max_sent_wait_s: float = 0.0
+    fences: int = 0  # steps that waited for saves before writing a freed block
+    fence_s: float = 0.0  # step thread: blocked on those waits (on the critical path)
+    max_fence_s: float = 0.0
     sync_loads: int = 0  # sync loads whose RPC was accepted (failed RPCs are not waited for)
     sync_first_steps: int = 0  # steps where a sync load was moved ahead of an async one
     sync_wait_s: float = 0.0  # step thread: waiting for their copies (on the critical path)
@@ -178,23 +178,21 @@ class Worker:
         self._cv = threading.Condition()
         self._submitted = 0  # step thread only
         self._completed = 0  # saver thread, under _cv
-        # req -> (last job that may read its blocks, when vLLM finished it)
-        self._finishing: dict[str, tuple[int, float]] = {}
         # (plan step, _submitted after that step's save) for steps whose jobs
         # are not known done, in step order; ``_done_seq`` is the newest
-        # sequence number dropped from the front (done). A finish fence on a
-        # step maps to that step's entry (``_fence_of``).
+        # sequence number dropped from the front (done). A fence on a step
+        # maps to that step's entry (``_fence_of``).
         self._step_seqs: collections.deque[tuple[int, int]] = collections.deque()
         self._done_seq = 0
         # Save batching (step thread only). Held jobs already own their
-        # sequence numbers, so finish fences and flush cover them.
+        # sequence numbers, so fences and flush cover them.
         self._batch_steps = batch_steps
         self._held: list[_SaveJob] = []
         self._held_steps = 0  # steps seen by the oldest held job
         self._held_since = 0.0
         self._held_bytes = 0  # estimated wire size of the held jobs' save entries
-        # Pinned saves: (job seq, plan step) of submitted jobs not known done,
-        # and the last plan step seen by ``save``.
+        # (job seq, plan step) of submitted jobs not known done, and the last
+        # plan step seen by ``save`` (``saved_through``).
         self._pinned = pinned_saves
         self._job_steps: collections.deque[tuple[int, int]] = collections.deque()
         self._last_step = -1
@@ -280,16 +278,7 @@ class Worker:
         )
 
     def start(self, plan: StepPlan) -> None:
-        """Start this step's loads and track requests vLLM holds for our saves.
-
-        Called before ``save`` of the same step. A finished request's last
-        save was planned in an earlier step (vLLM no longer schedules it), so
-        that save's job is already submitted; it is the request's fence.
-        """
-        if plan.finished:
-            now = self._clock()
-            for req_id, step in plan.finished.items():
-                self._finishing[req_id] = (self._fence_of(step), now)
+        """Start this step's loads."""
         self._start_loads(plan)
 
     def _fence_of(self, step: int) -> int:
@@ -444,8 +433,7 @@ class Worker:
             # saver only reads the blocks after the KV writes completed.
             ready = self._mark_compute()
             self._submitted += 1
-            if self._pinned:
-                self._job_steps.append((self._submitted, plan.step))
+            self._job_steps.append((self._submitted, plan.step))
             size = _wire_bytes(saves)
             if self._held and self._held_bytes + size > self.SAVE_RPC_MAX_BYTES:
                 # One merged RPC must stay well under the gRPC message limit.
@@ -459,7 +447,8 @@ class Worker:
             if self._release_due(t0):
                 self._release_held()
             elif plan.send_saves:
-                # KV pressure: held finished requests keep blocks vLLM needs.
+                # KV pressure: freed blocks are reused soon, and a fence on a
+                # held job would wait for the whole batch.
                 with self._cv:
                     self.save_stats.pressure_rpcs += 1
                 self._release_held()
@@ -527,6 +516,31 @@ class Worker:
 
     def _settled(self, target: int) -> bool:
         return self._saver_dead or self._completed >= target
+
+    def wait_saved(self, step: int) -> None:
+        """Block until the saves of plans up to ``step`` are done (the GPU->CPU
+        copies completed, or the save failed): this step writes blocks they
+        read. Held (batched) jobs among them are sent first. Waits for good,
+        like ``flush``."""
+        target = self._fence_of(step)
+        if self._held and self._held[0].seq <= target:
+            self._release_held()
+        t0 = self._clock()
+        with self._cv:
+            if self._settled(target):
+                return
+            while not self._cv.wait_for(lambda: self._settled(target), self.STALL_LOG_S):
+                logger.error(
+                    "[PegaKVConnectorV2] save fence waiting %.0f s (job %d of %d done)",
+                    self._clock() - t0,
+                    self._completed,
+                    target,
+                )
+            waited = self._clock() - t0
+            stats = self.save_stats
+            stats.fences += 1
+            stats.fence_s += waited
+            stats.max_fence_s = max(stats.max_fence_s, waited)
 
     def flush(self, timeout: float | None = None) -> bool:
         """Block until every submitted save job is done; False on timeout.
@@ -614,7 +628,7 @@ class Worker:
             "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
             "blocks=%d bytes=%d submit_ms=%.1f flushes=%d flush_ms=%.1f wait_ms=%.1f "
             "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d rpcs=%d pressure_rpcs=%d "
-            "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f kv_usage_unknown_steps=%d "
+            "fences=%d fence_ms=%.1f max_fence_ms=%.2f kv_usage_unknown_steps=%d "
             "sync_loads=%d sync_first_steps=%d sync_wait_ms=%.1f max_sync_wait_ms=%.2f "
             "load_steps=%d load_issue_ms=%.1f max_load_issue_ms=%.2f "
             "async_done=%d async_first_poll=%d async_polls=%d max_async_polls=%d "
@@ -635,9 +649,9 @@ class Worker:
             s.failed,
             s.rpcs,
             s.pressure_rpcs,
-            s.sent,
-            s.sent_wait_s * 1e3,
-            s.max_sent_wait_s * 1e3,
+            s.fences,
+            s.fence_s * 1e3,
+            s.max_fence_s * 1e3,
             s.kv_usage_unknown_steps,
             s.sync_loads,
             s.sync_first_steps,
@@ -665,24 +679,13 @@ class Worker:
     def poll(self) -> tuple[set[str], set[str], set[str]]:
         """Returns (finished_sending, finished_recving, failed_recving).
 
-        Failed receives are in both receive sets. A finished request is
-        reported as sent once the job of its last save, and every earlier
-        job, is done (stored, failed or raised).
+        Failed receives are in both receive sets. Nothing is ever sending:
+        finished requests are not held (fences cover their blocks).
         """
         sending: set[str] = set()
         with self._cv:
             completed = self._submitted if self._saver_dead else self._completed
         self._forget_done_steps(completed)
-        if self._finishing:
-            sending = {r for r, (fence, _) in self._finishing.items() if fence <= completed}
-            if sending:
-                now = self._clock()
-                waits = [now - self._finishing.pop(r)[1] for r in sending]
-                with self._cv:
-                    stats = self.save_stats
-                    stats.sent += len(waits)
-                    stats.sent_wait_s += sum(waits)
-                    stats.max_sent_wait_s = max(stats.max_sent_wait_s, *waits)
         finished, self._done = self._done, set()
         pending: list[_Batch] = []
         landed: list[int] = []

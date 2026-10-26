@@ -59,24 +59,23 @@ class StepPlan:
     """One step's work for every worker.
 
     Saves are asynchronous on the worker, so the plan also carries the block
-    lifecycle the worker must respect: ``finished`` maps each request whose
-    blocks vLLM holds for our saves to the plan step of its last chosen save
-    (report it in ``finished_sending`` once that step's save job, and so every
-    earlier one, is done), and ``flush`` asks the worker to finish
-    every pending save before this step touches any KV (vLLM freed blocks a
-    pending save may still read, e.g. on preemption). With pinned saves
-    (``Scheduler(pin_saves=True)``) neither is used: the scheduler keeps every
-    block it plans to save allocated in vLLM's block pool until all workers
-    report the step's saves done (``step``, ``Scheduler.on_saved_through``).
-    ``send_saves`` asks the
-    worker to send its held (batched) saves with this step's, without
-    waiting for them: vLLM's GPU KV cache is under pressure, and finished
-    requests held for batched saves keep blocks that waiting requests need.
+    lifecycle the worker must respect, before this step writes any KV:
+    ``fence_step`` (>= 0) asks it to wait until the saves of plans up to that
+    step are done (this step writes a block vLLM freed while one of them may
+    still read it: ``Scheduler.fence_writes``), and ``flush`` to finish every
+    pending save (vLLM freed blocks without telling which, e.g. on
+    preemption). With pinned saves (``Scheduler(pin_saves=True)``) neither is
+    used: the scheduler keeps every block it plans to save allocated in vLLM's
+    block pool until all workers report the step's saves done (``step``,
+    ``Scheduler.on_saved_through``). ``send_saves`` asks the worker to send
+    its held (batched) saves with this step's, without waiting for them:
+    vLLM's GPU KV cache is under pressure, so freed blocks are reused soon and
+    a fence on a held save would wait for the whole batch.
     """
 
     loads: list[LoadPlan] = field(default_factory=list)
     saves: list[GroupSave] = field(default_factory=list)
-    finished: dict[str, int] = field(default_factory=dict)  # req -> step of its last save
+    fence_step: int = -1  # wait for the saves of plans <= this before any KV write
     flush: bool = False
     send_saves: bool = False
     kv_usage_unknown: bool = False  # vLLM's KV usage was unavailable (send_saves set)
@@ -149,7 +148,7 @@ class Scheduler:
         reports that step's saves done (``on_saved_through``). A pinned block
         is never handed out again, so vLLM cannot zero, copy into (COW) or
         reuse it while the worker copies it: saves stay asynchronous without
-        preemption flushes or finish holds. For layouts where vLLM writes
+        preemption flushes or fences. For layouts where vLLM writes
         reallocated blocks before ``handle_preemptions`` (block zeroing, COW)
         or frees checkpoint state blocks while they are still being read.
         Saves are disabled (fail closed) if no pool was bound.
@@ -175,8 +174,24 @@ class Scheduler:
         self._deferred_since: dict[str, float] = {}
         self._defer_inflight = prefix_caching
         self._saved_upto: dict[str, int] = {}  # token count already offered for saving
-        # req -> plan step of its last chosen save: its finish fence.
-        self._saving: dict[str, int] = {}
+        # Fences (unpinned saves). req -> {GPU block: plan step of its last
+        # chosen save}. A finished request's entries move to ``_fenced``:
+        # vLLM gets the blocks back at once, and a step that writes a fenced
+        # block first waits for that step's saves (``fence_writes``).
+        self._saved_blocks: dict[str, dict[int, int]] = {}
+        self._fenced: dict[int, int] = {}  # GPU block -> plan step of its save
+        self._fence_steps: dict[int, list[int]] = {}  # plan step -> blocks fenced on it
+        self._last_save_step = -1  # last plan step with saves
+        self._saved_through = -1  # last plan step every worker reported saved
+        # Saves of plans up to this step are done before any later plan
+        # writes KV (reported saved, or a planned flush or fence waits for them).
+        self._fence_floor = -1
+        # Block size of the groups whose table is positional (a block below
+        # the computed tokens is a prefix hit, read only); any other group's
+        # new blocks all count as written.
+        self._positional_bt = {
+            g.gid: g.sem.block_tokens for g in layout.groups if g.sem.kind in ("full", "window")
+        }
         # vLLM frees window blocks that slide out while the request runs, which a
         # pending save may still read: such layouts flush before every step.
         # Pinned saves cover that too: a pinned block is never reallocated.
@@ -529,6 +544,10 @@ class Scheduler:
                 self._count("sync_planned")
             else:  # a sync load's blocks are cached at once
                 self._track_load(request, leases or [])
+            # The load writes its target blocks this step.
+            self._fence_blocks(
+                b for _, targets in plan.loads for row in targets for b in row if b is not None
+            )
         self._plan.loads.append(plan)
 
     def _recut(self, hit: _Hit, num_external_tokens: int) -> list[_Lease] | None:
@@ -657,12 +676,12 @@ class Scheduler:
         else:
             for req_id in preempted:
                 self._plan.flush = True
-                # The flush finishes the saves of its freed blocks. Keeping
-                # the fence would hold a request that finishes (e.g. aborted)
-                # while re-loading: vLLM would free the load's blocks on our
-                # finished_sending before the load is done.
-                self._saving.pop(req_id, None)
+                # The flush finishes the saves of its freed blocks.
+                self._saved_blocks.pop(req_id, None)
         self._plan.flush |= self._flush_always
+        if self._plan.flush:
+            # Every save planned before this step is done before it writes.
+            self._clear_fences(step - 1)
         if kv_usage is None:
             if not self._kv_usage_warned:
                 self._kv_usage_warned = True
@@ -738,7 +757,7 @@ class Scheduler:
                 continue
             seen.add(item)
             if not self._pin_saves:
-                self._saving[item.req_id] = step
+                self._saved_blocks.setdefault(item.req_id, {})[item.block_id] = step
             sid = sid_of[item.group]
             save = by_key.setdefault((sid, item.req_id), GroupSave(sid, [], []))
             save.block_ids.append(item.block_id)
@@ -748,6 +767,8 @@ class Scheduler:
         if self._pin_saves and saves:
             assert self._pin is not None
             self._pins[step] = self._pin([b for gs in saves for b in gs.block_ids])
+        if saves:
+            self._last_save_step = step
         self._plan.saves.extend(saves)
 
     # ----------------------------------------------------------- pinned saves
@@ -757,17 +778,73 @@ class Scheduler:
         self._pin, self._unpin = pin, unpin
 
     def on_saved_through(self, step: int) -> None:
-        """Every worker finished the saves of plans up to ``step``: unpin them."""
+        """Every worker finished the saves of plans up to ``step``: unpin
+        them, and drop the fences on them."""
+        self._clear_fences(step)
+        self._saved_through = max(self._saved_through, step)
         if not self._pins:
             return
         assert self._unpin is not None
         for s in [s for s in self._pins if s <= step]:
             self._unpin(self._pins.pop(s))
 
-    def has_pinned_saves(self) -> bool:
-        """Blocks are pinned for saves still in flight: vLLM must keep stepping
-        until the workers report them done."""
-        return bool(self._pins)
+    # ----------------------------------------------------------------- fences
+    def fence_writes(
+        self,
+        tables: Iterable[tuple[Sequence[Sequence[int] | None], int]],
+        blocks: Iterable[int] = (),
+    ) -> None:
+        """This step's KV writes, before ``plan_saves``: a write to a fenced
+        block first waits for the saves that read it (``StepPlan.fence_step``).
+
+        ``tables``: per request vLLM allocated blocks for this step, (block ids
+        per KV cache group, tokens computed before the step). In a positional
+        group a block wholly below those tokens is a prefix hit, only read;
+        the rest is written by this step or a later one. Pass all-new blocks
+        (appended to a running request's table) with 0 tokens. ``blocks``:
+        other blocks written before the forward (zeroed, copy targets). Load
+        targets are fenced when the load is planned.
+        """
+        if not self._fenced:
+            return
+
+        def written() -> Iterable[int]:
+            yield from blocks
+            for groups, computed in tables:
+                for gid, ids in enumerate(groups):
+                    if ids:
+                        bt = self._positional_bt.get(gid)
+                        yield from ids[computed // bt :] if bt else ids
+
+        self._fence_blocks(written())
+
+    def _fence_blocks(self, blocks: Iterable[int]) -> None:
+        fenced = self._fenced
+        if not fenced:
+            return
+        step = max((fenced.get(b, -1) for b in blocks), default=-1)
+        if step < 0:
+            return
+        self._plan.fence_step = max(self._plan.fence_step, step)
+        # The worker waits for every save of plans up to ``step`` before
+        # this plan's writes: those fences are done for every later plan.
+        self._clear_fences(step)
+
+    def _clear_fences(self, step: int) -> None:
+        self._fence_floor = max(self._fence_floor, step)
+        if not self._fence_steps:
+            return
+        for s in [s for s in self._fence_steps if s <= step]:
+            for b in self._fence_steps.pop(s):
+                if self._fenced.get(b) == s:
+                    del self._fenced[b]
+
+    def has_pending_saves(self) -> bool:
+        """Saves were planned that the workers have not reported done: vLLM
+        must keep stepping. Blocks stay pinned until then, and held (batched)
+        saves age only as steps run, so an idle engine would never send them
+        (the next request's lookup would miss them)."""
+        return bool(self._pins) or self._last_save_step > self._saved_through
 
     def _count_miss(
         self, request: Any, num_computed: int, present: tuple[frozenset[int], ...], p: int
@@ -838,14 +915,16 @@ class Scheduler:
 
     # ------------------------------------------------------------- lifecycle
     def request_finished(self, req_id: str) -> bool:
-        """True if vLLM must hold the request's blocks until the workers report
-        it in ``finished_sending`` (a save of its blocks may still be pending).
+        """Always False: vLLM frees the request's blocks at once.
 
-        The fence is the request's own last save, not every save submitted so
-        far: a finished request's blocks are read only by its own saves (a
-        block it shares through the prefix cache stays allocated by vLLM for
-        the other request; a preempted request's freed blocks are covered by
-        the step's flush)."""
+        A block one of the request's saves may still read is fenced on the
+        plan step of that save instead: vLLM may hand it out again, but a step
+        that writes it first waits until the save is done (``fence_writes``),
+        and the worker reports a save done only once its GPU->CPU copy has
+        completed. A block the request shares through the prefix cache may be
+        freed only later, by its last holder: the fence stays until the save
+        is done, whoever frees it. A preempted request's saves are covered by
+        the step's flush."""
         self._drop_hit(req_id)
         self._loading_since.pop(req_id, None)
         self._untrack_load(req_id)  # aborted while loading: never cached
@@ -855,11 +934,12 @@ class Scheduler:
         self._counted.pop(req_id, None)
         if self._hit_dirty and not self._requests:
             self.report_hit_stats()  # idle: the counters are final for now
-        last = self._saving.pop(req_id, None)
-        if last is None:
-            return False
-        self._plan.finished[req_id] = last
-        return True
+        saved = self._saved_blocks.pop(req_id, None)
+        for block, step in (saved or {}).items():
+            if step > self._fence_floor and self._fenced.get(block, -1) < step:
+                self._fenced[block] = step
+                self._fence_steps.setdefault(step, []).append(block)
+        return False
 
     def shutdown(self) -> None:
         if self._hit_dirty:

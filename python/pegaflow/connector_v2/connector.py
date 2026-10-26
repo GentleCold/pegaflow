@@ -76,7 +76,7 @@ class PegaConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class PegaWorkerMetadata(KVConnectorWorkerMetadata):
-    """Pinned saves: the latest plan step every worker finished saving."""
+    """The latest plan step every worker finished saving (pins and fences)."""
 
     saved_through: int
 
@@ -262,6 +262,27 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         if kv_cache_manager is not None and not self._pins_bound:
             self._pins_bound = True
             self._scheduler.bind_pins(*_block_pins(kv_cache_manager.block_pool))
+        # Blocks this step allocated: a freed block a save may still read is
+        # fenced. New requests carry their whole table (and their prefix-hit
+        # blocks, below num_computed_tokens, are only read); a resumed request
+        # carries its whole table, any other its appended blocks.
+        tables: list[tuple[Any, int]] = [
+            (r.block_ids, r.num_computed_tokens) for r in scheduler_output.scheduled_new_reqs
+        ]
+        tables.extend(
+            (ids, computed if req_id in cached.resumed_req_ids else 0)
+            for req_id, ids, computed in zip(
+                cached.req_ids, cached.new_block_ids, cached.num_computed_tokens, strict=True
+            )
+            if ids is not None
+        )
+        self._scheduler.fence_writes(
+            tables,
+            [
+                *(scheduler_output.new_block_ids_to_zero or ()),
+                *(c.dst_block_id for c in scheduler_output.kv_cache_block_copies or ()),
+            ],
+        )
         self._scheduler.plan_saves(
             scheduled,
             block_state.get_block_ids if block_state is not None else lambda _: None,
@@ -290,15 +311,16 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             self._scheduler.on_saved_through(meta.saved_through)
 
     def has_pending_push_work(self) -> bool:
-        # Keep the engine stepping until the workers report pinned saves done.
-        return self._scheduler is not None and self._scheduler.has_pinned_saves()
+        # Keep the engine stepping until the workers report every save done:
+        # held (batched) saves age per step, and pins and fences clear then.
+        return self._scheduler is not None and self._scheduler.has_pending_saves()
 
     def request_finished(
         self, request: Request, block_ids: list[int]
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self._scheduler is not None
-        # True while a save of the request's blocks may be pending: vLLM keeps
-        # the blocks until the workers report the request in finished_sending.
+        # Never held: blocks a pending save still reads are fenced instead
+        # (Scheduler.fence_writes), or pinned.
         return self._scheduler.request_finished(request.request_id), None
 
     def request_finished_all_groups(
@@ -316,14 +338,18 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         self._worker.register(kv_caches, specs)
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
-        # Blocks vLLM freed (preemption) may be reused by this step while a
-        # save still reads them. Runs before any KV write of the step; on the
-        # V2 model runner after block zeroing and copy-on-write, which is why
-        # layouts with those pin their saved blocks instead (_pin_saves).
+        # Blocks vLLM freed (finished or preempted requests) may be reused by
+        # this step while a save still reads them. Runs before any KV write of
+        # the step; on the V2 model runner after block zeroing and
+        # copy-on-write, which is why layouts with those pin their saved
+        # blocks instead (_pin_saves).
         assert self._worker is not None
         assert isinstance(kv_connector_metadata, PegaConnectorMetadata)
-        if kv_connector_metadata.plan.flush:
+        plan = kv_connector_metadata.plan
+        if plan.flush:
             self._worker.flush()
+        elif plan.fence_step >= 0:
+            self._worker.wait_saved(plan.fence_step)
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
         assert self._worker is not None
@@ -354,8 +380,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
 
     def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
         assert self._worker is not None
-        if not self._worker.pinned_saves:
-            return None
+        # Every step, from every worker: vLLM's aggregation keeps the first
+        # worker's value when another reports None, which would break the min.
         return PegaWorkerMetadata(self._worker.saved_through())
 
     def get_block_ids_with_load_errors(self) -> set[int]:
