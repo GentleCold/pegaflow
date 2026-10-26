@@ -43,6 +43,16 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   - If vLLM allocates a shorter hit than planned, and that hit is still a legal
     resume point, the load is re-planned. Otherwise the load is reported failed.
   - Each request gets its own `load` RPC, so one bad lease fails one request.
+  - vLLM prefix-caches an async load's blocks only once the load lands. A
+    request whose blocks another request is still loading asynchronously
+    (with prefix caching on) is not looked up: `get_num_new_matched_tokens`
+    returns `None` until those loads finish or fail (`finished_recving` /
+    `failed_recving` in `update_connector_output`, or the loader finishes),
+    so the shared blocks become vLLM's local hit and only the tail is
+    loaded. It waits only if the in-flight blocks give a resume point past
+    the local hit (`semantics.resolve`), holds no lease meanwhile, and gives
+    up after `loading_wait_ms` (0 disables the wait). Counted as `deferred`
+    in `hit stats`.
   - Short hits (at most `sync_load_tokens`, default 256) are loaded
     synchronously: vLLM schedules the request at once and `start_load_kv`
     waits for the copy before the forward (~1 ms). The wait has no deadline:

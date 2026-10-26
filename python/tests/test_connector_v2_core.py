@@ -494,6 +494,101 @@ def test_hit_lifecycle(sem):
     assert sched.get_num_new_matched_tokens(req, 0) == (0, False)
 
 
+def _other(num_tokens=13, n_hashes=3, req_id="b", diverge_at=None):
+    req = _req(num_tokens, n_hashes, req_id)
+    if diverge_at is not None:
+        req.block_hashes[diverge_at:] = [b"x%d" % i for i in range(diverge_at, n_hashes)]
+    return req
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "specs,kw,other,num_computed,event,expected",
+    [
+        # vLLM caches a's blocks only once its async load lands: b waits
+        # (no query, no lease) instead of loading its own copy.
+        pytest.param((StubFullSpec(),), {}, {}, 0, None, None, id="waits"),
+        pytest.param((StubFullSpec(),), {}, {}, 0, "landed", (12, True), id="landed"),
+        pytest.param((StubFullSpec(),), {}, {}, 0, "aborted", (12, True), id="loader-aborted"),
+        pytest.param((StubFullSpec(),), {}, {}, 0, "expired", (12, True), id="wait-expired"),
+        # vLLM's local hit already covers the in-flight blocks: nothing to wait for.
+        pytest.param((StubFullSpec(),), {}, {}, 12, None, (0, False), id="local-covers"),
+        # Sharing only block 0 still waits: vLLM then serves 4 tokens locally.
+        pytest.param((StubFullSpec(),), {}, {"diverge_at": 1}, 0, None, None, id="shares-a-prefix"),
+        pytest.param(
+            (StubFullSpec(),), {}, {"diverge_at": 0}, 0, None, (12, True), id="no-overlap"
+        ),
+        # A sync load's blocks are cached in its own step: never waited for.
+        pytest.param(
+            (StubFullSpec(),), {"sync_loads": True}, {}, 0, None, (12, False), id="sync-load"
+        ),
+        pytest.param(
+            (StubFullSpec(),), {"prefix_caching": False}, {}, 0, None, (12, True), id="no-caching"
+        ),
+        pytest.param(
+            (StubFullSpec(),),
+            {"policy": Policy(loading_wait_ms=0)},
+            {},
+            0,
+            None,
+            (12, True),
+            id="wait-disabled",
+        ),
+        # Checkpoint: a loads the state at 12 only. b shares blocks 0-1 but
+        # not 2, so a's load gives b no resume point (no state at 4 or 8).
+        pytest.param(
+            (StubCheckpointSpec(), StubFullSpec()), {}, {}, 0, None, None, id="checkpoint-waits"
+        ),
+        pytest.param(
+            (StubCheckpointSpec(), StubFullSpec()),
+            {},
+            {"diverge_at": 2},
+            0,
+            None,
+            (0, False),
+            id="checkpoint-no-gain",
+        ),
+    ],
+)
+def test_waits_for_inflight_loads_of_its_blocks(
+    sem, specs, kw, other, num_computed, event, expected
+):
+    """Mirrors vLLM's OffloadingConnector ``_chunks_being_loaded``."""
+    layout = _layout(sem, *specs)
+    checkpoint = len(specs) == 2
+    answers = {0: Ready(3, b"F")}
+    if checkpoint:
+        answers[1] = Ready(1, b"C", [2])
+    rpc = FakeRpc(answers)
+    kw = dict(kw)
+    policy = kw.pop("policy", Policy(sync_load_tokens=0 if not kw.get("sync_loads") else 256))
+    sched = Scheduler(layout, policy, rpc, "inst", clock=Clock(), semantics=sem, **kw)
+    a = _req(req_id="a")
+    matched = sched.get_num_new_matched_tokens(a, 0)
+    ids = ([0, 0, 33], FULL_IDS) if checkpoint else (FULL_IDS,)
+    sched.update_state_after_alloc(a, ids, matched[0])
+    assert not sched.take_plan().loads[0].fail
+    rpc.queried.clear()
+
+    b = _other(**other)
+    if event == "landed":
+        sched.on_loads_done({"a"})
+    elif event == "aborted":
+        sched.request_finished("a")
+    elif event == "expired":
+        assert sched.get_num_new_matched_tokens(b, num_computed) == (None, False)
+        sched._clock.now += 1.0
+    if checkpoint and other.get("diverge_at") == 2:
+        rpc.answers = {0: Ready(2, b"F2"), 1: Ready(0, b"")}
+    got = sched.get_num_new_matched_tokens(b, num_computed)
+    if expected is None:
+        assert (got, rpc.queried) == ((None, False), [])
+        assert sched.hit_stats.get("deferred") == 1
+    else:
+        assert got == expected
+        assert sched.hit_stats.get("deferred") == (1 if event == "expired" else None)
+
+
 FULL_IDS, WINDOW_IDS = [10, 11, 12, 13], [20, 21, 22, 23]
 
 

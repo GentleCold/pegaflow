@@ -133,6 +133,7 @@ class Scheduler:
         sync_loads: bool = False,
         confirm_steps: int = 2,
         pin_saves: bool = False,
+        prefix_caching: bool = True,
     ):
         """``sync_loads``: vLLM can recover from a failed synchronous load of this
         layout (it maps ``invalid_block_ids`` back to requests only with one
@@ -151,7 +152,11 @@ class Scheduler:
         preemption flushes or finish holds. For layouts where vLLM writes
         reallocated blocks before ``handle_preemptions`` (block zeroing, COW)
         or frees checkpoint state blocks while they are still being read.
-        Saves are disabled (fail closed) if no pool was bound."""
+        Saves are disabled (fail closed) if no pool was bound.
+
+        ``prefix_caching``: vLLM prefix-caches computed and loaded blocks, so
+        a request may wait for another request's load of its blocks
+        (``_defer_for_inflight``)."""
         self._layout = layout
         self._policy = policy
         self._rpc = rpc
@@ -162,6 +167,13 @@ class Scheduler:
         self._requests: dict[str, Any] = {}  # live vLLM Request objects
         self._hits: dict[str, _Hit] = {}  # leased, waiting for allocation
         self._loading_since: dict[str, float] = {}
+        # Async loads in flight: req -> the (sid, block hash) keys it writes,
+        # and how many in-flight loads write each key.
+        self._inflight: dict[str, list[tuple[int, bytes]]] = {}
+        self._inflight_refs: dict[tuple[int, bytes], int] = {}
+        # req -> when it was first deferred for another request's load.
+        self._deferred_since: dict[str, float] = {}
+        self._defer_inflight = prefix_caching
         self._saved_upto: dict[str, int] = {}  # token count already offered for saving
         # req -> plan step of its last chosen save: its finish fence.
         self._saving: dict[str, int] = {}
@@ -210,6 +222,8 @@ class Scheduler:
         self._requests.setdefault(req_id, request)
         # A previous hit that was never allocated (allocation failed) is stale.
         self._drop_hit(req_id)
+        if self._defer_for_inflight(request, num_computed):
+            return None, False
 
         try:
             lookup = self._lookup(request, num_computed)
@@ -248,6 +262,80 @@ class Scheduler:
         )
         self._hits[req_id] = hit
         return n, not hit.sync
+
+    def _defer_for_inflight(self, request: Any, num_computed: int) -> bool:
+        """Wait for another request's async load of this request's blocks.
+
+        vLLM prefix-caches an async load's blocks only once the load lands,
+        so a request looked up meanwhile misses them locally and would load
+        its own copy into its own blocks. Waiting turns them into vLLM's
+        local hit; only the tail past them is loaded. Deferred only if the
+        in-flight blocks, with the local hit, give a resume point past it
+        (``semantics.resolve``: e.g. no checkpoint state at a shared
+        boundary, no gain). No server query, so no lease is held while
+        deferred. A failed or aborted load ends the wait (``on_loads_done``,
+        ``request_finished``); ``loading_wait_ms`` bounds it per request.
+        """
+        req_id = request.request_id
+        if not self._defer_inflight or self._policy.loading_wait_ms <= 0:
+            return False
+        if not self._inflight_refs or req_id in self._inflight:
+            self._deferred_since.pop(req_id, None)
+            return False
+        now = self._clock()
+        since = self._deferred_since.get(req_id)
+        if since is not None and (now - since) * 1000 >= self._policy.loading_wait_ms:
+            return False
+        layout = self._layout
+        limit_tokens = max(request.num_tokens - 1, 0)
+        known: list[frozenset[int]] = []
+        for sid, g in enumerate(layout.groups):
+            bt = g.sem.block_tokens
+            hashes = layout.group_hashes(g, request.block_hashes)[: limit_tokens // bt]
+            local = num_computed // bt
+            known.append(
+                frozenset(
+                    b for b, h in enumerate(hashes) if b < local or (sid, h) in self._inflight_refs
+                )
+            )
+        try:
+            bound = self._sem.resolve([g.sem for g in layout.groups], known, request.num_tokens)
+        except Exception:
+            return False  # only a shortcut: look up as usual
+        if bound <= num_computed:
+            self._deferred_since.pop(req_id, None)
+            return False
+        if since is None:
+            self._deferred_since[req_id] = now
+            self.hit_stats["deferred"] = self.hit_stats.get("deferred", 0) + 1
+            self._hit_dirty = True
+        return True
+
+    def on_loads_done(self, req_ids: Iterable[str]) -> None:
+        """Async loads vLLM saw finish or fail (``finished_recving`` /
+        ``failed_recving``), before it caches their blocks this pass."""
+        for req_id in req_ids:
+            self._untrack_load(req_id)
+
+    def _track_load(self, request: Any, leases: list[_Lease]) -> None:
+        keys: list[tuple[int, bytes]] = []
+        for lease in leases:
+            hashes = self._layout.group_hashes(self._layout.groups[lease.sid], request.block_hashes)
+            keys.extend((lease.sid, hashes[b]) for b in sorted(lease.wanted) if b < len(hashes))
+        self._untrack_load(request.request_id)
+        if not keys:
+            return
+        self._inflight[request.request_id] = keys
+        for key in keys:
+            self._inflight_refs[key] = self._inflight_refs.get(key, 0) + 1
+
+    def _untrack_load(self, req_id: str) -> None:
+        for key in self._inflight.pop(req_id, ()):
+            n = self._inflight_refs[key] - 1
+            if n:
+                self._inflight_refs[key] = n
+            else:
+                del self._inflight_refs[key]
 
     def _lookup(self, request: Any, num_computed: int) -> _Lookup:
         """Query the server, storage group 0 first.
@@ -378,6 +466,7 @@ class Scheduler:
         self, request: Any, block_ids: tuple[list[int], ...], num_external_tokens: int
     ) -> None:
         req_id = request.request_id
+        self._deferred_since.pop(req_id, None)  # scheduled: a later wait starts afresh
         hit = self._hits.pop(req_id, None)
         if hit is None:
             return
@@ -409,6 +498,8 @@ class Scheduler:
             plan.loads = []
         else:
             self._release_unkept(hit.leases, leases or [])
+            if not plan.sync:  # a sync load's blocks are cached at once
+                self._track_load(request, leases or [])
         self._plan.loads.append(plan)
 
     def _recut(self, hit: _Hit, num_external_tokens: int) -> list[_Lease] | None:
@@ -724,6 +815,8 @@ class Scheduler:
         the step's flush)."""
         self._drop_hit(req_id)
         self._loading_since.pop(req_id, None)
+        self._untrack_load(req_id)  # aborted while loading: never cached
+        self._deferred_since.pop(req_id, None)
         self._saved_upto.pop(req_id, None)
         self._requests.pop(req_id, None)
         self._counted.pop(req_id, None)

@@ -174,6 +174,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 self._instance_id,
                 sync_loads=sync_loads,
                 pin_saves=_pin_saves(kv_cache_config, self._layout),
+                prefix_caching=bool(getattr(cc, "enable_prefix_caching", False)),
                 # Steps vLLM schedules before it processes a step's output
                 # (fallback: the largest value vLLM 0.32 uses, pp + 1).
                 confirm_steps=getattr(
@@ -274,6 +275,12 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         assert self._scheduler is not None
+        # Called before vLLM handles finished_recving (and caches the loaded
+        # blocks): requests deferred on these loads look up again this pass.
+        done = set(connector_output.finished_recving or ())
+        done.update(connector_output.failed_recving or ())
+        if done:
+            self._scheduler.on_loads_done(done)
         # A failed sync load: KV computed on it may be reused, stop saving.
         if connector_output.invalid_block_ids:
             self._scheduler.on_load_errors(connector_output.invalid_block_ids)
