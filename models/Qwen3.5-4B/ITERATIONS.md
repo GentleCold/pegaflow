@@ -1585,6 +1585,58 @@ apportioned to passes by time):
 
 ### Qwen3.5-4B TTFT p50 attribution (offline, both it4 pair runs)
 
+**Independent review verdict: PARTLY (2026-10-27).** The p50 gap is not
+closed as "vLLM batching only". The reviewer's scratch scripts are in
+`/tmp/q35rev` on the Mac.
+
+What holds:
+- The convoys are real: 3.8-4.1 arrivals per step against native's
+  1.25-1.33.
+- Native's turn-0 async lookups (about 1.1 s each) spread out its starts
+  and drive its p99.
+- Loads, bytes and tokens are equal in both arms.
+
+What was refuted or not shown (corrections to items 4 and the split table
+below):
+- "A lone v2 request matches native": v2 has only 22-25 lone requests per
+  pass. My own interpolation gives 193-210 ms for them, not 160-167 ms.
+- The convoy table is non-monotone at k=7+ because the gaps between log
+  anchors reach 125 steps.
+- "At equal convoy size v2 matches native": refuted. At k=2-3 v2 is
+  45-75 ms worse, and its window prefill is about 3× larger.
+
+Connector-side residuals the reviewer found:
+- **L1. Scheduler lookup cost.** Lookups in the same step are spaced
+  1.0-1.2 ms apart, while the server RPC takes 0.016 ms. That is about
+  1.1 ms of Python per lookup: 4 per-group `query_prefetch` RPCs plus
+  `semantics.resolve`. It costs 42-45 ms on the 32-request turn-0 step and
+  4-7 ms per convoy step.
+- **L2. One extra step to readiness.** Ready loads reach first_step 4 steps
+  after arrival in warm2/3, but some cold/warm requests take 3. I checked
+  the claim against vLLM 0.32: in
+  `vllm/v1/worker/kv_connector_model_runner_mixin.py:83-97`, a step without
+  sync loads calls `start_load_kv` in the `finally` block after the forward
+  launch, then calls `get_transfer_results` right away. That first poll
+  comes microseconds after the issue, so a load that takes about 4 ms to
+  copy cannot be ready for it. The a31c073 probe (`async_first_poll`)
+  measures this directly.
+
+Plan, one hypothesis at a time, after the H5 queue finishes:
+1. Next Qwen3.5 run (a31c073 plus probe additions):
+   - per-load poll index at which it was ready;
+   - worker issue-to-ready ms;
+   - scheduler `_lookup` ms per request.
+2. **H6 = L1:** a cheaper lookup within the existing server API, either
+   fewer RPCs per lookup or less Python per lookup. A multi-group query RPC
+   would be a server change: if it is the only way, record it as a server
+   limit.
+3. **H7 = L2:** only if the probe shows the first poll is systematically
+   too late and there is a connector-side fix. Otherwise attribute it to
+   vLLM's structure (the source line above).
+
+The original analysis follows unchanged. Items 4, the split table and
+"Next connector-side hypothesis" are superseded by the verdict above.
+
 Main rejected "the p50 gap is structural": native's loads are async too,
 yet native reaches p50 0.17-0.21 s against v2's 0.284-0.295 s. Data:
 `2026-10-26-qwen3.5-4b-p5-it4-pair-{02b6767,c8a8842}`, warm2/warm3, probe
