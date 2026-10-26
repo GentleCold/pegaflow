@@ -239,3 +239,14 @@ up to 0.005 below the plain one at 0.75 (P5-it2), so neither dominates.
 Official runs time 2 warm passes; Qwen3-4B it7: v2 behind native by 2.1 ms
 with a 25 ms warm2-warm3 range of its own (review `g4-native.md` SHOULD-1).
 See "Decisions" in PROGRESS.md for how the user resolved it.
+
+## gate.json per model, not per TP: Qwen3-4B TP2
+
+The committed spec dump is per TP (`spec-tp<N>.json`); gate.json is not,
+because the controls re-measure its claims every run. Qwen3-4B at TP2: the
+slice `2026-10-26-qwen3-4b-tp2-slice-4bb7d8d` has `G2.split_control` 0/64,
+`G2.batch_control` 0/64, `warm_equals_cold` and `plain_equals_baseline` with
+0 differ; the self-test `2026-10-26-qwen3-4b-tp2-selftest-478187e` has split
+0/128, batch 0/64, both output controls 0 differ. `spec-tp2.json` is the
+slice's baseline gsm8k dump; the self-test's fresh one has 0 `G0.spec` diffs
+against it.
