@@ -320,7 +320,7 @@ class Worker:
             return
         t0 = self._clock()
         sync: list[tuple[Any, list[int]]] = []
-        ordered = sorted(plan.loads, key=lambda lp: not lp.sync)
+        ordered = list(plan.loads)  # experiment arm: H5 stats only, no reordering
         reordered = ordered != plan.loads
         for lp in ordered:
             if lp.fail:

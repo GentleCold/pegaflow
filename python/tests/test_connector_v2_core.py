@@ -914,6 +914,7 @@ def test_demoted_load_fails():
         pytest.param([], [], (0, 0, 0.0, 0, 0.0), set(), id="no-loads"),
     ],
 )
+@pytest.mark.skip(reason="experiment arm: no reordering")
 def test_worker_sends_sync_loads_first(loads, order, stats, invalid):
     rpc = FakeRpc()
     rpc.load_ok[b"bad"] = False
