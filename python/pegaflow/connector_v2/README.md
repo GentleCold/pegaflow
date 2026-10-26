@@ -64,14 +64,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     vLLM can recover them: one KV cache group and no block zeroing
     (`needs_kv_cache_zeroing`); otherwise every load is asynchronous.
     The server copies a device's loads one at a time in arrival order, so
-    the workers send a step's sync loads before its async ones. With
-    `async_demote` (off by default, pending gate evidence) a short hit is
-    loaded asynchronously instead while a long async load from an earlier
-    step is still in flight (until vLLM reports it done or the request
-    finishes): a sync load behind it would hold the step for both copies.
-    Demoted loads never cause further demotions. A demoted request waits a
-    scheduler round trip, and requests sharing its prefix wait for its load
-    (`_defer_for_inflight`); both costs are in `hit stats`.
+    the workers send a step's sync loads before its async ones.
     The server keeps the first copy of a key, so nothing computed on a load
     that may have failed is saved:
     - a request whose blocks include a sync-loaded block saves nothing until
@@ -151,14 +144,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   waiting request every scheduling pass) (`missing=` with no group: the policy lowered `p`). This is the
   group-coherence signal for server eviction. Load counters:
   - `deferred`: requests that waited for another request's async load;
-    `deferred_demoted` of them behind a demoted load, with their wait
-    (`deferred_demoted_ms`, sum and `max_`) counted when they are allocated;
   - `sync_planned`: sync loads planned (a sync load is a short hit loaded
-    before the forward);
-  - `sync_demoted`: short hits loaded asynchronously (`async_demote`),
-    `max_demoted_run` the longest run of consecutive steps that demoted;
-    once vLLM reports them done (`demoted_done`, landed or failed), the time and plan steps
-    from allocation (`demoted_ms`, `demoted_steps`, sum and `max_`).
+    before the forward).
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first, and `LayerDecl.layout` when an

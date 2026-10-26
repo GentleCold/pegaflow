@@ -50,11 +50,6 @@ class Policy:
     # Hits of at most this many tokens load before the step's forward (where the
     # layout allows it), longer ones asynchronously between steps.
     sync_load_tokens: int = 256
-    # Load such a short hit asynchronously instead while a long async load
-    # from an earlier step is still in flight: the server copies a device's
-    # loads in arrival order, so the step would wait for both copies.
-    # Pending gate evidence: off by default.
-    async_demote: bool = False
     # Merge consecutive steps' saves into one save RPC: send when the oldest
     # held step has seen save_batch_steps steps (<= 1 sends every step), when
     # the GPU KV cache is under pressure, or after the worker's staleness cap
