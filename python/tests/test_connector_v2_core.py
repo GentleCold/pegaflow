@@ -1163,7 +1163,7 @@ def test_stub_matches_native():
 # ------------------------------------------------- adapters/full_attention.py
 @dataclass(frozen=True)
 class FullAttentionSpec:  # duck-typed vLLM 0.32 spec; the registry keys on the class name
-    """Defaults = docs/rsi/models/Qwen3-4B/spec.json (bf16, 8 kv heads x 128)."""
+    """Defaults match Qwen3-4B's full-attention spec: bf16, block 16, 8 KV heads x 128."""
 
     block_size: int = 16
     num_kv_heads: int = 8
