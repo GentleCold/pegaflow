@@ -320,9 +320,10 @@ class Worker:
             return
         t0 = self._clock()
         sync: list[tuple[Any, list[int]]] = []
-        ordered = sorted(plan.loads, key=lambda lp: not lp.sync)
-        reordered = ordered != plan.loads
-        for lp in ordered:
+        # Experiment arm (H5 stats only): send in plan order; count the steps
+        # the shipped sort would have reordered.
+        reordered = sorted(plan.loads, key=lambda lp: not lp.sync) != plan.loads
+        for lp in plan.loads:
             if lp.fail:
                 if lp.sync:
                     self._invalid.update(lp.covered)
