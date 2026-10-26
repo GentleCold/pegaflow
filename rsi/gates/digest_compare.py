@@ -211,7 +211,7 @@ class Reference:
         self.split_copies: dict[tuple[Key, Split], dict[tuple[str, ...], list[Any]]] = defaultdict(
             dict
         )
-        # R2: an all-zero digest is never a reference. vLLM zeroes freshly
+        # An all-zero digest is never a reference. vLLM zeroes freshly
         # allocated attention blocks, so a zero copy (a block overwritten
         # before it was digested) would match a load that wrote nothing.
         self.zero_copies = 0

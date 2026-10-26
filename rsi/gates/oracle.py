@@ -247,7 +247,7 @@ def block_bytes(spec: dict[str, Any]) -> list[int]:
     (vLLM's ``KVCacheConfig.kv_tp_replicas``: ranks holding the same bytes,
     e.g. MLA's single latent head at TP2 = 2). A store keeps one copy of
     replicated bytes: PegaFlow's save bytes on a TP2 MLA run equal
-    ``insertions x page x layers`` (DeepSeek-V2-Lite, 2026-10-23), and vLLM's
+    ``insertions x page x layers`` (DeepSeek-V2-Lite), and vLLM's
     offloading spec stores one copy under ``replicated_layout``.
     ``UniformTypeKVCacheSpecs`` already sums its per-layer pages, so it is
     not multiplied by the layer count.

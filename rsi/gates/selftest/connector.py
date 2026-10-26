@@ -1,4 +1,4 @@
-"""Gate self-test arms (M8).
+"""Gate self-test arms.
 
 ``SelftestConnector`` is a minimal in-process KV store with sabotage modes. It
 is not PegaFlow and not a reference for onboarding agents: it exists so every

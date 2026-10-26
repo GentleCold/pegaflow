@@ -14,7 +14,7 @@ its last process. Binds go through ``/proc/self/fd/N`` of dirs opened (in the
 new namespace) before the tmpfs is mounted: the kernel follows the fd to the original dir, and no
 path is canonicalized after ROOT is covered. The dir fds are not inherited
 by ``CMD``. ``DROP_CAPS`` leave the bounding set before the exec.
-``--wait-fd`` (S11): right after the unshare, block until the read end
+``--wait-fd``: right after the unshare, block until the read end
 ``FD`` of a pipe reaches EOF, i.e. until the gate (holding the write end) has
 opened the new namespace, so it is recorded before ``CMD`` can run.
 
