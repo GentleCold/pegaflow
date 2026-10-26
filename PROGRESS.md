@@ -26,7 +26,7 @@ state the rule only; the date and quote live here.
 | 2026-10-24 | Server stays at the base version ("server还是保持原始版本，把server的局限问题汇报给人就行，gate不要被server受限，命中率不用过度追求最高"); limits are reported, not fixed | GATES.md "Known server limits", skill step 5 |
 | 2026-10-24 | PR CI must pass (cz on every commit, typos, clippy) | skill Lessons "PR" |
 | 2026-10-24 | Store pool for unlimited runs 64gb, NUMA affinity off (technical, after the .44 move) | GATES.md G3 |
-| 2026-10-26 | G4 warm must also beat vLLM native offload (`*_vs_native`); overhead checks stay vs baseline | GATES.md G4 |
+| 2026-10-26 | G4 warm must also beat vLLM native offload (`*_vs_native`); overhead checks stay vs baseline. The hard part was superseded the same day ("close enough", below); native stays a required arm | GATES.md G4 |
 | 2026-10-26 | Process / incremental docs (PROGRESS, ITERATIONS, reviews, sha-map) out of the PR, onto this branch, with compaction ("还有很多文档，都是增量进行的，我觉得这些都不要进入pr，另外这些增量文档后面都需要重新优化下不然会一直增长") | README.md, skill "Notes and code branches" |
 | 2026-10-26 | G4 vs native noise rule B: 2 timed passes; \|gap\| below the larger pass-to-pass range of v2 / native is `inconclusive`, rerun once, inconclusive twice is a tie that does not block. Superseded the same day (next row) | (superseded) |
 | 2026-10-26 | G4 vs native "close enough" ("不一定和native保持一致，差不多就行了"): `*_vs_native` is a judged comparison, reported and never failing; the onboarding agent writes a "perf vs native judgment", the reviewer checks it. G4 vs baseline stays hard | GATES.md G4 (once `feat/rsi-gate-g4-noise` lands) |
@@ -158,11 +158,16 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   model needs a new official run that beats native (offline re-judge, the
   records stay official, medians of warm2/warm3, TTFT p50 s / req/s):
 
-  | record | v2 | native | old | baseline | `ttft_vs_native` | `req_s_vs_native` |
+  | record | v2 | native | old | baseline | TTFT behind native (historical) | req/s behind native (historical) |
   |---|---|---|---|---|---|---|
-  | Qwen3-4B it7 (`2026-10-25-qwen3-4b-p4-it7-off-a59a254`) | 0.5640 / 9.646 | 0.5619 / 9.359 | 0.6608 / 9.730 | 3.6314 / 2.522 | fail (2.1 ms) | pass |
-  | DSV2 it7 (`2026-10-25-dsv2-lite-p4-it7-off-a59a254`) | 0.2996 / 12.346 | 0.2919 / 13.085 | 0.3643 / 12.350 | 0.9289 / 5.405 | fail | fail |
-  | Qwen3.5 it2 (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) | 0.2974 / 14.633 | 0.1729 / 13.155 | 0.3539 / 14.070 | 1.1158 / 3.731 | fail (125 ms) | pass |
+  | Qwen3-4B it7 (`2026-10-25-qwen3-4b-p4-it7-off-a59a254`) | 0.5640 / 9.646 | 0.5619 / 9.359 | 0.6608 / 9.730 | 3.6314 / 2.522 | +0.37%, within noise (was fail, 2.1 ms) | -3.07% (was pass) |
+  | DSV2 it7 (`2026-10-25-dsv2-lite-p4-it7-off-a59a254`) | 0.2996 / 12.346 | 0.2919 / 13.085 | 0.3643 / 12.350 | 0.9289 / 5.405 | +2.64%, within noise (was fail) | +5.65% (was fail) |
+  | Qwen3.5 it2 (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) | 0.2974 / 14.633 | 0.1729 / 13.155 | 0.3539 / 14.070 | 1.1158 / 3.731 | +72.06% (was fail, 125 ms) | -11.23% (was pass) |
+
+  "Behind" is `native_report.behind_pct` (positive = v2 slower than
+  native); "within noise" is `within_noise` (\|gap\| <= the larger
+  warm2-warm3 range). "was" = the verdict under the hard rule, kept as
+  history.
 
   Open for the user (review SHOULD-1): with 2 timed passes the Qwen3-4B
   TTFT gap (2.1 ms) is below v2's own pass-to-pass range (25 ms), so that
@@ -171,7 +176,7 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   Resolved 2026-10-26 (see "Decisions"): first rule B (inconclusive within
   noise), then replaced by "close enough": `*_vs_native` is reported, the
   agent writes a perf vs native judgment (`feat/rsi-gate-g4-noise`), so the
-  "fail" cells above are gaps to judge, not failed gates.
+  gaps above are inputs to that judgment, not failed gates.
 
 ## Isolation (no reference to existing implementation)
 
@@ -210,9 +215,9 @@ names, magic constants that only exist in the old code).
 | P0 | gates: spec dump, V3 digest, gsm8k, perf workload, hit-rate metrics, old-connector baseline | done (p0-final 2026-10-23); G5 capacity gate in progress |
 | P1 | `pegaflow-semantics` crate + PyO3 + V1 vectors | done (review: `reviews/P1-semantics.md`) |
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
-| P3 | onboard Qwen3-4B | G4 vs native (2026-10-26) fails on it7 (warm TTFT 0.5640 vs native 0.5619 s): the next official run fails G4 unless the load path improves; before that rule G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
-| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge; under the lmcache gate's resume stage its it6 / it7 records fail `G2.resume_reference` (every arm): needs an official rerun with the resume stage; it7 also fails G4 vs native (2026-10-26: warm TTFT 0.2996 vs 0.2919 s, req/s 12.35 vs 13.09) |
-| P5 | onboard Qwen3.5-4B | in progress; it2 (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) fails G4 vs native (2026-10-26: warm TTFT 0.2974 vs native 0.1729 s) |
+| P3 | onboard Qwen3-4B | G4 vs native (judged since 2026-10-26): it7 warm TTFT +0.37% behind native (within noise), req/s 3.07% ahead; perf vs native judgment pending; before the vs-native rule G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
+| P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge; under the lmcache gate's resume stage its it6 / it7 records fail `G2.resume_reference` (every arm): needs an official rerun with the resume stage; it7 vs native (judged): warm TTFT +2.64% behind (within noise), req/s 5.65% behind; perf vs native judgment pending |
+| P5 | onboard Qwen3.5-4B | in progress; it2 (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) warm TTFT +72% behind native (0.2974 vs 0.1729 s): needs attribution and a hypothesis before acceptance (perf vs native judgment) |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ## Log
@@ -970,6 +975,27 @@ names, magic constants that only exist in the old code).
     self-test needs `G2.resume_reference` on split-variant models (DSV2
     self-test with the resume stage: GPU, pending). S6: the resume replay
     chains every episode of a preempted warm request.
+
+### 2026-10-26
+
+- G4 vs native is judged, not gated. User: "不一定和native保持一致，差不多就行了".
+  `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` are `reported` (no
+  `pass` key, never fail the arm or the exit code) and carry both arms'
+  timed warm pass values, medians, ranges, gap, gap %, noise and
+  `within_noise`; `summary.native_report` adds `behind_pct`. The
+  onboarding agent writes a "perf vs native judgment" next to the hit-rate
+  judgment (gap %, attributed to load path / save path / scheduling /
+  server, close enough or not); the review agent checks it; no numeric
+  threshold. `native` is still a required arm: a run whose native replay
+  is missing, lacks timed warm passes or is not a working store stays
+  non-official (`g4_native_problems`), since the judgment needs the
+  reference. G4 vs baseline stays hard. Branch `feat/rsi-gate-g4-noise`
+  (1a76b48 rule B, 1581c9b reported, e0c4f42 review fixes).
+- Review SHOULD-1 of `reviews/g4-native.md` (2-pass noise) is closed:
+  rule B (inconclusive within noise, rerun once) was implemented and
+  superseded the same day by the judged comparison above. The re-judge
+  table under "Gate changes" now shows gap % with the hard-rule verdicts
+  as history.
 
 ## Semantics changelog
 
