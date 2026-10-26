@@ -1088,6 +1088,32 @@ names, magic constants that only exist in the old code).
   official Qwen3-4B runs need `plain` until the post-merge TP1 / TP2
   plain refreshes replace them (`_AWAITING_REFRESH` in the tests lists
   them until then).
+- `rsi-gates` merged: 88f0078 with `-s ours` (cfb37f4, rsi/ and docs/rsi/
+  intact), then `feat/rsi-gate-slim` fb1d8a1 (91ded53). Controls refreshed
+  with plain self-tests on gate tree 91ded53 (full gsm8k set, records not
+  withheld, `recheck_controls_record` empty, every sabotage arm caught):
+  Qwen3.5-4B tp1 `2026-10-26-qwen3.5-4b-ctl-tp1-91ded53` (84b8454, first
+  record for the model), Qwen3-4B tp2 `2026-10-26-qwen3-4b-ctl2-tp2-91ded53`
+  (d62cf55), Qwen3-4B tp1 `2026-10-26-qwen3-4b-ctl2-tp1-91ded53` (2d3a722);
+  `_AWAITING_REFRESH` is empty. `selftest:sync` is for state-group models
+  only: on Qwen3-4B it refuses to start ("needs an align-mode Mamba state
+  group"), so the first Qwen3-4B tp1 attempt died there with no summary.
+- 65-worker cap fix on hardware (TP2 run above, native + cap, 155 convs,
+  capacity 2.21x GPU KV, f = 0.5):
+
+  | native G5 | off2 (32 workers) | ctl2-tp2 (65 workers) |
+  |---|---|---|
+  | H | 0.854 | 0.864 |
+  | H* | 0.998 | 0.998 |
+  | H*_C (belady) | 0.932 | 0.931 |
+  | H_lru | 0.853 | 0.860 |
+  | freeze | 0.926 | 0.713 |
+  | E_C | 0.008 | 0.547 |
+  | lru_vs_oracle_c | 0.003 | 0.853 |
+  | freeze_vs_oracle_c | 0.918 | 0.551 |
+
+  Freeze now separates from H*_C (bar 0.9). Native's E_C 0.55 at f = 0.5
+  is a reference number, not gated.
 
 ## Semantics changelog
 
