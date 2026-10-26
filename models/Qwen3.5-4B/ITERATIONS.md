@@ -2120,6 +2120,25 @@ hold, so it5 is a no-op there. Qwen3.5's p50 stop stays the phase lock
 (server load path plus vLLM step composition). Its numbers are in the
 table above.
 
+**Main's ruling (2026-10-27).**
+
+- Accepted: Qwen3.5-4B p50 stops at the phase lock (server load path
+  plus vLLM step composition). No more connector iterations target it.
+- Accepted: H6 (lookup cost) is skipped on Qwen3.5-4B.
+- `first_poll` 0/23 is vLLM-native. In vLLM 0.32
+  `kv_connector_model_runner_mixin.py:83-97` (`_get_kv_connector_output`),
+  with no sync loads `start_load_kv` runs in the `finally` after the
+  forward launch, and `get_transfer_results` is called right after it.
+  So the first poll of an async load always comes right after its issue
+  and cannot see it done. Every connector sees the same thing; this is not
+  a v2 cost.
+- Qwen3-4B lookup cost (about 1.2 ms/call vs native 0.2-0.36 ms, about 5%
+  of a step) is the candidate after it5, in a separate rev.
+- Next: it5 on Qwen3-4B, under main's correctness spec. Release blocks
+  only after the worker observes every D2H copy reading them complete on
+  the GPU, or use the native pattern (`request_finished` returns False,
+  the store is fenced against block reuse).
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
