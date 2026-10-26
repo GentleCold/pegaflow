@@ -90,10 +90,9 @@ OFFICIAL = {
     "max_num_seqs": 256,
 }
 ACC_TOL = 0.01
-# Hit-rate levels are reported, never gated (user, 2026-10-24: "命中率那块，不要
-# 设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多"). These are the
-# former bars, kept as reference points next to the numbers (``reported``);
-# the onboarding agent judges the hit rate in ITERATIONS.md (GATES.md).
+# Hit-rate levels are reported, never gated (GATES.md "Hit rate"). These are
+# reference points next to the numbers (``reported``); the onboarding agent
+# judges the hit rate in the model's iteration notes (rsi-notes branch).
 MIN_EFFICIENCY = 0.95  # G3 E_ext reference
 ORACLE_FLOOR = {"gsm8k": 0.5, "replay": 0.5}  # warm oracle hit rate below it: E says little
 MIN_JUDGED_GSM8K = 0.9  # every gsm8k request is digested: nearly all loads are judged
@@ -3147,7 +3146,8 @@ _HIT_KEYS = {
 def hit_report(v: dict[str, Any]) -> dict[str, Any]:
     """Every hit-rate number per arm (H, H*, E_ext, H*_C, H_lru, freeze, E_C),
     marked ``reported``: no hit-rate level is gated; the onboarding agent
-    judges them in ITERATIONS.md and the review agent checks that judgment."""
+    judges them in the model's iteration notes (rsi-notes branch) and the
+    review agent checks that judgment."""
     out: dict[str, Any] = {}
     for label, g in v.items():
         if label == "baseline" or not isinstance(g, dict):
@@ -3495,7 +3495,7 @@ def official_problems(
         if not same(k, v)
     ]
     kinds = {arm_kind(a) for a in arms}
-    # native: G4's warm replay reference next to baseline (user, 2026-10-26).
+    # native: G4's warm replay reference next to baseline.
     for need in ("plain", "baseline", "native", "under_test"):
         if need not in kinds:
             out.append(f"arm {need} missing")

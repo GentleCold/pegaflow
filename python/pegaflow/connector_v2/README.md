@@ -111,7 +111,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;
   - so are checkpoint groups, until the core handles vLLM's
-    `boundary_state_offloads` (P5);
+    `boundary_state_offloads`;
   - every TP rank's declarations must pass `semantics.seal_plan` (V0).
 
   At registration, every declared segment must equal `LayerView.bytes_per_block`,
@@ -129,7 +129,7 @@ Registered adapters:
 
 | Spec class | Module | Declares | Onboarded by |
 |---|---|---|---|
-| `FullAttentionSpec` | `full_attention` | `Group.full(block_size)`; one segment = the whole page (K/V interleaved per cell); `Heads` shard, replicas beyond `max_tp_shards` (checked against `kv_tp_replicas`); dense layer-compact pages only, no kernel-split HNC pages; rejects window, chunked, padded, packed, quantized and `non_causal` specs | Qwen3-4B (`docs/rsi/models/Qwen3-4B/ITERATIONS.md`) |
+| `FullAttentionSpec` | `full_attention` | `Group.full(block_size)`; one segment = the whole page (K/V interleaved per cell); `Heads` shard, replicas beyond `max_tp_shards` (checked against `kv_tp_replicas`); dense layer-compact pages only, no kernel-split HNC pages; rejects window, chunked, padded, packed, quantized and `non_causal` specs | Qwen3-4B |
 
 The shared rules live in the semantics crate, so an adapter only declares
 facts: the dependency kind, the tokens per block, the bytes per segment, and
