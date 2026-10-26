@@ -32,7 +32,8 @@ starts the conversations rotated by ``j/4`` of their count.
 
 Per-model gate settings (attention backend, batch invariance, extra vLLM args)
 come from ``docs/rsi/models/<model>/gate.json``; the committed spec dump is
-``docs/rsi/models/<model>/spec.json``.
+per TP (``committed_spec``): ``docs/rsi/models/<model>/spec.json`` at
+``--tp 1``, ``spec-tp<N>.json`` at ``--tp N``.
 
 A run is ``official`` only with the official profile (constants below, all
 required arms and workloads). Every required verdict that cannot be evaluated
@@ -1091,7 +1092,9 @@ def vllm_server(
     ``--num-gpu-blocks``. ``gsm8k``: the stage also gets gate.json's
     ``gsm8k_vllm_args`` (the cross-arm exact comparisons run there)."""
     if arm_kind(arm) == "lmcache" and not getattr(args, "lmcache_ranks", None):
-        raise ValueError("lmcache: storing ranks unknown (TP > 1 without a committed spec dump)")
+        raise ValueError(
+            f"lmcache: storing ranks unknown (no committed spec dump for --tp {args.tp})"
+        )
     lease = PortLease(1, block=VLLM_PORT_BLOCK, log=log)
     (port,) = lease.ports
     env = os.environ.copy()
@@ -3511,6 +3514,15 @@ def contamination(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def committed_spec(model_dir: Path, tp: int) -> Path:
+    """The committed spec dump of ``--tp``: ``spec.json`` at TP 1, else
+    ``spec-tp<N>.json``. Never another TP's: head counts, page bytes and
+    strides are per rank. Every consumer (G0.spec, lmcache storing ranks,
+    the preempt GPU pool, the unique-bytes estimate, the cap plan fallback,
+    ``official_problems``) reads this file; a missing one is never official."""
+    return model_dir / ("spec.json" if tp == 1 else f"spec-tp{tp}.json")
+
+
 def official_problems(
     args,
     arms: list[str],
@@ -3564,9 +3576,15 @@ def official_problems(
         # Without it the arm imports the venv's (unverified, unsnapshotted)
         # pegaflow tree: G0.provenance would accept any file there.
         out.append("--under-test-path missing: the connector under test has no verified snapshot")
-    for f in (gate_file, committed):
-        if not f.exists():
-            out.append(f"{f} missing")
+    if not gate_file.exists():
+        out.append(f"{gate_file} missing")
+    tp = getattr(args, "tp", 1)
+    if not committed.exists():
+        out.append(f"committed spec dump {committed} missing (no dump for --tp {tp})")
+    elif committed.is_file():
+        got = (json.loads(committed.read_text()).get("parallel") or {}).get("tp")
+        if got != tp:
+            out.append(f"committed spec dump {committed} records parallel.tp={got}, not --tp {tp}")
     return out
 
 
@@ -3955,10 +3973,10 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--replay-repeats must be >= 2 (the first warm pass is digested, not timed)")
 
     model_dir = REPO / "docs" / "rsi" / "models" / Path(args.model).name
-    gate_file, committed = model_dir / "gate.json", model_dir / "spec.json"
+    gate_file, committed = model_dir / "gate.json", committed_spec(model_dir, args.tp)
     gate = json.loads(gate_file.read_text()) if gate_file.exists() else {}
-    # LMCache's storing ranks (MLA: the first only), from the committed
-    # dump; None at TP > 1 without one fails the lmcache arm's stages.
+    # LMCache's storing ranks (MLA: the first only), from this TP's
+    # committed dump; None at TP > 1 without one fails the lmcache arm's stages.
     args.lmcache_ranks = lmcache_storing_ranks(
         json.loads(committed.read_text()) if committed.exists() else None, args.tp
     )

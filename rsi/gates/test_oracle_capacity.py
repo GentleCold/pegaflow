@@ -563,7 +563,7 @@ def test_lmcache_store_totals_c_over_storing_ranks(tmp_path, spec, tp, ranks, ba
     arm's whole store is at most C (fail-closed otherwise)."""
     assert run_gate.lmcache_storing_ranks(spec, tp) == ranks
     if ranks is None:
-        args = SimpleNamespace(lmcache_overlay=str(tmp_path), lmcache_chunk_size=256, lmcache_ranks=None)  # fmt: skip
+        args = SimpleNamespace(lmcache_overlay=str(tmp_path), lmcache_chunk_size=256, lmcache_ranks=None, tp=tp)  # fmt: skip
         with pytest.raises(ValueError, match="storing ranks unknown"):
             run_gate.vllm_server(args, {}, "lmcache", tmp_path, False, None, tmp_path / "l", c)
         return

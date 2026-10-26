@@ -27,7 +27,7 @@ one line to `PROGRESS.md` on the `rsi-notes` branch.
   `docs(rsi): ...` commits; `git pull --rebase` before every push, never
   force-push (several agents share it).
 - Code branches carry current-state docs only (`docs/rsi/GATES.md`,
-  `docs/rsi/models/<model>/{spec.json,gate.json}`, this skill, package
+  `docs/rsi/models/<model>/{spec.json,spec-tp<N>.json,gate.json}`, this skill, package
   READMEs): no dated history, change logs, journals or review files. State
   a decision as a rule; its date and quote go to the notes' "Decisions".
 - Compaction (notes `README.md`): `PROGRESS.md` <= 300 lines, each
@@ -55,8 +55,11 @@ connector is a black-box baseline (run it, read its numbers, not its code).
 1. **Spec dump + gate self-test** (G0): any gate run writes the dump (the
    `RsiProbe` stacked in every arm). Run the self-test command from GATES.md
    ("Self-test at onboarding"): plain, baseline and the `selftest:` arms on
-   128 gsm8k questions. Copy `RUN_DIR/baseline/gsm8k/probe/spec.json` to
-   `docs/rsi/models/<model>/spec.json`, and have the gate owner write
+   128 gsm8k questions, at each TP the model is gated at (`--tp N`). Copy
+   `RUN_DIR/baseline/gsm8k/probe/spec.json` to
+   `docs/rsi/models/<model>/spec.json` for TP 1 and to `spec-tp<N>.json` for
+   `--tp N` (the gate reads only the dump of the run's `--tp`; a TP without
+   one is never official), and have the gate owner write
    `docs/rsi/models/<model>/gate.json` (batch / split invariance, backend,
    `vllm_args`, `gsm8k_vllm_args`, `lmcache_dist`). Accept the model's gate
    only if the baseline controls pass, honest passes and every negative arm
