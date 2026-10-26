@@ -2614,8 +2614,9 @@ def _timed_warm(r: dict[str, Any] | None) -> tuple[str, ...]:
     return tuple(n for n in ps if n.startswith("warm") and n != "warm")
 
 
-# G4 keys the arm under test must also win against the native reference arm
-# (vLLM's OffloadingConnector) in the same run (user, 2026-10-26).
+# G4 warm keys reported for the arm under test against the native reference
+# arm (vLLM's OffloadingConnector) in the same run: a judged comparison, not
+# a gate (user, 2026-10-26: "不一定和native保持一致，差不多就行了").
 G4_NATIVE_KEYS = (("ttft_p50", True), ("req_per_s", False))
 # Run validity, not a bar on any arm (hit levels stay reported, 2026-10-24):
 # a native replay whose timed warm passes serve less than this share of the
@@ -2629,23 +2630,42 @@ NATIVE_MIN_EFFICIENCY = 0.9
 def _native_perf_verdicts(
     rep: dict[str, Any] | None, native_rep: dict[str, Any] | None, replay_ok: bool
 ) -> dict[str, Any]:
-    """G4 warm replay vs the in-run ``native`` arm, with the warm-vs-baseline
-    rule (``_cmp`` slack 0: median over the timed warm passes, strictly
-    better). ``native_rep`` None (arm missing or its replay stage crashed)
-    fails closed. Only the timing is used: native's own G0 / G2 verdicts do
-    not matter here. Void (fail) when the arm's replay KV was wrong."""
+    """G4 warm replay vs the in-run ``native`` arm, ``reported`` (no ``pass``
+    key: never fails the arm or the exit code). The onboarding agent judges
+    it in the "perf vs native judgment" (GATES.md G4). Per key: both arms'
+    timed warm pass values, medians, pass-to-pass ranges, ``gap`` (median -
+    native median), ``gap_pct`` (of native's median; for TTFT positive is
+    slower, for req/s negative is slower), ``noise`` (the larger range) and
+    ``within_noise`` (|gap| <= noise, a diagnostic). Only native's timing is
+    used. ``void`` when the arm's replay KV was wrong (its timing measures
+    nothing then)."""
     g: dict[str, Any] = {}
     for key, lower in G4_NATIVE_KEYS:
-        v = _cmp(
-            _pass_values(rep, _timed_warm(rep), key),
-            _pass_values(native_rep, _timed_warm(native_rep), key),
-            lower,
-            0.0,
-        )
-        v["native"] = v.pop("baseline")
-        v["pass"] = v["pass"] and replay_ok
+        mine = _pass_values(rep, _timed_warm(rep), key)
+        theirs = _pass_values(native_rep, _timed_warm(native_rep), key)
+        v: dict[str, Any] = {"status": "reported", "lower_is_better": lower}
+        v |= {"value": mine, "native": theirs}
+        if mine and theirs:
+            a, b = _median(mine), _median(theirs)
+            rng, nrng = max(mine) - min(mine), max(theirs) - min(theirs)
+            v |= {
+                "median": a,
+                "native_median": b,
+                "range": rng,
+                "native_range": nrng,
+                "gap": a - b,
+                "gap_pct": 100 * (a - b) / b if b else None,
+                "noise": max(rng, nrng),
+                "within_noise": abs(a - b) <= max(rng, nrng),
+            }
+        if not replay_ok:
+            v["void"] = "G2.digest_self.replay fails: the timing is not comparable"
         if native_rep is None:
             v["reason"] = "no native replay stage in this run"
+        elif not theirs:
+            v["reason"] = f"native replay has no timed warm pass with {key}"
+        elif not mine:
+            v["reason"] = f"no timed warm pass with {key}"
         g[f"G4.replay_warm.{key}_vs_native"] = v
     return g
 
@@ -3070,7 +3090,7 @@ def verdicts(
             rep, base.get("replay"), gsm, base.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
         )
         if kind not in _REFERENCE:
-            # The arm under test only: warm replay must also beat native's.
+            # The arm under test only: warm replay vs native's, reported.
             nat = results.get("native", {}).get("replay")
             g |= _native_perf_verdicts(
                 rep,
@@ -3161,6 +3181,28 @@ def hit_report(v: dict[str, Any]) -> dict[str, Any]:
         }  # fmt: skip
         if arm:
             out[label] = {"status": "reported"} | arm
+    return out
+
+
+def _behind_pct(x: dict[str, Any]) -> float | None:
+    pct = x.get("gap_pct")
+    return None if pct is None else (pct if x["lower_is_better"] else -pct)
+
+
+def native_report(v: dict[str, Any]) -> dict[str, Any]:
+    """Per arm judged against native: median, native median, gap %,
+    ``behind_pct`` (positive = slower than native, whatever the direction of
+    the key), within noise per ``*_vs_native`` key (full verdicts stay in
+    ``verdicts``)."""
+    out: dict[str, Any] = {}
+    for label, g in v.items():
+        keys = [k for k in g if k.endswith("_vs_native")] if isinstance(g, dict) else []
+        if keys:
+            out[label] = {
+                k: {f: g[k].get(f) for f in ("median", "native_median", "gap_pct", "within_noise", "void", "reason")}
+                | {"behind_pct": _behind_pct(g[k])}
+                for k in keys
+            }  # fmt: skip
     return out
 
 
@@ -4122,6 +4164,8 @@ def main(argv: list[str] | None = None) -> int:
         "results": {a: {w: strip(r) for w, r in per.items()} for a, per in results.items()},
         "verdicts": v,
         "hit_report": hit_report(v),
+        # Reported, not gated: input to the "perf vs native judgment".
+        "native_report": native_report(v),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
     print(
@@ -4131,6 +4175,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"[gate] hit rates (reported, not gated) {json.dumps(summary['hit_report'], default=str)}"
+    )
+    print(
+        f"[gate] perf vs native (reported, not gated) "
+        f"{json.dumps(summary['native_report'], default=str)}"
     )
     print(f"run record: {run_dir}")
     required = [x for x in v.values() if x.get("required", True)]

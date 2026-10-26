@@ -1889,13 +1889,24 @@ def test_warmup_seconds_reported_not_gated():
 
 
 def _replay(
-    ttft: float, rps: float, warm: tuple[str, ...] = ("warm2", "warm3"), eff: float = 1.0
+    ttft: float | tuple[float, ...],
+    rps: float | tuple[float, ...],
+    warm: tuple[str, ...] = ("warm2", "warm3"),
+    eff: float = 1.0,
 ) -> dict:
-    """A replay stage result with correct KV whose timed warm passes all
-    have ``ttft`` (TTFT p50), ``rps`` (req/s) and ``eff`` (E_ext)."""
+    """A replay stage result with correct KV whose timed warm passes have
+    ``ttft`` (TTFT p50), ``rps`` (req/s) and ``eff`` (E_ext); a tuple gives
+    one value per timed pass, a number the same value on every pass."""
+
+    def per_pass(x):
+        return x if isinstance(x, tuple) else (x,) * len(warm)
+
     hit = {"efficiency": eff, "oracle_hit_rate": 0.9, "hit_rate": 0.9, "local_hit_tokens": 0, "prompt_tokens": 1, "external_hit_rate": 0.9, "excess_tokens": 0, "excess_limit": 1}  # fmt: skip
     passes = {"cold": {"ttft_p50": 1.0, "req_per_s": 1.0}, "warm": {"ttft_p50": 9.0, "req_per_s": 0.1}}  # fmt: skip
-    passes |= {n: {"ttft_p50": ttft, "req_per_s": rps} for n in warm}
+    passes |= {
+        n: {"ttft_p50": t, "req_per_s": r}
+        for n, t, r in zip(warm, per_pass(ttft), per_pass(rps), strict=True)
+    }
     hits = dict.fromkeys(("warm", *warm), hit)
     return {"passes": passes, "hit": hits, "load_errors": [], "digest_self": _digest_ok()}
 
@@ -1904,35 +1915,83 @@ NATIVE_KEYS = ("G4.replay_warm.ttft_p50_vs_native", "G4.replay_warm.req_per_s_vs
 
 
 @pytest.mark.parametrize(
-    "mine,native,ok",
+    "mine,native,gap_pct,within",
     [
-        ((0.2, 9.0), (0.3, 8.0), (True, True)),
-        ((0.3, 9.0), (0.172, 8.0), (False, True)),  # Qwen3.5 it2: v2 0.300 s vs native 0.172 s
-        ((0.2, 8.0), (0.3, 9.0), (True, False)),
-        ((0.3, 8.0), (0.3, 8.0), (False, False)),  # a tie is not "no worse": strict, as vs baseline
-        ((0.2, 9.0), None, (False, False)),  # no native replay: fail closed
+        # Qwen3-4B it7: TTFT 2.1 ms behind, inside v2's 25.2 ms warm2-warm3
+        # range; req/s 0.287 ahead, outside both ranges (0.028, 0.135).
+        (((0.5514, 0.5766), (9.6597, 9.6319)), ((0.5612, 0.5626), (9.2913, 9.4260)), (0.37, 3.07), (True, False)),
+        # DSV2 it7: TTFT inside native's 24 ms range; req/s 5.6% behind.
+        (((0.2957, 0.3035), (12.4927, 12.1985)), ((0.2799, 0.3039), (13.0061, 13.1634)), (2.64, -5.65), (True, False)),
+        # Qwen3.5 it2: TTFT +72% (0.300 s vs 0.172 s), reported, never a fail.
+        (((0.2996, 0.2952), (14.6105, 14.6551)), ((0.1745, 0.1712), (13.1495, 13.1609)), (72.06, 11.23), (False, False)),
+        # |gap| == the larger range is within noise (exact binary fractions).
+        (((0.5, 1.0), (2.0, 3.0)), ((0.25, 0.25), (1.5, 1.5)), (200.0, 66.67), (True, True)),
+        (((0.5, 1.0), (2.0, 3.0)), ((0.125, 0.125), (1.0, 1.0)), (500.0, 150.0), (False, False)),
+        (((0.3, 0.3), (8.0, 8.0)), ((0.3, 0.3), (8.0, 8.0)), (0.0, 0.0), (True, True)),  # tie, range 0
     ],
-    ids=["wins", "ttft-worse", "req-s-worse", "tie", "native-missing"],
-)
-def test_g4_warm_replay_vs_native(tmp_path, mine, native, ok):
-    """User, 2026-10-26: the arm under test's timed warm replay TTFT p50 and
-    req/s must beat the in-run native arm's, by the warm-vs-baseline rule
-    (medians over warm2..N, slack 0). Native's own G0 / G2 do not matter."""
-    base = {"replay": _replay(5.0, 1.0)}
-    results = {"baseline": base, "pegaflow.m:C": {"replay": _replay(*mine)}}
-    if native:
-        results["native"] = {"replay": _replay(*native) | {"digest_self": None}}
+    ids=["qwen3-4b-it7", "dsv2-it7", "qwen35-it2", "gap-equals-range", "gap-above-range", "tie"],
+)  # fmt: skip
+def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
+    """User, 2026-10-26: v2 vs native on G4 warm is a judged comparison
+    ("差不多就行了"), not a gate. ``*_vs_native`` is ``reported`` (no ``pass``
+    key) and carries what the perf vs native judgment needs: per-arm pass
+    values, medians, ranges, gap, gap %, noise, ``within_noise``. Native's
+    own G0 / G2 do not matter; G4 vs baseline stays hard."""
+    results = {"baseline": {"replay": _replay(5.0, 1.0)}}
+    results |= {"pegaflow.m:C": {"replay": _replay(*mine)}}
+    results |= {"native": {"replay": _replay(*native) | {"digest_self": None}}}
     v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
     g = v["pegaflow.m:C"]
-    assert (g[NATIVE_KEYS[0]]["pass"], g[NATIVE_KEYS[1]]["pass"]) == ok
+    assert not v["native"]["G2.digest_self.replay"]["pass"]  # its KV verdicts fail ...
+    for k, lo, hi, pct, w in zip(NATIVE_KEYS, mine, native, gap_pct, within, strict=True):
+        x = g[k]  # ... its timing still counts
+        assert x["status"] == "reported" and "pass" not in x and "void" not in x
+        assert (x["value"], x["native"]) == (list(lo), list(hi))
+        assert x["range"] == max(lo) - min(lo) and x["native_range"] == max(hi) - min(hi)
+        assert x["gap"] == x["median"] - x["native_median"]
+        assert x["noise"] == max(x["range"], x["native_range"])
+        assert x["gap_pct"] == pytest.approx(pct, abs=0.01) and x["within_noise"] is w
     assert g["G4.replay_warm.ttft_p50"]["pass"] and g["G4.replay_warm.req_per_s"]["pass"]
-    if native:
-        assert not v["native"]["G2.digest_self.replay"]["pass"]  # its KV verdicts fail ...
-        assert g[NATIVE_KEYS[0]]["native"] == [native[0]] * 2  # ... its timing still counts
-    # Void like every replay G4 check when the arm's replay KV is wrong.
+    rep = run_gate.native_report(v)["pegaflow.m:C"]
+    for k, pct, lower in zip(NATIVE_KEYS, gap_pct, (True, False), strict=True):
+        assert rep[k]["gap_pct"] == g[k]["gap_pct"]
+        assert rep[k]["behind_pct"] == pytest.approx(pct if lower else -pct, abs=0.01)
+    # A wrong-KV replay marks the comparison void (the arm fails on G2 / G4 vs baseline).
     results["pegaflow.m:C"]["replay"]["digest_self"] = None
-    v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
-    assert not any(v["pegaflow.m:C"][k]["pass"] for k in NATIVE_KEYS)
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert all("void" in g[k] and "pass" not in g[k] for k in NATIVE_KEYS)
+    # No native replay: reported with the reason (the run is not official).
+    del results["native"]
+    results["pegaflow.m:C"]["replay"] = _replay(*mine)
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert all(g[k]["reason"] and "gap" not in g[k] and "pass" not in g[k] for k in NATIVE_KEYS)
+    # Native ran but has no timed warm pass: reported with the reason too.
+    results["native"] = {"replay": _replay(0.3, 8.0, warm=())}
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert all("timed warm pass" in g[k]["reason"] for k in NATIVE_KEYS)
+    # The arm under test has no timed warm pass, native is normal.
+    results["native"] = {"replay": _replay(*native)}
+    results["pegaflow.m:C"]["replay"] = _replay(0.3, 8.0, warm=())
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert all(g[k]["reason"].startswith("no timed warm pass") and "gap" not in g[k] for k in NATIVE_KEYS)  # fmt: skip
+
+
+def test_g4_vs_native_never_fails_a_passing_arm(tmp_path):
+    """An arm under test that passes every gated check still passes with its
+    warm TTFT far behind native's, outside both pass-to-pass ranges
+    (Qwen3.5 it2-like: 0.297 s vs 0.173 s): ``*_vs_native`` and its
+    ``within_noise`` never reach the arm's ``pass``."""
+    nat = _replay((0.1745, 0.1712), (13.1495, 13.1609))
+    cap = _cap_result(8 * PAGE * LAYERS, loaded=10**9)
+    cap["digest_self"] |= {"external_compared": 1}
+    gsm = {"hit": nat["hit"], "load_errors": []}
+    arm = {"replay": _replay((0.2996, 0.2952), (14.6105, 14.6551)), "cap": cap, "gsm8k": gsm}
+    extra = {"baseline": {"replay": _replay(5.0, 1.0)}, "pegaflow.m:C": arm, "native": {"replay": nat}}  # fmt: skip
+    g, _ = _resume_run(tmp_path, True, False, label="pegaflow.m:C", extra=extra)
+    assert g["pass"] is True, {k: x for k, x in g.items() if isinstance(x, dict) and x.get("pass") is False}  # fmt: skip
+    t = g["G4.replay_warm.ttft_p50_vs_native"]
+    assert t["gap_pct"] > 70 and abs(t["gap"]) > 10 * t["noise"]
+    assert all(g[k]["status"] == "reported" and g[k]["within_noise"] is False for k in NATIVE_KEYS)
 
 
 def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
@@ -1943,7 +2002,7 @@ def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
     v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
     for label in ("native", "old", "lmcache", "selftest-honest"):
         assert not any(k in v[label] for k in NATIVE_KEYS), label
-    assert all(k in v["pegaflow.m:C"] and not v["pegaflow.m:C"][k]["pass"] for k in NATIVE_KEYS)
+    assert all(v["pegaflow.m:C"][k]["status"] == "reported" for k in NATIVE_KEYS)
 
 
 ARMS_N = ["plain", "baseline", "native", "pegaflow.m:C"]
@@ -2846,8 +2905,10 @@ def test_context_fingerprint_is_per_episode(tmp_path, ep0_byte, exact):
     assert run_gate._digest_verdict(d, None)["pass"] is (exact == 3)
 
 
-def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, resume_ok: bool = True):  # fmt: skip
-    """A gsm8k record of the baseline and an honest self-test arm. Prompt 1
+def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, resume_ok: bool = True, label: str = "selftest-honest", extra: dict | None = None):  # fmt: skip
+    """A gsm8k record of the baseline and arm ``label`` (an honest self-test
+    arm by default); ``extra``: more stage fields per arm and workload,
+    merged into the record. Prompt 1
     (``q``, 10 blocks) is computed from scratch in every pass: 10 judged warm
     blocks. Prompt 0 is 13 tokens (keys ``p:0..2``, not aligned to vLLM's
     16). Baseline
@@ -2891,11 +2952,10 @@ def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, re
     warm3 = "A3" if split_inv else "W3" if wrong else "B3"
     arm_reqs.append(_ep_req("xw", "warm", 0, [[10, 0, 2 * BT]], [[10, 3 * BT + 1]]))
     arm_digs.append(_blk_rec("xw", [(BT, "A1"), (2 * BT, "S2" if wrong else "A2"), (3 * BT, warm3)]))  # fmt: skip
-    label = "selftest-honest"
     bp = probe("baseline", "gsm8k", base_reqs, base_digs)
     ap = probe(label, "gsm8k", arm_reqs, arm_digs)
     committed.write_text(json.dumps(spec))
-    acc = {"cold": {"accuracy": 1.0}, "warm": {"accuracy": 1.0}}
+    acc = {p: {"accuracy": 1.0, "seconds": 1.0} for p in ("cold", "warm")}
     results: dict = {
         "baseline": {
             "gsm8k": {
@@ -2908,6 +2968,8 @@ def _resume_run(tmp_path, split_inv: bool, resume: bool, wrong: bool = False, re
             "gsm8k": {"passes": acc, "digest_self": digest_compare.compare(ap, ap, True, split_inv)}
         },  # fmt: skip
     }
+    for lab, per in (extra or {}).items():
+        results[lab] = results.get(lab, {}) | {wl: results.get(lab, {}).get(wl, {}) | r for wl, r in per.items()}  # fmt: skip
     two = ["ans", "ansq"]
     outs = {("baseline", "gsm8k", "cold"): two, (label, "gsm8k", "cold"): two, (label, "gsm8k", "warm"): two}  # fmt: skip
     if resume:
