@@ -269,7 +269,7 @@ class Scheduler:
         # The server copies a device's loads one at a time in arrival order,
         # and an async load takes longer than a step: a sync load right
         # after one would stall the whole batch until both copies land.
-        hit.demoted = short and self._async_load_last_step()
+        hit.demoted = False  # experiment arm: H5 part 1 only
         hit.sync = short and not hit.demoted
         self._hits[req_id] = hit
         return n, not hit.sync

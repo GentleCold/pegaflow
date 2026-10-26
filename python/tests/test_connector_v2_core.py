@@ -730,6 +730,7 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
         pytest.param(2, False, True, id="two-steps-later"),
     ],
 )
+@pytest.mark.skip(reason="experiment arm: no demotion")
 def test_sync_load_demoted_after_async_load(steps_between, second_async, expected):
     layout = _layout(StubSemantics, StubFullSpec())
     rpc = FakeRpc({0: Ready(3, b"L0")})
