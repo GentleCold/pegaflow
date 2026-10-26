@@ -70,7 +70,7 @@ arm under test. Self-test arms get no G3 / G4 / G5 verdict; `plain` and
 
 | Verdict | Arms | Passes iff | Section |
 |---|---|---|---|
-| `G0.spec` | every probed arm | spec dump and layer view layouts equal baseline's; baseline's equal `spec.json` | G0 |
+| `G0.spec` | every probed arm | spec dump and layer view layouts equal baseline's; baseline's equal the committed dump of `--tp` (G0) | G0 |
 | `G0.vllm_args` | baseline verdicts | every stage's `vllm_cmd` carries each gate.json flag as its last occurrence | Per-model settings |
 | `G0.provenance` | every arm, baseline | spec dumps' module files resolve under the expected roots | Provenance |
 | `G0.lmcache_build` | `lmcache` | every stage's `result.lmcache.dist` = gate.json `lmcache_dist` | lmcache |
@@ -121,7 +121,7 @@ Official only if all hold:
 | Arms | `plain`, `baseline`, `native`, one connector under test; `lmcache` wherever comparable (else drop it citing "lmcache status per model") |
 | Workloads | `gsm8k`, `replay`, `cap`; plus `preempt` on a model with a Mamba state group (committed spec): there gsm8k loads a single prefix, and only `preempt` judges every resumed episode's state load |
 | No overrides | no `--num-gpu-blocks` / `--vllm-arg` |
-| Committed files | `docs/rsi/models/<model>/{gate.json,spec.json}` |
+| Committed files | `docs/rsi/models/<model>/gate.json` and the committed spec dump of `--tp` (G0), recording `parallel.tp` = `--tp`; a TP without one is non-official (`committed spec dump ... missing (no dump for --tp N)`) |
 | Capacity floor | `C(0.5) >= 2 x` vLLM GPU KV bytes |
 | Cap plan | not sized from a spec with unmodeled Checkpoint features (`cap_plan.unmodeled`) |
 | Freeze separation | arm under test's `freeze_vs_oracle_c` at `f = 0.5` `< 0.9` |
@@ -276,10 +276,25 @@ only make an honest block inexact, never a wrong one exact.
 
 ## G0
 
-- Spec dump committed to `docs/rsi/models/<model>/spec.json`:
-  `kv_cache_config`, per-group spec class, block_size, page bytes, layer ->
-  group map, TP shard info, the gsm8k stage's effective `compilation` (mode,
-  backend, `inductor_compile_config`, `cudagraph_mode`).
+- Spec dump committed per TP (`run_gate.committed_spec`):
+  `docs/rsi/models/<model>/spec.json` for `--tp 1`, `spec-tp<N>.json` for
+  `--tp N`. Head counts, page bytes and block strides are per rank, so a dump
+  is never judged at another TP. Contents: `kv_cache_config`, per-group spec
+  class, block_size, page bytes, layer -> group map, TP shard info, the gsm8k
+  stage's effective `compilation` (mode, backend, `inductor_compile_config`,
+  `cudagraph_mode`).
+- Every consumer reads the selected dump: `G0.spec`, lmcache storing ranks,
+  the preempt GPU pool, the `UniqueEstimate` pool check, the cap plan
+  fallback and the official rules (Mamba state group -> `preempt` required;
+  committed dump present with `parallel.tp` = `--tp`). Without it at `--tp
+  N`: `G0.spec` fails, the preempt workload and the lmcache arm at TP > 1
+  do not start, the pool estimate is skipped, and the run is non-official.
+- gate.json is per model, not per TP: its claims (`batch_invariant`,
+  `split_invariant`, backends, vLLM args) hold at every TP the model has a
+  dump for, and `G2.batch_control` / `G2.split_control` re-measure them in
+  every run, so a TP where one does not hold fails there. Qwen3-4B's
+  controls pass at TP2 (split 0/64, batch 0/64, `warm_equals_cold`,
+  `plain_equals_baseline`).
 - The adapter's declared layout (Kind, Shard, unit size, needed set) is
   checked against it: sizes add up, every layer in exactly one group.
 - `G0.spec`: arm's scheduler dump and layer view layouts (shape without the
@@ -639,8 +654,8 @@ only (`LMCACHE_*` inherited dropped): `LMCACHE_LOCAL_CPU=True`,
 `LMCACHE_MAX_LOCAL_DISK_SIZE=0`, no remote, chunk 256, telemetry off
 (`LMCACHE_TRACK_USAGE=false`, `DO_NOT_TRACK=1`). `r` = 1 if all groups are
 `MLAAttentionSpec`, else `tp` (`lmcache_storing_ranks`, from the committed
-dump); the stage fails unless vLLM's log shows exactly `r` backends, and TP >
-1 without a committed dump does not start. `result.lmcache` records env,
+dump of `--tp`); the stage fails unless vLLM's log shows exactly `r` backends,
+and TP > 1 without that dump does not start. `result.lmcache` records env,
 logged config, `dist`, `storing_ranks`, `per_rank_bytes`, `backends`. 256-token
 chunks (no trailing partial) are a granularity loss inside its `E` / `E_C`.
 `G0.lmcache_build`: each stage's dist (what the overlay holds) = gate.json
@@ -848,12 +863,16 @@ LD_LIBRARY_PATH=~/kexi/cuda13-lib \
 
 ### Self-test at onboarding
 
-gsm8k, 128 questions per self-test arm, no PegaFlow. Add `preempt` (on
-state-group models the honest arm fails without it) and `selftest:sync`
-there:
+gsm8k, 128 questions per self-test arm, no PegaFlow, once per TP the model
+is gated at (`--tp N --gpu` with N devices). Add `preempt` (on state-group
+models the honest arm fails without it) and `selftest:sync` there:
 
 ```bash
 ... run_gate --model ... --tag <model>-selftest \
   --arms plain,baseline,selftest:honest,selftest:liar,selftest:bitflip,selftest:offbyone \
   --workloads gsm8k,preempt --gsm8k-limit 128
 ```
+
+`preempt` needs the committed dump of `--tp`: for a TP without one, run
+`--workloads gsm8k` first, commit its `baseline/gsm8k/probe/spec.json` as
+`spec.json` (TP 1) or `spec-tp<N>.json`, then rerun with `preempt`.
