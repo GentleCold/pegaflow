@@ -134,6 +134,21 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   7443 at 0.5, 2 of 7433 at 0.75: negligible at the floor. On a sub-floor
   pool (0.05x GPU KV) one reclaim round exceeds the whole pool
   (`models/Qwen3.5-4B/ITERATIONS.md`).
+- Loads run serially, one task per load RPC, on a single load worker per
+  device (`gpu_worker.rs`). Each task synchronizes its own CUDA event
+  before the next one starts. The memcpy backend issues one
+  `cuMemcpyHtoDAsync` per merged contiguous range. Measured on Qwen3-4B
+  TP1 (P5 it4, `2026-10-26-qwen3-4b-p5-it4-defer-e985938`):
+  - Turn 0: v2's 31 queries all land within about 19 ms (one step), and
+    each is a full hit.
+  - Even so, the loads complete over steps 2-12, against native's 2-4.
+  - v2 H2D runs at 14.8 GB/s; native (vLLM's OffloadingConnector)
+    reaches about 22 GB/s.
+  - The connector-side alternative, one load RPC per step, is parked: the
+    server fails the whole call on one bad lease, so one expired lease
+    would fail every load in that step.
+  Accepted by main 2026-10-26 (`models/Qwen3.5-4B/ITERATIONS.md`, it4
+  attribution).
 
 ### Gate changes
 

@@ -1307,6 +1307,111 @@ because it has no plain, baseline or cap arm. The control is the A/B run
 - Decision: keep it4. Next are the TP2 slice and Qwen3.5 TP1, comparing
   the follow-up head against c8a8842.
 
+### it4 TP2 pair: Qwen3-4B TP2, c8a8842 vs 02b6767 in-run
+
+The two runs went back to back on GPUs 0-1. Both used gate rev c8a8842,
+the replay workload, and native + v2 arms. KV is 203,616 tokens in every
+arm. Runs: `~/kexi/rsi-runs/2026-10-26-qwen3-4b-p5-it4-tp2-{c8a8842,02b6767}`.
+Neither run is official (no plain or baseline arm, exit 1 as expected).
+Neither vllm.log has a traceback.
+
+TTFT in seconds:
+
+| run | arm | warm2 p50 / mean / p90 | warm3 p50 / mean / p90 | req/s w2 / w3 |
+|---|---|---|---|---|
+| c8a8842 | native | 0.165 / 0.164 / 0.212 | 0.171 / 0.169 / 0.231 | 19.28 / 19.07 |
+| c8a8842 | v2 | 0.132 / 0.148 / 0.194 | 0.132 / 0.150 / 0.198 | 17.60 / 17.20 |
+| 02b6767 | native | 0.161 / 0.168 / 0.228 | 0.166 / 0.164 / 0.215 | 19.21 / 19.13 |
+| 02b6767 | v2 | 0.157 / 0.155 / 0.241 | 0.166 / 0.172 / 0.276 | 18.75 / 18.60 |
+
+- G4 medians vs native in the same run:
+  - c8a8842: TTFT p50 21.3% ahead, req/s 9.3% behind.
+  - 02b6767: TTFT p50 1.1% behind (noise), req/s 2.6% behind.
+- G3: hit rate is 0.99826 in all arms. Local hit was 0.8334 at c8a8842
+  and is 0.8641 at 02b6767, equal to native's 0.8641. Turn-0 external
+  tokens fell from 54,144 to 14,960; native's are 14,990. 93 requests
+  were deferred.
+- Loads fell from 31.0 to 25.2 GB, at 9.3-9.7 GB/s. Warm saves are
+  0.1 GB. The cold save is 27.7 GB at 5.3 GB/s.
+- Step time is v2 18.0/18.2 -> 17.1/17.3 ms, against native's 16.0-16.3.
+  The share of warm3 tokens with an ITL of 25-50 ms is 18.3% -> 6.3%;
+  native's is 3.4-5.0%. vLLM mean ITL at 02b6767 is 17.4/17.3 ms for v2
+  and 16.5/16.7 ms for native.
+- Queue steps for turn>0 loaded requests: v2 p50 4 (mean ~3.4), native
+  p50 5-6 (mean ~6.2). At TP2, v2 is ahead on admission.
+- The save hold is 258 ms (c8a8842) and 274 ms (02b6767), with 0 pressure
+  RPCs. KV usage stays below 0.9, so batches wait the full 32 steps or the
+  1 s cap.
+- The remaining TP2 gap is about 6.5% longer decode steps. That is target
+  (a), save/load copy contention. Admission is not the cause.
+
+### it4 attribution: TP1 queue gap and turn-0 spread (offline, deferral run)
+
+Source: `2026-10-26-qwen3-4b-p5-it4-defer-e985938`, cap 4467 blocks.
+Scripts are in `~/kexi/tmp/p5-it3-attr/`: qcount, pair, qtime, t0q,
+order, pair2, lastsave, inv, kvcap and itl.
+
+**Loaded turn>0 requests: queue p50 of 27 steps for v2 vs 11 for native**
+
+- The inputs are identical. All 232 turn>0 requests load in both arms,
+  with about 1772 local and 3480 external tokens.
+- This is a phase shift, not a per-request delay.
+  - The mean gap is 35.9 vs 33.8 steps.
+  - Paired by native's bucket, v2 minus native is +1 for native gaps under
+    10. It is +16 at p50 for native gaps of 10-29. For native gaps of 30
+    or more it is -3 at p50 and -10 at mean.
+  - By turn, the gap p50 (v2/native) is: t1 5/8, t2 5/6, t3 21/8,
+    t4 26/10, t5 68/71, t6 73/72, t7 74/73, t8 39/70, t9 9/6.
+  - v2's first_step drifts from +5 steps at turn 0 to +34/+44 at turn 9,
+    while both runs take the same time.
+- In wall time, v2 queues less.
+  - vLLM request_queue mean is 756 ms vs 843 ms; the queue_time sum is
+    199.7 s vs 222.6 s.
+  - Prefill is 60 vs 94 ms, and e2e is 2314 vs 2438 ms.
+  - Native's steps are longer (25.3 vs 23.4 ms).
+- The mechanism is KV-blocked FIFO admission, in both arms.
+  - vLLM breaks out of its waiting loop when `allocate_slots` fails, so a
+    request is only looked up once it reaches the head.
+  - From finish to the first server query is p50 28.6 steps. The first to
+    the last query takes 1.6 steps, and the last query to first_step
+    about 0.
+  - Requests with a gap of 30 or more average 8.6 queries (max 54) and
+    need about 4600 tokens, against about 2700 for the rest.
+- v2 has 43 order inversions; native has 0. All 43 are sync loads
+  (16 requests, ext ≤ 256) overtaking async loads. This is a probe
+  artefact: an async load's first_step includes the load, about 7 steps.
+- The one connector-side lever is the hold after finish.
+  - v2's `request_finished` returns True whenever the request has a
+    planned save. vLLM then keeps the blocks until finished_sending.
+  - Native returns False and fences block reuse instead.
+  - 86% of requests made their last save at least 3 steps before they
+    finished, so their hold is a pure round trip.
+  - A KV-capacity model gives 24.4 blocked steps at hold 3, 20.8 at hold
+    0, and 24.8 for native.
+  - The measured dose-response is weak: hold 108 -> 67 ms moved queue
+    p50 from 34/32 to 30/32.
+  - Candidate it5: return False at finish when the workers' reported
+    saved_through is at or past the request's last save step.
+
+**Turn-0 admission spread: steps 2-12 for v2 vs 2-4 for native**
+
+- v2's 31 server queries all land within about 19 ms, and each is a full
+  hit. The spread is in load completion.
+- Attribution: server. The load worker runs serially, one task per RPC,
+  and syncs after each task. H2D is 14.8 GB/s, against about 22 GB/s for
+  native. Recorded under PROGRESS "Server limitations". One load RPC per
+  step stays parked (one bad lease fails the whole call).
+
+**Main's decision (2026-10-26)**
+
+- Target (a), save-path ITL, comes first. Attribute it offline before
+  writing code: save D2H, load H2D, and saver-thread/CPU contention, and
+  whether the burst of saves after the TP2 hold drives the 25-50 ms ITL
+  tail.
+- it5 (release at finish when the saves are done) is queued next.
+- The Qwen3.5 pair (c8a8842 vs 02b6767, GPU5, replay + gsm8k) is running:
+  `qwen3.5-4b-p5-it4-pair-{c8a8842,02b6767}`.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
