@@ -1180,7 +1180,8 @@ def test_hit_stats_logged_when_idle_and_on_cadence():
         assert lines == []  # "s" still live, cadence not due
         sched._clock.now += Scheduler.HIT_LOG_S
         sched.get_num_new_matched_tokens(_req(req_id="t"), 0)
-        assert lines == ["[PegaKVConnectorV2] hit stats {'lookups': 3}"]
+        cost = "{'calls': 3, 'rpcs': 3, 'us': 0, 'max_us': 0}"
+        assert lines == [f"[PegaKVConnectorV2] hit stats {{'lookups': 3}} lookup_cost {cost}"]
         sched.request_finished("s")
         sched.request_finished("t")  # idle, but nothing new to report
         sched.shutdown()
@@ -1190,7 +1191,8 @@ def test_hit_stats_logged_when_idle_and_on_cadence():
     finally:
         log.removeHandler(handler)
         log.setLevel(level)
-    assert lines[1:] == ["[PegaKVConnectorV2] hit stats {'lookups': 4}"]
+    cost = "{'calls': 4, 'rpcs': 4, 'us': 0, 'max_us': 0}"
+    assert lines[1:] == [f"[PegaKVConnectorV2] hit stats {{'lookups': 4}} lookup_cost {cost}"]
 
 
 @BOTH
@@ -1321,7 +1323,8 @@ def test_worker_loads_and_poll():
     pending = FakeLoadState(ready=False)
     # One state per load RPC: ok, bad-lease (unused), gpu-error, later.
     states = [FakeLoadState(), FakeLoadState(), FakeLoadState(state=-1), pending]
-    worker = _worker(StubSemantics, rpc, states)
+    clock = StepClock()
+    worker = _worker(StubSemantics, rpc, states, clock=clock)
     plan = StepPlan(
         loads=[
             LoadPlan("fail", fail=True),
@@ -1334,15 +1337,19 @@ def test_worker_loads_and_poll():
     )
     worker.start(plan)
     assert len(rpc.loads) == 4  # one RPC per request with something to load
+    clock.now = 1.0
     _, finished, failed = worker.poll()
     assert failed == {"fail", "bad-lease", "gpu-error"}
     assert finished == {"fail", "empty", "ok", "bad-lease", "gpu-error"}
     pending.ready = True
+    clock.now = 3.0
     assert worker.poll() == (set(), {"later"}, set())
     assert worker.poll() == (set(), set(), set())
-    # Polls until each load RPC was ready: 1 for ok and gpu-error, 2 for later.
+    # Polls until each load RPC was ready: 1 for ok and gpu-error, 2 for later;
+    # seconds from the RPC to the poll that saw it ready: 1, 1 and 3.
     s = worker.save_stats
     assert (s.async_done, s.async_first_poll, s.async_polls, s.max_async_polls) == (3, 2, 4, 2)
+    assert (s.async_ready_s, s.max_async_ready_s) == (5.0, 3.0)
 
 
 @pytest.mark.parametrize(

@@ -146,6 +146,10 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   - `deferred`: requests that waited for another request's async load;
   - `sync_planned`: sync loads planned (a sync load is a short hit loaded
     before the forward).
+
+  The same line carries `lookup_cost`: `calls` / `us` / `max_us`, the wall
+  time of every server lookup vLLM's scheduler thread waited for (re-queries
+  of a waiting request included), and `rpcs`, its `query_prefetch` calls.
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first, and `LayerDecl.layout` when an
@@ -176,9 +180,10 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   - async loads, in `get_finished`: `async_done` (load RPCs seen ready,
     landed or failed), `async_first_poll` (of those, ready at the first
     poll, the issuing step's), `async_polls` / `max_async_polls` (polls
-    until ready, the landing one included). vLLM promotes a request the
-    step after the poll that reports it, so 1 poll is its minimum round
-    trip.
+    until ready, the landing one included), and `async_ready_ms` /
+    `max_async_ready_ms` (from the start of the issuing step's
+    `start_load_kv` to the poll that saw it ready). vLLM promotes a request the step after the poll that reports
+    it, so 1 poll is its minimum round trip.
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;
   - every TP rank's declarations must pass `semantics.seal_plan` (V0).

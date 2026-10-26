@@ -49,6 +49,7 @@ class _Batch:
     state: Any  # PyLoadState
     req_ids: list[str]
     polls: int = 0  # poll() calls that saw it, the landing one included
+    issued_at: float = 0.0  # worker clock when its step's start_load_kv began
 
 
 @dataclass
@@ -103,6 +104,8 @@ class SaveStats:
     async_first_poll: int = 0  # of those, ready at the first poll (the issuing step's)
     async_polls: int = 0  # their polls, the landing one included
     max_async_polls: int = 0
+    async_ready_s: float = 0.0  # their step's start_load_kv -> the poll that saw them ready
+    max_async_ready_s: float = 0.0
     _since: float = field(default=0.0, repr=False)
 
 
@@ -346,7 +349,7 @@ class Worker:
                 elif lp.sync:
                     sync.append((state, lp.covered))
                 else:
-                    self._batches.append(_Batch(state, [lp.req_id]))
+                    self._batches.append(_Batch(state, [lp.req_id], issued_at=t0))
         if sync:
             self._wait_sync(sync)
         issued = self._clock() - t0
@@ -614,7 +617,8 @@ class Worker:
             "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f kv_usage_unknown_steps=%d "
             "sync_loads=%d sync_first_steps=%d sync_wait_ms=%.1f max_sync_wait_ms=%.2f "
             "load_steps=%d load_issue_ms=%.1f max_load_issue_ms=%.2f "
-            "async_done=%d async_first_poll=%d async_polls=%d max_async_polls=%d",
+            "async_done=%d async_first_poll=%d async_polls=%d max_async_polls=%d "
+            "async_ready_ms=%.1f max_async_ready_ms=%.2f",
             self._par.tp_rank,
             now - s._since,
             s.steps,
@@ -646,6 +650,8 @@ class Worker:
             s.async_first_poll,
             s.async_polls,
             s.max_async_polls,
+            s.async_ready_s * 1e3,
+            s.max_async_ready_s * 1e3,
         )
 
     def shutdown(self) -> None:
@@ -680,12 +686,15 @@ class Worker:
         finished, self._done = self._done, set()
         pending: list[_Batch] = []
         landed: list[int] = []
+        ready_s: list[float] = []
+        now = self._clock() if self._batches else 0.0
         for b in self._batches:
             b.polls += 1
             if not b.state.is_ready():
                 pending.append(b)
                 continue
             landed.append(b.polls)
+            ready_s.append(now - b.issued_at)
             finished.update(b.req_ids)
             state = b.state.get_state()
             if state != 1:
@@ -699,5 +708,7 @@ class Worker:
                 stats.async_first_poll += landed.count(1)
                 stats.async_polls += sum(landed)
                 stats.max_async_polls = max(stats.max_async_polls, *landed)
+                stats.async_ready_s += sum(ready_s)
+                stats.max_async_ready_s = max(stats.max_async_ready_s, *ready_s)
         failed, self._failed = self._failed, set()
         return sending, finished | failed, failed

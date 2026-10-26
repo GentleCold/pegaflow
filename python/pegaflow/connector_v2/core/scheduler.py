@@ -207,6 +207,9 @@ class Scheduler:
         # per (request, resume point): vLLM re-queries a waiting request every
         # scheduling pass until it can be allocated.
         self.hit_stats: dict[str, int] = {}
+        # Wall time of every _lookup call (vLLM's scheduler thread waits for
+        # it, re-queries of a waiting request included) and its query RPCs.
+        self.lookup_cost = {"calls": 0, "rpcs": 0, "us": 0, "max_us": 0}
         self._counted: dict[str, tuple[int, int]] = {}
         self._hit_dirty = False  # counters changed since the last line
         self._hit_logged_at = clock()
@@ -228,12 +231,15 @@ class Scheduler:
             self._loading_since.pop(req_id, None)
             return None, False
 
+        t0 = self._clock()
         try:
             lookup = self._lookup(request, num_computed)
         except Exception:
             logger.warning("[PegaKVConnectorV2] query failed req=%s", req_id, exc_info=True)
             self._loading_since.pop(req_id, None)
             return 0, False
+        finally:
+            self._time_lookup(self._clock() - t0)
 
         if lookup.loading:
             self._release(lookup.leases)
@@ -321,6 +327,16 @@ class Scheduler:
         self.hit_stats[key] = self.hit_stats.get(key, 0) + 1
         self._hit_dirty = True
 
+    def _time_lookup(self, seconds: float) -> None:
+        """Every ``_lookup`` call (vLLM's scheduler thread waits for it),
+        re-queries of a waiting request included."""
+        us = int(seconds * 1e6)
+        cost = self.lookup_cost
+        cost["calls"] += 1
+        cost["us"] += us
+        cost["max_us"] = max(cost["max_us"], us)
+        self._hit_dirty = True
+
     def on_loads_done(self, req_ids: Iterable[str]) -> None:
         """Async loads vLLM saw finish or fail (``finished_recving`` /
         ``failed_recving``), before it caches their blocks this pass."""
@@ -389,6 +405,7 @@ class Scheduler:
                 if not hashes[sid] or g.sem.kind == "scratch":
                     present.append(frozenset())
                     continue
+                self.lookup_cost["rpcs"] += 1
                 ans = self._rpc.query_prefetch(
                     self._instance_id, hashes[sid], request.request_id, False, sid
                 )
@@ -792,7 +809,11 @@ class Scheduler:
         final counters must not depend on it."""
         self._hit_dirty = False
         self._hit_logged_at = self._clock()
-        logger.info("[PegaKVConnectorV2] hit stats %s", dict(sorted(self.hit_stats.items())))
+        logger.info(
+            "[PegaKVConnectorV2] hit stats %s lookup_cost %s",
+            dict(sorted(self.hit_stats.items())),
+            self.lookup_cost,
+        )
 
     def _touches_unconfirmed(self, block_ids: tuple[list[int], ...]) -> bool:
         return any(
