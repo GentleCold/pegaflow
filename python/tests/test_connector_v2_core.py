@@ -719,9 +719,11 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
 
 # Short-hit demotion (policy ``async_demote``) script: "long" / "short" look
 # up and allocate a 12- / 8-token hit (the short one expected "sync" or
-# "demoted"), "sharer" a request on another's blocks (expected deferred),
-# "bad-alloc" looks up at the given local hit and allocates more tokens than
-# planned (the plan fails); "step"
+# "demoted"), "sharer" a request on other requests' blocks (block i from the
+# i-th named request, one name for all; expected deferred),
+# "bad-alloc" looks up at the given local hit (then "sync" if that hit is
+# short and not demoted) and allocates more tokens than planned (the plan
+# fails); "step"
 # plans a step, "done" reports loads landed or failed, "finish" aborts.
 DEMOTE = Policy(sync_load_tokens=8, async_demote=True)
 CASCADE = [("long", "a"), ("step",), ("short", "b1", "demoted"), ("step",)]
@@ -769,6 +771,7 @@ CASCADE += [("wait", 0.25), ("done", "b1", "b2")]
             {"sync_planned": 1},
             id="long-plan-failed",
         ),
+        pytest.param(DEMOTE, [("bad-alloc", "b", 4, "sync")], {}, id="sync-plan-failed"),
         # Sync loads are copied before the forward: nothing in flight after.
         pytest.param(
             DEMOTE,
@@ -789,6 +792,14 @@ CASCADE += [("wait", 0.25), ("done", "b1", "b2")]
                 "max_demoted_ms": 250,
             },
             id="cascade",
+        ),
+        # A step without a demotion ends the run.
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("short", "b1", "demoted"), ("step",), ("step",)]
+            + [("short", "b2", "demoted"), ("short", "b3", "demoted")],
+            {"sync_demoted": 3, "max_demoted_run": 1},
+            id="run-gap",
         ),
         # A failed demoted plan is a failed receive, not a demotion.
         pytest.param(
@@ -823,6 +834,31 @@ CASCADE += [("wait", 0.25), ("done", "b1", "b2")]
             | {"max_deferred_demoted_ms": 50},
             id="sharer-deferred",
         ),
+        # A wait on a long load is not the demotion's cost, also when the
+        # sharer waits on a demoted load too.
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("sharer", "s", "a"), ("wait", 0.05), ("done", "a")]
+            + [("short", "s", "sync")],
+            {"sync_planned": 1, "deferred": 1},
+            id="sharer-behind-long",
+        ),
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("short", "b", "demoted"), ("sharer", "s", "x", "a", "b")],
+            {"sync_demoted": 1, "max_demoted_run": 1, "deferred": 1},
+            id="sharer-behind-both",
+        ),
+        # An aborted sharer's wait is not counted.
+        pytest.param(
+            DEMOTE,
+            [("long", "a"), ("step",), ("short", "b", "demoted"), ("sharer", "s", "b")]
+            + [("wait", 0.05), ("finish", "s"), ("done", "a", "b")],
+            {"sync_demoted": 1, "max_demoted_run": 1, "deferred": 1, "deferred_demoted": 1}
+            | {"demoted_done": 1, "demoted_ms": 50, "max_demoted_ms": 50}
+            | {"demoted_steps": 0, "max_demoted_steps": 0},
+            id="sharer-aborted",
+        ),
     ],
 )
 def test_sync_load_demotion(policy, script, stats):
@@ -834,9 +870,10 @@ def test_sync_load_demotion(policy, script, stats):
     )
     reqs = {}
 
-    def req(rid, like=None):
+    def req(rid, *likes):
+        likes = list(likes or [rid]) * (3 // len(likes or [rid]))
         r = _req(req_id=rid)
-        r.block_hashes = [b"%s%d" % ((like or rid).encode(), i) for i in range(3)]
+        r.block_hashes = [b"%s%d" % (likes[i].encode(), i) for i in range(3)]
         return reqs.setdefault(rid, r)
 
     for op, *args in script:
@@ -849,11 +886,11 @@ def test_sync_load_demotion(policy, script, stats):
         elif op == "finish":
             sched.request_finished(args[0])
         elif op == "sharer":
-            assert sched.get_num_new_matched_tokens(req(args[0], args[1]), 4) == (None, False)
+            assert sched.get_num_new_matched_tokens(req(*args), 4) == (None, False)
         else:
             r = reqs.pop(args[0], None) or req(args[0])
             reqs[args[0]] = r
-            num_computed = {"long": 0, "bad-alloc": args[-1]}.get(op, 4)
+            num_computed = {"long": 0, "bad-alloc": args[1]}.get(op, 4)
             n, is_async = sched.get_num_new_matched_tokens(r, num_computed)
             n += 4 * (op == "bad-alloc")
             sched.update_state_after_alloc(r, ([10, 11, 12, 13],), n)
@@ -862,7 +899,8 @@ def test_sync_load_demotion(policy, script, stats):
                 "fail" if lp.fail else "sync" if lp.sync else "async" if op == "long" else "demoted"
             )
             want = {"long": "async", "bad-alloc": "fail"}.get(op) or args[1]
-            assert (args[0], got, is_async) == (args[0], want, want != "sync")
+            sync = want == "sync" or args[2:] == ["sync"]  # a failed plan had a sync hit
+            assert (args[0], got, is_async) == (args[0], want, not sync)
     assert {k: v for k, v in sched.hit_stats.items() if k != "lookups"} == stats
     # Nothing is left once every request finished.
     for rid in reqs:

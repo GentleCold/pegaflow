@@ -334,22 +334,27 @@ class Scheduler:
         if since is None:
             self._deferred_since[req_id] = now
             self._count("deferred")
-            if self._behind_demoted(request):
+            if self._behind_demoted(request, num_computed):
                 self._deferred_demoted[req_id] = now
                 self._count("deferred_demoted")
         return True
 
-    def _behind_demoted(self, request: Any) -> bool:
-        """A demoted load writes some of this request's blocks."""
+    def _behind_demoted(self, request: Any, num_computed: int) -> bool:
+        """Every in-flight load writing this request's blocks past its local
+        hit is a demoted one: the wait is the demotion's cost. A wait on a
+        long load too would have happened without the demotion."""
         if not self._demoted:
             return False
-        keys = {key for r in self._demoted for key in self._inflight.get(r, ())}
         layout = self._layout
-        return any(
-            (sid, h) in keys
+        wanted = {
+            (sid, h)
             for sid, g in enumerate(layout.groups)
-            for h in layout.group_hashes(g, request.block_hashes)
-        )
+            for h in layout.group_hashes(g, request.block_hashes)[
+                num_computed // g.sem.block_tokens :
+            ]
+        }
+        behind = {r for r, keys in self._inflight.items() if not wanted.isdisjoint(keys)}
+        return bool(behind) and behind <= self._demoted.keys()
 
     def _count(self, key: str, value: int = 1, peak: bool = False) -> None:
         """Add ``value`` to ``hit_stats[key]`` (``peak``: also track
@@ -557,9 +562,6 @@ class Scheduler:
             plan.loads = []
         else:
             self._release_unkept(hit.leases, leases or [])
-            # A request is reallocated only after its last load ended.
-            self._long_loads.pop(req_id, None)
-            self._demoted.pop(req_id, None)
             if plan.sync:
                 self._count("sync_planned")
             else:  # a sync load's blocks are cached at once
