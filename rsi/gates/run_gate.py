@@ -3578,13 +3578,14 @@ def official_problems(
         out.append("--under-test-path missing: the connector under test has no verified snapshot")
     if not gate_file.exists():
         out.append(f"{gate_file} missing")
-    tp = getattr(args, "tp", 1)
     if not committed.exists():
-        out.append(f"committed spec dump {committed} missing (no dump for --tp {tp})")
-    elif committed.is_file():
+        out.append(f"committed spec dump {committed} missing (no dump for --tp {args.tp})")
+    else:
         got = (json.loads(committed.read_text()).get("parallel") or {}).get("tp")
-        if got != tp:
-            out.append(f"committed spec dump {committed} records parallel.tp={got}, not --tp {tp}")
+        if got != args.tp:
+            out.append(
+                f"committed spec dump {committed} records parallel.tp={got}, not --tp {args.tp}"
+            )
     return out
 
 

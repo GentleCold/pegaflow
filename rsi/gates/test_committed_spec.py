@@ -37,6 +37,27 @@ def _gate_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _stub_main(monkeypatch, repo: Path, stage=None) -> None:
+    """Everything in ``main`` that would touch real trees, the GPU or the
+    toolchain; ``stage``: the ``run_stage`` stub (default: fail fast)."""
+
+    def unexpected(*_a, **_k):
+        raise AssertionError("main ran a stage")
+
+    monkeypatch.setattr(run_gate, "REPO", repo)
+    monkeypatch.setattr(run_gate, "install_stop_handlers", lambda: None)
+    monkeypatch.setattr(run_gate, "record_provenance", lambda *_: {})
+    monkeypatch.setattr(run_gate, "cuda_env", lambda: {})
+    monkeypatch.setattr(run_gate, "cuda_problems", lambda _: [])
+    monkeypatch.setattr(run_gate, "scan_record", lambda _: {"flagged": []})
+    monkeypatch.setattr(run_gate, "run_stage", stage or unexpected)
+    monkeypatch.setattr(
+        run_gate,
+        "ProvenanceWatch",
+        lambda *_: SimpleNamespace(check=lambda _w: {}, problems=lambda: [], record=lambda: {}),
+    )
+
+
 @pytest.mark.parametrize(
     "tp,selected",
     [(1, "spec.json"), (2, "spec-tp2.json"), (4, None)],
@@ -68,18 +89,7 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
     spy("plan_cap_convs", ret={}, arg=1)
     spy("official_problems", run_gate.official_problems, arg=4)
     spy("verdicts", ret={}, arg=2)
-    monkeypatch.setattr(run_gate, "REPO", repo)
-    monkeypatch.setattr(run_gate, "install_stop_handlers", lambda: None)
-    monkeypatch.setattr(run_gate, "record_provenance", lambda *_: {})
-    monkeypatch.setattr(run_gate, "cuda_env", lambda: {})
-    monkeypatch.setattr(run_gate, "cuda_problems", lambda _: [])
-    monkeypatch.setattr(run_gate, "scan_record", lambda _: {"flagged": []})
-    monkeypatch.setattr(run_gate, "run_stage", lambda _a, _g, arm, wl, _o, **_k: {"arm": arm, "workload": wl})  # fmt: skip
-    monkeypatch.setattr(
-        run_gate,
-        "ProvenanceWatch",
-        lambda *_: SimpleNamespace(check=lambda _w: {}, problems=lambda: [], record=lambda: {}),
-    )
+    _stub_main(monkeypatch, repo, lambda _a, _g, arm, wl, _o, **_k: {"arm": arm, "workload": wl})  # fmt: skip
     wls = "gsm8k,replay,cap" + (",preempt" if selected else "")
     argv = ["--model", "/m/Qwen3-4B", "--tag", "t", "--runs-root", str(tmp_path / "runs"),
             "--arms", "plain,baseline,old", "--workloads", wls,
@@ -103,14 +113,23 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
         assert f"committed spec dump {want} missing (no dump for --tp {tp})" in problems
 
 
-def test_preempt_without_this_tps_dump_does_not_start(tmp_path, monkeypatch):
-    """The preempt pool is sized from this TP's dump only: none, no run."""
-    monkeypatch.setattr(run_gate, "REPO", _gate_repo(tmp_path))
-    monkeypatch.setattr(run_gate, "install_stop_handlers", lambda: None)
+def test_preempt_without_this_tps_dump_does_not_start(tmp_path, monkeypatch, capsys):
+    """The preempt pool is sized from this TP's dump only: none, no run (an
+    argument error before the run dir, provenance or any stage)."""
+    repo = _gate_repo(tmp_path)
+    _stub_main(monkeypatch, repo)
+
+    def no_sizing(*_a):
+        raise AssertionError("preempt pool sized without this TP's dump")
+
+    monkeypatch.setattr(run_gate, "preempt_gpu_blocks", no_sizing)
+    monkeypatch.setattr(run_gate, "record_provenance", lambda *_: pytest.fail("ran past the preempt guard"))  # fmt: skip
     argv = ["--model", "/m/Qwen3-4B", "--tag", "t", "--runs-root", str(tmp_path / "runs"),
             "--workloads", "gsm8k,preempt", "--tp", "4", "--gpu", "0,1,2,3"]  # fmt: skip
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as e:
         run_gate.main(argv)
+    assert e.value.code == 2
+    assert "docs/rsi/models/Qwen3-4B/spec-tp4.json (missing)" in capsys.readouterr().err
     assert not (tmp_path / "runs").exists()
 
 

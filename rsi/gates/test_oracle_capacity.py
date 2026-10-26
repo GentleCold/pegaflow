@@ -19,6 +19,13 @@ PAGE = 500  # bytes per layer page
 LAYERS = 2  # -> 1000 bytes per (group, key) block
 
 
+def _official_files(d: Path) -> tuple[Path, Path]:
+    """gate.json and a TP1 committed spec dump for ``official_problems``."""
+    (d / "gate.json").write_text("{}")
+    (d / "spec.json").write_text(json.dumps({"parallel": {"tp": 1}}))
+    return d / "gate.json", d / "spec.json"
+
+
 def _group(gid: int, cls: str, mro: list[str], bt: int = BT, page: int = PAGE) -> dict:
     return {
         "id": gid,
@@ -594,10 +601,10 @@ def test_lmcache_build_must_be_the_declared_one(tmp_path, declared, dists, ok):
     for d in dists:
         (tmp_path / f"{d}.dist-info").mkdir()
     gate = {"lmcache_dist": declared} if declared else {}
-    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "lmcache_chunk_size": 256, "lmcache_overlay": str(tmp_path)}  # fmt: skip
+    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "lmcache_chunk_size": 256, "lmcache_overlay": str(tmp_path), "tp": 1}  # fmt: skip
     args = argparse.Namespace(**(run_gate.OFFICIAL | fixed))
     arms = ["plain", "baseline", "lmcache", "pegaflow.m:C"]
-    probs = run_gate.official_problems(args, arms, list(run_gate.WORKLOADS), tmp_path, tmp_path, gate)  # fmt: skip
+    probs = run_gate.official_problems(args, arms, list(run_gate.WORKLOADS), *_official_files(tmp_path), gate)  # fmt: skip
     assert (not any("lmcache" in p for p in probs)) is ok, probs
     stage = {"lmcache": {"dist": [f"{d}.dist-info" for d in dists], "cpu_bytes": 10, "storing_ranks": 1, "per_rank_bytes": 10, "backends": 1}}  # fmt: skip
     assert run_gate.lmcache_build_verdict({"gsm8k": stage, "cap": stage}, gate)["pass"] is ok
@@ -925,10 +932,12 @@ def test_official_args(tmp_path, over, key, ok):
     import argparse
 
     arm = over.pop("arm", "pegaflow.m:C")
-    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python", "lmcache_chunk_size": run_gate.LMCACHE_CHUNK, "lmcache_overlay": str(tmp_path)}  # fmt: skip
+    fixed = {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t/python", "lmcache_chunk_size": run_gate.LMCACHE_CHUNK, "lmcache_overlay": str(tmp_path), "tp": 1}  # fmt: skip
     args = argparse.Namespace(**(run_gate.OFFICIAL | fixed | over))
     arms = ["plain", "baseline", "lmcache", arm]
-    probs = run_gate.official_problems(args, arms, list(run_gate.WORKLOADS), tmp_path, tmp_path)
+    probs = run_gate.official_problems(
+        args, arms, list(run_gate.WORKLOADS), *_official_files(tmp_path)
+    )
     assert any(p.startswith(key) for p in probs) is not ok, probs
 
 
@@ -1708,8 +1717,8 @@ def test_official_needs_under_test_path(tmp_path):
     pegaflow (no snapshot, no verification): never official."""
     import argparse
 
-    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": ""}))  # fmt: skip
-    probs = run_gate.official_problems(args, ["plain", "baseline", "m:C"], list(run_gate.WORKLOADS), tmp_path, tmp_path)  # fmt: skip
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "", "tp": 1}))  # fmt: skip
+    probs = run_gate.official_problems(args, ["plain", "baseline", "m:C"], list(run_gate.WORKLOADS), *_official_files(tmp_path))  # fmt: skip
     assert any(p.startswith("--under-test-path missing") for p in probs), probs
 
 
@@ -2036,11 +2045,11 @@ def test_official_needs_native_warm_replay(tmp_path, arms, wls, native, problem)
     arm / workload guard is inside it, so this covers the wiring's logic."""
     import argparse
 
-    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t"}))  # fmt: skip
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "tp": 1}))  # fmt: skip
     results = {"baseline": {"replay": _replay(5.0, 1.0)}}
     if native is not None:
         results["native"] = {"replay": native}
-    probs = run_gate.official_problems(args, arms, list(wls), tmp_path, tmp_path)
+    probs = run_gate.official_problems(args, arms, list(wls), *_official_files(tmp_path))
     probs += run_gate.g4_native_problems(results, arms, list(wls))
     gap = [p for p in probs if "native" in p or p.startswith("workloads")]
     assert (gap == []) is (problem is None), probs
@@ -2163,14 +2172,15 @@ def test_stop_signal_aborts_the_run(tmp_path, sig, where):
     assert not (tmp_path / "finished").exists()
 
 
-def test_g0_spec_ignores_module_paths(tmp_path):
+@pytest.mark.parametrize("dump", ["spec.json", "spec-tp2.json"], ids=["tp1", "tp2"])
+def test_g0_spec_ignores_module_paths(tmp_path, dump):
     """M4: a fresh probe dump carries ``modules`` (host paths: the arm under
     test imports pegaflow from its overlay, the baseline from the venv; the
-    committed dump has none). G0.spec must pass on the committed Qwen3-4B
-    layout with differing ``modules``; G0.provenance judges them."""
+    committed TP1 dump has none). G0.spec must pass on each committed
+    Qwen3-4B layout with differing ``modules``; G0.provenance judges them."""
     import json
 
-    committed = run_gate.REPO / "docs/rsi/models/Qwen3-4B/spec.json"
+    committed = run_gate.REPO / "docs/rsi/models/Qwen3-4B" / dump
     spec = json.loads(committed.read_text())
     for label, pf in (("baseline", "/venv/pegaflow/__init__.py"), ("arm", "/run/overlay/pegaflow/__init__.py")):  # fmt: skip
         probe = tmp_path / label / "gsm8k" / "probe"
@@ -3517,9 +3527,9 @@ def test_official_needs_preempt_on_state_models(model, wls, missing):
     ``preempt`` (gsm8k loads one state key per group)."""
     import argparse
 
-    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t"}))  # fmt: skip
+    args = argparse.Namespace(**(run_gate.OFFICIAL | {"num_gpu_blocks": 0, "vllm_arg": [], "under_test_path": "/t", "tp": 1}))  # fmt: skip
     committed = run_gate.REPO / f"docs/rsi/models/{model}/spec.json"
-    probs = run_gate.official_problems(args, ["plain", "baseline", "pegaflow.m:C"], wls, committed, committed)  # fmt: skip
+    probs = run_gate.official_problems(args, ["plain", "baseline", "pegaflow.m:C"], wls, committed.parent / "gate.json", committed)  # fmt: skip
     assert any(p.startswith("workload preempt missing") for p in probs) is missing, probs
 
 

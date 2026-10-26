@@ -292,9 +292,7 @@ only make an honest block inexact, never a wrong one exact.
 - gate.json is per model, not per TP: its claims (`batch_invariant`,
   `split_invariant`, backends, vLLM args) hold at every TP the model has a
   dump for, and `G2.batch_control` / `G2.split_control` re-measure them in
-  every run, so a TP where one does not hold fails there. Qwen3-4B's
-  controls pass at TP2 (split 0/64, batch 0/64, `warm_equals_cold`,
-  `plain_equals_baseline`).
+  every run, so a TP where one does not hold fails there.
 - The adapter's declared layout (Kind, Shard, unit size, needed set) is
   checked against it: sizes add up, every layer in exactly one group.
 - `G0.spec`: arm's scheduler dump and layer view layouts (shape without the
@@ -819,6 +817,7 @@ field with another value, still fails.
 | `oracle.py` | G3 `H*`; G5 `U`, `H*_C` candidates, `H_lru`, `H_freeze` |
 | `test_oracle_capacity.py` | oracle and gate contract on synthetic traces, no GPU |
 | `test_probe_steps.py` | probe and self-test step logic (CPU; imports vllm, torch) |
+| `test_committed_spec.py` | per-TP committed spec dump: selection, every consumer in `main`, non-official without one (no GPU) |
 | `workloads.py` | gsm8k, replay, resume replay, Prometheus scrape |
 | `run_gate.py` | orchestrator: arms x workloads, passes, verdicts |
 | `provenance.py` | tree verification, snapshot, static scan + allowlist |
