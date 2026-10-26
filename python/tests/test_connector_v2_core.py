@@ -717,7 +717,70 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
     worker.shutdown()
 
 
-# Step 2 onwards, after vLLM processed step 0's outcome. "X" is shared's next
+@pytest.mark.parametrize(
+    "steps_between,second_async,expected",
+    [
+        # The workers send a step's sync loads first: an async load of the
+        # same step is no reason to demote.
+        pytest.param(None, False, True, id="same-step"),
+        # The server copies loads in arrival order: right after last step's
+        # async load, a sync load would stall the step behind it.
+        pytest.param(1, False, False, id="after-async-step"),
+        pytest.param(1, True, False, id="async-both-steps"),
+        pytest.param(2, False, True, id="two-steps-later"),
+    ],
+)
+def test_sync_load_demoted_after_async_load(steps_between, second_async, expected):
+    layout = _layout(StubSemantics, StubFullSpec())
+    rpc = FakeRpc({0: Ready(3, b"L0")})
+    sched = Scheduler(
+        layout,
+        Policy(sync_load_tokens=8),
+        rpc,
+        "inst",
+        clock=Clock(),
+        semantics=StubSemantics,
+        sync_loads=True,
+    )
+    ids = ([10, 11, 12, 13],)
+
+    def alloc(req, num_computed):
+        n, is_async = sched.get_num_new_matched_tokens(req, num_computed)
+        sched.update_state_after_alloc(req, ids, n)
+        return is_async
+
+    assert alloc(_req(req_id="a"), 0)  # 12 tokens: async
+    for _ in range(steps_between or 0):
+        sched.plan_saves([], lambda _: None)
+    if second_async:
+        assert alloc(_other(req_id="a2", diverge_at=0), 0)
+    short = _req(req_id="b")  # 8 tokens past the local hit, not waiting on a or a2
+    short.block_hashes = [b"y0", b"y1", b"y2"]
+    assert alloc(short, 4) is not expected
+    sync = [p.sync for p in sched.take_plan().loads if p.req_id == "b"]
+    assert (sync, sched.hit_stats.get("sync_demoted", 0)) == ([expected], int(not expected))
+    sched.on_loads_done(["b"])
+    assert sched._demoted == {}
+
+
+def test_worker_sends_sync_loads_first():
+    """A sync load sent after an async one waits for its copy as well."""
+    rpc = FakeRpc()
+    worker = _worker(StubSemantics, rpc, [FakeLoadState(), FakeLoadState(), FakeLoadState()])
+    plan = StepPlan(
+        loads=[
+            LoadPlan("long", [(b"L0", [[1]])]),
+            LoadPlan("short", [(b"L1", [[2]])], sync=True, covered=[2]),
+            LoadPlan("long2", [(b"L2", [[3]])]),
+        ]
+    )
+    worker.start(plan)
+    assert [loads[0][0] for loads in rpc.loads] == [b"L1", b"L0", b"L2"]
+    stats = worker.save_stats
+    assert (stats.sync_loads, stats.sync_first_steps) == (1, 1)
+    worker.shutdown()
+
+
 # turn: a new request whose prefix hit covers shared's blocks 10, 11, 20, 21.
 OK_NEXT = [[("r", 17, 1), ("shared", 17, 1)], [("X", 16, 5)]]
 FAIL_NEXT = [[("r", 4, 13), ("shared", 17, 1)], [("X", 16, 5)]]

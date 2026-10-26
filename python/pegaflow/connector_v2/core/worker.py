@@ -70,7 +70,8 @@ def _wire_bytes(saves: list[tuple[str, list[int], list[bytes]]]) -> int:
 
 @dataclass
 class SaveStats:
-    """Save cost since the last report (grep "save stats" in vllm.log)."""
+    """Save cost since the last report (grep "save stats" in vllm.log), and
+    the sync-load wait, the worker's other cost on the step's critical path."""
 
     steps: int = 0  # wait_for_save calls
     save_steps: int = 0  # steps that queued a save job
@@ -90,6 +91,10 @@ class SaveStats:
     sent: int = 0  # finished requests reported in finished_sending
     sent_wait_s: float = 0.0  # their total time held between finish and report
     max_sent_wait_s: float = 0.0
+    sync_loads: int = 0  # sync load RPCs issued
+    sync_first_steps: int = 0  # steps whose sync loads were moved ahead of async ones
+    sync_wait_s: float = 0.0  # step thread: waiting for them (on the critical path)
+    max_sync_wait_s: float = 0.0  # longest wait of one step
     _since: float = field(default=0.0, repr=False)
 
 
@@ -295,7 +300,7 @@ class Worker:
             self._done_seq = steps.popleft()[1]
 
     def _start_loads(self, plan: StepPlan) -> None:
-        """One ``load`` RPC per request.
+        """One ``load`` RPC per request, the step's sync loads first.
 
         The server consumes leases one by one and fails the whole call on the
         first bad one (e.g. an expired lease), so batching requests would fail
@@ -303,10 +308,17 @@ class Worker:
 
         Sync loads are waited for before returning (vLLM calls this before
         the forward when the step has any); a failed one reports its blocks
-        as invalid. Async loads report through ``poll``.
+        as invalid. Async loads report through ``poll``. The server copies a
+        device's loads one at a time in arrival order, so a sync load sent
+        after the step's async loads would stall the step for their copies
+        too.
         """
         sync: list[tuple[Any, list[int]]] = []
-        for lp in plan.loads:
+        ordered = sorted(plan.loads, key=lambda lp: not lp.sync)
+        if ordered != plan.loads:
+            with self._cv:
+                self.save_stats.sync_first_steps += 1
+        for lp in ordered:
             if lp.fail:
                 if lp.sync:
                     self._invalid.update(lp.covered)
@@ -376,6 +388,12 @@ class Worker:
                     len(covered),
                 )
                 self._invalid.update(covered)
+        waited = self._clock() - t0
+        with self._cv:
+            stats = self.save_stats
+            stats.sync_loads += len(loads)
+            stats.sync_wait_s += waited
+            stats.max_sync_wait_s = max(stats.max_sync_wait_s, waited)
 
     def take_invalid(self) -> set[int]:
         """GPU blocks whose sync load failed since the last call."""
@@ -577,7 +595,8 @@ class Worker:
             "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
             "blocks=%d bytes=%d submit_ms=%.1f flushes=%d flush_ms=%.1f wait_ms=%.1f "
             "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d rpcs=%d pressure_rpcs=%d "
-            "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f kv_usage_unknown_steps=%d",
+            "sent=%d sent_wait_ms=%.1f max_sent_wait_ms=%.1f kv_usage_unknown_steps=%d "
+            "sync_loads=%d sync_first_steps=%d sync_wait_ms=%.1f max_sync_wait_ms=%.2f",
             self._par.tp_rank,
             now - s._since,
             s.steps,
@@ -598,6 +617,10 @@ class Worker:
             s.sent_wait_s * 1e3,
             s.max_sent_wait_s * 1e3,
             s.kv_usage_unknown_steps,
+            s.sync_loads,
+            s.sync_first_steps,
+            s.sync_wait_s * 1e3,
+            s.max_sync_wait_s * 1e3,
         )
 
     def shutdown(self) -> None:

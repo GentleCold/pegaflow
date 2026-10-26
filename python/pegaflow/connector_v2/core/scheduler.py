@@ -98,6 +98,7 @@ class _Hit:
     present: tuple[frozenset[int], ...]  # server answers per sid (for re-planning)
     leases: list[_Lease]  # held leases, each with a non-empty ``wanted``
     sync: bool = False  # loaded before the forward of the step that schedules it
+    demoted: bool = False  # short enough to load sync, async after a recent async load
 
 
 @dataclass
@@ -187,6 +188,10 @@ class Scheduler:
         # keeps the first copy of a key, so such saves would persist wrong hits.
         self._confirm_steps = max(1, confirm_steps)
         self._steps = 0  # plan_saves calls so far
+        # The last two plan steps that started an async load (older first).
+        self._async_load_steps = (-2, -2)
+        # Demoted sync loads in flight: req_id -> (clock, step) when planned.
+        self._demoted: dict[str, tuple[float, int]] = {}
         # (gid, block index, GPU block id) -> step from which saves may resume.
         # Prefix-cache sharing keeps a block at the same index in every table.
         self._unconfirmed: dict[tuple[int, int, int], int] = {}
@@ -260,11 +265,21 @@ class Scheduler:
         # forward beats the two scheduler round trips of an async load. After
         # a failed sync load every load is async: vLLM keeps a failed sync
         # load's blocks prefix-cached, a failed async load's never.
-        hit.sync = (
-            self._sync_loads and not self._saves_disabled and n <= self._policy.sync_load_tokens
-        )
+        short = self._sync_loads and not self._saves_disabled and n <= self._policy.sync_load_tokens
+        # The server copies a device's loads one at a time in arrival order,
+        # and an async load takes longer than a step: a sync load right
+        # after one would stall the whole batch until both copies land.
+        hit.demoted = short and self._async_load_last_step()
+        hit.sync = short and not hit.demoted
         self._hits[req_id] = hit
         return n, not hit.sync
+
+    def _async_load_last_step(self) -> bool:
+        """An async load was planned in the previous step. The workers send a
+        step's sync loads before its async ones, so this step's do not count."""
+        older, newest = self._async_load_steps
+        prev = self._steps - 1
+        return newest == prev or (newest == self._steps and older == prev)
 
     def _defer_for_inflight(self, request: Any, num_computed: int) -> bool:
         """Wait for another request's async load of this request's blocks.
@@ -323,6 +338,14 @@ class Scheduler:
         ``failed_recving``), before it caches their blocks this pass."""
         for req_id in req_ids:
             self._untrack_load(req_id)
+            demoted = self._demoted.pop(req_id, None)
+            if demoted is not None:  # what the demotion cost this request
+                logger.info(
+                    "[PegaKVConnectorV2] demoted sync load landed req=%s after_ms=%.1f steps=%d",
+                    req_id,
+                    (self._clock() - demoted[0]) * 1e3,
+                    self._steps - demoted[1],
+                )
 
     def _track_load(self, request: Any, leases: list[_Lease]) -> None:
         keys: list[tuple[int, bytes]] = []
@@ -507,6 +530,12 @@ class Scheduler:
             self._release_unkept(hit.leases, leases or [])
             if not plan.sync:  # a sync load's blocks are cached at once
                 self._track_load(request, leases or [])
+                if self._async_load_steps[1] != self._steps:
+                    self._async_load_steps = (self._async_load_steps[1], self._steps)
+            if hit.demoted:  # short, loaded async after a recent async load
+                self.hit_stats["sync_demoted"] = self.hit_stats.get("sync_demoted", 0) + 1
+                self._hit_dirty = True
+                self._demoted[req_id] = (self._clock(), self._steps)
         self._plan.loads.append(plan)
 
     def _recut(self, hit: _Hit, num_external_tokens: int) -> list[_Lease] | None:
@@ -823,6 +852,7 @@ class Scheduler:
         self._drop_hit(req_id)
         self._loading_since.pop(req_id, None)
         self._untrack_load(req_id)  # aborted while loading: never cached
+        self._demoted.pop(req_id, None)
         self._deferred_since.pop(req_id, None)
         self._saved_upto.pop(req_id, None)
         self._requests.pop(req_id, None)
