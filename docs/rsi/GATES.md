@@ -44,7 +44,8 @@ must not be far off. G4 warm replay vs `native` is judged the same way (G4,
   (`MIN_JUDGED_*`, `MIN_COMPUTED_COVERAGE`, `MIN_PREWARMED`); excess within
   one block per request; `G3.no_eviction`; cap pool and load proofs
   (`pool_ok`, `loads_ok`, `unmatched_requests == 0`); G5 capacity floor and
-  freeze separation (run validity); every G0 / G2 / G4 check.
+  freeze separation (run validity); every G0 / G2 / G4 check (except
+  `*_vs_native`, reported).
 - Hit-rate judgment, per accepted run, in
   `rsi-notes:models/<model>/ITERATIONS.md`: measured vs `H*` / `H*_C` and the
   reference arms (`H_lru`, `old`, `native`, `lmcache`), every gap explained
@@ -61,6 +62,11 @@ Constants (`run_gate.py`): `ACC_TOL` 0.01, `MIN_JUDGED_GSM8K` 0.9,
 `MAX_PREEMPTED_UNCERTAIN` 0.01, `CAPACITY_FRACTION` 0.5, `MIN_CAPACITY_GPU_KV`
 2.0, `FREEZE_SEPARATION` 0.9, `NATIVE_MIN_EFFICIENCY` 0.9, `CONTAMINATION_P99`
 10.
+
+Arms column: "every arm" = every arm except `plain` and `baseline` (store
+arms and self-test arms); "store arms" = `old`, `native`, `lmcache` and the
+arm under test. Self-test arms get no G3 / G4 / G5 verdict; `plain` and
+`baseline` get no G3 / G4 / G5 verdict either.
 
 | Verdict | Arms | Passes iff | Section |
 |---|---|---|---|
@@ -84,11 +90,11 @@ Constants (`run_gate.py`): `ACC_TOL` 0.01, `MIN_JUDGED_GSM8K` 0.9,
 | `G2.caught_per_group` | negative self-tests | every sabotaged group caught in both gsm8k digest checks | Self-test arms |
 | `G3.gsm8k_warm`, `G3.replay_warm` | store arms | excess within one block per request, no load errors | G3 |
 | `G3.no_eviction` | store arms | no server eviction in any gsm8k / replay pass | G3 |
-| `G4.replay_warm.{ttft_p50,req_per_s}` | under test, `old`, self-tests | timed warm passes strictly better than baseline | G4 |
-| `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` | under test | reported, never fails (no `pass` key); judged | G4 |
-| `G4.replay_cold.{ttft_p50,req_per_s}` | as G4 warm | at most 2% worse than baseline | G4 |
-| `G4.gsm8k_{cold,warm}.seconds` | every gsm8k arm | wall time at most 2% worse than baseline | G4 |
-| `G4.warmup_seconds` | every arm | reported only | Passes |
+| `G4.replay_warm.{ttft_p50,req_per_s}` | store arms | timed warm passes strictly better than baseline | G4 |
+| `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` | arm under test only | reported, never fails (no `pass` key); judged | G4 |
+| `G4.replay_cold.{ttft_p50,req_per_s}` | store arms | at most 2% worse than baseline | G4 |
+| `G4.gsm8k_{cold,warm}.seconds` | store arms | wall time at most 2% worse than baseline | G4 |
+| `G4.warmup_seconds` | store arms | reported only | Passes |
 | `G5.replay_warm` | store arms | at `f = 0.5`: excess, load errors, refs, `G2.digest_self.cap`, pool and load proof | G5 verdicts |
 | `G5.curve` | store arms | same at the other fractions; never gated | G5 verdicts |
 
@@ -204,7 +210,8 @@ invariance (`VLLM_BATCH_INVARIANT=1` + FLASH_ATTN).
   episode (a resume after preemption opens one); `progress = [step,
   computed_after]` at key-token boundaries. `local_hit` = the value passed to
   `get_num_new_matched_tokens` at the last attempt before scheduling. Load
-  failures go to `load_errors.jsonl`.
+  failures go to `load_errors.jsonl`. `preempt_digested` lists the episodes
+  digested at their preemption (below).
 - Digest V3 at finish, for requests tagged `rsi_digest = full` (gsm8k all;
   replay `cold` / `warm` every 4th conversation; cap and preempt all): every
   fully computed block of every transferable group, per layer, on the raw
@@ -225,8 +232,8 @@ invariance (`VLLM_BATCH_INVARIANT=1` + FLASH_ATTN).
     computes from, so a sync load lands after it and is `mismatched`;
   - `requests.jsonl` `states` lists `[episode, covered, group, what]`; `what`
     other than `offer` / `start` is a skip (`not_offered`, `start_*`). Only
-    step ends exactly on a boundary are references. Any `start_*` fails the
-    digest verdict.
+    step ends exactly on a boundary are references. The digest verdict
+    reports the skips (`state_skipped`); any `start_*` fails it.
 - Preempted episodes: `handle_preemptions` digests the blocks a preempted
   episode left (references; its loads judged). A block vLLM reallocated and
   overwrote earlier that step (`new_block_ids_to_zero`, a COW destination) is
@@ -314,8 +321,9 @@ tokens each (`ignore_eos`), cold then warm, on a pool of `preempt_gpu_blocks`
 at the block count). Every request and preempted episode is digested. Passes
 iff the exhaustive digest verdict passes (as `G2.digest_self.cap`, judged
 `>= 0.9` for an arm), `preempted_requests > 0`, and a resumed episode's load
-was compared (`after_preemption`). Required for the honest self-test when run,
-and always on state-group models.
+was compared (`after_preemption`). Required for the honest self-test when run
+and, on state-group models, always (missing = fail); a negative arm is
+judged by the gsm8k digest checks.
 
 ### Split invariance
 
@@ -437,6 +445,12 @@ local))`.
 
 ## G4 Performance (hard)
 
+Every gated check is against the baseline arm of the same run; G4 vs
+`native` is reported and judged. Store arms get the vs-baseline checks
+(required only for the arm under test; `old`, `native`, `lmcache` record
+them); only the arm under test gets `*_vs_native`. Self-test arms, `plain`
+and `baseline` get no G4 verdict.
+
 Workload: multi-turn agent traces (user-provided "agentx" when available;
 until then R2EGym-SFT-Trajectories as growing multi-turn chat,
 `~/kexi/datasets/r2egym-256.jsonl`) plus gsm8k as a short-prefix workload.
@@ -447,7 +461,7 @@ p99 recorded, not gated.
 | Check | Rule |
 |---|---|
 | `G4.replay_warm.ttft_p50`, `.req_per_s` | `warm2..N` strictly better than baseline |
-| `..._vs_native` | reported, not gated: `warm2..N` vs in-run `native`'s `warm2..N`. Arm under test only; only native's timing is used. Missing or crashed native replay: `reason` set, run non-official |
+| `..._vs_native` | reported, not gated: `warm2..N` vs in-run `native`'s `warm2..N`. Arm under test only; only native's timing is used. `reason` set when native has no replay stage (missing or crashed: run non-official), when native's replay or the arm's has no timed warm pass with the key |
 | `G4.replay_cold.ttft_p50`, `.req_per_s` | at most 2% worse than baseline cold (bounds the save cost) |
 | `G4.gsm8k_{cold,warm}.seconds` | at most 2% worse than baseline (bounds per-step overhead) |
 | last accepted iteration | no > 5% regression (by hand) |
@@ -462,10 +476,12 @@ references stay baseline's (native fails `G0.spec` by construction).
 Each `*_vs_native` record holds both arms' pass values, medians and
 pass-to-pass ranges, `gap` (median - native median), `gap_pct` (of native's
 median; TTFT positive = slower, req/s negative = slower), `noise` (the larger
-range) and `within_noise` (`|gap| < noise`, a diagnostic).
+range) and `within_noise` (`|gap| <= noise`, a diagnostic); median, gap and
+noise are absent when either side has no timed warm pass with the key.
 `summary.native_report` (the `[gate] perf vs native (reported, not gated)`
-line) lists median, native median, `gap_pct`, `within_noise`, `void`,
-`reason` per arm.
+line) lists median, native median, `gap_pct`, `behind_pct` (positive = the
+arm is slower than native, for either metric), `within_noise`, `void`,
+`reason` per arm and key.
 
 Per accepted run, in `rsi-notes:models/<model>/ITERATIONS.md` next to the
 hit-rate judgment: the gap in %, attributed (load path, save path,
@@ -561,8 +577,9 @@ Per segment (`warm_timed` = `cap_warm2..N`, and per pass):
 
 - `G5.replay_warm` (f = 0.5) gates: excess within one block per request, no
   load errors, `unmatched_requests == 0`, `G2.digest_self.cap`, and for a
-  PegaFlow arm `pool_capacity_bytes <= C` and Σ `loaded_bytes >=` Σ
-  `external_hit_bytes` over `warm_timed` (`native` / `lmcache`: n/a).
+  PegaFlow arm `pool_capacity_bytes` present and `<= C` (an arm without the
+  pool metric fails) and Σ `loaded_bytes >=` Σ `external_hit_bytes` over
+  `warm_timed` (`native` / `lmcache`: n/a).
   Reported: `E_C` and its change vs the last accepted iteration, `U`, `C`,
   hit / oracle / oracle_C / LRU / freeze rates, eviction deltas, server I/O
   and resident / used bytes per pass, and for `H_lru` and the winner
@@ -645,7 +662,9 @@ mismatches, warm accuracy within `ACC_TOL`). Never use a wrong-KV number.
 
 The PR #4467 overlay is an unmodified source build of LMCache
 `e05c2ea9781b4021081f34dfb982189ec0fabc15` against the shared venv's torch
-(recipe: `rsi-notes:gates-evidence.md`).
+(recipe: `rsi-notes:gates-evidence.md`). Qwen3-4B's lmcache numbers thus
+come from an unmerged upstream PR: an open item for the user's final
+acceptance.
 
 ## Known server limits
 
@@ -703,7 +722,7 @@ instrument and nothing in-process can detect that. The gate bounds this:
 - Isolation: the arm's vLLM and server exec through `rsi/gates/isolate.py`
   in a private mount namespace: runs root under an empty tmpfs with only the
   current stage dir (rw), the snapshot (ro) and its bytecode cache bound
-  back; block devices and `/dev/{mem,kmem,port}` masked; `CAP_SYS_ADMIN` /
+  back (earlier stages and the gate dir stay hidden); block devices and `/dev/{mem,kmem,port}` masked; `CAP_SYS_ADMIN` /
   `CAP_SYS_PTRACE` / ... dropped from the bounding set. Host pid / IPC /
   network namespaces (CUDA IPC, loopback). `isolate.py` waits after
   `unshare` until the gate holds `/proc/<pid>/ns/mnt`. `summary.isolation`.
@@ -727,8 +746,8 @@ instrument and nothing in-process can detect that. The gate bounds this:
 - No plugins: every vLLM runs with `VLLM_PLUGINS=""`; arms name connectors
   by module path. Exception: `old` gets `VLLM_PLUGINS=pegaflow` (vLLM 0.32's
   API server rebuilds MultiConnector child stats by registered name; the
-  plugin comes from the venv and only registers names). A connector under
-  test that reports stats must register its class under its class name on
+  plugin comes from the venv and only registers names); the arm under test
+  never gets the plugin. A connector under test that reports stats must register its class under its class name on
   import, else requests fail with HTTP 500. `summary.vllm_plugins`.
 - Independent signal: completions are read client-side from
   `/v1/completions` and judged in the gate; what the gate writes is in
@@ -759,7 +778,10 @@ field with another value, still fails.
 - Ports: leased from 20000-29999 (`ip_local_reserved_ports`) under per-port
   `flock` files in `~/kexi/rsi-ports`, bind-checked; vLLM also gets 8
   contiguous ports as `VLLM_PORT`. EADDRINUSE before healthy fails the stage
-  with `PortRace` (ports, holders, lease files, log line), never retried.
+  with `PortRace`, never retried: it names the ports parsed from the failing
+  log lines plus any leased port another process holds once the stage
+  process is dead (no port found: "unknown"), whether the gate leased each,
+  the lease files and the failing line.
   Leases are released on every exit path; failed stages write
   `stage-error.json`; `summary.port_leases` lists all leases.
 - Stopping: `kill -TERM -<run_gate pgid>` (or `-INT`, `-HUP`; launched with

@@ -1,6 +1,6 @@
 ---
 name: pegaflow-new-model
-description: Onboard a new model to the PegaFlow vLLM connector in RSI mode (spec dump -> adapter/policy -> gates -> review). Use when adding support for a new model or KV layout, or when resuming the RSI effort in docs/rsi/.
+description: Onboard a new model to the PegaFlow vLLM connector in RSI mode (spec dump -> adapter/policy -> gates -> review). Use when adding support for a new model or KV layout, or when resuming the RSI effort (working memory on the rsi-notes branch, gates in docs/rsi/GATES.md).
 ---
 
 # PegaFlow new-model onboarding (RSI loop)
@@ -31,10 +31,12 @@ one line to `PROGRESS.md` on the `rsi-notes` branch.
   READMEs): no dated history, change logs, journals or review files. State
   a decision as a rule; its date and quote go to the notes' "Decisions".
 - Compaction (notes `README.md`): `PROGRESS.md` <= 300 lines, each
-  `ITERATIONS.md` <= 400. When over budget, and at every model acceptance,
-  rewrite instead of appending: current state first, each closed iteration
-  one table row (iteration, hypothesis, result, run tag, commit), dead ends
-  one line each, superseded numbers dropped.
+  `ITERATIONS.md` <= 400, `gates-evidence.md` <= 300. When over budget, and
+  at every model acceptance, rewrite instead of appending: current state
+  first, each closed iteration one table row (iteration, hypothesis, result,
+  run tag, commit), dead ends one line each, superseded numbers dropped. A
+  review file on the notes branch lives only until its findings are
+  resolved, then becomes one line in the model's `ITERATIONS.md`.
 
 ## 1. Isolation
 
@@ -161,9 +163,12 @@ Host and build:
   `bin` and `~/kexi/cuda13/bin` on `PATH`, `LD_LIBRARY_PATH=~/kexi/cuda13-lib`
   (unversioned symlinks to the venv's `nvidia/cu13/lib`): the system toolkit
   is 12.x, a cuda-13 server build aborts when `libcudart.so` resolves to
-  12.x, and FlashInfer JIT needs a 13.0 nvcc matching the 13.0 headers.
-- A tree for `--under-test-path` must hold no `.pyc` and carry `.rsi-rev`:
-  extract with `git archive <rev> | tar -x` (+ `echo <rev> > .rsi-rev`) or
+  12.x, and FlashInfer JIT needs a 13.0 nvcc matching the 13.0 headers
+  (`~/kexi/cuda13` comes from the venv wheels `nvidia-cuda-nvcc`,
+  `nvidia-cuda-crt` and `nvidia-nvvm`, pinned to 13.0.x).
+- A tree for `--under-test-path`, and the gate / feature tree the run
+  starts from, must hold no `.pyc` and carry `.rsi-rev` (else provenance is
+  unverified and the run not official): extract with `git archive <rev> | tar -x` (+ `echo <rev> > .rsi-rev`) or
   sync with `tar --exclude=__pycache__ --exclude='*.pyc'`; never import from
   it before the run.
 - vLLM 0.32 + flashinfer-python 0.7.0.post1: remove stale `flashinfer-cubin`
@@ -175,9 +180,10 @@ Host and build:
 - No `uv` / `ruff` on the local Mac: sync with `COPYFILE_DISABLE=1 tar czf -`
   (else `._*` files break ruff), run `uvx --index-url
   https://pypi.tuna.tsinghua.edu.cn/simple ruff format/check --config
-  python/pyproject.toml` remotely, tar the result back. Local stub-only
-  tests: `python3 -m venv /tmp/rsi-venv && /tmp/rsi-venv/bin/pip install
-  pytest ruff`.
+  python/pyproject.toml` remotely, tar the result back. Local tests without uv:
+  `python3 -m venv /tmp/rsi-venv && /tmp/rsi-venv/bin/pip install pytest
+  ruff`; that runs the stub cases only, the native cases need the remote
+  venv.
 - Long ssh commands: launch gate runs with `setsid nohup ... < /dev/null &`
   and poll the log instead of sleeping > 2 min in one call.
 - The local vLLM checkouts are not 0.32. Read the real source with
@@ -199,11 +205,12 @@ Gate reading:
   `uncertain`; that is expected.
 - Self-test signatures on Qwen3-4B: liar = all external blocks unreferenced
   in self and mismatched vs baseline, acc 0; bitflip = one mismatched block
-  per request, outputs only partly differ; offbyone = most external blocks
+  per request, outputs only partly differ (accuracy alone would miss it); offbyone = most external blocks
   mismatched, acc ~0.2.
 - Garbage KV produces garbage text: workload parsers must not crash on it
   (`float('1e999')`).
-- `rsi_poison` goes through `POST /collective_rpc`; kwargs arrive as strings.
+- `rsi_poison` goes through `POST /collective_rpc`; kwargs arrive as strings
+  over HTTP, so call methods without kwargs (or cast inside).
 - G4 is hard: beat baseline on warm replay (TTFT p50 and req/s) and cost at
   most 2% on cold replay and gsm8k. Read every `G4.*` verdict; the save
   path's cost shows in the cold and gsm8k checks. A 64-question gsm8k slice
@@ -246,14 +253,16 @@ Adapter and connector:
 - On short-prefix workloads the async load round trip, not the copy, is the
   cost (a warm gsm8k request waited ~7.6 steps for a ~1 ms load): read the
   probe's `episodes` vs first `progress` step before blaming saves. A sync
-  load fixes it, but vLLM only recovers failed sync loads via
-  `invalid_block_ids` with one KV cache group and no block zeroing. A failed
-  sync load has already fed the forward and the server keeps a key's first
+  load (`load_kv_async=False`, wait in `start_load_kv`) fixes it, but vLLM
+  only recovers failed sync loads via `invalid_block_ids` with one KV cache
+  group and no block zeroing. A failed sync load has already fed the forward and the server keeps a key's first
   copy: hold every save of a request touching sync-loaded blocks until vLLM
   processed that step's output (`max_concurrent_batches` plans), and after
-  any reported failure stop all saves for the process (tracking "tainted"
-  requests misses sharers and preempted loaders). Never give a sync load a
-  deadline: the server's copy may still land.
+  any reported failure stop all saves for the process: under the recompute
+  policy vLLM evicts nothing, so KV computed on the bad blocks stays
+  prefix-cached under correct hashes and any later request can extend it
+  (tracking "tainted" requests misses sharers and preempted loaders). Never
+  give a sync load a deadline: the server's copy may still land.
 
 PR:
 - PR CI must pass. Before reporting a branch done, run `./scripts/check.sh`
