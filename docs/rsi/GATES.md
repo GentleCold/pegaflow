@@ -96,10 +96,10 @@ growing context), plus gsm8k few-shot as a short-prefix workload.
 Metrics: TTFT p50/p99, end-to-end throughput (req/s, output tok/s), load and
 save bandwidth (GB/s), connector scheduler-side CPU time per step, GPU memory
 overhead. Compared against baseline vLLM (no PegaFlow), `native` (vLLM's
-OffloadingConnector; warm replay is gated against it) and the old connector.
+OffloadingConnector; warm replay is judged against it) and the old connector.
 
-Gate (hard): warm replay TTFT p50 and throughput must beat baseline vLLM and
-the `native` reference arm (vLLM's OffloadingConnector, same run; user,
+Gate (hard): warm replay TTFT p50 and throughput must beat baseline vLLM
+(vs the `native` reference arm: reported and judged, not gated; user,
 2026-10-26); cold replay and gsm8k may be at most 2% worse than baseline (see G4 under
 precise definitions); no >5% regression vs. last accepted iteration of the
 same model.
@@ -168,7 +168,7 @@ so such stranded bytes are possible today.
 - Reference arms: `old`, `native` (vLLM `OffloadingConnector` with exactly
   `C` CPU bytes) and `lmcache` (LMCache local CPU backend of exactly `C`
   bytes, 256-token chunks) record their G5 numbers and are never required.
-  Warm replay is gated against `native` since 2026-10-26 (G4 precise
+  Warm replay is judged against `native` since 2026-10-26 (G4 precise
   definitions); `E_C` is reported, not gated, against any reference.
 - lmcache store size. LMCache sizes its local CPU backend per worker
   process, not per instance. On an MLA model (DeepSeek-V2-Lite, TP2) only
@@ -495,7 +495,7 @@ stage is missing, crashed, or lacks one of the baseline's timed warm passes
 not a working store: any load error, warm-pass excess above
 `excess_limit`, or a timed warm pass with `E_ext <
 NATIVE_MIN_EFFICIENCY = 0.9` (a native that loads nothing times like
-baseline and would pass any arm that beats baseline). G4 vs native has no
+baseline, so the comparison would say nothing). G4 vs native has no
 reference then (`run_gate.g4_native_problems`). This is run validity
 judged from native's own replay data, not a gate on native: hit levels
 stay reported (2026-10-24). Native measured `E_ext = 1.0` on every timed
@@ -568,7 +568,7 @@ the last accepted run record by hand until `--accepted` exists.
   `OffloadingConnector` as `--kv-offloading-size` sets it up,
   `kv_connector_extra_config = {"cpu_bytes_to_use": B}`, no PegaFlow server,
   `B` = `--pool-size` bytes for gsm8k/replay and exactly `C` for `cap`;
-  G4 warm replay is gated against it, `E_C` only reported; OffloadingConnector
+  G4 warm replay is judged against it, `E_C` only reported; OffloadingConnector
   switches `kv_cache_layout` to `LBHNC`, so its `G0.spec` and
   `G2.digest_vs_baseline.gsm8k` fail by construction: layout, not data;
   `G2.digest_self.*` and `G2.gsm8k_outputs` are its correctness evidence),
@@ -1190,42 +1190,25 @@ the last accepted run record by hand until `--accepted` exists.
   measured on the baseline's trace, exceeds `--pool-size`;
   `summary.pool_checks` records each check.
 - G4 (hard since 2026-10-23, user: "性能需要达标才行，需要比基准快"; every
-  check is against the baseline arm on the same run unless it says native,
+  check is against the baseline arm on the same run,
   medians over the listed passes, `MAX_OVERHEAD = 0.02`):
   - `G4.replay_warm.ttft_p50` / `.req_per_s`: timed warm passes (warm2..N)
     strictly better than baseline's.
-  - `G4.replay_warm.ttft_p50_vs_native` / `.req_per_s_vs_native` (hard
-    since 2026-10-26): the same timed warm passes strictly better than the
-    in-run `native` arm's (vLLM's OffloadingConnector), by the same rule
-    as vs baseline (`_cmp` with slack 0: median of warm2..N vs median of
-    native's warm2..N, `<` for TTFT, `>` for req/s; a tie fails). User
-    decision, 2026-10-26 (human gate owner): G4's warm-gain checks also
-    compare against native, not only the no-offload baseline; the arm
-    under test's replay warm TTFT p50 and req/s must be no worse than
-    native's in the same run, as a strict hard check with no tolerance.
-    "No worse" is implemented with the warm-vs-baseline comparison
-    (strictly better), so equal medians fail. Applied to the connector
-    under test only, not to `old` / `native` / `lmcache` or the self-test
-    arms. Only native's timing is used: its own G0 / G2 failures (it fails
-    `G0.spec` by construction) do not disqualify it as a performance
-    reference. A missing or crashed native replay stage fails both checks
-    and makes the run non-official (Official run, above). Void (fail) when
-    the arm's `G2.digest_self.replay` fails, like every replay G4 check.
-    Noise (user, 2026-10-26): still 2 timed passes and no tolerance, but
-    a check whose |median gap| is below the larger of the two arms'
-    pass-to-pass ranges (max - min over warm2..N) is `inconclusive`
-    (`pass` null, neither pass nor fail; `|gap| == range` is decidable).
-    Each verdict records both arms' pass values, medians, ranges, the gap
-    and its status; summary `g4_inconclusive` lists them per arm. Process:
-    rerun once on the same rev; a decidable rerun's verdict counts. Still
-    inconclusive: a tie with native within noise, which does not block
-    acceptance and is listed in the acceptance entry for the user's final
-    pass.
-    Records made before this check (gate revs before 2026-10-26) are
-    re-judged with it like any other input the record has: native was an
-    optional arm, not an input the gate failed to produce, so S1's `na` does
-    not apply; a record without the native arm fails `*_vs_native`, and a
-    record keeps the verdict of the gate rev it ran under (S1).
+  - `G4.replay_warm.ttft_p50_vs_native` / `.req_per_s_vs_native`
+    (reported, not gated; user, 2026-10-26: "不一定和native保持一致，差不多就行了"):
+    the arm under test's timed warm passes vs the in-run `native` arm's
+    (vLLM's OffloadingConnector). Each records both arms' pass values,
+    medians and pass-to-pass ranges, the gap and gap % (of native's
+    median), `noise` (the larger range) and `within_noise` (|gap| < noise,
+    a diagnostic); `summary.native_report` lists them. The onboarding agent
+    writes a "perf vs native judgment" next to the hit-rate judgment: the
+    gap in %, attributed (load path, save path, scheduling, server), and
+    whether it is close enough; the review agent checks it. No numeric
+    threshold: a gap within run noise or a few percent is close; a large
+    gap (Qwen3.5 it2 warm TTFT +72%) needs attribution and a hypothesis
+    before acceptance. Native must still exist and work (Official run,
+    above); only its timing is used (its own G0 / G2 failures do not
+    matter). Marked `void` when the arm's `G2.digest_self.replay` fails.
     Why the overhead checks below stay against baseline: they bound what
     the connector costs when it has nothing to load (cold replay: vLLM's
     own prefix cache serves the earlier turns; gsm8k: the few-shot prefix
@@ -1233,7 +1216,7 @@ the last accepted run record by hand until `--accepted` exists.
     without any connector. Native is another offloading store with its own
     save cost, so "within 2% of native" would let the two costs add up;
     the warm checks are where an offloading store competes, so native is
-    added there. G2 correctness references likewise stay baseline's (native
+    compared there. G2 correctness references likewise stay baseline's (native
     is not a byte-identity reference: it fails `G0.spec`).
   - `G4.replay_cold.ttft_p50` / `.req_per_s`: cold pass at most 2% worse than
     baseline's cold (nothing to load yet; vLLM's own prefix cache serves the

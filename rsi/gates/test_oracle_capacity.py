@@ -1915,81 +1915,53 @@ NATIVE_KEYS = ("G4.replay_warm.ttft_p50_vs_native", "G4.replay_warm.req_per_s_vs
 
 
 @pytest.mark.parametrize(
-    "mine,native,ok",
+    "mine,native,gap_pct,within",
     [
-        ((0.2, 9.0), (0.3, 8.0), (True, True)),
-        ((0.3, 9.0), (0.172, 8.0), (False, True)),  # Qwen3.5 it2: v2 0.300 s vs native 0.172 s
-        ((0.2, 8.0), (0.3, 9.0), (True, False)),
-        ((0.3, 8.0), (0.3, 8.0), (False, False)),  # a tie is not "no worse": strict, as vs baseline
-        ((0.2, 9.0), None, (False, False)),  # no native replay: fail closed
+        # Qwen3-4B it7: TTFT 2.1 ms behind, inside v2's 25.2 ms warm2-warm3
+        # range; req/s 0.287 ahead, outside both ranges (0.028, 0.135).
+        (((0.5514, 0.5766), (9.6597, 9.6319)), ((0.5612, 0.5626), (9.2913, 9.4260)), (0.37, 3.07), (True, False)),
+        # DSV2 it7: TTFT inside native's 24 ms range; req/s 5.6% behind.
+        (((0.2957, 0.3035), (12.4927, 12.1985)), ((0.2799, 0.3039), (13.0061, 13.1634)), (2.64, -5.65), (True, False)),
+        # Qwen3.5 it2: TTFT +72% (0.300 s vs 0.172 s), reported, never a fail.
+        (((0.2996, 0.2952), (14.6105, 14.6551)), ((0.1745, 0.1712), (13.1495, 13.1609)), (72.06, 11.23), (False, False)),
+        # |gap| == the larger range is outside noise (exact binary fractions).
+        (((0.5, 1.0), (2.0, 3.0)), ((0.25, 0.25), (1.5, 1.5)), (200.0, 66.67), (False, False)),
+        (((0.3, 0.3), (8.0, 8.0)), ((0.3, 0.3), (8.0, 8.0)), (0.0, 0.0), (False, False)),  # tie, range 0
     ],
-    ids=["wins", "ttft-worse", "req-s-worse", "tie", "native-missing"],
-)
-def test_g4_warm_replay_vs_native(tmp_path, mine, native, ok):
-    """User, 2026-10-26: the arm under test's timed warm replay TTFT p50 and
-    req/s must beat the in-run native arm's, by the warm-vs-baseline rule
-    (medians over warm2..N, slack 0). Native's own G0 / G2 do not matter."""
-    base = {"replay": _replay(5.0, 1.0)}
-    results = {"baseline": base, "pegaflow.m:C": {"replay": _replay(*mine)}}
-    if native:
-        results["native"] = {"replay": _replay(*native) | {"digest_self": None}}
+    ids=["qwen3-4b-it7", "dsv2-it7", "qwen35-it2", "gap-equals-range", "tie"],
+)  # fmt: skip
+def test_g4_vs_native_reported(tmp_path, mine, native, gap_pct, within):
+    """User, 2026-10-26: v2 vs native on G4 warm is a judged comparison
+    ("差不多就行了"), not a gate. ``*_vs_native`` is ``reported`` (no ``pass``
+    key) and carries what the perf vs native judgment needs: per-arm pass
+    values, medians, ranges, gap, gap %, noise, ``within_noise``. Native's
+    own G0 / G2 do not matter; G4 vs baseline stays hard."""
+    results = {"baseline": {"replay": _replay(5.0, 1.0)}}
+    results |= {"pegaflow.m:C": {"replay": _replay(*mine)}}
+    results |= {"native": {"replay": _replay(*native) | {"digest_self": None}}}
     v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
     g = v["pegaflow.m:C"]
-    assert (g[NATIVE_KEYS[0]]["pass"], g[NATIVE_KEYS[1]]["pass"]) == ok
+    assert not v["native"]["G2.digest_self.replay"]["pass"]  # its KV verdicts fail ...
+    for k, lo, hi, pct, w in zip(NATIVE_KEYS, mine, native, gap_pct, within, strict=True):
+        x = g[k]  # ... its timing still counts
+        assert x["status"] == "reported" and "pass" not in x and "void" not in x
+        assert (x["value"], x["native"]) == (list(lo), list(hi))
+        assert x["range"] == max(lo) - min(lo) and x["native_range"] == max(hi) - min(hi)
+        assert x["gap"] == x["median"] - x["native_median"]
+        assert x["noise"] == max(x["range"], x["native_range"])
+        assert x["gap_pct"] == pytest.approx(pct, abs=0.01) and x["within_noise"] is w
     assert g["G4.replay_warm.ttft_p50"]["pass"] and g["G4.replay_warm.req_per_s"]["pass"]
-    if native:
-        assert not v["native"]["G2.digest_self.replay"]["pass"]  # its KV verdicts fail ...
-        assert g[NATIVE_KEYS[0]]["native"] == [native[0]] * 2  # ... its timing still counts
-    # Void like every replay G4 check when the arm's replay KV is wrong.
-    results["pegaflow.m:C"]["replay"]["digest_self"] = None
-    v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
-    assert not any(v["pegaflow.m:C"][k]["pass"] for k in NATIVE_KEYS)
-
-
-@pytest.mark.parametrize(
-    "mine,native,status",
-    [
-        # Qwen3-4B it7: TTFT gap 2.1 ms < v2's own 25.2 ms warm2-warm3 range;
-        # req/s gap 0.287 > both ranges (0.028, 0.135).
-        (
-            ((0.5514, 0.5766), (9.6597, 9.6319)),
-            ((0.5612, 0.5626), (9.2913, 9.4260)),
-            ("inconclusive", "pass"),
-        ),
-        # DSV2 it7: TTFT gap 7.7 ms < native's 24 ms range; req/s 0.739 behind.
-        (
-            ((0.2957, 0.3035), (12.4927, 12.1985)),
-            ((0.2799, 0.3039), (13.0061, 13.1634)),
-            ("inconclusive", "fail"),
-        ),
-        # |gap| == the larger range is decidable (exact binary fractions).
-        (((0.5, 1.0), (2.0, 3.0)), ((0.25, 0.25), (1.5, 1.5)), ("fail", "pass")),
-        (((0.25, 0.25), (1.5, 1.5)), ((0.5, 1.0), (2.0, 3.0)), ("pass", "fail")),
-    ],
-    ids=["qwen3-4b-it7", "dsv2-it7", "boundary-a", "boundary-b"],
-)
-def test_g4_vs_native_noise(tmp_path, mine, native, status):
-    """User, 2026-10-26 (option B): |median gap| below the larger pass-to-pass
-    range of the two arms is ``inconclusive``: neither pass nor fail, so it
-    does not fail the arm but is listed; otherwise strict pass / fail."""
-    results = {"baseline": {"replay": _replay(5.0, 1.0)}}
-    results |= {"pegaflow.m:C": {"replay": _replay(*mine)}, "native": {"replay": _replay(*native)}}
-    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
-    assert tuple(g[k]["status"] for k in NATIVE_KEYS) == status
-    flagged = [k for k, s in zip(NATIVE_KEYS, status, strict=True) if s == "inconclusive"]
-    assert g["inconclusive"] == flagged
-    for k, lo, hi in zip(NATIVE_KEYS, mine, native, strict=True):
-        v = g[k]  # self-explanatory: per-arm pass values, ranges, gap
-        assert (v["value"], v["native"]) == (list(lo), list(hi))
-        assert v["range"] == max(lo) - min(lo) and v["native_range"] == max(hi) - min(hi)
-        assert v["gap"] == v["median"] - v["native_median"]
-        assert v["noise"] == max(v["range"], v["native_range"])
-    # Inconclusive does not block; a decidable fail does.
-    assert run_gate._all_pass({k: g[k] for k in NATIVE_KEYS}) == ("fail" not in status)
-    # A void replay stays a fail, never inconclusive.
+    rep = run_gate.native_report(v)["pegaflow.m:C"][NATIVE_KEYS[0]]
+    assert rep["gap_pct"] == g[NATIVE_KEYS[0]]["gap_pct"]
+    # A wrong-KV replay marks the comparison void (the arm fails on G2 / G4 vs baseline).
     results["pegaflow.m:C"]["replay"]["digest_self"] = None
     g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
-    assert [g[k]["status"] for k in NATIVE_KEYS] == ["fail", "fail"] and not g["inconclusive"]
+    assert all("void" in g[k] and "pass" not in g[k] for k in NATIVE_KEYS)
+    # No native replay: reported with the reason (the run is not official).
+    del results["native"]
+    results["pegaflow.m:C"]["replay"] = _replay(*mine)
+    g = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")["pegaflow.m:C"]
+    assert all(g[k]["reason"] and "gap" not in g[k] and "pass" not in g[k] for k in NATIVE_KEYS)
 
 
 def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
@@ -2000,7 +1972,7 @@ def test_g4_vs_native_only_for_the_arm_under_test(tmp_path):
     v = run_gate.verdicts(results, tmp_path, tmp_path / "spec.json")
     for label in ("native", "old", "lmcache", "selftest-honest"):
         assert not any(k in v[label] for k in NATIVE_KEYS), label
-    assert all(k in v["pegaflow.m:C"] and not v["pegaflow.m:C"][k]["pass"] for k in NATIVE_KEYS)
+    assert all(v["pegaflow.m:C"][k]["status"] == "reported" for k in NATIVE_KEYS)
 
 
 ARMS_N = ["plain", "baseline", "native", "pegaflow.m:C"]

@@ -112,8 +112,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
      (semantics, human-reviewed) or a server change (separate PR) instead.
 6. **Review**: spawn an independent review agent (fresh context) with the diff,
    gate summary, and isolation list. It checks: correctness of semantics changes,
-   gate integrity (nothing relaxed), the hit-rate judgment (numbers against
-   `summary.hit_report`, gaps explained), copying from the old connector, regressions
+   gate integrity (nothing relaxed), the hit-rate and perf vs native
+   judgments (numbers against `summary.hit_report` / `native_report`, gaps
+   explained), copying from the old connector, regressions
    on earlier models, the policy complexity rules above (grep `policy.py`
    for model / spec class names, count knobs and lines, unused knobs), and
    that the connector does not touch the probe (no instrument or run-artifact
@@ -126,7 +127,7 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    the arm under test (v2), `old`, `native` and `lmcache` (or "not
    comparable" with the GATES.md reason). The G4 table shows the warm
    replay TTFT p50 and req/s of v2 next to both of its references,
-   `baseline` and `native`, with the `*_vs_native` verdicts. Do not wait for the user: the review agent's
+   `baseline` and `native`, with the perf vs native judgment. Do not wait for the user: the review agent's
    pass is the acceptance; the user does one acceptance pass at the end.
 
 ## 3. Lessons (append)
@@ -213,19 +214,16 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   beats baseline vLLM on warm replay (TTFT p50 and req/s) and costs at most 2%
   on cold replay and gsm8k. Read every `G4.*` verdict, not only warm TTFT;
   the save path's cost shows up in the cold and gsm8k checks.
-- G4 warm also has to beat `native` (user, 2026-10-26):
-  `G4.replay_warm.{ttft_p50,req_per_s}_vs_native`, strict, medians of
-  warm2..N in the same run. Beating the no-offload baseline is not enough:
-  vLLM's own OffloadingConnector already beats it by a wide margin (Qwen3.5-4B
-  P5 it2: native warm TTFT p50 0.172 s vs v2 0.300 s vs baseline 1.12 s).
-  When a `*_vs_native` check fails, compare v2's and native's load path
-  first (sync vs async load, load round trip in steps, per-request load
-  size) before touching policy. The overhead checks stay vs baseline.
-  An `inconclusive` `*_vs_native` (|gap| below either arm's warm2-warm3
-  range; summary `g4_inconclusive`) is not a fail: rerun the gate once on
-  the same rev and use that verdict. Inconclusive twice is a tie with
-  native within noise: it does not block acceptance; list it in the
-  acceptance entry for the user's final pass.
+- G4 warm vs `native` is judged, not gated (user, 2026-10-26: "差不多就行了"):
+  `G4.replay_warm.{ttft_p50,req_per_s}_vs_native` are `reported`
+  (`summary.native_report`). Write a "perf vs native judgment" next to the
+  hit-rate judgment: gap in %, attributed (load path, save path,
+  scheduling, server), and whether it is close enough; the review agent
+  checks it. No threshold: within run noise (`within_noise`) or a few
+  percent is close; a large gap (Qwen3.5 it2 warm TTFT +72%, 0.300 s vs
+  0.172 s) needs attribution and a hypothesis before acceptance (compare
+  v2's and native's load path first: sync vs async load, load round trip
+  in steps, per-request load size). The overhead checks stay vs baseline.
   A native replay that loads nothing (load errors, timed-pass `E_ext <
   0.9`) makes the run non-official: fix the native arm's setup or have the
   gate owner list the model as "no working native" in GATES.md.
