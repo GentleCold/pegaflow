@@ -890,7 +890,7 @@ def test_sync_load_demotion(policy, script, stats):
         else:
             r = reqs.pop(args[0], None) or req(args[0])
             reqs[args[0]] = r
-            num_computed = {"long": 0, "bad-alloc": args[1]}.get(op, 4)
+            num_computed = {"long": 0}.get(op, args[1] if op == "bad-alloc" else 4)
             n, is_async = sched.get_num_new_matched_tokens(r, num_computed)
             n += 4 * (op == "bad-alloc")
             sched.update_state_after_alloc(r, ([10, 11, 12, 13],), n)
