@@ -1504,6 +1504,85 @@ On TP1 e985938, part 1 gives 0.29 s and part 1 + demote gives 0.05 s, with
   - Then TP1 replay + full gsm8k, `qwen3-4b-p5-h5-tp1-{...}`.
   - Each run includes native.
 
+### H5 review: REJECT as committed, fixed in daa5e11 (2026-10-26)
+
+- **Review of b8501b2.** Part 1 (sync loads first) was accepted. Part 2 was
+  rejected:
+  - every async load re-armed the step window, demoted ones included, so
+    one long load followed by one short hit per step demoted 6 of 6 (M1);
+  - one step is too short a window for a copy that can take several (M2).
+- **Fix (daa5e11, new commit).**
+  - A short hit is demoted only while a long, non-demoted async load from
+    an earlier step is in flight, until vLLM reports it done or the request
+    finishes. There is no step counting.
+  - The demotion sits behind the `async_demote` knob, off by default and
+    pending gate evidence (5/12 knobs).
+  - The per-request INFO line became hit stats: `sync_planned`,
+    `sync_demoted`, `max_demoted_run`, `demoted_done`, `demoted_ms` /
+    `demoted_steps` (sum and max), and `deferred_demoted(_ms)` for sharers
+    deferred behind a demoted load.
+  - New save stats: `load_steps`, `load_issue_ms` and `max_load_issue_ms`,
+    covering all of `start_load_kv`.
+  - All 15 mutants are killed, the review's 6 included. New cases: the M1
+    cascade, a failed demoted load, an abort, a preempted reload, failed
+    plans, and a deferred sharer.
+- **Gate arms (S1).**
+  - `exp/rsi-qwen35-h5-stats` cf67695: stats only, plan order.
+  - daa5e11: plus ordering (part 1).
+  - `exp/rsi-qwen35-h5-demote` 0f63123: plus `async_demote = true`, held
+    until the re-review passes.
+  - The b8501b2 gate jobs were dropped.
+
+### H5 TP2 pair: 02b6767 vs 7bc785a (part 1), Qwen3-4B TP2, native in each run
+
+The runs are `2026-10-26-qwen3-4b-p5-h5-tp2-{02b6767,7bc785a}`. They come
+from separate sessions, so they are compared only through ratios to their
+own native.
+
+| warm pass | 02b6767 v2 / native | 7bc785a v2 / native |
+|---|---|---|
+| TTFT p50 warm2 | 0.1454 / 0.1776 = 0.82 | 0.1498 / 0.1610 = 0.93 |
+| TTFT p50 warm3 | 0.1509 / 0.1635 = 0.92 | 0.1554 / 0.1706 = 0.91 |
+| req/s warm2 | 18.70 / 18.89 = 0.990 | 18.66 / 19.35 = 0.964 |
+| req/s warm3 | 18.70 / 19.25 = 0.972 | 18.55 / 19.16 = 0.968 |
+| gate G4 TTFT p50 (median) | -13.1% | -8.0% |
+| gate G4 req/s (median) | -1.9% | -3.4% |
+| ms/step warm | 20.11 / 18.87 (+1.24) | 19.87 / 18.90 (+0.97) |
+| ms/step warm2 | 17.18 / 16.39 (+0.79) | 17.28 / 15.97 (+1.31) |
+| ms/step warm3 | 17.25 / 16.13 (+1.12) | 17.23 / 16.13 (+1.10) |
+| ITL 25-50 ms share, warm2/3 | 8.2/7.4% vs 5.1/4.6% | 9.4/8.0% vs 3.7/4.4% |
+
+Hit rates are identical in both runs: v2 0.9983, local 0.8641, ext 0.9872;
+native 0.9984.
+
+The sync stall measured with part 1 (7bc785a, tp0 save-stats windows,
+apportioned to passes by time):
+
+| pass | sync loads | reordered steps | sync_wait | per step | max one step |
+|---|---|---|---|---|---|
+| warm | ~67 | ~18 | ~188 ms | 0.29 ms | 83 ms |
+| warm2 | ~78 | ~13 | ~115 ms | 0.17 ms | 114 ms |
+| warm3 | ~50 | ~8 | ~213 ms | 0.39 ms | 114 ms |
+
+- **Part 1 did not measurably move step time.** The warm2/3 excess over
+  native is +0.96 ms with 02b6767 and +1.21 ms with 7bc785a. The
+  run-to-run spread of the same arm is ±0.3 ms, so this is noise. The
+  req/s ratio stays 3-4% behind.
+- **What is left of the 1.05 ms.**
+  - The sync wait is now measured at 0.17-0.39 ms/step, at most about a
+    third of the gap. The serial-loader model overestimated it (0.43/0.69
+    s per pass for part 1, measured ~0.12/0.21 s).
+  - The wait is concentrated in a few steps: the max per step is 114 ms,
+    from a sync load queued behind long loads of earlier steps. That is
+    what demotion targets; part 1 cannot reach it.
+  - The remaining ~0.7-0.9 ms/step is not the sync wait. It matches the
+    loader-busy overlap (cross-context copies, 0.4-0.7 ms of step per ms
+    busy; PROGRESS "Server limitations"). That is a server limit, plus run
+    noise.
+- **02b6767 has no sync counters,** so a before/after sync_wait is
+  impossible here. The TP1 pair cf67695 (stats) vs daa5e11 (part 1) gives
+  it in one session.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
