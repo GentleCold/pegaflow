@@ -2459,11 +2459,11 @@ def test_controls_record_is_bound_to_model_and_tp(tmp_path, key, args, problem):
     assert bad and problem in bad, bad
 
 
-# Records measured before the fingerprint hashed the control glue and
-# ``identity``: stale until the next plain run of that model and TP replaces
-# them (official runs there need the plain arm until then). Drop an entry
-# with its refresh; an entry that is current fails, so the list cannot rot.
-_AWAITING_REFRESH = {("Qwen3-4B", "tp1")}
+# (model, tp) records a fingerprint change made stale (``identity`` missing):
+# stale until the next plain run of that model and TP replaces them (official
+# runs there need the plain arm until then). Drop an entry with its refresh;
+# an entry that is current fails, so the list cannot rot.
+_AWAITING_REFRESH: set[tuple[str, str]] = set()
 
 
 def test_committed_controls_records_are_current(monkeypatch):
