@@ -863,10 +863,11 @@ def test_unique_estimate_counts_only_saved_checkpoints():
         # H*_C); 65 hold 1.5 x (simulated freeze 0.60, H_lru 0.85).
         pytest.param("Qwen3-4B/spec-tp2.json", 4756, 65, id="qwen3-tp2"),
         pytest.param("Qwen3-4B/spec-tp2.json", 0, 32, id="no-turns"),
-        # DeepSeek-V2-Lite TP2 (MLA, one 16-token group, 6074 blocks in the
-        # recorded cap probe; cap_cold mean 4980): 32 workers already hold
-        # 1.64 x GPU KV, the rule gives 30 and the floor keeps 32.
-        pytest.param({"kv_cache_config": {"num_blocks": 6074, "groups": [{"spec": {"block_size": 16}}]}}, 4980, 32, id="dsv2-lite-tp2"),
+        # DeepSeek-V2-Lite TP2 (MLA, one 16-token group; num_blocks of its
+        # committed spec-tp2 dump on feat/rsi-deepseek-v2-lite; cap_cold
+        # mean 4980): 32 workers already hold 1.6 x GPU KV, the rule gives
+        # 31 and the floor keeps 32.
+        pytest.param({"kv_cache_config": {"num_blocks": 6226, "groups": [{"spec": {"block_size": 16}}]}}, 4980, 32, id="dsv2-lite-tp2"),
     ],
 )  # fmt: skip
 def test_cap_workers_oversubscribe_gpu_kv(spec, mean, workers):
@@ -2168,12 +2169,15 @@ _PASSED = {
 }  # fmt: skip
 
 
+_FILES = dict.fromkeys(run_gate.CONTROL_FILES_REQUIRED, "0" * 64)
+
+
 def _controls_gate(tmp_path, gate: dict, tp: int = 1, rec: dict | None = None, **edit) -> dict:
     """``gate`` with a passing full-set controls record for ``tp`` measured
     at the current inputs, ``rec`` merged into the record, then ``edit``
     applied to the gate (a setting changed after)."""
     inputs = run_gate.control_inputs(gate, _slim_args(tmp_path, tp=tp))
-    full = {"run": "r", "rev": "abc", "gsm8k_limit": 0, "verdicts": _PASSED, "inputs": inputs}
+    full = {"run": "r", "tag": "t", "rev": "abc", "gsm8k_limit": 0, "files": _FILES, "verdicts": _PASSED, "inputs": inputs}  # fmt: skip
     return gate | {"controls": {f"tp{tp}": full | (rec or {})}} | edit
 
 
@@ -2209,6 +2213,16 @@ _REC = "onboarding controls for --tp 1 (gate.json, run r)"
         (_SLIM, (_GATE, {"verdicts": _PASSED | {"G2.plain_equals_baseline": {"pass": True, "differ": 2}}}), 1, f"{_REC}: recorded verdicts do not hold: G2.plain_equals_baseline differs"),
         (_SLIM, (_GATE, {}, {"batch_invariant": False}), 1, f"{_REC} are stale: settings.batch_invariant"),
         (_SLIM, (_GATE, {"inputs_recomputed": ""}), 1, f"{_REC}: inputs_recomputed must say why"),
+        (_SLIM, (_GATE, {"verdicts": _PASSED | {"G2.split_control": _PASSED["G2.split_control"] | {"n": "1319"}}}), 1, f"{_REC}: recorded verdicts do not hold: G2.split_control n='1319' is not int"),
+        (_SLIM, (_GATE, {"verdicts": _PASSED | {"G2.batch_control": _PASSED["G2.batch_control"] | {"prewarmed": None}}}), 1, f"{_REC}: recorded verdicts do not hold: G2.batch_control prewarmed=None is not int"),
+        (_SLIM, (_GATE, {"verdicts": _PASSED | {"G2.batch_control": _PASSED["G2.batch_control"] | {"n": 64.0}}}), 1, f"{_REC}: recorded verdicts do not hold: G2.batch_control n=64.0 is not int"),
+        (_SLIM, (_GATE, {"verdicts": _PASSED | {"G2.plain_equals_baseline": {"pass": True, "differ": 0, "logprob_differ": "0"}}}), 1, f"{_REC}: recorded verdicts do not hold: G2.plain_equals_baseline logprob_differ='0' is not int"),
+        (_SLIM, (_GATE, {"verdicts": ["G2.split_control"]}), 1, f"{_REC} record no passing"),
+        (_SLIM, (_GATE, {"inputs": ["x"]}), 1, f"{_REC} are stale: identity.model"),
+        (_SLIM, (_GATE, {}, {"controls": {"tp1": "r"}}), 1, "onboarding controls for --tp 1 not recorded"),
+        (_SLIM, (_GATE, {"tag": None}), 1, f"{_REC} name no tag"),
+        (_SLIM, (_GATE, {"files": {}}), 1, f"{_REC} hash no .gate/plain/gsm8k/cold-outputs.json, .gate/baseline/gsm8k/cold-outputs.json"),
+        (_SLIM, (_GATE, {"files": _FILES | {"x": "abc"}}), 1, f"{_REC}: files x are not sha256 hex"),
         (["native", "pegaflow.m:C"], (_GATE, {}), 1, "arm baseline missing"),
         (["baseline", "pegaflow.m:C"], (_GATE, {}), 1, "arm native missing"),
         (["baseline", "native"], (_GATE, {}), 1, "arm under_test missing"),
@@ -2217,7 +2231,9 @@ _REC = "onboarding controls for --tp 1 (gate.json, run r)"
          "other-tp-record", "stale-vllm-args", "no-run", "no-rev", "failed-verdict",
          "na-verdict", "no-verdicts", "subset-record", "no-limit", "false-limit", "float-limit",
          "pasted-verdicts", "verdict-contradicts-claim", "verdict-not-prewarmed", "verdict-differs",
-         "claim-changed-after", "recomputed-without-why",
+         "claim-changed-after", "recomputed-without-why", "str-count", "null-count", "float-count",
+         "str-logprob-differ", "verdicts-not-dict", "inputs-not-dict", "record-not-dict", "no-tag",
+         "no-files", "bad-hash",
          "no-baseline", "no-native", "no-arm-under-test"],
 )  # fmt: skip
 def test_official_arm_set(tmp_path, arms, gate, tp, problem):
@@ -2373,15 +2389,55 @@ def test_controls_record_only_from_clean_passing_full_set_runs(tmp_path, v, plai
     override), full-set run with the plain arm whose three controls passed;
     it carries run, rev, limit, the verdicts and the inputs, and a record
     pasted from it is accepted. Otherwise it is None with the reason."""
-    args = _slim_args(tmp_path, gsm8k_limit=limit)
-    rec, got = run_gate.controls_record(_GATE, args, "run-x", "abc", v, plain, unclean)
+    args = _slim_args(tmp_path, gsm8k_limit=limit, tag="t")
+    run_dir = tmp_path / "run-x"
+    for label in ("plain", "baseline"):
+        d = run_dir / run_gate.GATE_DIR / label / "gsm8k"
+        d.mkdir(parents=True)
+        (d / "cold-outputs.json").write_text(json.dumps([label]))
+    rec, got = run_gate.controls_record(_GATE, args, run_dir, "abc", v, plain, unclean)
     if why is None:
         assert got is None and rec["verdicts"] == v["baseline"], got
-        assert (rec["run"], rec["rev"], rec["gsm8k_limit"]) == ("run-x", "abc", 0)
+        assert (rec["run"], rec["tag"], rec["rev"], rec["gsm8k_limit"]) == ("run-x", "t", "abc", 0)
+        assert sorted(rec["files"]) == sorted(run_gate.CONTROL_FILES_REQUIRED)
         gate = _GATE | {"controls": {"tp1": rec}}
         assert run_gate.controls_problem(json.loads(json.dumps(gate)), args) is None
     else:
         assert rec is None and why in got, got
+
+
+def test_controls_record_rechecks_on_its_run(tmp_path):
+    """``recheck_controls_record`` (the reviewer's check on the host): a
+    record made from a run dir rechecks clean there; an edited output file,
+    an edited verdict or another run's record does not."""
+    run_dir = tmp_path / "2026-10-27-t"
+    passes = {"plain": {"cold": ["a", "b"], "split_ref": ["a", "b"], "split": ["a", "b"]}, "baseline": {"cold": ["a", "b"]}}  # fmt: skip
+    for label, files in passes.items():
+        d = run_dir / run_gate.GATE_DIR / label / "gsm8k"
+        d.mkdir(parents=True)
+        for name, outs in files.items():
+            (d / f"{name}-outputs.json").write_text(json.dumps(outs))
+            if label == "plain" and name != "cold":
+                (d / f"{name}-tokens.json").write_text(json.dumps([{"prompt_tokens": 33, "cached": 32}] * 2))  # fmt: skip
+    results = {"plain": {"gsm8k": {"passes": {}}}, "baseline": {"gsm8k": {}}}
+    gate = {"batch_invariant": True}
+    summary = {"tag": "t", "rev": "abc", "results": results, "gate": gate}
+    (run_dir / "summary.json").write_text(json.dumps(summary))
+    rec = {
+        "run": run_dir.name,
+        "tag": "t",
+        "rev": "abc",
+        "files": run_gate.control_files(run_dir),
+        "verdicts": json.loads(json.dumps(run_gate.control_verdicts(results, run_dir, gate))),
+    }
+    assert rec["verdicts"]["G2.split_control"]["n"] == 2
+    assert run_gate.recheck_controls_record(run_dir, rec) == []
+    assert run_gate.recheck_controls_record(run_dir, rec | {"rev": "def"}) == ["rev: record 'def', run 'abc'"]  # fmt: skip
+    forged = rec | {"verdicts": rec["verdicts"] | {"G2.split_control": rec["verdicts"]["G2.split_control"] | {"n": 1319}}}  # fmt: skip
+    assert run_gate.recheck_controls_record(run_dir, forged) == ["verdicts.G2.split_control differ from control_verdicts on the run dir"]  # fmt: skip
+    (run_dir / run_gate.GATE_DIR / "plain/gsm8k/split-outputs.json").write_text(json.dumps(["a", "c"]))  # fmt: skip
+    bad = run_gate.recheck_controls_record(run_dir, rec)
+    assert bad[0].startswith("files..gate/plain/gsm8k/split-outputs.json: record ") and len(bad) == 2, bad  # fmt: skip
 
 
 @pytest.mark.parametrize(

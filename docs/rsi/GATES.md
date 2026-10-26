@@ -342,27 +342,43 @@ pasteable record. Any other run writes None there and the reason in
 `summary.controls_record_withheld`. The record goes into gate.json
 `controls["tp<N>"]` unchanged:
 
-- `run` (run dir name) and `rev` (gate rev);
+- `run` (run dir name), `tag` (`--tag`) and `rev` (gate rev);
+- `files`: sha256 of every file the control verdicts may read, by path in
+  the run dir (`control_files`): the plain and baseline
+  `.gate/<label>/gsm8k/*-outputs.json` and `*-tokens.json`, and the baseline
+  gsm8k spec dump (hit alignment). Both cold outputs must be named;
 - `gsm8k_limit`: always 0. A record is full-set because official runs are
   full-set: the split control judges every prompt whose warm pass the
   official run judges, and a subset leaves the rest unmeasured;
 - `verdicts`: the three control verdicts, each a measured pass (`na` is not
-  one) with its counts (`CONTROL_MEASURED`);
+  one) with its counts, typed (`CONTROL_MEASURED`: counts are ints, claims
+  bools);
 - `inputs` = `control_inputs` of that run.
 
 A run without `plain` reports the three `na`. It is official only if the
-record of `--tp` names a run and rev, holds three passing verdicts, has
+record of `--tp` names a run, tag and rev, hashes its files, holds three
+passing verdicts, has
 `gsm8k_limit` exactly the integer 0, its verdicts hold when re-judged, and
 its `inputs` equal this run's `control_inputs`
-(`run_gate.controls_problem`). Re-judged: each verdict carries its counts,
+(`run_gate.controls_problem`). Re-judged: each verdict carries its counts
+with the right types (a malformed value is a problem, not a crash),
 plain equals baseline with 0 differing, the split and batch controls
 measured gate.json's current `split_invariant` / `batch_invariant` claims
 and found them, pre-warmed at least `MIN_PREWARMED` of a non-empty set, the
 split reference equals cold, and the batch control compared
-`BATCH_CONTROL_N`. A pasted `{"pass": true}` is rejected. The verdicts are
-not sealed to the run: a forged but self-consistent record passes these
-checks, and the reviewer compares it with the run's `summary.json`. Any
-gap is non-official and names what is missing or changed. `control_inputs`
+`BATCH_CONTROL_N`. A pasted `{"pass": true}` is rejected. Any gap is
+non-official and names what is missing or changed.
+
+The gate cannot tell a forged but self-consistent record from a real one;
+`tag` and `files` let the reviewer check it on the host where the run dir
+lives. From a gate tree at the record's `rev`, run
+`run_gate.recheck_controls_record(<run dir>, <record>)`. It must return
+`[]`: the run dir's name, summary.json's `tag` and `rev` match the record,
+every file hashes as in `files` (none added or missing), and
+`control_verdicts` re-run on the run dir (summary.json's `results` and
+`gate`) gives the record's `verdicts`. The reviewer also checks
+summary.json's `controls_record` against the record and that
+`controls_record_withheld` is None. `control_inputs`
 holds:
 
 - `identity`: the model (dir name), `--tp`, and sha256 of that TP's
@@ -383,8 +399,9 @@ holds:
   (`control_verdicts`: which arm's outputs and which claims each verdict
   reads; `_predates`, `_ran_without`). Not hashed: process plumbing that
   reaches neither vLLM's arguments nor its env (port leases, launch and
-  teardown, isolation of the arm under test), and `main`'s one-line calls
-  into these functions;
+  teardown, isolation of the arm under test), and the one-line calls into
+  these functions from `main` and from `verdicts()` (which places the three
+  `control_verdicts` results in `v["baseline"]`);
 - the constants `SPLIT_PASSES`, `MIN_PREWARMED`, `BATCH_PASS`,
   `BATCH_CONTROL_N`, `ALONE_REF`, `_ALONE`, `_REFERENCE`, `AUTOTUNE_SOURCE`;
 - the run arguments of the gsm8k stages: `shots`, `concurrency`,

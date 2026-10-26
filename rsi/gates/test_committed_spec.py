@@ -130,6 +130,48 @@ def test_main_feeds_every_consumer_the_selected_dump(tmp_path, monkeypatch, tp, 
         assert f"committed spec dump {want} missing (no dump for --tp {tp})" in problems
 
 
+_VERIFIED = {"gate": {"verified": True}, "venv_pegaflow": {"verified": True}}
+
+
+@pytest.mark.parametrize(
+    "prov,watch,extra,withheld",
+    [
+        (_VERIFIED, [], [], None),
+        (_VERIFIED | {"gate": {"verified": False, "root": "/g", "reason": "dirty"}}, [], [], "run not clean: gate tree (rsi/, the judge) /g at an unverified rev (dirty)"),
+        (_VERIFIED, ["gate tree changed before plain/gsm8k: rsi/x"], [], "run not clean: gate tree changed before plain/gsm8k"),
+        (_VERIFIED, [], ["--vllm-arg=--enforce-eager"], "run not clean: --num-gpu-blocks / --vllm-arg override"),
+        (_VERIFIED, [], ["--num-gpu-blocks", "100"], "run not clean: --num-gpu-blocks / --vllm-arg override"),
+    ],
+    ids=["clean", "dirty-tree", "tree-changed", "vllm-arg", "num-gpu-blocks"],
+)  # fmt: skip
+def test_main_withholds_the_controls_record_from_unclean_runs(tmp_path, monkeypatch, prov, watch, extra, withheld):  # fmt: skip
+    """``main`` with plain and passing controls: a clean run writes
+    ``summary.controls_record``; an unverified tree, a tree changed during
+    the run (ProvenanceWatch) or a vLLM override writes None and the reason
+    in ``controls_record_withheld``."""
+    repo = _gate_repo(tmp_path)
+    _stub_main(monkeypatch, repo, lambda _a, _g, arm, wl, _o, **_k: {"arm": arm, "workload": wl})
+    monkeypatch.setattr(run_gate, "record_provenance", lambda *_: prov)
+    monkeypatch.setattr(
+        run_gate,
+        "ProvenanceWatch",
+        lambda *_: SimpleNamespace(check=lambda _w: {}, problems=lambda: watch, record=lambda: {}),
+    )
+    passed = {k: {"pass": True} for k in run_gate.CONTROL_VERDICTS}
+    monkeypatch.setattr(run_gate, "verdicts", lambda *_a, **_k: {"baseline": {"pass": True} | passed})  # fmt: skip
+    argv = ["--model", "/m/Qwen3-4B", "--tag", "t", "--runs-root", str(tmp_path / "runs"),
+            "--arms", "plain,baseline", "--workloads", "gsm8k", "--tp", "1", "--gpu", "0", *extra]  # fmt: skip
+    assert run_gate.main(argv) == 1  # never official: sliced arms
+    (summary,) = (tmp_path / "runs").glob("*-t/summary.json")
+    s = json.loads(summary.read_text())
+    if withheld is None:
+        assert s["controls_record_withheld"] is None
+        assert s["controls_record"]["verdicts"] == passed and s["controls_record"]["tag"] == "t"
+    else:
+        assert s["controls_record"] is None
+        assert s["controls_record_withheld"].startswith(withheld), s["controls_record_withheld"]
+
+
 def test_preempt_without_this_tps_dump_does_not_start(tmp_path, monkeypatch, capsys):
     """The preempt pool is sized from this TP's dump only: none, no run (an
     argument error before the run dir, provenance or any stage)."""

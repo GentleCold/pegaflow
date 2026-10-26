@@ -64,8 +64,8 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    `vllm_args`, `gsm8k_vllm_args`, `lmcache_dist`). The self-test's `plain`
    arm runs the onboarding controls (`G2.plain_equals_baseline`,
    `G2.split_control`, `G2.batch_control`) on the full gsm8k set; when they
-   pass, the gate owner copies `summary.controls_record` (run, rev,
-   `gsm8k_limit` 0, the three verdicts, `inputs`) into gate.json
+   pass, the gate owner copies `summary.controls_record` (run, tag, rev,
+   `gsm8k_limit` 0, file hashes, the three verdicts, `inputs`) into gate.json
    `controls["tp<N>"]` (GATES.md "Onboarding controls"). A subset, failing
    or unclean run (dirty or changed tree, bad CUDA env, override) writes no
    record (`summary.controls_record_withheld` says why).

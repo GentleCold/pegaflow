@@ -200,13 +200,15 @@ CONTROL_CODE = (
     "_predates",
     "_ran_without",
 )
-# What a recorded control verdict must carry besides ``pass``: a bare
-# ``{"pass": true}`` measured nothing.
+# What a recorded control verdict must carry besides ``pass``, and its type
+# (``bool?``: bool or None): a bare ``{"pass": true}`` measured nothing.
 CONTROL_MEASURED = {
-    "G2.plain_equals_baseline": ("differ",),
-    "G2.split_control": ("n", "prewarmed", "split_invariant", "measured_invariant"),
-    "G2.batch_control": ("n", "prewarmed", "batch_invariant", "measured_invariant"),
-}
+    "G2.plain_equals_baseline": {"differ": "int"},
+    "G2.split_control": {"n": "int", "prewarmed": "int", "split_invariant": "bool", "measured_invariant": "bool?", "ref_equals_cold": "bool"},
+    "G2.batch_control": {"n": "int", "prewarmed": "int", "batch_invariant": "bool", "measured_invariant": "bool"},
+}  # fmt: skip
+# Optional measured fields (type-checked when present).
+CONTROL_MEASURED_OPTIONAL = {"logprob_differ": "int"}
 CONTROL_SETTINGS = (
     "attention_backend",
     "invariant_attention_backend",
@@ -3843,20 +3845,96 @@ def _control_passed(v: Any) -> bool:
     return isinstance(v, dict) and v.get("pass") is True and "na" not in v
 
 
+def override_problems(args) -> list[str]:
+    """A vLLM override: never official, never a controls record."""
+    if args.num_gpu_blocks or args.vllm_arg:
+        return ["--num-gpu-blocks / --vllm-arg override"]
+    return []
+
+
+def control_files(run_dir: Path) -> dict[str, str]:
+    """sha256 of every file ``control_verdicts`` may read, by path relative
+    to the run dir: the plain and baseline gsm8k outputs and token records
+    and the baseline gsm8k spec dump (hit alignment). A superset: the files
+    a verdict reads depend on gate.json's claims."""
+    files = [
+        f
+        for label in ("plain", "baseline")
+        for pat in ("*-outputs.json", "*-tokens.json")
+        for f in (run_dir / GATE_DIR / label / "gsm8k").glob(pat)
+    ]
+    files.append(run_dir / "baseline" / "gsm8k" / "probe" / "spec.json")
+    return {
+        str(f.relative_to(run_dir)): _sha256(f.read_bytes()) for f in sorted(files) if f.is_file()
+    }
+
+
+# What a record's ``files`` must name: the two cold passes every verdict
+# reads, whatever gate.json claims.
+CONTROL_FILES_REQUIRED = (
+    f"{GATE_DIR}/plain/gsm8k/cold-outputs.json",
+    f"{GATE_DIR}/baseline/gsm8k/cold-outputs.json",
+)
+
+
+def recheck_controls_record(run_dir: Path, rec: dict[str, Any]) -> list[str]:
+    """What a reviewer checks on the host, from a gate tree at the record's
+    ``rev``: the record names this run (dir, tag, rev in summary.json), its
+    ``files`` hash as recorded, and ``control_verdicts`` re-run on the run
+    dir (summary.json's results and gate.json) gives its ``verdicts``."""
+    summary = json.loads((run_dir / "summary.json").read_text())
+    out = [
+        f"{k}: record {rec.get(k)!r}, run {got!r}"
+        for k, got in (("run", run_dir.name), ("tag", summary.get("tag")), ("rev", summary.get("rev")))
+        if rec.get(k) != got
+    ]  # fmt: skip
+    files, want = control_files(run_dir), _dict(rec.get("files"))
+    out += [
+        f"files.{f}: record {want.get(f)}, run {files.get(f)}"
+        for f in sorted(set(files) | set(want))
+        if files.get(f) != want.get(f)
+    ]
+    got = control_verdicts(summary.get("results") or {}, run_dir, summary.get("gate"))
+    out += [
+        f"verdicts.{k} differ from control_verdicts on the run dir"
+        for k in CONTROL_VERDICTS
+        if json.loads(json.dumps(got[k])) != _dict(rec.get("verdicts")).get(k)
+    ]
+    return out
+
+
 def _full_set(limit: Any) -> bool:
     """``--gsm8k-limit`` 0, the int (not False, 0.0 or None)."""
     return type(limit) is int and limit == OFFICIAL["gsm8k_limit"]
+
+
+def _dict(x: Any) -> dict[str, Any]:
+    """``x`` if a dict, else empty (a malformed record judges as missing)."""
+    return x if isinstance(x, dict) else {}
+
+
+def _is_type(x: Any, t: str) -> bool:
+    """``int`` (not bool, not float), ``bool``, ``bool?`` (bool or None)."""
+    if t == "int":
+        return type(x) is int
+    return type(x) is bool or (t == "bool?" and x is None)
 
 
 def _control_rejudge(verd: dict[str, Any], gate: dict[str, Any]) -> list[str]:
     """What the recorded verdicts' own measurements contradict: each must
     carry its counts (``CONTROL_MEASURED``), have measured gate.json's
     current claims, compared something and found what it passed on."""
-    bad = [
-        f"{k} lacks {', '.join(m)}"
-        for k, keys in CONTROL_MEASURED.items()
-        if (m := [x for x in keys if x not in (verd.get(k) or {})])
-    ]
+    bad = []
+    for k, fields in CONTROL_MEASURED.items():
+        x = _dict(verd.get(k))
+        if m := [f for f in fields if f not in x]:
+            bad.append(f"{k} lacks {', '.join(m)}")
+        typed = fields | {f: t for f, t in CONTROL_MEASURED_OPTIONAL.items() if f in x}
+        bad += [
+            f"{k} {f}={x[f]!r} is not {t}"
+            for f, t in typed.items()
+            if f in x and not _is_type(x[f], t)
+        ]
     if bad:
         return bad
     out = []
@@ -3885,7 +3963,7 @@ def _control_rejudge(verd: dict[str, Any], gate: dict[str, Any]) -> list[str]:
 def controls_record(
     gate: dict[str, Any],
     args,
-    run: str,
+    run_dir: Path,
     rev: str,
     v: dict[str, Any],
     plain: bool,
@@ -3894,7 +3972,8 @@ def controls_record(
     """``summary.controls_record``: what gate.json ``controls["tp<N>"]``
     takes from this run, or None and why. Only a clean (``unclean`` empty:
     setup, provenance, provenance watch and CUDA env), full-set run with the
-    plain arm whose three controls passed yields one."""
+    plain arm whose three controls passed yields one. ``tag`` and ``files``
+    (``control_files``) bind it to the run: ``recheck_controls_record``."""
     if not plain:
         return None, "no plain arm in this run"
     if unclean:
@@ -3905,7 +3984,14 @@ def controls_record(
         return None, f"controls not passing: {', '.join(bad)}"
     if not _full_set(args.gsm8k_limit):
         return None, f"gsm8k_limit={args.gsm8k_limit}: a controls record is full-set (0)"
-    rec = {"run": run, "rev": rev, "gsm8k_limit": args.gsm8k_limit, "verdicts": verd}
+    rec = {
+        "run": run_dir.name,
+        "tag": args.tag,
+        "rev": rev,
+        "gsm8k_limit": args.gsm8k_limit,
+        "files": control_files(run_dir),
+        "verdicts": verd,
+    }
     return rec | {"inputs": control_inputs(gate, args)}, None
 
 
@@ -3914,7 +4000,7 @@ def controls_problem(gate: dict[str, Any], args) -> str | None:
     run recorded in gate.json for its TP: a named full-set run whose three
     controls passed, measured at this run's ``control_inputs``."""
     tp = args.tp
-    rec = (gate.get("controls") or {}).get(f"tp{tp}")
+    rec = _dict(_dict(gate.get("controls")).get(f"tp{tp}"))
     if not rec:
         return (
             f"onboarding controls for --tp {tp} not recorded in gate.json "
@@ -3923,7 +4009,7 @@ def controls_problem(gate: dict[str, Any], args) -> str | None:
     if not rec.get("run") or not rec.get("rev"):
         return f"onboarding controls for --tp {tp} (gate.json) name no run and rev"
     what = f"onboarding controls for --tp {tp} (gate.json, run {rec['run']})"
-    verd = rec.get("verdicts") or {}
+    verd = _dict(rec.get("verdicts"))
     bad = [k for k in CONTROL_VERDICTS if not _control_passed(verd.get(k))]
     if bad:
         return f"{what} record no passing {', '.join(bad)}"
@@ -3931,7 +4017,8 @@ def controls_problem(gate: dict[str, Any], args) -> str | None:
         # The split control judges every prompt the official run's warm
         # passes start from; a subset leaves the rest unmeasured.
         return f"{what} ran gsm8k_limit={rec.get('gsm8k_limit')!r}, not the full set (0)"
-    ident = (rec.get("inputs") or {}).get("identity") or {}
+    got = _dict(rec.get("inputs"))
+    ident = _dict(got.get("identity"))
     # A record without ``identity`` predates it: stale below, by name.
     if ident and (ident.get("model"), ident.get("tp")) != (Path(args.model).name, tp):
         return f"{what} measured {ident.get('model')} --tp {ident.get('tp')}, not {Path(args.model).name} --tp {tp}"  # fmt: skip
@@ -3942,18 +4029,25 @@ def controls_problem(gate: dict[str, Any], args) -> str | None:
         # as they did at ``rev``: what differs and why it does not matter.
         return f"{what}: inputs_recomputed must say why the controls are unchanged"
     want = control_inputs(gate, args)
-    if rec.get("inputs") != want:
-        got = rec.get("inputs") or {}
+    if got != want:
         stale = [
             f"{part}.{k}"
             for part in want
             for k in want[part]
-            if (got.get(part) or {}).get(k, "<missing>") != want[part][k]
+            if _dict(got.get(part)).get(k, "<missing>") != want[part][k]
         ]
         return (
             f"{what} are stale: {', '.join(stale) or 'inputs'} changed "
             "(rerun the self-test with plain, or add the plain arm)"
         )
+    # Bound to its run: a reviewer rechecks it there (recheck_controls_record).
+    files = _dict(rec.get("files"))
+    if not (isinstance(rec.get("tag"), str) and rec["tag"]):
+        return f"{what} name no tag"
+    if missing := [f for f in CONTROL_FILES_REQUIRED if f not in files]:
+        return f"{what} hash no {', '.join(missing)}"
+    if bad := [f for f, h in files.items() if not (isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h))]:  # fmt: skip
+        return f"{what}: files {', '.join(bad)} are not sha256 hex"
     # Current inputs: the verdicts must also hold on their own counts.
     if bad := _control_rejudge(verd, gate):
         return f"{what}: recorded verdicts do not hold: {'; '.join(bad)}"
@@ -4002,8 +4096,7 @@ def official_problems(
         # gsm8k loads one state key per group; preempt judges resumed
         # episodes' state loads, which no other official stage exhausts.
         out.append(f"workload {PREEMPT} missing (required on models with a Mamba state group)")
-    if args.num_gpu_blocks or args.vllm_arg:
-        out.append("--num-gpu-blocks / --vllm-arg override")
+    out += override_problems(args)
     if "lmcache" in kinds and args.lmcache_chunk_size != LMCACHE_CHUNK:
         out.append(f"lmcache_chunk_size={args.lmcache_chunk_size} (official {LMCACHE_CHUNK})")
     if "lmcache" in kinds:
@@ -4618,11 +4711,8 @@ def main(argv: list[str] | None = None) -> int:
         + cuda_bad
         + model_files_problems(gate_file, committed, args.tp)
     )
-    if args.num_gpu_blocks or args.vllm_arg:
-        unclean.append("--num-gpu-blocks / --vllm-arg override")
-    ctl_rec, ctl_why = controls_record(
-        gate, args, run_dir.name, git_rev(), v, "plain" in results, unclean
-    )
+    unclean += override_problems(args)
+    ctl_rec, ctl_why = controls_record(gate, args, run_dir, git_rev(), v, "plain" in results, unclean)  # fmt: skip
     summary = {
         "tag": args.tag,
         "rev": git_rev(),
