@@ -124,7 +124,12 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   queries from its local hit and never refreshes them; v2 queries from
   block 0. Proposal H5: opt-in tail-first eviction in the retained class.
 - Not group-coherent: a resume point needs every group, but each group key
-  is evicted on its own (matters for hybrid models; not measured yet).
+  is evicted on its own. Measured on Qwen3.5-4B (P5 it2 official c5d3f04,
+  C(0.5) = 2.52x GPU KV): `hit stats` `missing=1,2,3` (full group backs the
+  resume point, all GDN groups evicted) in 4 of 7441 lookups at 0.25, 4 of
+  7443 at 0.5, 2 of 7433 at 0.75: negligible at the floor. On a sub-floor
+  pool (0.05x GPU KV) one reclaim round exceeds the whole pool
+  (`models/Qwen3.5-4B/ITERATIONS.md`).
 
 ### Gate changes
 
@@ -221,7 +226,7 @@ names, magic constants that only exist in the old code).
 | P2 | new connector skeleton (core glue + adapters + policy + models), coexists with old | done, review fixes applied (`reviews/P2-connector-skeleton.md` Resolution) |
 | P3 | onboard Qwen3-4B | G4 vs native (judged since 2026-10-26): it7 warm TTFT +0.37% behind native (within noise), req/s 3.07% ahead; perf vs native judgment pending; before the vs-native rule G0-G4 accepted at 8a05b7c (it2d official `2026-10-23-qwen3-4b-p3-it2d`, review ACCEPT-WITH-FIXES, fixes in it2e); G5 E_C reported (not gated since 2026-10-24): 0.684 on the base server (official r3, `models/Qwen3-4B/ITERATIONS.md` "G5 official (r3)"), hit-rate judgment pending on the base server (server proposals H1-H5 parked, see "Server limitations") |
 | P4 | onboard DeepSeek-V2-Lite-Chat | in progress (`feat/rsi-deepseek-v2-lite`, TP2); review accept-after-must-fix, official run pending this merge; under the lmcache gate's resume stage its it6 / it7 records fail `G2.resume_reference` (every arm): needs an official rerun with the resume stage; it7 vs native (judged): warm TTFT +2.64% behind (within noise), req/s 5.65% behind; perf vs native judgment pending |
-| P5 | onboard Qwen3.5-4B | in progress; it2 (`2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04`) warm TTFT +72% behind native (0.2974 vs 0.1729 s): needs attribution and a hypothesis before acceptance (perf vs native judgment) |
+| P5 | onboard Qwen3.5-4B | it2 official `2026-10-25-qwen3.5-4b-p5-it2-off-c5d3f04` (c5d3f04): v2 passes every verdict, review ACCEPT-WITH-FIXES applied; hit judgment close enough. S1 regression slices (4bb7d8d): Qwen3-4B no regression, DSV2 running. it3 (in progress): warm TTFT vs native gap on all three models attributed to queue time (KV held by the finish fence); hypothesis = per-request finish fence. Record: `models/Qwen3.5-4B/ITERATIONS.md` |
 | P6 | onboard gemma-4-E4B-it | todo |
 
 ## Log
