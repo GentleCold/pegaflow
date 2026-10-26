@@ -1253,6 +1253,59 @@ baseline or gsm8k).
   (stale controls record). Qwen3-4B TP1 and a TP2 slice, then Qwen3.5,
   e985938 vs c8a8842. It replaces the 512-token async-start budget
   hypothesis unless an admission-burst cost remains after it.
+- Order changed by main: the deferral run came before the Qwen3.5 self-test,
+  which waits for slim to be merged.
+
+### Review (ACCEPT with nits) and follow-up 02b6767
+- No MUST items. The follow-up adds table cases for a local hit with an
+  in-flight tail, two loaders of the same blocks, a re-queued request and
+  `skip_reading_prefix_cache`. All five mutants (M1, M9, M2,
+  skip-reading, clock reset) are killed.
+- Edge-case behaviour changes (not on the gate's paths):
+  - A deferral resets the prefetch wait clock.
+  - Requests that skip the prefix cache are never deferred.
+  - The connector's `prefix_caching` fallback is now True.
+- Docs: `loading_wait_ms` bounds both waits, and 0 disables both.
+
+### it4 result: confirmed on Qwen3-4B TP1 (`2026-10-26-qwen3-4b-p5-it4-defer-e985938`)
+
+The run used GPU0, TP1 and gate c8a8842, with arms native and v2 at
+e985938 on replay and gsm8k. KV is 71,472 tokens. It is not official
+because it has no plain, baseline or cap arm. The control is the A/B run
+`-new-c8a8842` on the same GPU and gate, run just before.
+
+| run | arm | warm2/3 TTFT p50 | mean | p90 | req/s | cold req/s |
+|---|---|---|---|---|---|---|
+| defer | native | 0.555/0.467 | 0.989/0.941 | 2.18/2.09 | 9.299/9.263 | 5.766 |
+| defer | v2 e985938 | 0.620/0.610 | 0.847/0.849 | 1.84/1.83 | 9.804/9.798 | 6.250 |
+| A/B new | native | 0.505/0.537 | 0.959/0.973 | 2.14/2.15 | 9.133/9.185 | 5.808 |
+| A/B new | v2 c8a8842 | 0.663/0.696 | 0.854/0.859 | 1.81/1.80 | 9.568/9.509 | 6.297 |
+
+- Turn 0 in warm2 (`t0.py`): v2 now gives convs 1-31 local=1264 and loads
+  14,960 external tokens. Native loads 14,990; c8a8842 gave local=0 and
+  loaded 54,144. v2 admits them at steps 2-12; native admits them at
+  steps 2-4.
+- Hit stats: `deferred` is 93 for replay and 10 for gsm8k. G3 replay_warm
+  local is 0.354, vs 0.326 before and 0.368 for native. There were no load
+  errors.
+- G4 medians vs native: req/s is 5.6% ahead (it was 4.2%). TTFT p50 is
+  20.3% behind (it was 30.5%).
+- v2, e985938 vs c8a8842:
+  - req/s +2.5% / +3.0%.
+  - p50 -6.5% / -12.4%; mean and p90 are flat.
+  - ITL 24.5 -> 23.4 ms.
+  - Cold is unchanged (6.250 vs 6.297, within noise).
+- gsm8k: accuracy 0.8552 in both arms. v2 takes 172.4 s cold and
+  169.9 s warm, vs native's 171.9 and 175.4 (+0.3% and -3.1%, inside the
+  2% bound).
+- What remains of the p50 gap: for turn>0 requests that load, v2's
+  queue p50 is 25-26 steps vs native's 10-11, with the same load round
+  trip (p50 7 steps). Turn-0 admission is also spread out (steps 2-12
+  vs 2-4).
+- The only traceback in the v2 replay log is vLLM's EngineDeadError after
+  the gate's SIGTERM at shutdown. It is not a connector error.
+- Decision: keep it4. Next are the TP2 slice and Qwen3.5 TP1, comparing
+  the follow-up head against c8a8842.
 
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
