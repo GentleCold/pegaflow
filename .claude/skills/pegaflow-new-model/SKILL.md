@@ -56,7 +56,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    (0.5.6; PR #4467 crashes on MLA); a new model declares the build it
    validated in its gate.json, else the run is not official; full command in
    GATES.md "Implementation"; always include `plain`). Official runs carry
-   the reference arms `native` and `lmcache` next to `old`; drop `lmcache`
+   the reference arms `native` and `lmcache` next to `old`. `native` is
+   required: it is G4's warm replay reference, and a run without it (or
+   whose native replay stage crashed) is not official. Drop `lmcache`
    only where GATES.md G5 "lmcache status per model" says it is not
    comparable on this model (cite it), and never use a wrong-KV
    reference number (e.g. a curve point whose `digest_self` fails). Run
@@ -122,7 +124,9 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    the hit-rate table (local / external / total hit, oracle H*, E_ext; at
    capacity H*_C, H_lru, E_C) next to the G4 perf table, one row each for
    the arm under test (v2), `old`, `native` and `lmcache` (or "not
-   comparable" with the GATES.md reason). Do not wait for the user: the review agent's
+   comparable" with the GATES.md reason). The G4 table shows the warm
+   replay TTFT p50 and req/s of v2 next to both of its references,
+   `baseline` and `native`, with the `*_vs_native` verdicts. Do not wait for the user: the review agent's
    pass is the acceptance; the user does one acceptance pass at the end.
 
 ## 3. Lessons (append)
@@ -209,6 +213,14 @@ connector is a black-box baseline (run it, read its numbers, not its code).
   beats baseline vLLM on warm replay (TTFT p50 and req/s) and costs at most 2%
   on cold replay and gsm8k. Read every `G4.*` verdict, not only warm TTFT;
   the save path's cost shows up in the cold and gsm8k checks.
+- G4 warm also has to beat `native` (user, 2026-10-26):
+  `G4.replay_warm.{ttft_p50,req_per_s}_vs_native`, strict, medians of
+  warm2..N in the same run. Beating the no-offload baseline is not enough:
+  vLLM's own OffloadingConnector already beats it by a wide margin (Qwen3.5-4B
+  P5 it2: native warm TTFT p50 0.172 s vs v2 0.300 s vs baseline 1.12 s).
+  When a `*_vs_native` check fails, compare v2's and native's load path
+  first (sync vs async load, load round trip in steps, per-request load
+  size) before touching policy. The overhead checks stay vs baseline.
 - Async saves in vLLM 0.32 need three hooks, not one: `wait_for_save` only
   queues (CUDA event + saver thread); `request_finished` returns True and
   `get_transfer_results.finished_sending` releases the blocks after the copy;

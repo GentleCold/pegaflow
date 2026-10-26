@@ -107,6 +107,15 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   `G2.resume_reference` (the honest self-test included); the lmcache arm
   is sized per storing rank and must use gate.json's `lmcache_dist`
   (`G0.lmcache_build`, else not official).
+- 2026-10-26, user (human gate owner, hard rule): G4's warm-gain checks
+  also compare against the `native` arm (vLLM OffloadingConnector), not
+  only the no-offload baseline. New `G4.replay_warm.ttft_p50_vs_native` /
+  `.req_per_s_vs_native` on the arm under test (same statistic and strict
+  rule as warm vs baseline); `native` is a required arm of an official
+  run and its replay must produce every timed warm pass, else not
+  official. Overhead checks (gsm8k, replay cold, 2% vs baseline) and G2
+  references stay baseline's; native's own G0 / G2 failures do not
+  disqualify its timing. Branch `feat/rsi-gate-g4-native`.
 
 ## Isolation (no reference to existing implementation)
 

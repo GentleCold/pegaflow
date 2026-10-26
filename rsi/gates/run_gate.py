@@ -2602,6 +2602,62 @@ def _cmp(mine: list[float], theirs: list[float], lower: bool, slack: float) -> d
     return {"pass": ok, "value": mine, "baseline": theirs, "slack": slack}
 
 
+def _pass_values(r: dict[str, Any] | None, names: tuple[str, ...], key: str) -> list[float]:
+    """``key`` of each named pass of stage result ``r`` that recorded it."""
+    ps = (r or {}).get("passes", {})
+    return [ps[n][key] for n in names if n in ps and key in ps[n]]
+
+
+def _timed_warm(r: dict[str, Any] | None) -> tuple[str, ...]:
+    """G4-timed warm replay passes (warm2..N; ``warm`` carries the digests)."""
+    ps = (r or {}).get("passes", {})
+    return tuple(n for n in ps if n.startswith("warm") and n != "warm")
+
+
+# G4 keys the arm under test must also win against the native reference arm
+# (vLLM's OffloadingConnector) in the same run (user, 2026-10-26).
+G4_NATIVE_KEYS = (("ttft_p50", True), ("req_per_s", False))
+
+
+def _native_perf_verdicts(
+    rep: dict[str, Any] | None, native_rep: dict[str, Any] | None, replay_ok: bool
+) -> dict[str, Any]:
+    """G4 warm replay vs the in-run ``native`` arm, with the warm-vs-baseline
+    rule (``_cmp`` slack 0: median over the timed warm passes, strictly
+    better). ``native_rep`` None (arm missing or its replay stage crashed)
+    fails closed. Only the timing is used: native's own G0 / G2 verdicts do
+    not matter here. Void (fail) when the arm's replay KV was wrong."""
+    g: dict[str, Any] = {}
+    for key, lower in G4_NATIVE_KEYS:
+        v = _cmp(
+            _pass_values(rep, _timed_warm(rep), key),
+            _pass_values(native_rep, _timed_warm(native_rep), key),
+            lower,
+            0.0,
+        )
+        v["native"] = v.pop("baseline")
+        v["pass"] = v["pass"] and replay_ok
+        if native_rep is None:
+            v["reason"] = "no native replay stage in this run"
+        g[f"G4.replay_warm.{key}_vs_native"] = v
+    return g
+
+
+def g4_native_problems(results: dict[str, dict[str, Any]]) -> list[str]:
+    """Why a run cannot be official for G4 vs native: the native arm's replay
+    stage is missing or crashed, or it lacks a timed warm pass (ttft_p50 and
+    req_per_s) that the baseline has. Native's G0 / G2 verdicts are not
+    looked at (it fails G0.spec by construction)."""
+    nat = results.get("native", {}).get("replay")
+    if nat is None or "error" in nat:
+        return ["native replay stage missing or failed (G4 vs native needs its warm numbers)"]
+    want = _timed_warm(results.get("baseline", {}).get("replay"))
+    have = {n for n in _timed_warm(nat) if all(k in nat["passes"][n] for k, _ in G4_NATIVE_KEYS)}
+    if not want or set(want) - have:
+        return [f"native replay timed warm passes {sorted(have)} != baseline's {sorted(want)}"]
+    return []
+
+
 def _perf_verdicts(
     rep: dict[str, Any] | None,
     base_rep: dict[str, Any] | None,
@@ -2611,15 +2667,7 @@ def _perf_verdicts(
 ) -> dict[str, Any]:
     """G4 vs baseline vLLM. Replay numbers only count when the replay KV was
     correct (``replay_ok``)."""
-
-    def passes(r: dict[str, Any] | None, names: tuple[str, ...], key: str) -> list[float]:
-        ps = (r or {}).get("passes", {})
-        return [ps[n][key] for n in names if n in ps and key in ps[n]]
-
-    def timed(r: dict[str, Any] | None) -> tuple[str, ...]:
-        ps = (r or {}).get("passes", {})
-        return tuple(n for n in ps if n.startswith("warm") and n != "warm")
-
+    passes, timed = _pass_values, _timed_warm
     g: dict[str, Any] = {}
     for key, lower in (("ttft_p50", True), ("req_per_s", False)):
         for name, names, slack in (
@@ -2989,6 +3037,14 @@ def verdicts(
         g |= _perf_verdicts(
             rep, base.get("replay"), gsm, base.get("gsm8k"), g["G2.digest_self.replay"]["pass"]
         )
+        if kind not in _REFERENCE:
+            # The arm under test only: warm replay must also beat native's.
+            nat = results.get("native", {}).get("replay")
+            g |= _native_perf_verdicts(
+                rep,
+                nat if nat is not None and "error" not in nat else None,
+                g["G2.digest_self.replay"]["pass"],
+            )
         cap = per_wl.get("cap")
         pegaflow = kind not in _OFFLOAD
         # The arm under test must load in the cap passes (a passing G5 needs
@@ -3406,7 +3462,8 @@ def official_problems(
         if not same(k, v)
     ]
     kinds = {arm_kind(a) for a in arms}
-    for need in ("plain", "baseline", "under_test"):
+    # native: G4's warm replay reference next to baseline (user, 2026-10-26).
+    for need in ("plain", "baseline", "native", "under_test"):
         if need not in kinds:
             out.append(f"arm {need} missing")
     if set(wls) - {PREEMPT} != set(WORKLOADS):
@@ -3968,6 +4025,8 @@ def main(argv: list[str] | None = None) -> int:
         return {k: v for k, v in r.items() if k not in ("digest_self", "ref_local")}
 
     problems = official_problems(args, arms, wls, gate_file, committed, gate)
+    if "native" in arms and "replay" in wls:
+        problems += g4_native_problems(results)
     contaminated = contamination(results)
     problems += [
         f"contaminated: {c['arm']} replay/{c['pass']} p99 TTFT {c['ttft_p99']:.3g}s > "
