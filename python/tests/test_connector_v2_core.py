@@ -1093,6 +1093,7 @@ def test_miss_attribution_names_the_missing_group(sem):
     # vLLM re-queries a request it could not allocate: counted once per
     # (request, resume point); a finished request id counts afresh.
     sched._rpc.answers = {0: Ready(3, b"F"), 1: Ready(1, b"C", [0])}
+    sched._clock.now += Scheduler.HIT_REUSE_MAX_S  # too old to reuse: queried again
     sched.get_num_new_matched_tokens(_req(), 0)
     assert sched.hit_stats == {"lookups": 2, "missing=1": 1, "lost_tokens": 8}
     sched.request_finished("r")
@@ -1163,6 +1164,31 @@ def test_lookup_skips_queries_that_cannot_beat_the_local_hit(
     assert sched.hit_stats == {"lookups": 1, **stats}
 
 
+@pytest.mark.parametrize(
+    "computed,age,reused",
+    [
+        pytest.param(0, 0.0, True, id="same-local-hit"),
+        pytest.param(4, 0.0, False, id="local-hit-moved"),
+        pytest.param(0, Scheduler.HIT_REUSE_MAX_S, False, id="too-old"),
+    ],
+)
+def test_unallocated_hit_is_reused(computed, age, reused):
+    """vLLM re-asks for a waiting head it could not allocate every scheduling
+    pass. Within HIT_REUSE_MAX_S and for the same local hit, the held hit and
+    its leases are offered again without a server query; otherwise they are
+    released and the request is looked up afresh."""
+    sched, rpc = _sched(StubSemantics, {0: Ready(3, b"F"), 1: Ready(3, b"W")})
+    assert sched.get_num_new_matched_tokens(_req(), 0) == (12, True)
+    queried = len(rpc.queried)
+    sched._clock.now += age
+    n = 12 - computed
+    assert sched.get_num_new_matched_tokens(_req(), computed) == (n, True)
+    assert (len(rpc.queried) == queried, sched.lookup_cost["reused"]) == (reused, int(reused))
+    assert sorted(rpc.released) == ([] if reused else [b"F", b"W"])
+    sched.update_state_after_alloc(_req(), ([20, 21, 22], [10, 11, 12]), n)
+    assert [lp.req_id for lp in sched.take_plan().loads] == ["r"]
+
+
 def test_hit_stats_logged_when_idle_and_on_cadence():
     """The gate force-kills the engine core (no ``shutdown``): the counters
     must reach the log when the last request finishes and every HIT_LOG_S."""
@@ -1182,7 +1208,7 @@ def test_hit_stats_logged_when_idle_and_on_cadence():
         assert lines == []  # "s" still live, cadence not due
         sched._clock.now += Scheduler.HIT_LOG_S
         sched.get_num_new_matched_tokens(_req(req_id="t"), 0)
-        cost = "{'calls': 3, 'rpcs': 3, 'us': 0, 'max_us': 0}"
+        cost = "{'calls': 3, 'rpcs': 3, 'us': 0, 'max_us': 0, 'reused': 0}"
         assert lines == [f"[PegaKVConnectorV2] hit stats {{'lookups': 3}} lookup_cost {cost}"]
         sched.request_finished("s")
         sched.request_finished("t")  # idle, but nothing new to report
@@ -1193,7 +1219,7 @@ def test_hit_stats_logged_when_idle_and_on_cadence():
     finally:
         log.removeHandler(handler)
         log.setLevel(level)
-    cost = "{'calls': 4, 'rpcs': 4, 'us': 0, 'max_us': 0}"
+    cost = "{'calls': 4, 'rpcs': 4, 'us': 0, 'max_us': 0, 'reused': 0}"
     assert lines[1:] == [f"[PegaKVConnectorV2] hit stats {{'lookups': 4}} lookup_cost {cost}"]
 
 

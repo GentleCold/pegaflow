@@ -97,6 +97,7 @@ class _Hit:
     present: tuple[frozenset[int], ...]  # server answers per sid (for re-planning)
     leases: list[_Lease]  # held leases, each with a non-empty ``wanted``
     sync: bool = False  # loaded before the forward of the step that schedules it
+    at: float = 0.0  # scheduler clock when the server answered
 
 
 @dataclass
@@ -120,6 +121,11 @@ def _offered_ids(g: GroupInfo, blocks: range, offers: Sequence[tuple[int, int, i
 
 class Scheduler:
     HIT_LOG_S = 30.0  # min seconds between "hit stats" lines while lookups run
+    # Age cap for reusing an unallocated hit, not a tuned policy: far below
+    # the server's lease TTL, and it bounds how long a newer save of the
+    # request's blocks goes unseen. vLLM re-asks for a head it could not
+    # allocate every scheduling pass.
+    HIT_REUSE_MAX_S = 2.0
 
     def __init__(
         self,
@@ -224,7 +230,7 @@ class Scheduler:
         self.hit_stats: dict[str, int] = {}
         # Wall time of every _lookup call (vLLM's scheduler thread waits for
         # it, re-queries of a waiting request included) and its query RPCs.
-        self.lookup_cost = {"calls": 0, "rpcs": 0, "us": 0, "max_us": 0}
+        self.lookup_cost = {"calls": 0, "rpcs": 0, "us": 0, "max_us": 0, "reused": 0}
         self._counted: dict[str, tuple[int, int]] = {}
         self._hit_dirty = False  # counters changed since the last line
         self._hit_logged_at = clock()
@@ -238,13 +244,20 @@ class Scheduler:
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
         self._requests.setdefault(req_id, request)
-        # A previous hit that was never allocated (allocation failed) is stale.
-        self._drop_hit(req_id)
+        # A previous hit vLLM could not allocate: reused if nothing it rests on
+        # changed, else stale.
+        reuse = self._reusable_hit(req_id, num_computed)
         if self._defer_for_inflight(request, num_computed):
+            if reuse is not None:
+                self._release(reuse.leases)
             # Its own clock bounds this wait: a prefetch wait before it must not
             # expire the moment the request is looked up again.
             self._loading_since.pop(req_id, None)
             return None, False
+        if reuse is not None:
+            self.lookup_cost["reused"] += 1
+            self._hit_dirty = True
+            return self._offer(req_id, reuse, num_computed)
 
         t0 = self._clock()
         try:
@@ -276,6 +289,10 @@ class Scheduler:
             self._release(lookup.leases)
             return 0, False
         self._release_unkept(lookup.leases, hit.leases)
+        hit.at = t0
+        return self._offer(req_id, hit, num_computed)
+
+    def _offer(self, req_id: str, hit: _Hit, num_computed: int) -> tuple[int, bool]:
         n = hit.p - num_computed
         # A short load costs about a millisecond; waiting for it before the
         # forward beats the two scheduler round trips of an async load. After
@@ -286,6 +303,23 @@ class Scheduler:
         )
         self._hits[req_id] = hit
         return n, not hit.sync
+
+    def _reusable_hit(self, req_id: str, num_computed: int) -> _Hit | None:
+        """Pop the request's unallocated hit; return it if it can be offered
+        again without a server query, else release it.
+
+        Its leases keep the blocks it loads on the server, so the answer still
+        holds; it is reused only for the same local hit and within
+        ``HIT_REUSE_MAX_S``. A longer hit (another request saved more of the
+        prefix meanwhile) is picked up at the next fresh query.
+        """
+        hit = self._hits.pop(req_id, None)
+        if hit is None:
+            return None
+        if hit.num_computed == num_computed and self._clock() - hit.at < self.HIT_REUSE_MAX_S:
+            return hit
+        self._release(hit.leases)
+        return None
 
     def _defer_for_inflight(self, request: Any, num_computed: int) -> bool:
         """Wait for another request's async load of this request's blocks.

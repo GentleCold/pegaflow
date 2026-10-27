@@ -36,6 +36,14 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     not past the local hit, the remaining groups are not queried and
     create no lease (group 0's lease is released). A full-only layout
     skips only when no full block lies past the local hit.
+  - A hit vLLM could not allocate (its KV pool was short) is kept with its
+    leases. vLLM asks again for the same waiting head every pass; if its
+    local hit is unchanged and the hit is younger than
+    `Scheduler.HIT_REUSE_MAX_S` (2 s), the same hit is offered again
+    without a server query. That cap is not a tuned value: it is far below
+    the server's lease TTL (600 s) and bounds how long a longer hit, saved
+    meanwhile by another request, goes unseen. Otherwise the held leases
+    are released and the request is looked up again.
   - `semantics.resolve` gives the longest legal `p`. `policy.accept` may lower it.
   - Only the blocks in `semantics.needed(g, p)` that are past vLLM's local hit get loaded.
   - Leases that cover none of those blocks are released immediately. Unwanted
@@ -191,7 +199,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
 
   The same line carries `lookup_cost`: `calls` / `us` / `max_us`, the wall
   time of every server lookup vLLM's scheduler thread waited for (re-queries
-  of a waiting request included), and `rpcs`, its `query_prefetch` calls.
+  of a waiting request included), `rpcs`, its `query_prefetch` calls, and
+  `reused`, re-asks answered from a held hit without a lookup (see Hits).
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first, and `LayerDecl.layout` when an
