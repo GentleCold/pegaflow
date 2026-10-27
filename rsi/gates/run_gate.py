@@ -4562,6 +4562,14 @@ def main(argv: list[str] | None = None) -> int:
     # Before any stage: what the run is about to measure.
     prov = record_provenance(args, run_dir)
     print(f"[gate] provenance {json.dumps(prov, default=str)}", flush=True)
+    dropped = (prov.get("under_test") or {}).get("dropped")
+    if dropped:
+        # The arm would run the rev without these files: fail before any stage.
+        ap.error(
+            f"--under-test-path {args.under_test_path}: untracked files are not in the "
+            f"snapshot the arm imports: {dropped[:10]}. Commit them (profile overrides "
+            "included) and pass that rev's tree."
+        )
     watch = ProvenanceWatch(args, model_dir)
     cuda = cuda_env()
     cuda_bad = cuda_problems(cuda)

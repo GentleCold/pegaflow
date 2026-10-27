@@ -334,6 +334,12 @@ def stage(under_test: Path, dest: Path, trees: Trees) -> dict[str, Any]:
         shutil.copyfile(under_test / native, dest / native)
     copy = check(dest, ("pegaflow",), blobs, native)
     rec |= {"copy": copy, "native": native, "native_sha256": copy["native_sha256"].get(native)}
+    # Files on disk the snapshot leaves out (untracked: an uncommitted
+    # profile override, a new module). The arm never sees them, so a run
+    # meant to test them would measure the rev instead. Bytecode is left out
+    # by design and not listed.
+    files, _ = _walk(under_test, "pegaflow")
+    rec["dropped"] = [f for f in files if f not in blobs and f != native and not f.endswith(".pyc")]
     if not src["verified"]:
         rec["reason"] = f"source: {src.get('reason')}"
     elif not copy["verified"]:

@@ -1504,8 +1504,28 @@ def test_stage_copies_only_the_verified_rev(tmp_path):
     snap = Path(rec["pegaflow_dir"])
     assert sorted(p.name for p in snap.iterdir()) == sorted(["__init__.py", "a.py", "conn.py", _native(snap).name])  # fmt: skip
     assert rec["native_sha256"] == provenance.sha256(_native(root / "python/pegaflow"))
+    assert rec["dropped"] == []
     (root / "python/pegaflow/a.py").write_text("x = 'edited mid-run'\n")
     assert (snap / "a.py").read_text() == "x = 1\n"
+
+
+def test_stage_names_untracked_files_it_leaves_out(tmp_path):
+    """An untracked file (e.g. an uncommitted profile override) is not in the
+    snapshot; ``dropped`` names it so the run fails instead of silently
+    measuring the rev without it. Bytecode is not listed."""
+    from rsi.gates import provenance
+
+    repo, rev = _git_tree(tmp_path)
+    root = _copy(repo, tmp_path, rev)
+    (root / "python/pegaflow/models").mkdir()
+    (root / "python/pegaflow/models/Override.toml").write_text("save_batch_steps = 1\n")
+    (root / "python/pegaflow/__pycache__").mkdir()
+    (root / "python/pegaflow/__pycache__/a.cpython-312.pyc").write_bytes(b"")
+    trees = provenance.Trees(tmp_path / "work", remote=f"file://{repo}")
+    rec = provenance.stage(root / "python", tmp_path / "ov", trees)
+    assert rec["verified"] is False
+    assert rec["dropped"] == ["pegaflow/models/Override.toml"]
+    assert not (tmp_path / "ov/pegaflow/models").exists()
 
 
 @pytest.mark.parametrize(
