@@ -107,8 +107,8 @@ class SaveStats:
     max_pending: int = 0  # jobs queued or running at submit time
     failed: int = 0  # jobs that did not store their blocks
     raised: int = 0  # save RPCs that raised with a copy possibly running (each quiesces)
-    rpcs: int = 0  # save RPCs issued (one per released batch)
-    pressure_rpcs: int = 0  # of those, sent early on KV pressure (StepPlan.send_saves)
+    rpcs: int = 0  # save RPCs sent (one per released batch not dropped by a quiesce)
+    pressure_rpcs: int = 0  # batches released early on KV pressure (StepPlan.send_saves)
     kv_usage_unknown_steps: int = 0  # steps without vLLM's KV usage (batching off)
     fences: int = 0  # steps that waited for saves before writing a freed block
     fence_s: float = 0.0  # step thread: blocked on those waits (on the critical path)
@@ -154,8 +154,12 @@ class Worker:
     # may still run. Gate logs (277 v2 runs, 3853 ``save stats`` windows)
     # show a whole job (compute wait + RPC) at p99 0.63 s and at most 2.98 s
     # (one 557 MB RPC); 10 s is over 3x that. It is also the longest a fence
-    # or pin on the raised job can hold vLLM's step.
+    # or pin on the raised job can hold vLLM's step. Each consecutive raise
+    # doubles the window up to SAVE_QUIESCE_MAX_S, so a cause that persists
+    # (a pinned pool that stays exhausted) stalls fences less often; a save
+    # RPC that stores its blocks resets it.
     SAVE_QUIESCE_S = 10.0
+    SAVE_QUIESCE_MAX_S = 60.0
 
     def __init__(
         self,
@@ -231,6 +235,8 @@ class Worker:
         # A save RPC raised and its window (SAVE_QUIESCE_S) runs: new saves
         # are dropped (future misses). Set and cleared by the saver thread.
         self._quiescing = False
+        self._quiesce_s = self.SAVE_QUIESCE_S  # next window (saver thread only)
+        self._stop = threading.Event()  # shutdown: ends a quiesce window early
         self._jobs: queue.SimpleQueue[_SaveJob | None] = queue.SimpleQueue()
         self._saver = threading.Thread(
             target=self._save_loop, name="pegaflow-v2-saver", daemon=True
@@ -542,12 +548,23 @@ class Worker:
         job = jobs[-1]
         if len(jobs) > 1:
             job = _SaveJob(job.seq, job.ready, [s for j in jobs for s in j.saves])
-        with self._cv:
-            self.save_stats.rpcs += 1
         self._jobs.put(job)
 
     def _settled(self, target: int) -> bool:
         return self._saver_dead or self._completed >= target
+
+    def _log_stall(self, what: str, t0: float, target: int) -> None:
+        """A stuck fence or flush (under ``_cv``). Waiting out a quiesce window
+        is expected (bounded), not a stall."""
+        log = logger.warning if self._quiescing else logger.error
+        log(
+            "[PegaKVConnectorV2] save %s waiting %.0f s (job %d of %d done%s)",
+            what,
+            self._clock() - t0,
+            self._completed,
+            target,
+            ", save quiesce window" if self._quiescing else "",
+        )
 
     def wait_saved(self, step: int) -> None:
         """Block until the saves of plans up to ``step`` are done (the GPU->CPU
@@ -562,12 +579,7 @@ class Worker:
             if self._settled(target):
                 return
             while not self._cv.wait_for(lambda: self._settled(target), self.STALL_LOG_S):
-                logger.error(
-                    "[PegaKVConnectorV2] save fence waiting %.0f s (job %d of %d done)",
-                    self._clock() - t0,
-                    self._completed,
-                    target,
-                )
+                self._log_stall("fence", t0, target)
             waited = self._clock() - t0
             stats = self.save_stats
             stats.fences += 1
@@ -594,12 +606,7 @@ class Worker:
                 while not (
                     done := self._cv.wait_for(lambda: self._settled(target), self.STALL_LOG_S)
                 ):
-                    logger.error(
-                        "[PegaKVConnectorV2] save flush waiting %.0f s (job %d of %d done)",
-                        self._clock() - t0,
-                        self._completed,
-                        target,
-                    )
+                    self._log_stall("flush", t0, target)
             self.save_stats.flushes += 1
             self.save_stats.flush_s += self._clock() - t0
         return done
@@ -615,13 +622,17 @@ class Worker:
                 self._cv.notify_all()
 
     def _quiesce(self, raised: _SaveJob) -> bool:
-        """After ``raised``'s RPC raised: send nothing for ``SAVE_QUIESCE_S``
-        while its fences and pins hold (its copy may still run), then count
-        it done and resume. Jobs queued behind it are completed as failed
-        without an RPC (no copy of theirs started): under the pressure that
-        made the RPC raise they would likely raise too, each holding fences
-        for another window. False if shutdown came during the window."""
-        self._quiesce_wait()
+        """After ``raised``'s RPC raised: send nothing for the window
+        (``SAVE_QUIESCE_S``, doubled per consecutive raise) while its fences
+        and pins hold (its copy may still run), then count it done and
+        resume. Jobs queued behind it, held (batched) jobs released during
+        the window included, are completed as failed without an RPC (no copy
+        of theirs started): under the pressure that made the RPC raise they
+        would likely raise too, each holding fences for another window.
+        Shutdown ends the window early. False if shutdown came during it."""
+        window = self._quiesce_s
+        self._quiesce_s = min(2 * window, self.SAVE_QUIESCE_MAX_S)
+        self._quiesce_wait(window)
         last, dropped, stop = raised.seq, 0, False
         while True:
             try:
@@ -639,13 +650,13 @@ class Worker:
             self._cv.notify_all()
         logger.warning(
             "[PegaKVConnectorV2] saves resume after %.0f s quiesce (%d queued jobs dropped)",
-            self.SAVE_QUIESCE_S,
+            window,
             dropped,
         )
         return not stop
 
-    def _quiesce_wait(self) -> None:  # tests replace it
-        time.sleep(self.SAVE_QUIESCE_S)
+    def _quiesce_wait(self, seconds: float) -> None:  # tests replace it
+        self._stop.wait(seconds)
 
     def _run_job(self, job: _SaveJob) -> bool:
         """Run one save job; False if its copy may still run.
@@ -666,7 +677,8 @@ class Worker:
         """
         t0 = self._clock()
         t1 = t2 = t0
-        ok = over = raised = False  # over: no copy of this job can still be running
+        # over: no copy of this job can still be running
+        ok = over = raised = sent = False
         try:
             try:
                 job.ready.synchronize()
@@ -674,6 +686,7 @@ class Worker:
                 ok, over, msg = False, True, f"compute wait failed: {e!r}"
             else:
                 t1 = self._clock()
+                sent = True
                 try:
                     ok, msg = self._rpc.save(
                         self._instance_id,
@@ -690,7 +703,7 @@ class Worker:
             if not over:
                 logger.error(
                     "[PegaKVConnectorV2] save RPC raised, saves pause %.0f s (fail closed): %s",
-                    self.SAVE_QUIESCE_S,
+                    self._quiesce_s,
                     msg,
                 )
             elif not ok:
@@ -703,6 +716,9 @@ class Worker:
                 stats.rpc_s += t2 - t1
                 stats.max_job_s = max(stats.max_job_s, t2 - t0)
                 stats.failed += not ok
+                stats.rpcs += sent
+                if ok:
+                    self._quiesce_s = self.SAVE_QUIESCE_S  # stored: backoff resets
                 if over:
                     # Failed or not, the copy is over: held blocks are released.
                     self._completed = job.seq
@@ -767,6 +783,7 @@ class Worker:
         )
 
     def shutdown(self) -> None:
+        self._stop.set()  # a quiesce window ends now: its queued jobs are dropped
         if not self.flush(self.SHUTDOWN_FLUSH_S):
             logger.warning("[PegaKVConnectorV2] saves still pending at shutdown")
         self._jobs.put(None)

@@ -1479,7 +1479,7 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     rpc.save = lambda *args: save(calls, args[-1])
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=lambda: FakeMark(gate))
-    worker._quiesce_wait = lambda: window.wait(5)
+    worker._quiesce_wait = lambda s: window.wait(5)
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
 
     sched, _ = _sched(StubSemantics, {}, layout=layout)
@@ -1534,6 +1534,98 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
         assert worker.flush(5) and len(calls) == 1
         assert worker.save_stats.failed == 2
     worker.shutdown()
+
+
+def _quiesce_rig(outcomes, monkeypatch=None):
+    """Worker whose save RPCs return or raise ``outcomes`` in order. Each
+    quiesce window records its length in ``windows`` and lasts until the
+    test releases ``ends`` once."""
+    import threading
+
+    rpc, calls, outs = FakeRpc(), [], iter(outcomes)
+    rpc.save = lambda *args: _save_outcome(next(outs))(calls, args[-1])
+    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    windows, ends = [], threading.Semaphore(0)
+
+    def wait(seconds):
+        windows.append(seconds)
+        assert ends.acquire(timeout=5), "test never ended the quiesce window"
+
+    worker._quiesce_wait = wait
+    return worker, calls, windows, ends
+
+
+def _save_plan(step, send=False):
+    return StepPlan(saves=[GroupSave(0, [step], [b"h%d" % step])], step=step, send_saves=send)
+
+
+def _wait_quiescing(worker):
+    with worker._cv:
+        assert worker._cv.wait_for(lambda: worker._quiescing, 5)
+
+
+def test_quiesce_window_holds_only_the_raised_and_later_saves(monkeypatch):
+    """During a window: a fence on a step before the raised job's clears at
+    once; a fence on its step and a flush wait for the window; a new save
+    and a held batch released meanwhile are dropped without an RPC. Then
+    saving resumes."""
+    one_step = _wire_bytes([("layers.0.attn", [0], [b"h0"])])
+    monkeypatch.setattr(Worker, "SAVE_RPC_MAX_BYTES", one_step)  # each step sends the last
+    worker, calls, windows, ends = _quiesce_rig(["saved", "raises", "saved"])
+    worker._batch_steps = 100
+    worker.save(_save_plan(0))  # held
+    worker.save(_save_plan(1))  # sends step 0 (stored), holds step 1
+    worker.save(_save_plan(2))  # sends step 1 (raises), holds step 2
+    _wait_quiescing(worker)
+    assert not _blocked(worker.wait_saved, 0).is_alive()
+    fence = _blocked(worker.wait_saved, 1)
+    flush = _blocked(worker.flush)  # releases held step 2 into the window
+    assert fence.is_alive() and flush.is_alive()
+    worker.save(_save_plan(3))  # dropped
+    ends.release()
+    fence.join(5)
+    flush.join(5)
+    assert not fence.is_alive() and not flush.is_alive()
+    s = worker.save_stats
+    assert (len(calls), windows, s.raised, s.rpcs, s.failed) == (2, [10.0], 1, 2, 3)
+    worker.save(_save_plan(4))
+    assert worker.flush(5) and len(calls) == 3
+    worker.shutdown()
+
+
+def test_quiesce_window_backs_off():
+    """Each consecutive raise doubles the window up to SAVE_QUIESCE_MAX_S; a
+    save RPC that stores its blocks resets it (a failed reply does not)."""
+    outcomes = ["raises"] * 4 + ["save-failed", "raises", "saved", "raises"]
+    worker, calls, windows, ends = _quiesce_rig(outcomes)
+    for step, outcome in enumerate(outcomes):
+        worker.save(_save_plan(step))
+        if outcome == "raises":
+            ends.release()
+        assert worker.flush(5)
+    assert windows == [10.0, 20.0, 40.0, 60.0, 60.0, 10.0]
+    assert len(calls) == len(outcomes)
+    worker.shutdown()
+
+
+def test_shutdown_ends_a_quiesce_window():
+    """Shutdown does not wait out a window: the saver resumes at once and
+    exits, and no further save RPC is sent."""
+    import time
+
+    rpc, calls = FakeRpc(), []
+    save = _save_outcome("raises")
+    rpc.save = lambda *args: save(calls, args[-1])
+    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.save(_save_plan(0))
+    _wait_quiescing(worker)
+    worker.save(_save_plan(1))  # dropped
+    t0 = time.monotonic()
+    worker.shutdown()
+    assert time.monotonic() - t0 < Worker.SAVE_QUIESCE_S / 2
+    assert not worker._saver.is_alive() and len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -1641,7 +1733,7 @@ def _fence_rig(outcomes=None, policy=None):
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=lambda: FakeMark(next(marks)))
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
-    worker._quiesce_wait = lambda: None
+    worker._quiesce_wait = lambda s: None
     sched, _ = _sched(StubSemantics, {}, policy=policy, layout=layout)
     tables = {"a": [10, 11, 12, 13], "b": [20, 21, 22, 23], "c": [30, 31, 32, 33]}
     for rid in tables:
@@ -2035,7 +2127,7 @@ def test_pinned_saves_released_when_a_save_raises(outcome):
     worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     window = threading.Event()
-    worker._quiesce_wait = lambda: window.wait(5)
+    worker._quiesce_wait = lambda s: window.wait(5)
     worker.save(plan)
     if outcome == "raises":
         with worker._cv:

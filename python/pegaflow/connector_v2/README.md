@@ -146,8 +146,17 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     recovery). For `Worker.SAVE_QUIESCE_S` (10 s) no save RPC is sent, new
     saves are dropped, and the raised job's fences and pins (and those of
     every later job) hold. Then the job counts as done, the jobs queued
-    behind it are dropped without an RPC, and saving resumes. Each raise
-    is logged and counted as `raised` in `save stats`. This covers server
+    behind it (held batches released meanwhile included) are dropped
+    without an RPC, and saving resumes. Each consecutive raise doubles the
+    window, up to `SAVE_QUIESCE_MAX_S` (60 s); a save RPC that stores its
+    blocks resets it. Shutdown ends a window early. Each raise is logged
+    and counted as `raised` in `save stats`.
+    During a window, earlier steps' fences clear as usual. A step waits
+    for the rest of the window if it writes a block fenced on the raised
+    step or later (also blocks whose save was dropped: the scheduler does
+    not know), and every flush does (preemption, window-group layouts).
+    Pinned layouts never wait, but their pins of the window's planned
+    saves stay in vLLM's block pool until it ends. This covers server
     errors such as an exhausted pinned pool (Internal) or an unknown
     instance (FailedPrecondition). The binding raises those as the same
     class as transport errors (`PegaFlowError`), and the client also
@@ -224,7 +233,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   - on the saver thread: `wait_ms` (compute event), `rpc_ms`, `max_job_ms`,
     `max_pending` jobs;
   - failed saves, and `raised` (save RPCs that raised with a copy possibly
-    running; each starts a quiesce window);
+    running; each starts a quiesce window); `rpcs` counts save RPCs sent,
+    `pressure_rpcs` batches released early on KV pressure;
   - loads, on the step thread: `sync_loads` (sync loads whose RPC the server
     accepted), `sync_first_steps` (steps where a sync load was moved ahead
     of an async one), `sync_wait_ms` / `max_sync_wait_ms` (waiting for the
