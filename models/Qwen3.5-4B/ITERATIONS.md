@@ -2858,6 +2858,113 @@ buckets are too coarse for p50/p90. Tool: `p5-it3-attr/h9rep.py`.
   arms here. It is the next item: a per-step split of connector cost
   (`PEGA_CONN` diag hook, run `qwen3-4b-p5-tpot-tp2-dc4a4e0`).
 
+### TPOT split (2026-10-27): the gap is scheduling shape, not per-step connector cost (reviewed)
+
+Run `qwen3-4b-p5-tpot-tp2-dc4a4e0` (TP2 replay, base server, dc4a4e0, both
+arms) used the diag-only hook `~/kexi/tmp/p5-diag-conn/sitecustomize.py`
+(`PEGA_DIAG_CONN=1`). The hook times:
+
+- every MultiConnector child's methods (v2 or OffloadingConnector, plus
+  RsiProbe);
+- schedule() and update_from_output();
+- the V2 runner's pre_forward/post_forward and execute/sample CPU;
+- CUDA events from the end of pre_forward to finish_forward.
+
+Tools are `p5-it3-attr/conn*.py`. The aligned numbers come from the
+reviewer's `p5-review-tpot/rv4.py` and `rv5.py`.
+
+**Hook overhead.** Hooked TPOT is native 16.78/16.75 ms and v2
+17.83/17.77 ms (+6.3/+6.1%). Unhooked native in the H9 runs is
+16.70-16.96 ms. Hooked v2 warm2 is about 0.1 ms above every unhooked v2
+warm2 (17.41-17.71). The hooked ratio stays inside the unhooked range of
++4.2 to +8.0%, so the split is not skewed.
+
+**Direct connector cost per pure-decode step** (ms; scheduler plus worker
+rank 0, connector child only, probe excluded):
+
+| category | native (OffloadingConnector) | v2 |
+|---|---|---|
+| save enqueue (`wait_for_save`; native also submits its stores in `start_load_kv`) | 0.001 + 0.370 (start_load_kv, stores + loads) | 0.061 |
+| fence (`handle_preemptions`) | 0.002 | 0.001 |
+| metadata build (`build_connector_meta` + bind/clear) | 0.196 | 0.063 |
+| poll (`update_connector_output` + `get_transfer_results` / worker meta) | 0.052 | 0.013 |
+| load issue (`start_load_kv`) | (in the save row) | 0.075 |
+| lookup (`get_num_new_matched_tokens` + `update_state_after_alloc`) | 0.047 | 0.084 |
+| other | 0.002 | 0.002 |
+| total | ≈0.67 | ≈0.30 |
+
+On pure steps the period minus the GPU span is 1.27 ms native vs 0.93 ms
+v2. v2's lower CPU cost shows up in its favour. The one connector cost
+on the critical path that this table leaves out: on 112 of v2's 239
+prefill-carrying steps, `pre_forward` blocks on sync loads for 5.95 ms on
+average. It is worth about 0.17 ms of TPOT (rough and confounded). H9
+already screened this cost: lowering the threshold made TPOT worse.
+
+**Gap attribution.** The step period is aligned as `U[k+1].t − U[k].t`.
+My first cut used `S[s] − S[s−1]`, which under async scheduling reflects
+step s−2 (reviewer). The aligned estimator gives native 16.80 and v2
+17.81 ms, matching per-request TPOT from U (16.77 / 17.80) and the vLLM
+metric. The gap is +1.01 ms per output token:
+
+| part | native | v2 | TPOT effect |
+|---|---|---|---|
+| (a) share of decode tokens in prefill-carrying steps | 4.8% (137 steps) | 11.8% (239 steps) | **+0.99 ms** (+0.95 with the other ordering) |
+| (b) pure-decode step period (nreq-matched +0.08) | 16.13 | 16.22 | +0.08 |
+| (c) prefill-carrying step period | 30.13 | 29.70 | −0.05 |
+
+- A prefill-carrying step costs about 14 ms more than a pure decode step
+  in both arms. Any row with more than 1 token makes
+  `decode_graph_eligible` false (V2 runner `gather_batch_req_state`), so
+  the batch runs PIECEWISE instead of FULL cudagraph. `exec` CPU rises to
+  12-14 ms on those steps (launch-bound), and the cost barely depends on
+  the prefill size (≤16 extra tokens already costs +8 to +11 ms). This is
+  vLLM-native behaviour.
+- Every prefill-carrying step is a request's first compute step: about
+  8 prefill tokens on a near-full hit. There are no chunk continuations
+  and no preemptions. Distinct first-compute steps per pass across 6 TP2
+  runs: native 70-88, v2 113-187. The sync_load_tokens=0 arm is the
+  highest at 187, with the worst TPOT (+8.0%). Across 12 passes, step
+  count correlates with v2 TPOT at r = 0.54.
+- Where v2's extra steps come from (diag run, PEGA_DIAG):
+  - Native loads everything async with a uniform 2-6 step delay, and an
+    arrival group lands in 1.45 compute steps.
+  - v2 computes sync hits in their arrival step. Its async loads land
+    after 2-12 steps, and a group spreads over 2.00 compute steps.
+  - Closed-loop replay amplifies this: spread landings give spread
+    finishes, which give more arrival groups (110 vs 76 per pass).
+  - The async tail is the load copy time itself, not scheduling after
+    landing. Save stats show 25-80 ms mean ready time, up to 211 ms and
+    11 polls (one step each). The server copies a device's loads one at a
+    time, so this suggests (not verified) the server's load latency.
+  - Counterfactual (rv5): if sync hits joined their group's async landing
+    and each group's async loads landed together, v2 would have 98/87
+    admission steps per pass instead of 122/116 (native 81/80).
+    Within-group spread explains about 25 of the ~40 extra steps; the
+    feedback explains the rest.
+
+**Verdict.**
+
+- The +1.0 ms/token gap is almost all scheduling shape: more decode
+  tokens ride vLLM's PIECEWISE prefill-carrying steps.
+- Direct per-step connector cost (save enqueue, fence, metadata build,
+  poll) is about half of native's, so it is not headroom.
+- v2 does trigger the shape through admission timing, and the only
+  connector levers there are TTFT trades:
+  - delaying sync hits or holding early landers to coalesce a group gives
+    back part of v2's −18 to −28% TTFT p50;
+  - the 6-12 step tail is load latency (server-side, out of scope).
+- No connector change is free headroom. A possible screen (not started)
+  is H10: coalesce a step's async landings, reporting `finished_recving`
+  together under a short cap. It would trade TTFT for TPOT, and rps moved
+  with step count (−1.2 to −6.0%).
+
+Script bugs the reviewer found:
+
+- `connsplit.py`/`conncf.py` step-period misalignment (fixed in `rv4`);
+- `conncf.py`'s sync/async labels are a size threshold, not the load
+  mode;
+- `connsteps.py` counts 1-token full hits (3-6 per pass).
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
