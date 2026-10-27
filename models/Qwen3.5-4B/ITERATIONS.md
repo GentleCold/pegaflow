@@ -2406,6 +2406,114 @@ Why 10 s:
 
 Pool exhaustion is raised before any copy is issued (offload.rs, phase-2
 alloc). The server follow-up is recorded in PROGRESS "Server limitations".
+
+**e4a2373 review:** APPROVE. Earlier steps' fences clear during a window.
+Fences on the raised step or later and every flush wait it out, and pinned
+layouts accumulate pins. The concern was the duty cycle under persistent
+pressure (10 s off per raise).
+
+**33666ce (backoff).** Each consecutive raise doubles the window
+(10 → 20 → 40 → 60 s cap). A save RPC that stores its blocks resets it.
+Shutdown ends a window early. The same commit fixes the review nits:
+`rpcs` is counted when sent, stall logs inside a window are warnings, and
+the README describes held batches. It adds four tests (window scope,
+backoff, shutdown, held-hit reuse).
+
+## H8 (2026-10-27): reuse an unallocated hit instead of re-querying
+
+### Hypothesis H8 (ee249b7, fixes dc4a4e0)
+
+The it5 diag showed v2 lookups at 1186-1210 µs/call vs native 306, and
+94% of lookup µs fell on `alloc_fail` passes. vLLM re-asks for the same
+waiting head every pass, and v2 released the held hit and queried the
+server again each time.
+
+H8 keeps that hit and offers it again when two things hold:
+- the local hit (`num_computed`) is unchanged;
+- the hit is younger than `Scheduler.HIT_REUSE_MAX_S` = 2 s.
+
+Otherwise the leases are released and the request is looked up afresh.
+The held leases keep the server blocks, so the answer still holds. This
+adds no knob: the cap is a constant (see below).
+
+Review: APPROVE, no correctness bug or lease leak on normal paths. The
+nits are fixed in dc4a4e0:
+- a raise inside the deferral check could leak the popped hit, so
+  deferral is now checked first;
+- the deferral release path had no test, now it does;
+- README wording: "did not allocate", and a deferred request waits
+  rather than being looked up;
+- reuse skips `Policy.accept`, whose inputs are unchanged; this is now
+  noted.
+
+### H8 result: perf-neutral, lookup cost -65% (`2026-10-27-qwen3-4b-p5-h8-tp1-ee249b7`)
+
+Official TP1 run: GPU3, native + v2, replay and gsm8k, base server. Exit
+1 is structural: the failing verdicts are the same set as it5.
+
+**Correctness:**
+- G2 `digest_self.gsm8k` 171348 local / 5473 external, 0 mismatched;
+- `digest_self.replay` 9630 / 17896, 0 mismatched;
+- `gsm8k_outputs`, `no_eviction` and G3 efficiency 1.0 all pass;
+- gsm8k accuracy 0.8552, equal to native.
+
+| warm2 / warm3 | native it5 | v2 it5 (ebe69db) | native H8 run | v2 H8 (ee249b7) |
+|---|---|---|---|---|
+| ttft p50 (s) | 0.602 / 0.571 | 0.506 / 0.544 | 0.550 / 0.506 | 0.507 / 0.528 |
+| rps | 8.98 / 8.92 | 10.17 / 10.13 | 9.29 / 9.20 | 10.16 / 10.12 |
+| ms/step | 26.2 / 26.5 | 23.0 / 23.1 | 25.5 / 25.7 | 23.0 / 23.1 |
+| ttft_steps p50 (all) | 11 / 11 | 18 / 19 | 10 / 10 | 18 / 19 |
+| gsm8k warm s | 173.6 | 169.2 | 173.4 | 169.0 |
+
+- **G4.** ttft_p50 is -1.9% vs native (within noise); it5 was -10.5%.
+  - The change is on the native side: its median was 0.587 in it5 and is
+    0.528 here.
+  - v2 itself moved only from 0.525 to 0.518.
+  - rps is +9.7% (it5 +13.3%).
+
+**Diag pass** (`2026-10-27-qwen3-4b-p5-h8-diag-tp1-ee249b7`; before =
+`...-diag-tp1-ebe69db`). Values are warm2 / warm3.
+
+| | native | v2 before | v2 H8 |
+|---|---|---|---|
+| lookup µs/call | 240-310 | 1210 / 1186 | 314 / 333 |
+| lookup ms/step | 0.23-0.30 | 1.14 / 1.12 | 0.30 / 0.32 |
+| asks per pass | 1085-1089 | 1069 / 1069 | 1073 / 1092 |
+| TTFT-window steps p50 | 12-15 | 24 / 25 | 25 / 23 |
+| step duration p50 (ms) | 21.8-21.9 | 21.8 / 21.8 | 21.8 / 21.9 |
+| held-hit span p50 / p90 / max (ms) | 57-73 / 1223-1327 / 1798 | 56 / 315-335 / 1500 | 56-58 / 185-365 / 1469 |
+
+**Replay `lookup_cost`** (cumulative):
+- before: calls 4284, 2910 ms;
+- after: calls 1169, reused 3091 (72.6% of asks answered without a
+  query), 1016 ms;
+- gsm8k reused 0 (no `alloc_fail` heads).
+
+**Lease hold.** A span runs from the first `alloc_fail` pass with a held
+hit to admission. Spans are unchanged by H8 and none reached 2 s. Before
+H8 the leases were also held across each pass: they were released and
+retaken at the next ask. H8 removes the release/re-query, not the pin
+time. Whether reuse changes reclaim/eviction under pinned-pool pressure
+is checked in the TP2 cap rerun on dc4a4e0.
+
+**Why 2 s and a constant.** Replaying the pre-H8 re-asks under a cap C:
+
+| C (s) | 0.1 | 0.25 | 0.5 | 1 | 2 |
+|---|---|---|---|---|---|
+| asks reused | 69% | 77% | 80% | 81% | 81-82% |
+
+The longest wait is 1.5 s, so 2 s answers each wait with one query. A
+smaller cap only trades queries (about 1 ms each) for seeing a newer save
+sooner. It bounds staleness; it does not tune behaviour, so it stays a
+constant.
+
+**Reading.** H8 cuts server queries by 72% and brings lookup µs/call to
+native level, but it is perf-neutral. Step duration did not move: vLLM's
+async scheduling had already hidden the lookup CPU behind the forward.
+The TP1 step gap (v2 18-19 vs native 10-11 ttft_steps p50) is unchanged.
+So the hypothesis that the remaining step gap is lookup cost is
+**rejected**: the cost was real but off the critical path. H8 stays
+because it removes server load and adds no knob.
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
