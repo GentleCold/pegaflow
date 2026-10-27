@@ -2965,6 +2965,137 @@ Script bugs the reviewer found:
   mode;
 - `connsteps.py` counts 1-token full hits (3-6 per pass).
 
+### H10 screen (2026-10-27): coalesce a step's async landings, rejected
+
+Change, on diag branch `diag/p5-h10-coalesce`:
+
+- fcb1e07 adds a generic policy knob, `async_coalesce_ms` (default 0,
+  off). With it set, a landed async load is held in `Worker.poll` until
+  every async load issued in the same `start_load_kv` has landed, or
+  until it has been ready for the cap. Unit test
+  `test_worker_coalesces_a_steps_async_landings`.
+- 582f664 sets the cap to 20 ms (about one decode step); 9feb425 sets
+  60 ms (about the mean landing time), both via
+  `models/Qwen3ForCausalLM.toml`.
+
+Checks before the runs: ruff check and format, cz, the source-only gate
+(555 passed) and the core tests with the base .so (303 passed). Runs are
+TP2 replay on the base server, native in each run, tags
+`qwen3-4b-p5-h10-tp2-<rev>`.
+
+| arm | pass | rps nat / v2 | TTFT p50 nat / v2 ms | TTFT p90 nat / v2 ms | TPOT nat / v2 ms | v2 vs nat: rps / p50 / p90 / TPOT | admission steps v2 (nat) |
+|---|---|---|---|---|---|---|---|
+| 20 ms | warm2 | 18.97 / 18.49 | 182 / 148 | 225 / 216 | 16.71 / 17.75 | −2.5 / −18.7 / −3.8 / +6.2% | 117 (70) |
+| | warm3 | 18.77 / 18.42 | 180 / 164 | 259 / 323 | 16.81 / 17.46 | −1.9 / −8.7 / +24.8 / +3.9% | 102 (83) |
+| 60 ms | warm2 | 18.76 / 18.58 | 175 / 150 | 231 / 282 | 16.88 / 17.53 | −1.0 / −14.0 / +22.1 / +3.8% | 117 (84) |
+| | warm3 | 18.84 / 18.38 | 178 / 153 | 257 / 241 | 16.79 / 17.69 | −2.4 / −14.0 / −6.5 / +5.4% | 118 (82) |
+
+**Default-v2 reference set:** six unhooked TP2 runs on the base server,
+`h9-dc4a4e0`, `diag-dc4a4e0`, `it5-5c3ab63`, `h5-02b6767`, `h5-daa5e11`
+and `it4-02b6767`. The hooked `tpot-dc4a4e0` run (+6.3/+6.1% TPOT) is
+left out. Ranges over that set:
+
+- rps −0.6 to −4.1%;
+- TPOT +3.8 to +5.7%;
+- TTFT p50 +0.2 to −19.9%;
+- admission steps 100-128 per pass.
+
+- **No gain beyond the spread.**
+  - rps (−1.0 to −2.5%) sits inside the default range at both caps.
+  - TPOT (+3.8 to +6.2%) sits inside or slightly above the top of the
+    range.
+  - Admission steps (102-118) are inside the 100-128 range.
+  - The acceptance rule (beyond the ~3 pp spread, confirmed by a
+    repeat) is not met, so no repeat or TP1 check was run.
+- **TTFT.** p50 (−8.7 to −18.7%) is inside the default range (+0.2 to
+  −19.9%), so no TTFT cost was measured. The p90 tail is mixed (+22 to +25% in one pass of
+  each cap), also within what the default arm shows (+46.7% in
+  `h9-dc4a4e0` warm3).
+- **Behaviour did change.**
+  - Polls per landing rose from 2.50-2.67 (default, four runs) to 3.14
+    (20 ms) and 3.96 (60 ms); max polls from 11 to 15 and 26.
+  - Mean ready time per landing is unchanged: 65.6 / 52.3 ms vs
+    50.8-67.6 ms.
+  - Polls count only up to the first ready poll. More poll calls per
+    unit time while held requests wait would explain this (not verified;
+    no PEGA_DIAG in these runs).
+  - The knob acted, but the outcome is inside the spread.
+- **Bound (reviewer).** In the diag run's timed passes:
+  - 159 steps issue async loads. 98 of them issue one (27% of async
+    requests), and the other 61 hold 73%.
+  - 32 of those 61 groups land over 2 or more compute steps.
+  - Collapsing every group onto its last landing step, with no feedback
+    and sync hits left in place, gives 128→114 and 126→111 admission
+    steps per pass. That is about 15 of the ~40 steps over native's
+    88/83.
+  - H10's 117/102 and 117/118 cannot be told apart from the default's
+    spread.
+  - The caps (20 ms ≈ 1 poll, 60 ms ≈ 3 polls) are small next to the
+    2-12 step landing spread. A larger cap was not tried: its gain is
+    bounded at about 15 steps, and it trades TTFT directly.
+- **Cross-step coalescing.** Holding a landed load for later arrivals is
+  a pure TTFT-for-TPOT trade. Even perfect coalescing (rv5: 98/87
+  admission steps, sync hits moved too) stays above native's 81/80.
+- **Failure reporting.** The only semantic change: a failed async load
+  in a held group is reported up to the cap later.
+- **Verdict: rejected.** The knob stays on the diag branch and is not
+  merged.
+
+## Qwen3-4B TP2 stop (2026-10-27)
+
+Stop. The TP2 gap to native is vLLM's PIECEWISE step shape plus v2's
+async-load landing spread. The spread is load copy time, probably
+server-side but not verified. No connector-side headroom was found that
+clears the run spread.
+
+- **v2 vs native**, over the default-v2 reference set above: rps −0.6 to
+  −4.1% (run spread about 3 pp), TTFT p50 +0.2 to −19.9%, TPOT +3.8 to
+  +5.7%.
+  - Across all TP2 screens, worse cells occur: rps −6.0%, TPOT +8.0%
+    with sync_load_tokens=0.
+  - An older TP2 run, from before the fixes kept here, is outside these
+    ranges: c8a8842 is −8.7/−9.8% rps and +14.7/+16.2% TPOT.
+- **TPOT, reviewed:**
+  - The +1.0 ms per token is almost all decode tokens riding
+    prefill-carrying steps. Those run vLLM's PIECEWISE graph and cost
+    about 14 ms more than a FULL-graph decode step.
+  - v2 has more of these steps for two reasons. Its async loads land
+    over 2-12 steps, with copy time 25-80 ms mean and up to 211 ms. And
+    its sync hits run in their arrival step.
+- **Direct connector cost** per decode step (save enqueue, fence,
+  metadata build, poll, load issue) is about 0.30 ms, vs about 0.67 ms
+  for native's OffloadingConnector.
+- **Levers tried, none cleared the spread:**
+  - H9(a): sync_load_tokens 0 and 64;
+  - H10: same-step landing coalescing at 20 and 60 ms.
+- **Levers left, and why each is not taken:**
+  - **Delay sync hits / hold landings across steps.** These are
+    TTFT-for-TPOT trades. v2 has up to ~20% TTFT p50 to spare against
+    native (the only perf reference), about 0 in one it4-02b6767 pass,
+    but rps is the throughput signal. H10 is
+    already such a trade (behaviour changed) and rps did not move. Even
+    perfect coalescing bounds the admission steps above native's
+    (rv5: 98/87; same-step async only: ~114/111), so the expected gain
+    stays inside the spread.
+  - **One RPC for a step's async loads** (the async counterpart of the
+    parked H9(b)). It may narrow the spread within a group, since the
+    server copies a device's loads one at a time in arrival order.
+    Parked: one bad lease fails the whole RPC (`_start_loads`
+    docstring), and its gain is bounded by the same ~15-step same-step
+    bound.
+  - **Load copy latency** is server-side (out of scope).
+  - **The PIECEWISE cost of mixed batches** is vLLM-native.
+- **TP1** had already stopped (reviewed earlier in this file, "Qwen3-4B
+  stop attribution"): rps +9.7%, wall time equal or better.
+- **Cleanup after this record:**
+  - delete diag branch `diag/p5-h10-coalesce` and ut trees
+    582f664/9feb425;
+  - delete the `~/kexi/tmp` diag hooks and analysis dirs (`p5-diag-hook`,
+    `p5-diag-conn`, `p5-it3-attr`, `p5-review-tpot`,
+    `p5-review-stop`), archived first to
+    `~/kexi/rsi-runs/p5-tp2-stop-tools.tar.gz` so every number here
+    stays reproducible from the kept run summaries and logs.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
