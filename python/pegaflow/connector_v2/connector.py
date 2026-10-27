@@ -97,6 +97,9 @@ def _pin_saves(kv_cache_config: Any, layout: Any) -> bool:
 
 class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
     _cache_hit_source = CacheHitSource.HOST
+    # Q1 diag arms only (diag branch): force pinned saves / unbatched saves.
+    _DIAG_PIN_ALL = False
+    _DIAG_NO_BATCH = False
 
     def __init__(
         self,
@@ -172,7 +175,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 self._rpc,
                 self._instance_id,
                 sync_loads=sync_loads,
-                pin_saves=_pin_saves(kv_cache_config, self._layout),
+                pin_saves=self._DIAG_PIN_ALL or _pin_saves(kv_cache_config, self._layout),
                 prefix_caching=bool(getattr(cc, "enable_prefix_caching", True)),
                 # Steps vLLM schedules before it processes a step's output
                 # (fallback: the largest value vLLM 0.32 uses, pp + 1).
@@ -194,9 +197,9 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
 
             # The scheduler pins what these layouts save (_pin_saves): the
             # saves stay asynchronous, unbatched so blocks stay pinned briefly.
-            pinned = _pin_saves(kv_cache_config, self._layout)
+            pinned = self._DIAG_PIN_ALL or _pin_saves(kv_cache_config, self._layout)
             policy = Policy()
-            batch_steps = 1 if pinned else policy.save_batch_steps
+            batch_steps = 1 if pinned or self._DIAG_NO_BATCH else policy.save_batch_steps
             logger.info(
                 "[PegaKVConnectorV2] saves=%s batch_steps=%d max_kv_usage=%s",
                 "async-pinned" if pinned else "async",
@@ -457,3 +460,15 @@ def _ipc_bytes(tensor: torch.Tensor) -> bytes:
     from pegaflow.ipc_wrapper import CudaIPCWrapper
 
     return pickle.dumps(CudaIPCWrapper(tensor))
+
+
+class PegaKVConnectorV2NoBatch(PegaKVConnectorV2):
+    """Q1 diag arm: save_batch_steps = 1."""
+
+    _DIAG_NO_BATCH = True
+
+
+class PegaKVConnectorV2PinAll(PegaKVConnectorV2):
+    """Q1 diag arm: pinned saves on every layout (batch 1, no fences, no flush)."""
+
+    _DIAG_PIN_ALL = True
