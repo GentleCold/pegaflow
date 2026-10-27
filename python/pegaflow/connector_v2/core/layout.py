@@ -33,6 +33,25 @@ class GroupInfo:
 
 
 @dataclass(frozen=True)
+class StorageRanks:
+    """How this PP stage's TP ranks map onto the server's per-rank slots.
+
+    From ``seal_plan``: ranks holding the same part of every layer (replicas,
+    e.g. the MLA latent under TP) share one storage rank, so the server keeps
+    one slot per part instead of one per TP rank, and only the part's
+    designated writer saves it. Every holder still loads into its own GPU.
+    """
+
+    tp_size: int  # parts per layer: the server's slots per layer
+    rank: tuple[int, ...]  # tp_rank -> storage rank (the part it holds)
+    writer: tuple[bool, ...]  # tp_rank -> saves its part
+
+    @staticmethod
+    def identity(tp_size: int) -> StorageRanks:
+        return StorageRanks(tp_size, tuple(range(tp_size)), (True,) * tp_size)
+
+
+@dataclass(frozen=True)
 class Layout:
     # Transferable groups; the index is the server storage group id ("sid").
     groups: tuple[GroupInfo, ...]
@@ -40,6 +59,7 @@ class Layout:
     namespace: str
     transfer_backend: str = "direct"  # RegisterContext transfer_mode, from LayerDecl
     page_first: bool = False  # RegisterContext page_first, from LayerDecl
+    storage: StorageRanks = StorageRanks.identity(1)
 
     def group_hashes(self, g: GroupInfo, block_hashes: list[bytes]) -> list[bytes]:
         """Hashes of the group's blocks: the last hash_block_size hash of each."""
@@ -79,14 +99,6 @@ def build_layout(
         group_spec = next(iter(specs.values()), kv_group.kv_cache_spec)
         adapter = adapter_for(group_spec, gid)
         sem = adapter.group(group_spec)
-        if sem.kind == "checkpoint":
-            # vLLM 0.32 hands Mamba "align" boundary states off with exact block
-            # ids (KVConnectorBlockState.boundary_state_offloads); positional
-            # save/load would store wrong state under a correct key (P5 core task).
-            raise Unsupported(
-                f"group {gid} ({type(group_spec).__name__}): checkpoint groups need core "
-                f"support for vLLM boundary_state_offloads"
-            )
         bt = sem.block_tokens
         if bt != group_spec.block_size:
             raise Unsupported(
@@ -121,7 +133,8 @@ def build_layout(
 
     decls = _rank_decls(groups, group_specs, par)
     backend, page_first = _transfer_mode(decls, len(groups))
-    _check_seal_plan(sem_mod, decls)
+    plan = _check_seal_plan(sem_mod, decls)
+    storage = _storage_ranks(plan, decls, par.tp_size)
 
     step = 1
     for g in groups:
@@ -135,11 +148,14 @@ def build_layout(
         "kv_cache_layout": getattr(kv_cache_config, "kv_cache_layout", None),
         "parallel": [par.tp_size, par.pp_size, par.dcp_size, par.dcp_interleave],
         "transfer": [backend, page_first],
+        # Slots per layer on the server: blocks stored with another count
+        # fail every load ("namespace is shared by incompatible KV layouts").
+        "storage_tp": storage.tp_size,
         **identity,
     }
     blob = json.dumps(doc, sort_keys=True, default=str).encode()
     namespace = hashlib.sha256(blob).hexdigest()[:8]
-    return Layout(tuple(groups), step, namespace, backend, page_first)
+    return Layout(tuple(groups), step, namespace, backend, page_first, storage)
 
 
 def _tp_ranks(par: Parallel) -> list[Parallel]:
@@ -161,7 +177,10 @@ def _layer_fingerprint(gid: int, specs: dict[str, Any], par: Parallel) -> list[A
         decls = []
         for rank in _tp_ranks(par):
             decl = adapter.layer(spec, name, rank)
-            decls.append([list(decl.segments), repr(decl.shard)])
+            entry: list[Any] = [list(decl.segments), repr(decl.shard)]
+            if decl.layout:  # only when declared, so existing namespaces do not move
+                entry.append(list(decl.layout))
+            decls.append(entry)
         seen.add(json.dumps([type(spec).__name__, decls]))
     return sorted(seen)
 
@@ -195,16 +214,55 @@ def _transfer_mode(decls: list[_Decl], n_groups: int) -> tuple[str, bool]:
     return backend, page_first
 
 
-def _check_seal_plan(semantics: Any, decls: list[_Decl]) -> None:
+def _check_seal_plan(semantics: Any, decls: list[_Decl]) -> Any:
     """V0: every TP rank's declarations must seal without gaps or overlaps."""
     by_rank: dict[int, list[Any]] = {}
     for rank, sid, name, d in decls:
         region = semantics.Region(name, sid, [int(s) for s in d.segments], d.shard)
         by_rank.setdefault(rank, []).append(region)
     try:
-        semantics.seal_plan(sorted(by_rank.items()))
+        return semantics.seal_plan(sorted(by_rank.items()))
     except ValueError as e:
         raise Unsupported(f"adapter declarations fail seal_plan: {e}") from e
+
+
+def _storage_ranks(plan: Any, decls: list[_Decl], tp_size: int) -> StorageRanks:
+    """Collapse TP ranks that hold the same part of every layer.
+
+    Applies only when the plan is uniform: every layer has the same number of
+    parts, and each rank holds one part throughout and is that part's writer
+    for all of its layers or none. Anything else keeps one storage rank per
+    TP rank, every rank saving its own copy (correct, without de-duplication).
+    """
+    frags = {g: plan.fragments(g) for g in plan.groups}
+    parts_of = {(g, f.layer): 0 for g, fs in frags.items() for f in fs}
+    for g, fs in frags.items():
+        for f in fs:
+            parts_of[(g, f.layer)] += 1
+    counts: set[int] = set()
+    part: dict[int, set[int]] = {}
+    writes: dict[int, set[bool]] = {}
+    for rank, _, name, _ in decls:
+        found = plan.slot_of(rank, name)
+        if found is None:
+            return StorageRanks.identity(tp_size)
+        g, slot = found
+        frag = frags[g][slot]
+        counts.add(parts_of[(g, name)])
+        part.setdefault(rank, set()).add(frag.part)
+        writes.setdefault(rank, set()).add(frag.writer == rank)
+    if (
+        len(counts) != 1
+        or sorted(part) != list(range(tp_size))
+        or any(len(p) != 1 or len(writes[r]) != 1 for r, p in part.items())
+    ):
+        return StorageRanks.identity(tp_size)
+    (n_parts,) = counts
+    return StorageRanks(
+        n_parts,
+        tuple(next(iter(part[r])) for r in range(tp_size)),
+        tuple(next(iter(writes[r])) for r in range(tp_size)),
+    )
 
 
 def may_zero_or_copy_blocks(kv_cache_config: Any) -> bool:
