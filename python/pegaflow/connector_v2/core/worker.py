@@ -44,30 +44,23 @@ from .scheduler import StepPlan
 logger = logging.getLogger(__name__)
 
 
-# Status codes the server's save handler returns (validation, unknown
-# instance, storage/CUDA errors), as the binding formats them:
-# "save RPC failed: code: '<tonic Code description>', message: ...".
-_SERVER_CODES = (
-    "code: 'Client specified an invalid argument'",
-    "code: 'The system is not in a state required",
-    "code: 'Internal error'",
-)
+def _save_settled(e: Exception) -> bool:
+    """True if a raised save RPC proves that no copy of the job runs.
 
+    Only an InvalidArgument status does: the binding raises ``ValueError``
+    for it, tonic's client never makes it, and the save handler returns it
+    before it copies or after its copy synchronized. Every other error may
+    leave a copy reading the job's blocks:
 
-def _server_replied(e: BaseException) -> bool:
-    """True if a raised save RPC carries the server handler's own error.
-
-    The handler maps every engine error to a status instead of a failed
-    reply, and it seals a job's blocks only after its copy succeeded, so
-    after such a status none of the job's blocks is stored: a future miss,
-    like a failed reply. Anything else (unavailable, cancelled, unknown,
-    deadline: no reply) may leave the handler running. An h2 protocol error
-    also reads as Internal; it resets the stream, which drops the handler
-    before it seals. A message that matches none of these (e.g. a changed
-    tonic wording) fails closed.
+    - Internal: the handler also returns it when a GPU copy failed
+      part-way with earlier copies still queued, and the client itself
+      reports decode and HTTP/2 errors as Internal;
+    - no reply (Unavailable, Cancelled, DeadlineExceeded, Unknown): the
+      handler may still run;
+    - FailedPrecondition (unknown instance) raises the same exception
+      class as those, so it fails closed too.
     """
-    msg = str(e)
-    return any(code in msg for code in _SERVER_CODES)
+    return isinstance(e, ValueError)
 
 
 @dataclass
@@ -611,19 +604,18 @@ class Worker:
     def _run_job(self, job: _SaveJob) -> bool:
         """Run one save job; False if the saver must stop (fail closed).
 
-        A save RPC that raises without the server's own error status
-        (``_server_replied``: transport error, no reply) is not a finished
-        save: the server may still copy and seal the job's blocks. Its fences
-        cannot wait for a copy nobody will report, so the saver stops
-        instead, as it does when the thread dies mid-job: the job is not
-        counted as completed, no later job sends an RPC (no other copy reads
-        a block that gets reused), and every fence and hold is released
-        through ``_saver_dead``. Only that one job's copy may race a reuse;
-        closing that needs a server that stops or reports an unanswered
-        copy (a server limitation).
-        A failed reply, a server error status (nothing of the job is sealed),
-        or a failed compute wait (no RPC sent) completes the job as a failed
-        save: a future miss.
+        A save RPC that raises (``_save_settled`` false) is not a finished
+        save: the server may still copy the job's blocks. Its fences cannot
+        wait for a copy nobody will report, so the saver stops instead, as
+        it does when the thread dies mid-job: the job is not counted as
+        completed, no later job sends an RPC (no other copy reads a block
+        that gets reused), and every fence and hold is released through
+        ``_saver_dead``. Only that one job's copy may race a reuse; closing
+        that needs a server that reports such a copy only once it stopped
+        (a server limitation).
+        A failed reply, a rejected request (``_save_settled``), or a failed
+        compute wait (no RPC sent) completes the job as a failed save: a
+        future miss.
         """
         t0 = self._clock()
         t1 = t2 = t0
@@ -645,7 +637,7 @@ class Worker:
                     )
                     over = True
                 except Exception as e:
-                    ok, over, msg = False, _server_replied(e), repr(e)
+                    ok, over, msg = False, _save_settled(e), repr(e)
             t2 = self._clock()
             if not over:
                 logger.error(

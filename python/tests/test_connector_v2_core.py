@@ -1403,25 +1403,13 @@ class _SaverExit(BaseException):
     """Escapes ``except Exception``: ends the saver thread."""
 
 
-# How the binding raises a save RPC's status (python/src/lib.rs rpc_status_error
-# around tonic's Status Display).
-SERVER_ERROR = (
-    "save RPC failed: code: 'Internal error', message: "
-    '"storage error: pinned pool exhausted while allocating block buffer"'
-)
-NO_REPLY = (
-    "save RPC failed: code: 'The service is currently unavailable', message: "
-    '"error trying to connect: tcp connect error"'
-)
-
-
 def _save_outcome(outcome):
     def save(calls, saves):
         calls.append(saves)
-        if outcome == "server-error":
-            raise RuntimeError(SERVER_ERROR)
-        if outcome == "raises":
-            raise RuntimeError(NO_REPLY)
+        if outcome == "rejected":  # InvalidArgument: the binding raises ValueError
+            raise ValueError("save RPC failed: code: 'Client specified an invalid argument'")
+        if outcome == "raises":  # any other status: a copy may still run
+            raise RuntimeError("save RPC failed: code: 'Internal error'")
         if outcome == "saver-dies":
             raise _SaverExit
         return outcome == "saved", ""
@@ -1440,9 +1428,7 @@ def _blocked(fn, *args):
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-@pytest.mark.parametrize(
-    "outcome", ["saved", "save-failed", "server-error", "raises", "saver-dies"]
-)
+@pytest.mark.parametrize("outcome", ["saved", "save-failed", "rejected", "raises", "saver-dies"])
 def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     """vLLM gets a finished request's blocks back at once (request_finished is
     always False, no finished_sending hold), but a step that writes one of
@@ -1451,10 +1437,9 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
 
     The step thread never waits on the GPU for a save: the save RPC runs
     after the compute mark. The fence clears once the save is done, stored
-    or not (a reported failure, or the server's own error status, is a
-    future miss). S4: a save RPC that raises without a server status is not
-    a finished copy (the server may still copy): like a dying saver thread
-    it stops the saver (fail closed). The fence is released instead of
+    or not (a reported failure, or a rejected request, is a future miss).
+    S4: any other raised save RPC is not a finished copy (the server may
+    still copy): like a dying saver thread it stops the saver (fail closed). The fence is released instead of
     hanging, the job is not counted done, and later saves are dropped, so
     no further copy reads a reused block.
     """
@@ -1654,8 +1639,8 @@ A_FENCED, B_FENCED = {10: 0, 11: 0, 12: 0}, {20: 1, 21: 1, 22: 1}
         # A raising save RPC stops the saver (fail closed): every fence clears
         # and b's job never sends a copy.
         pytest.param(["raises", "saved"], [[0], [1]], [{}, {}], id="raise-fails-closed"),
-        # The server's own error status: nothing sealed, the saver goes on.
-        pytest.param(["server-error", "saved"], [[0], [1]], [B_FENCED, {}], id="server-error"),
+        # A rejected request copied nothing: a future miss, the saver goes on.
+        pytest.param(["rejected", "saved"], [[0], [1]], [B_FENCED, {}], id="rejected"),
     ],
 )
 def test_finish_fences_on_the_requests_last_save(outcomes, release, expected):
@@ -1990,10 +1975,10 @@ def test_pinned_saves_hold_blocks_until_every_worker_saved():
     assert pool.refs == {} and not sched.has_pending_saves()
 
 
-@pytest.mark.parametrize("outcome", ["server-error", "raises"])
+@pytest.mark.parametrize("outcome", ["rejected", "raises"])
 def test_pinned_saves_released_when_a_save_raises(outcome):
-    """A raised save releases its pins either way; only a raise without a
-    server status stops the saver, so the next job sends no copy."""
+    """A raised save releases its pins either way; only a raise other than a
+    rejected request stops the saver, so the next job sends no copy."""
     pool = FakePool()
     sched = _pinned_sched(_layout(StubSemantics, StubFullSpec()), pool)
     sched.on_new_request(_req())
@@ -2012,7 +1997,7 @@ def test_pinned_saves_released_when_a_save_raises(outcome):
     assert pool.refs == {} and not sched.has_pending_saves()
     worker.save(StepPlan(saves=plan.saves, step=1))
     assert worker.flush(5)
-    assert len(calls) == (2 if outcome == "server-error" else 1)
+    assert len(calls) == (2 if outcome == "rejected" else 1)
     worker.shutdown()
 
 
