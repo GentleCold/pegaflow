@@ -852,6 +852,23 @@ PR), and a gap they cause is explained, not fixed.
 - The LRU (`pegaflow-core/src/cache.rs`) evicts each (hash, group) key alone,
   not prefix-aware: chain heads served from vLLM's local cache age out first
   and strand the tails for lookups from block 0.
+- Fragmentation can drain the read cache. With `--blockwise-alloc` off
+  (the default), a save allocates one pinned region per layer and segment
+  for all blocks of the RPC (`offload.rs`). Such a region frees only once
+  every block in it is evicted. Reclaim
+  (`reclaim_until_allocator_can_allocate`, `storage/mod.rs`) evicts
+  512-block batches until a *contiguous* region fits, so a fragmented pool
+  can evict every cache-owned block, including a hot shared prefix. The
+  same rev then flips per run between a pass with server hits and one
+  without: Qwen3-4B TP2 cap075 warm3 ext was 0 or 6352-7856 on identical
+  code (P5 `cap075 check`, rsi-notes). Master's #465 / #470 are in the
+  tested base and do not change the save path.
+  - G5 at f = 0.75 (and any curve fraction near the store's working set)
+    can therefore be bimodal per run. A single run's verdict there needs a
+    repeat before it is read as a regression or a gain.
+  - The per-pass `cache_block_evictions_total` sums every reclaim call in
+    the pass. Over-eviction (evictions well past resident + inserts − `C`)
+    is the signal; the per-call drain is visible only at debug log level.
 
 ## Provenance
 
