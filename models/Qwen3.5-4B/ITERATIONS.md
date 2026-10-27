@@ -2672,6 +2672,42 @@ verified, log `batch_steps=1`, about 189 save RPCs per window vs 15).
   read cache". The fragmentation explanation is downgraded from
   mechanism to contributing factor.
 
+**`--blockwise-alloc` diag (2 runs, dc4a4e0).** Runs
+`...-c75-tp2-bw-dc4a4e0-{a,b}`, non-official because the server
+wrapper's sha differs. The log shows "Blockwise allocation enabled for
+batch_save". Pool used − resident is 0.00 GiB on every pass, so the
+fragmentation is gone.
+
+| run | warm2 ev / need | warm3 ev / need | ext warm / warm2 / warm3 | warm_timed |
+|---|---|---|---|---|
+| bw a | 1499 / 1164 | 2048 / 1560 | 2832 / 1936 / 32 | .7977 |
+| bw b | 2048 / 1545 | 1536 / 1158 | 3296 / 2832 / 6032 | .8214 |
+
+- Run a still loses the shared prefix in warm3: the first t0 (c6, lh=0)
+  gets 0 server blocks, and ext is 32. warm_timed equals the drained
+  dc4a4e0 runs. Run b keeps it.
+- So, with only 2 runs: removing fragmentation does not appear to remove
+  the prefix-loss mode. It suggests the trigger is elsewhere in reclaim
+  or eviction order: the rank race, in-flight regions, or plain LRU order,
+  where the prefix's blocks are oldest after a pass served them locally.
+  Not ruled out: that blockwise lowers the rate.
+- Server stays out of scope. This is recorded as evidence for the server
+  limit, not acted on.
+
+**Recorded limit (final wording).** On a pool near the working set (G5
+f=0.75), the base server can evict a hot shared prefix in one pass. The
+next pass then misses it on the server. Which mode a run lands in varies
+per run on the same rev:
+- dc4a4e0 drains 4 of 5;
+- 33666ce 1 of 3;
+- save_batch_steps=1 1 of 2;
+- `--blockwise-alloc` 1 of 2.
+
+Fragmentation (batch-mode per-RPC regions) contributes but is not
+necessary. Open causes are the rank race in reclaim, in-flight regions,
+and LRU order of locally served prefixes. G5 f=0.75 single-run verdicts
+need a repeat.
+
 ## Qwen3-4B stop attribution (2026-10-27): reviewed, TP2 stop not supported
 
 The question: should the Qwen3-4B iterations stop on dc4a4e0, given two G4
