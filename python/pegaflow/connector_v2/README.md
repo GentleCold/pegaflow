@@ -128,11 +128,21 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     speculative Mamba blocks, so check this before enabling spec decode on a
     checkpoint layout;
   - a save the server reports failed still releases its blocks (a failed
-    save is a future miss). A save RPC that raises, or a saver thread that
-    dies, stops the saver for good (fail closed): fences and holds are
-    released, later saves are dropped, and no other copy runs. The one job
-    whose RPC raised may still be copying on the server; closing that needs
-    a server reply only once no copy is in flight (a server limitation). A
+    save is a future miss). The server's save handler reports its errors
+    (bad request, unknown instance, pinned pool exhausted, CUDA errors) as a
+    gRPC status, so the RPC raises; such a status counts as a failed save
+    too: the server seals a job's blocks only after its copy succeeded, so
+    none of them is stored. A save RPC that raises without one (no reply:
+    unavailable, cancelled, unknown), or a saver thread that dies, stops
+    the saver for good (fail closed): fences and holds are released, later
+    saves are dropped, and no other copy runs. Server limitations: the one
+    job whose RPC got no reply may still be copying on the server, and
+    vLLM may reuse its blocks meanwhile. The client drops the call, which
+    cancels the handler before it seals, so a torn block is stored only if
+    the server stalls past the HTTP/2 keepalive; closing it needs a server
+    that stops or reports an unanswered copy. A copy failing part-way
+    replies at once and may leave queued copies reading the blocks (it
+    seals nothing). A
     save RPC that hangs blocks `flush` and fences for good (logged every
     10 s): the client has no per-call deadline, and the server may still be
     copying.
