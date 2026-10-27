@@ -2358,6 +2358,54 @@ plain/baseline arms).
   part of it lookup cost). It is not a hold. It5 neither costs nor buys
   anything here.
 
+### Saver follow-up (163f0b8 -> e4a2373, 2026-10-27)
+
+This is a correctness follow-up, not a knob, so it needs no gate run.
+
+**163f0b8 / 809a0c6.** Any raised save RPC stopped the saver for good. The
+reasoning was that the server may still be copying the job's blocks, and
+fences cannot wait on a copy that nobody will report.
+
+**12ce60a.** Matched the error text so that server errors would count as
+settled.
+- Review: REQUEST CHANGES. Two problems: the client produces Internal on its
+  own for decode and HTTP/2 errors, and a part-way d2h failure also returns
+  Internal while earlier copies are still queued.
+
+**e49c584.** Classifies by exception class instead. Only `ValueError`
+counts as settled: it means InvalidArgument (the client never produces
+it) or a failure before the RPC was sent.
+- Review: APPROVE with nits.
+  - (a) The server never seals a failed job's blocks.
+  - (b) No deadlock or step stall.
+
+**e4a2373 (bounded recovery).** e49c584 had an availability cost: a single
+pinned-pool exhaustion turned saves off until restart.
+
+Counts across all 529 server logs:
+
+| Run | Arm | Errors |
+|---|---|---|
+| `2026-10-26-qwen3-4b-tp2-slice-4bb7d8d` cap025 | v2 | 48 Internal "pinned pool exhausted" in 45 s |
+| same | old | 3 of the same |
+| dsv2-lite mf1 | old | 4 CUDA_ERROR_ILLEGAL_ADDRESS |
+| everything else, including cap075 | | 0 save errors |
+
+How e4a2373 handles a raise:
+- An ambiguous raise keeps the job's fences and pins.
+- New saves are dropped for `SAVE_QUIESCE_S` = 10 s.
+- After the window the job counts as done, the jobs queued behind it are
+  dropped without an RPC, and saving resumes.
+- Each raise counts as `raised=` in `save stats`.
+
+Why 10 s:
+- `max_job_ms` across 3853 `save stats` windows in 277 v2 runs is p50 76 ms,
+  p99 630 ms, max 2985 ms (one 557 MB RPC, dsv2-lite).
+- 10 s is more than 3x that max.
+- It is a heuristic, not a proof.
+
+Pool exhaustion is raised before any copy is issued (offload.rs, phase-2
+alloc). The server follow-up is recorded in PROGRESS "Server limitations".
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here

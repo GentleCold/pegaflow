@@ -175,6 +175,30 @@ H1+H3+H4 0.699-0.719, + H5 0.759-0.769 (hit 0.86 -> 0.89). H1+H3+H4 add
   - The connector cannot remove this cost, only shorten it, by copying
     fewer bytes.
   (`models/Qwen3.5-4B/ITERATIONS.md`, "target (a) attribution")
+- Save errors are not classified by copy state. The save handler maps
+  every engine error to a gRPC status, and both of these come back as
+  Internal:
+  - "pinned pool exhausted": raised in allocation, before any GPU->CPU
+    copy of the request is issued, so it is safe;
+  - a part-way d2h failure in `gpu_worker.rs`: earlier copies may still
+    be queued.
+
+  So the connector must treat every Internal as "copy may still run". It
+  holds the job's fences and pins and pauses saves for a 10 s quiesce
+  window (`connector_v2` e4a2373). That window is a heuristic, not a
+  proof. Before e4a2373 it stopped saves for good, which under pool
+  pressure would have dropped the hit rate to 0.
+  - Seen in the Qwen3-4B TP2 slice at C/U 0.25
+    (`2026-10-26-qwen3-4b-tp2-slice-4bb7d8d` cap025): 48 v2 and 3 old
+    pool-exhausted save errors, all within 45 s.
+  - Follow-up (server, not done): reply `SaveResponse{status.ok = false}`
+    for any error raised before the copy is submitted. The connector
+    already treats that as a plain failed save (a future miss), with no
+    window. A distinct status code such as RESOURCE_EXHAUSTED is weaker,
+    because tonic's client can produce it itself.
+  - A copy that is already running still needs a reply that comes only
+    once no copy of the job runs.
+  (`models/Qwen3.5-4B/ITERATIONS.md`, saver follow-up)
 
 ### Gate changes
 
