@@ -2575,3 +2575,76 @@ Hit-rate judgment: close enough at the gated point, not at the edges.
   makes the gap clearer.
 - The 0.25 and 0.75 gaps stay open items for the next connector iteration,
   alongside the G4 native gap.
+
+## P5 official rerun on the folded tree (`2026-10-27-dsv2-lite-p5-off-e1bab80`, GPU 0,1, TP2, 64gb, 10:41:34 to 14:18:11Z)
+
+Setup:
+- Gate rsi-gates 0290e54; under test feat/semantics-rsi e1bab80; base
+  server 056eb4b. e1bab80 has no native or server diff vs base.
+- Arms plain, baseline, old, native, lmcache, v2. Workloads gsm8k, replay,
+  cap (default `cap_fractions` 0.5 only, so no 0.25 / 0.75 curve), preempt.
+  lmcache overlay 0.5.6.
+- `official: true`. All 5 provenance records verified. Contamination,
+  isolation and scan are clean.
+
+**G2.resume_reference passes on every arm.** v2 has 1319 planned, 1122
+waves, 0 missing, 0 start_differs; old and native have 82 start_differs
+each. The it6 / it7 failure was a record issue: those official runs used
+gate ce645d7, which has no resume stage, so `_resume_verdict(None)` failed
+every arm. The gate and the connector were fine; no gate change was made.
+
+Verdicts. v2 fails one check, `G0.spec`:
+
+- The committed `spec-tp2.json` (c4a4784) is the old pre-schema-3 TP2 dump,
+  without `compilation`, `model_runner` or `prefix_cache_retention_interval`.
+- The schema-3 regeneration (feat/rsi-deepseek-v2-lite e764fd5 `spec.json`,
+  from the S5 self-test) was not carried over by the fold.
+- `g0` against the e764fd5 dump: old, lmcache and v2 pass with 0 diffs;
+  native fails 55 diffs (its LBHNC layout, by construction).
+- Fix on rsi-gates: commit e764fd5's dump as `spec-tp2.json`. Gate-side,
+  pending review. All other required checks pass for v2.
+
+| check | v2 | old | native | lmcache |
+|---|---|---|---|---|
+| G2.preempt | pass, 3104 ext | pass, 3424 ext | pass, 900 ext | pass, 128 ext |
+| G2.digest_self.cap | pass, 510868 ext, 0 mismatched | pass | pass | pass |
+| G2.digest_vs_baseline.gsm8k | pass, 9982 ext, coverage 1.0 | pass | pass | fail (S7 coverage signature, 0 mismatched) |
+| G2.gsm8k cold / warm vs baseline | +0.00 / +0.53 pp | +0.00 / +0.45 | +0.00 / +0.45 | +0.00 / −0.08 |
+
+Perf vs in-run native (replay; warm = warm2 / warm3):
+
+| metric | native | v2 | v2 vs native |
+|---|---|---|---|
+| cold TTFT p50 (s) | 0.627 | 0.606 | −3.3% |
+| cold req/s | 7.91 | 7.87 | −0.5% |
+| warm TTFT p50 (s) | 0.272 / 0.295 | 0.289 / 0.277 | +6.2 / −6.2% (gate median −0.2%, within noise) |
+| warm TTFT p90 (s) | 0.379 / 0.435 | 0.429 / 0.425 | +13.1 / −2.1% |
+| warm req/s | 13.29 / 12.95 | 12.48 / 12.64 | −6.1 / −2.5% (gate median −4.3%, outside native's range 0.34) |
+| warm TPOT mean (ms) | 20.98 / 21.70 | 22.38 / 22.09 | +6.7 / +1.8% |
+| gsm8k cold / warm (s) | 197.6 / 192.6 | 195.8 / 190.3 | −0.9 / −1.2% |
+| gsm8k acc cold / warm | 0.6725 / 0.6770 | 0.6725 / 0.6778 | +0.00 / +0.08 pp (≤2% bar met) |
+
+old: warm p50 0.382 / 0.335 and 12.67 / 12.42 req/s. lmcache: 0.388 / 0.392
+and 11.16 / 11.14 req/s.
+
+Hits:
+
+| pass | v2 | native | old | lmcache | oracle |
+|---|---|---|---|---|---|
+| G3 gsm8k warm total (local / ext) | 0.9926 (0.940 / 0.876) | 0.9934 (0.940 / 0.889) | 0.9934 | 0.9410 (E 0.015) | 0.9926 |
+| G3 replay warm total (local / ext) | 0.9983 (0.494 / 0.997) | 0.9985 (0.495 / 0.997) | 0.9985 | 0.9783 (E 0.960) | 0.9983 |
+| G5 cap 0.5 hit / LRU / oracle_C / E_C | 0.847 / 0.847 / 0.925 / 0.621 | 0.851 / 0.847 / 0.924 / 0.627 | 0.844 / 0.847 / 0.925 / 0.622 | 0.839 / 0.847 / 0.924 / 0.612 | |
+
+- **vs M2 (it7 a59a254, unofficial).** Warm TTFT p50 vs native improved
+  from +11.9 / +12.1% to +6.2 / −6.2% (gate median about −0.2%). Warm
+  req/s moved from −4.8 / −5.3% to −6.1 / −2.5% (gate median −4.3%). The
+  cold numbers are now at parity.
+- **G5 at 0.5:** v2 equals LRU (0.847). native is +0.004, within noise.
+  `efficiency_c` stays below the 0.9 reference on every arm, a reported
+  server-limited value.
+- **The req/s gap matches the Qwen3-4B TP2 shape.** TPOT is +1.8 to
+  +6.7%, and TTFT is at parity or better. That points to the same
+  PIECEWISE step-shape effect, but it is not measured for DSV2 (no
+  PEGA_CONN run).
+- Per the complexity freeze (reviews/complexity-e1bab80.md) this is a
+  note, not an iteration. The run is the Q1 baseline for DSV2.
