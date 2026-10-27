@@ -2514,6 +2514,95 @@ The TP1 step gap (v2 18-19 vs native 10-11 ttft_steps p50) is unchanged.
 So the hypothesis that the remaining step gap is lookup cost is
 **rejected**: the cost was real but off the critical path. H8 stays
 because it removes server load and adds no knob.
+
+## cap075 check (2026-10-27): ext drop after 4bb7d8d
+
+Main flagged the TP2 cap rerun on dc4a4e0 as a possible hit-rate
+regression. cap075 external tokens fell from about 14k to about 2k per
+warm pass, and the hit rate from 0.826/0.832 to 0.810/0.804.
+
+**Setup.** Qwen3-4B TP2, cap only (`--cap-fractions 0.5,0.75`), with the
+slice args `--cap-convs 8 --cap-turns 6` on the base server. The runs are
+`2026-10-27-qwen3-4b-p5-c75-tp2-<rev>-<a|b|c>`, plus `...-capre-tp2-dc4a4e0`.
+Each one-off tool is in `~/kexi/tmp/p5-it3-attr/` on .44:
+- `c75.py`: per-pass hit and ext;
+- `c75pair.py`: paired per-request diff;
+- `c75ev.py` / `c75frag.py` / `c75srv3.py`: server `/metrics` deltas;
+- `c75sim*.py`: trace LRU replays.
+
+| rev | ext warm / warm2 / warm3 | hit per pass | warm_timed |
+|---|---|---|---|
+| 4bb7d8d a | 11680 / 10112 / 15088 | .810 / .800 / .834 | .8167 |
+| 4bb7d8d b | 11680 / 14912 / 10912 | .810 / .833 / .805 | .8188 |
+| c8a8842 | 13936 / 13696 / 16480 | .826 / .824 / .843 | .8338 |
+| e985938 (H4 deferral) | 3296 / 3376 / 6768 | .814 / .814 / .837 | .8258 |
+| ebe69db (it5) | 5088 / 1936 / 6352 | .826 / .804 / .835 | .8194 |
+| 5c3ab63 | 2832 / 0 / 1632 | .810 / .791 / .802 | .7965 |
+| ee249b7 (H8) | 5088 / 464 / 6096 | .826 / .794 / .833 | .8135 |
+| 33666ce a / b | 2832 / 1936 / 6352; 5088 / 8304 / 7856 | | — |
+| dc4a4e0 x3 | 2832 / 1936 / 0 (all three) | .810 / .804 / .791 | .7976 |
+
+The rows show two effects.
+
+**1. ext 14k → 3k is H4 deferral, as accounting.** The paired diff shows
+deferred t0 requests take the shared 1264-token prefix from vLLM's local
+cache once the first loader lands, where before each one loaded it
+externally. cap_warm t0 first_computed is 11040 on both 4bb7d8d and
+dc4a4e0. e985938's warm_timed (.8258) lies inside the old rev's spread
+(.8167-.8338).
+
+Main's lead was that tails are not saved or found. It shows up on single
+rows (e985938 warm2 c1 t1 loses a 2784-token tail), but other rows gain,
+and the net effect is not separable from noise. Not a loss.
+
+**2. The zero-hit passes are server reclaim draining the cache, not a
+connector state bug.** On dc4a4e0 warm3, and on 5c3ab63 warm2:
+- `lookup_cost` gains 39 calls / 39 rpcs per pass, as on every other pass
+  and rev;
+- `reused` is 0, `raised` / `failed` / `fences` are 0, no ERROR lines,
+  one session per stage;
+- the first t0 (c6, lh=0) gets 0 blocks: the shared prefix is gone from
+  the server, and every later request gets it locally from c6.
+
+The pass before is where it happens. The server counters give the
+evictions the pool needed (resident + inserts − 1528) and those it did
+(in 512-block `RECLAIM_BATCH_SIZE` batches):
+
+| run, pass | need | evicted | resident after | next pass ext |
+|---|---|---|---|---|
+| 33666ce a, warm2 | 1162 | 1536 | 1154 | 6352 |
+| dc4a4e0 a, warm2 | 1162 | 2009 (3x512 + 473) | 681 | 0 |
+| dc4a4e0 c, warm2 | 1162 | 2011 | 681 | 0 |
+| 5c3ab63, warm | 1295 | 2471 (4x512 + 423) | 352 | 0 |
+
+A partial batch means `remove_lru_batch` found no cache-owned block left:
+`reclaim_until_allocator_can_allocate` drained the whole evictable cache,
+and the shared prefix went with it. The trigger is fragmentation. The pool
+bytes used minus resident bytes is 0.80-0.82 GiB on the draining passes
+vs 0.11-0.45 elsewhere. With `blockwise_alloc` off, a save allocates one
+pinned region per layer per RPC (`offload.rs`), and reclaim evicts until a
+contiguous region fits. 33666ce and dc4a4e0 diverge at the same warm2:
+same inserts (1917), same need (1162).
+
+**Not a commit.** ebe69db..dc4a4e0 make the same decisions on this
+workload:
+- the saver chain acts only on a raise (raised=0);
+- 5c3ab63 adds fences (fences=0);
+- H8 and dc4a4e0 act only on a held hit (reused=0);
+- dc4a4e0 is a reorder of 33666ce.
+
+33666ce gave warm3 6352 / 7856 and dc4a4e0 gave 0 three times, so the
+outcome follows save-RPC interleaving into the shared pool across the two
+TP ranks. Why dc4a4e0 landed the same way three times is not established:
+the passes before the fork are identical across those runs.
+
+**Server limitation (recorded).** A save allocation that misses on
+fragmentation drains the read cache instead of evicting what it needs.
+Batch-mode per-RPC regions strand bytes. This makes G5 f=0.75 bimodal
+per run (warm_timed .7965-.8338 here). A connector cannot steer it.
+Fixing it needs a server-side change, for example blockwise or size-class
+save allocation, or a reclaim bound.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
