@@ -2603,6 +2603,45 @@ per run (warm_timed .7965-.8338 here). A connector cannot steer it.
 Fixing it needs a server-side change, for example blockwise or size-class
 save allocation, or a reclaim bound.
 
+**Repeats (main's follow-up).** Same rev, same workload. Every run's
+warm2 needed 1162 evictions.
+
+| run | warm2 evicted | used − resident after warm2 | warm3 ext |
+|---|---|---|---|
+| dc4a4e0 a / c / d | 2009 / 2011 / 2009 | 0.82 / 0.80 / 0.81 GiB | 0 / 0 / 0 |
+| dc4a4e0 "sb1-a" (override not applied, see below) | 1536 | 0.28 GiB | 6352 |
+| 33666ce a / b | 1536 / 1536 | 0.28 / 0.19 GiB | 6352 / 7856 |
+
+dc4a4e0 drains in 4 of 5 runs. The 5th matches 33666ce's no-drain runs
+block for block. So one rev is bimodal, which settles "not a commit".
+
+**Reviewer (independent, against base 056eb4b).** The base equals dc4a4e0
+in `storage/`, allocator, pinned_pool, cache.rs and offload.rs.
+- Claim 1 holds: per-RPC per-layer/segment regions (`offload.rs:455-456`),
+  each block holding an `Arc` to its region.
+- Claim 2 holds: reclaim loops on contiguous `largest_free`
+  (`storage/mod.rs:572`).
+- Claim 3 partly: a partial batch does mean no cache-owned block was left
+  (`read_cache.rs:242-255, 635-655`). The per-pass counter sums every
+  reclaim call, though, so "3x512 + 473" is suggestive, not proof. The
+  per-call debug line (`mod.rs:622`) would prove it.
+- Not ruled out: the two ranks racing in reclaim (nothing serializes
+  allocate + reclaim). Ruled out: NUMA (the server logs "global pinned pool
+  (NUMA affinity disabled)").
+- The reclaimed-bytes / (evicted x block bytes) ratio is 0.86-1.88 across
+  passes, consistent with regions freeing only once all their blocks go.
+- Master's 75dfa4c (#465) and de58f96 (#470) are in 056eb4b and do not
+  change the save path.
+- The existing server option that addresses it is `--blockwise-alloc`.
+  Not tested yet: a diag run is planned on dc4a4e0.
+
+**Gate pitfall found.** The first save_batch_steps=1 diag added an
+untracked `models/Qwen3ForCausalLM.toml` to the ut tree. The gate snapshot
+copies tracked blobs only, so the run used the defaults (log: batch_steps
+32). It was marked unverified, but it did not fail. Rerun from the pushed
+diag-only branch `diag/p5-sb1-dc4a4e0` (0b144c2). A guard that fails the
+run on dropped files is pending on rsi-gates.
+
 ## Qwen3-4B stop attribution (2026-10-27): reviewed, TP2 stop not supported
 
 The question: should the Qwen3-4B iterations stop on dc4a4e0, given two G4
