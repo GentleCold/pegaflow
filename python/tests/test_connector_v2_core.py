@@ -32,7 +32,7 @@ from pegaflow.connector_v2.core import (
 from pegaflow.connector_v2.core.layout import StorageRanks
 from pegaflow.connector_v2.core.scheduler import GroupSave, LoadPlan
 from pegaflow.connector_v2.core.worker import _wire_bytes
-from pegaflow.connector_v2.policy import Policy, SaveItem, load_policy
+from pegaflow.connector_v2.policy import Policy, SaveItem
 
 BT = 4
 
@@ -714,32 +714,21 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
     worker.start(sched.take_plan())
     _, recving, _ = worker.poll()
     assert (matched, recving, worker.take_invalid()) == expected
-    assert sched.hit_stats.get("sync_planned") == (None if matched[1] else 1)
     worker.shutdown()
 
 
 @pytest.mark.parametrize(
-    "loads,order,stats,invalid",
+    "loads,order,invalid",
     [
         # A sync load sent after an async one waits for its copy as well.
-        pytest.param(
-            ["long", "short", "long2"],
-            [b"L1", b"L0", b"L2"],
-            (1, 1, 1.0, 1, 3.0),
-            set(),
-            id="reordered",
-        ),
-        pytest.param(
-            ["short", "long"], [b"L1", b"L0"], (1, 0, 1.0, 1, 3.0), set(), id="already-first"
-        ),
+        pytest.param(["long", "short", "long2"], [b"L1", b"L0", b"L2"], set(), id="reordered"),
+        pytest.param(["short", "long"], [b"L1", b"L0"], set(), id="already-first"),
         # A sync load whose RPC failed is invalid, never waited for.
-        pytest.param(
-            ["long", "bad"], [b"bad", b"L0"], (0, 1, 0.0, 1, 1.0), {2}, id="sync-rpc-failed"
-        ),
-        pytest.param([], [], (0, 0, 0.0, 0, 0.0), set(), id="no-loads"),
+        pytest.param(["long", "bad"], [b"bad", b"L0"], {2}, id="sync-rpc-failed"),
+        pytest.param([], [], set(), id="no-loads"),
     ],
 )
-def test_worker_sends_sync_loads_first(loads, order, stats, invalid):
+def test_worker_sends_sync_loads_first(loads, order, invalid):
     rpc = FakeRpc()
     rpc.load_ok[b"bad"] = False
     plans = {
@@ -748,13 +737,10 @@ def test_worker_sends_sync_loads_first(loads, order, stats, invalid):
         "bad": LoadPlan("bad", [(b"bad", [[2]])], sync=True, covered=[2]),
         "long2": LoadPlan("long2", [(b"L2", [[3]])]),
     }
-    # The clock advances 1 s per read: sync_wait = 1, load_issue = 1 + 2 per sync wait.
     states = [FakeLoadState() for _ in loads]
-    worker = _worker(StubSemantics, rpc, states, clock=JumpClock(1.0))
+    worker = _worker(StubSemantics, rpc, states)
     worker.start(StepPlan(loads=[plans[k] for k in loads]))
-    s = worker.save_stats
-    got = (s.sync_loads, s.sync_first_steps, s.sync_wait_s, s.load_steps, s.load_issue_s)
-    assert ([lo[0][0] for lo in rpc.loads], got, worker.take_invalid()) == (order, stats, invalid)
+    assert ([lo[0][0] for lo in rpc.loads], worker.take_invalid()) == (order, invalid)
     worker.shutdown()
 
 
@@ -823,9 +809,10 @@ def test_sync_load_outcome_gates_saves(load_state, steps, preempted, expected, f
         "other": [30, 31, 32, 33],
         "X": [10, 11, 20, 21, 22, 23],
     }
-    for rid in ("r", "shared", "other"):
-        sched.on_new_request(_req(17, 4, rid))
-    req = sched._requests["r"]
+    reqs = {rid: _req(17, 4, rid) for rid in ("r", "shared", "other")}
+    for req in reqs.values():
+        sched.on_new_request(req)
+    req = reqs["r"]
     n, load_async = sched.get_num_new_matched_tokens(req, 4)
     assert (n, load_async) == (8, False)
     sched.update_state_after_alloc(req, (tables["r"],), n)
@@ -884,10 +871,11 @@ def test_lifecycle_after_saves_disabled(event, expected):
         confirm_steps=2,
     )
     tables = {"r": [10, 11, 12, 13], "other": [30, 31, 32, 33]}
-    for rid in ("r", "other"):
-        sched.on_new_request(_req(17, 4, rid))
-    n, _ = sched.get_num_new_matched_tokens(sched._requests["r"], 4)
-    sched.update_state_after_alloc(sched._requests["r"], (tables["r"],), n)
+    reqs = {rid: _req(17, 4, rid) for rid in ("r", "other")}
+    for req in reqs.values():
+        sched.on_new_request(req)
+    n, _ = sched.get_num_new_matched_tokens(reqs["r"], 4)
+    sched.update_state_after_alloc(reqs["r"], (tables["r"],), n)
     sched.plan_saves([("r", 12, 5), ("other", 0, 17)], lambda rid: (tables[rid],))
     assert [b for s in sched.take_plan().saves for b in s.block_ids] == [30, 31, 32, 33]
     sched.on_load_errors({11, 12})  # r's sync load failed
@@ -907,13 +895,16 @@ def test_lifecycle_after_saves_disabled(event, expected):
     assert plan.saves == []
 
 
-def test_shutdown_releases_unsent_plans():
+def test_shutdown_releases_unsent_plans_and_held_hits():
     sched, rpc = _sched(StubSemantics, HIT)
     req = _req()
     sched.get_num_new_matched_tokens(req, 0)
     sched.update_state_after_alloc(req, (WINDOW_IDS, FULL_IDS), 12)
+    rpc.answers = {0: Ready(3, b"H0"), 1: Ready(3, b"H1", [0, 1, 2])}
+    # Never allocated; other blocks than r's in-flight load (no deferral).
+    assert sched.get_num_new_matched_tokens(_other(req_id="held", diverge_at=0), 0) == (12, True)
     sched.shutdown()
-    assert sorted(rpc.released) == [b"L0", b"L1"]
+    assert sorted(rpc.released) == [b"H0", b"H1", b"L0", b"L1"]
 
 
 # ---------------------------------------------------------------------- saves
@@ -1093,7 +1084,6 @@ def test_miss_attribution_names_the_missing_group(sem):
     # vLLM re-queries a request it could not allocate: counted once per
     # (request, resume point); a finished request id counts afresh.
     sched._rpc.answers = {0: Ready(3, b"F"), 1: Ready(1, b"C", [0])}
-    sched._clock.now += Scheduler.HIT_REUSE_MAX_S  # too old to reuse: queried again
     sched.get_num_new_matched_tokens(_req(), 0)
     assert sched.hit_stats == {"lookups": 2, "missing=1": 1, "lost_tokens": 8}
     sched.request_finished("r")
@@ -1164,29 +1154,21 @@ def test_lookup_skips_queries_that_cannot_beat_the_local_hit(
     assert sched.hit_stats == {"lookups": 1, **stats}
 
 
-@pytest.mark.parametrize(
-    "computed,age,reused",
-    [
-        pytest.param(0, 0.0, True, id="same-local-hit"),
-        pytest.param(4, 0.0, False, id="local-hit-moved"),
-        pytest.param(0, Scheduler.HIT_REUSE_MAX_S, False, id="too-old"),
-    ],
-)
-def test_unallocated_hit_is_reused(computed, age, reused):
+@pytest.mark.parametrize("computed", [0, 4], ids=["same-local-hit", "local-hit-moved"])
+def test_unallocated_hit_is_released_when_asked_again(computed):
     """vLLM re-asks for a waiting head it could not allocate every scheduling
-    pass. Within HIT_REUSE_MAX_S and for the same local hit, the held hit and
-    its leases are offered again without a server query; otherwise they are
-    released and the request is looked up afresh."""
+    pass: the held hit's leases are released once and the request is looked
+    up afresh; only the new hit is loaded."""
     sched, rpc = _sched(StubSemantics, {0: Ready(3, b"F"), 1: Ready(3, b"W")})
     assert sched.get_num_new_matched_tokens(_req(), 0) == (12, True)
-    queried = len(rpc.queried)
-    sched._clock.now += age
+    rpc.queried.clear()
     n = 12 - computed
     assert sched.get_num_new_matched_tokens(_req(), computed) == (n, True)
-    assert (len(rpc.queried) == queried, sched.lookup_cost["reused"]) == (reused, int(reused))
-    assert sorted(rpc.released) == ([] if reused else [b"F", b"W"])
+    assert (rpc.queried, sorted(rpc.released)) == ([0, 1], [b"F", b"W"])
     sched.update_state_after_alloc(_req(), ([20, 21, 22], [10, 11, 12]), n)
     assert [lp.req_id for lp in sched.take_plan().loads] == ["r"]
+    sched.request_finished("r")
+    assert sorted(rpc.released) == [b"F", b"W"]  # the loaded hit's leases go to the workers
 
 
 def test_held_hit_released_when_deferred():
@@ -1204,7 +1186,7 @@ def test_held_hit_released_when_deferred():
     sched.take_plan()
     rpc.queried.clear()
     assert sched.get_num_new_matched_tokens(b, 0) == (None, False)
-    assert (rpc.queried, rpc.released, sched.lookup_cost["reused"]) == ([], [b"B"], 0)
+    assert (rpc.queried, rpc.released) == ([], [b"B"])
 
 
 def test_hit_stats_logged_when_idle_and_on_cadence():
@@ -1226,8 +1208,7 @@ def test_hit_stats_logged_when_idle_and_on_cadence():
         assert lines == []  # "s" still live, cadence not due
         sched._clock.now += Scheduler.HIT_LOG_S
         sched.get_num_new_matched_tokens(_req(req_id="t"), 0)
-        cost = "{'calls': 3, 'rpcs': 3, 'us': 0, 'max_us': 0, 'reused': 0}"
-        assert lines == [f"[PegaKVConnectorV2] hit stats {{'lookups': 3}} lookup_cost {cost}"]
+        assert lines == ["[PegaKVConnectorV2] hit stats {'lookups': 3}"]
         sched.request_finished("s")
         sched.request_finished("t")  # idle, but nothing new to report
         sched.shutdown()
@@ -1237,8 +1218,7 @@ def test_hit_stats_logged_when_idle_and_on_cadence():
     finally:
         log.removeHandler(handler)
         log.setLevel(level)
-    cost = "{'calls': 4, 'rpcs': 4, 'us': 0, 'max_us': 0, 'reused': 0}"
-    assert lines[1:] == [f"[PegaKVConnectorV2] hit stats {{'lookups': 4}} lookup_cost {cost}"]
+    assert lines[1:] == ["[PegaKVConnectorV2] hit stats {'lookups': 4}"]
 
 
 @BOTH
@@ -1369,8 +1349,7 @@ def test_worker_loads_and_poll():
     pending = FakeLoadState(ready=False)
     # One state per load RPC: ok, bad-lease (unused), gpu-error, later.
     states = [FakeLoadState(), FakeLoadState(), FakeLoadState(state=-1), pending]
-    clock = StepClock()
-    worker = _worker(StubSemantics, rpc, states, clock=clock)
+    worker = _worker(StubSemantics, rpc, states)
     plan = StepPlan(
         loads=[
             LoadPlan("fail", fail=True),
@@ -1383,19 +1362,12 @@ def test_worker_loads_and_poll():
     )
     worker.start(plan)
     assert len(rpc.loads) == 4  # one RPC per request with something to load
-    clock.now = 1.0
     _, finished, failed = worker.poll()
     assert failed == {"fail", "bad-lease", "gpu-error"}
     assert finished == {"fail", "empty", "ok", "bad-lease", "gpu-error"}
     pending.ready = True
-    clock.now = 3.0
     assert worker.poll() == (set(), {"later"}, set())
-    assert worker.poll() == (set(), set(), set())
-    # Polls until each load RPC was ready: 1 for ok and gpu-error, 2 for later;
-    # seconds from the RPC to the poll that saw it ready: 1, 1 and 3.
-    s = worker.save_stats
-    assert (s.async_done, s.async_first_poll, s.async_polls, s.max_async_polls) == (3, 2, 4, 2)
-    assert (s.async_ready_s, s.max_async_ready_s) == (5.0, 3.0)
+    assert worker.poll() == (set(), set(), set())  # each load is reported once
 
 
 @pytest.mark.parametrize(
@@ -1435,9 +1407,8 @@ def test_worker_save_by_storage_group():
     worker.save(StepPlan())
     assert worker.flush(5)
     assert saved == [[("layers.0.attn", [21], [b"h1"]), ("layers.1.attn", [11], [b"h1"])]]
-    # S2: the gate log attributes G4 to save cost; 2 x (64 + 64) B segments.
     stats = worker.save_stats
-    assert (stats.steps, stats.save_steps, stats.blocks, stats.bytes) == (2, 1, 2, 256)
+    assert (stats.steps, stats.rpcs) == (2, 1)
     worker.report_save_stats()
     assert worker.save_stats.steps == 0
     worker.shutdown()
@@ -1508,7 +1479,7 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     step0 = sched.take_plan()
     worker.start(step0)
     worker.save(step0)  # returns although the compute mark is not reached
-    assert calls == [] and worker.save_stats.save_steps == 1
+    assert calls == []
     assert sched.has_pending_saves()  # vLLM keeps stepping until it is reported
 
     # Both finish: neither is held, only the saved blocks are fenced.
@@ -1535,7 +1506,7 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     waiter.join(5)
     assert not waiter.is_alive() and len(calls) == 1
     s = worker.save_stats
-    assert s.fences == 1 and s.max_fence_s > 0
+    assert s.fences == 1 and s.fence_s > 0
     assert (s.failed, s.raised) == ({"saved": 0, "raises": 2}.get(outcome, 1), int(raises))
     worker.save(step1)
     sched.on_saved_through(worker.saved_through())
@@ -1612,17 +1583,17 @@ def test_quiesce_window_holds_only_the_raised_and_later_saves(monkeypatch):
     worker.shutdown()
 
 
-def test_quiesce_window_backs_off():
-    """Each consecutive raise doubles the window up to SAVE_QUIESCE_MAX_S; a
-    save RPC that stores its blocks resets it (a failed reply does not)."""
-    outcomes = ["raises"] * 4 + ["save-failed", "raises", "saved", "raises"]
+def test_every_raise_quiesces_for_the_fixed_window():
+    """Each raise quiesces for SAVE_QUIESCE_S, then saving resumes (a failed
+    reply does not quiesce)."""
+    outcomes = ["raises", "raises", "save-failed", "raises", "saved"]
     worker, calls, windows, ends = _quiesce_rig(outcomes)
     for step, outcome in enumerate(outcomes):
         worker.save(_save_plan(step))
         if outcome == "raises":
             ends.release()
         assert worker.flush(5)
-    assert windows == [10.0, 20.0, 40.0, 60.0, 60.0, 10.0]
+    assert windows == [Worker.SAVE_QUIESCE_S] * 3
     assert len(calls) == len(outcomes)
     worker.shutdown()
 
@@ -1958,7 +1929,7 @@ def test_kv_pressure_sends_held_saves(kv_usage, threshold, send, caplog):
     """Under GPU KV pressure, held saves go out in the step's RPC instead of
     waiting for the batch bound: freed blocks are reused soon, and a fence on
     a held save would wait for the whole batch. The step does not wait.
-    Unknown usage counts as pressure, warned once and counted in save stats."""
+    Unknown usage counts as pressure, warned once."""
     layout = _layout(StubSemantics, StubFullSpec())
     sched, _ = _sched(
         StubSemantics, {}, policy=Policy(save_batch_max_kv_usage=threshold), layout=layout
@@ -1970,7 +1941,6 @@ def test_kv_pressure_sends_held_saves(kv_usage, threshold, send, caplog):
     warned = [r for r in caplog.records if "usage is unavailable" in r.getMessage()]
     assert len(warned) == (1 if kv_usage is None else 0)
     assert pressured.send_saves is send and pressured.flush is False
-    assert pressured.kv_usage_unknown is (kv_usage is None)
 
     calls = []
     rpc = FakeRpc()
@@ -1982,8 +1952,6 @@ def test_kv_pressure_sends_held_saves(kv_usage, threshold, send, caplog):
     pressured.saves = [GroupSave(0, [12], [b"h2"])]
     worker.save(pressured)
     assert len(worker._held) == (0 if send else 2)
-    assert worker.save_stats.pressure_rpcs == (1 if send else 0)
-    assert worker.save_stats.kv_usage_unknown_steps == (1 if kv_usage is None else 0)
     assert worker.flush(5)
     assert [[ids for _, ids, _ in c] for c in calls] == [[[11], [12]]]
     worker.shutdown()
@@ -2124,6 +2092,8 @@ def test_pinned_saves_hold_blocks_until_every_worker_saved():
     assert pool.refs == {11: 1, 32: 1} and sched.has_pending_saves()
     sched.on_saved_through(5)
     assert pool.refs == {} and not sched.has_pending_saves()
+    sched.on_saved_through(0)  # a lower report never moves saved_through back
+    assert not sched.has_pending_saves()
 
 
 @pytest.mark.parametrize("outcome", ["rejected", "raises"])
@@ -2272,17 +2242,6 @@ def test_namespace_covers_transfer_mode():
     assert (a.transfer_backend, b.transfer_backend) == ("direct", "kernel")
     assert a.namespace != b.namespace
     assert a.namespace == _layout(StubSemantics, StubFullSpec()).namespace
-
-
-# --------------------------------------------------------------------- policy
-def test_policy_defaults_match_shipped_toml():
-    assert load_policy(None) == Policy()
-
-
-@pytest.mark.parametrize("profile", ["../x", "a/b", "x y"])
-def test_policy_profile_name_is_checked(profile):
-    with pytest.raises(ValueError, match="model_profile"):
-        load_policy(profile)
 
 
 # ----------------------------------------------------------- stub vs native

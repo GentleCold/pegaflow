@@ -78,7 +78,6 @@ class StepPlan:
     fence_step: int = -1  # wait for the saves of plans <= this before any KV write
     flush: bool = False
     send_saves: bool = False
-    kv_usage_unknown: bool = False  # vLLM's KV usage was unavailable (send_saves set)
     step: int = -1  # plan_saves call that built this plan (pinned saves report it back)
 
 
@@ -97,7 +96,22 @@ class _Hit:
     present: tuple[frozenset[int], ...]  # server answers per sid (for re-planning)
     leases: list[_Lease]  # held leases, each with a non-empty ``wanted``
     sync: bool = False  # loaded before the forward of the step that schedules it
-    at: float = 0.0  # scheduler clock when the server answered
+
+
+@dataclass
+class _Req:
+    """One live request's state; ``request_finished`` drops it (and releases
+    its hit's leases)."""
+
+    request: Any  # the vLLM Request
+    hit: _Hit | None = None  # leased, waiting for allocation
+    loading_since: float | None = None  # prefetch wait start
+    deferred_since: float | None = None  # in-flight wait start (``_defer_for_inflight``)
+    inflight: list[tuple[int, bytes]] = field(default_factory=list)  # keys its async load writes
+    saved_upto: int | None = None  # tokens already offered for saving
+    # Unpinned saves: GPU block -> plan step of its last chosen save (fenced at finish).
+    saved_blocks: dict[int, int] = field(default_factory=dict)
+    counted: tuple[int, int] | None = None  # (num_computed, p_full) last counted in hit stats
 
 
 @dataclass
@@ -121,15 +135,6 @@ def _offered_ids(g: GroupInfo, blocks: range, offers: Sequence[tuple[int, int, i
 
 class Scheduler:
     HIT_LOG_S = 30.0  # min seconds between "hit stats" lines while lookups run
-    # Age cap for reusing an unallocated hit; a bound, not a tuned policy.
-    # vLLM re-asks for a head it did not allocate every scheduling pass. The
-    # cap bounds how long a newer save of the request's blocks goes unseen,
-    # and stays far below the server's lease TTL (600 s). In a TP1 replay
-    # gate diag (2026-10-26, ebe69db) the longest wait was 1.5 s, so
-    # 2 s answers each wait with one query; 0.5 s would add about 11% more
-    # queries, still about 1 ms each. A reused hit skips `Policy.accept`:
-    # its inputs (`p`, the server answers) are unchanged.
-    HIT_REUSE_MAX_S = 2.0
 
     def __init__(
         self,
@@ -173,22 +178,13 @@ class Scheduler:
         self._clock = clock
         self._sem = semantics if semantics is not None else native_semantics()
         self._sync_loads = sync_loads
-        self._requests: dict[str, Any] = {}  # live vLLM Request objects
-        self._hits: dict[str, _Hit] = {}  # leased, waiting for allocation
-        self._loading_since: dict[str, float] = {}
-        # Async loads in flight: req -> the (sid, block hash) keys it writes,
-        # and how many in-flight loads write each key.
-        self._inflight: dict[str, list[tuple[int, bytes]]] = {}
+        self._reqs: dict[str, _Req] = {}
+        # How many in-flight async loads write each (sid, block hash) key.
         self._inflight_refs: dict[tuple[int, bytes], int] = {}
-        # req -> when it was first deferred for another request's load.
-        self._deferred_since: dict[str, float] = {}
         self._defer_inflight = prefix_caching
-        self._saved_upto: dict[str, int] = {}  # token count already offered for saving
-        # Fences (unpinned saves). req -> {GPU block: plan step of its last
-        # chosen save}. A finished request's entries move to ``_fenced``:
-        # vLLM gets the blocks back at once, and a step that writes a fenced
-        # block first waits for that step's saves (``fence_writes``).
-        self._saved_blocks: dict[str, dict[int, int]] = {}
+        # Fences (unpinned saves). A finished request's ``saved_blocks`` move
+        # here: vLLM gets the blocks back at once, and a step that writes a
+        # fenced block first waits for that step's saves (``fence_writes``).
         self._fenced: dict[int, int] = {}  # GPU block -> plan step of its save
         self._fence_steps: dict[int, list[int]] = {}  # plan step -> blocks fenced on it
         self._last_save_step = -1  # last plan step with saves
@@ -232,58 +228,53 @@ class Scheduler:
         # per (request, resume point): vLLM re-queries a waiting request every
         # scheduling pass until it can be allocated.
         self.hit_stats: dict[str, int] = {}
-        # Wall time of every _lookup call (vLLM's scheduler thread waits for
-        # it, re-queries of a waiting request included) and its query RPCs.
-        self.lookup_cost = {"calls": 0, "rpcs": 0, "us": 0, "max_us": 0, "reused": 0}
-        self._counted: dict[str, tuple[int, int]] = {}
         self._hit_dirty = False  # counters changed since the last line
         self._hit_logged_at = clock()
 
     # ------------------------------------------------------------------ hits
+    def _rec(self, request: Any) -> _Req:
+        rec = self._reqs.get(request.request_id)
+        if rec is None:
+            rec = self._reqs[request.request_id] = _Req(request)
+        return rec
+
     def on_new_request(self, request: Any) -> None:
-        self._requests[request.request_id] = request
+        self._rec(request)
 
     def get_num_new_matched_tokens(
         self, request: Any, num_computed: int
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
-        self._requests.setdefault(req_id, request)
-        if self._defer_for_inflight(request, num_computed):
-            self._drop_hit(req_id)
+        rec = self._rec(request)
+        # vLLM re-asks for a request it did not allocate: its previous hit is
+        # released and the request looked up afresh.
+        self._drop_hit(rec)
+        if self._defer_for_inflight(rec, num_computed):
             # Its own clock bounds this wait: a prefetch wait before it must not
             # expire the moment the request is looked up again.
-            self._loading_since.pop(req_id, None)
+            rec.loading_since = None
             return None, False
-        # A previous hit vLLM did not allocate: reused if nothing it rests on
-        # changed, else stale.
-        reuse = self._reusable_hit(req_id, num_computed)
-        if reuse is not None:
-            self.lookup_cost["reused"] += 1
-            self._hit_dirty = True
-            return self._offer(req_id, reuse, num_computed)
 
-        t0 = self._clock()
         try:
             lookup = self._lookup(request, num_computed)
         except Exception:
             logger.warning("[PegaKVConnectorV2] query failed req=%s", req_id, exc_info=True)
-            self._loading_since.pop(req_id, None)
+            rec.loading_since = None
             return 0, False
-        finally:
-            self._time_lookup(self._clock() - t0)
 
         if lookup.loading:
             self._release(lookup.leases)
-            start = self._loading_since.setdefault(req_id, self._clock())
-            if (self._clock() - start) * 1000 < self._policy.loading_wait_ms:
+            if rec.loading_since is None:
+                rec.loading_since = self._clock()
+            if (self._clock() - rec.loading_since) * 1000 < self._policy.loading_wait_ms:
                 return None, False
             logger.info("[PegaKVConnectorV2] prefetch wait expired req=%s", req_id)
-            self._loading_since.pop(req_id, None)
+            rec.loading_since = None
             return 0, False
-        self._loading_since.pop(req_id, None)
+        rec.loading_since = None
 
         try:
-            hit = self._plan_hit(request, num_computed, lookup)
+            hit = self._plan_hit(rec, num_computed, lookup)
         except Exception:
             # semantics or policy raised: never leak the leases or crash vLLM.
             logger.warning("[PegaKVConnectorV2] hit planning failed req=%s", req_id, exc_info=True)
@@ -292,10 +283,6 @@ class Scheduler:
             self._release(lookup.leases)
             return 0, False
         self._release_unkept(lookup.leases, hit.leases)
-        hit.at = t0
-        return self._offer(req_id, hit, num_computed)
-
-    def _offer(self, req_id: str, hit: _Hit, num_computed: int) -> tuple[int, bool]:
         n = hit.p - num_computed
         # A short load costs about a millisecond; waiting for it before the
         # forward beats the two scheduler round trips of an async load. After
@@ -304,27 +291,10 @@ class Scheduler:
         hit.sync = (
             self._sync_loads and not self._saves_disabled and n <= self._policy.sync_load_tokens
         )
-        self._hits[req_id] = hit
+        rec.hit = hit
         return n, not hit.sync
 
-    def _reusable_hit(self, req_id: str, num_computed: int) -> _Hit | None:
-        """Pop the request's unallocated hit; return it if it can be offered
-        again without a server query, else release it.
-
-        Its leases keep the blocks it loads on the server, so the answer still
-        holds; it is reused only for the same local hit and within
-        ``HIT_REUSE_MAX_S``. A longer hit (another request saved more of the
-        prefix meanwhile) is picked up at the next fresh query.
-        """
-        hit = self._hits.pop(req_id, None)
-        if hit is None:
-            return None
-        if hit.num_computed == num_computed and self._clock() - hit.at < self.HIT_REUSE_MAX_S:
-            return hit
-        self._release(hit.leases)
-        return None
-
-    def _defer_for_inflight(self, request: Any, num_computed: int) -> bool:
+    def _defer_for_inflight(self, rec: _Req, num_computed: int) -> bool:
         """Wait for another request's async load of this request's blocks.
 
         vLLM prefix-caches an async load's blocks only once the load lands,
@@ -339,16 +309,16 @@ class Scheduler:
         separately from the prefetch wait. Not for a request that skips
         vLLM's prefix cache: vLLM ignores its hit (and a None) anyway.
         """
-        req_id = request.request_id
+        request = rec.request
         if not self._defer_inflight or self._policy.loading_wait_ms <= 0:
             return False
         if getattr(request, "skip_reading_prefix_cache", False):
             return False
-        if not self._inflight_refs or req_id in self._inflight:
-            self._deferred_since.pop(req_id, None)
+        if not self._inflight_refs or rec.inflight:
+            rec.deferred_since = None
             return False
         now = self._clock()
-        since = self._deferred_since.get(req_id)
+        since = rec.deferred_since
         if since is not None and (now - since) * 1000 >= self._policy.loading_wait_ms:
             return False
         layout = self._layout
@@ -368,10 +338,10 @@ class Scheduler:
         except Exception:
             return False  # only a shortcut: look up as usual
         if bound <= num_computed:
-            self._deferred_since.pop(req_id, None)
+            rec.deferred_since = None
             return False
         if since is None:
-            self._deferred_since[req_id] = now
+            rec.deferred_since = now
             self._count("deferred")
         return True
 
@@ -379,36 +349,28 @@ class Scheduler:
         self.hit_stats[key] = self.hit_stats.get(key, 0) + 1
         self._hit_dirty = True
 
-    def _time_lookup(self, seconds: float) -> None:
-        """Every ``_lookup`` call (vLLM's scheduler thread waits for it),
-        re-queries of a waiting request included."""
-        us = int(seconds * 1e6)
-        cost = self.lookup_cost
-        cost["calls"] += 1
-        cost["us"] += us
-        cost["max_us"] = max(cost["max_us"], us)
-        self._hit_dirty = True
-
     def on_loads_done(self, req_ids: Iterable[str]) -> None:
         """Async loads vLLM saw finish or fail (``finished_recving`` /
         ``failed_recving``), before it caches their blocks this pass."""
         for req_id in req_ids:
-            self._untrack_load(req_id)
+            rec = self._reqs.get(req_id)
+            if rec is not None:
+                self._untrack_load(rec)
 
-    def _track_load(self, request: Any, leases: list[_Lease]) -> None:
-        keys: list[tuple[int, bytes]] = []
+    def _track_load(self, rec: _Req, leases: list[_Lease]) -> None:
+        self._untrack_load(rec)
+        hashes_of = rec.request.block_hashes
         for lease in leases:
-            hashes = self._layout.group_hashes(self._layout.groups[lease.sid], request.block_hashes)
-            keys.extend((lease.sid, hashes[b]) for b in sorted(lease.wanted) if b < len(hashes))
-        self._untrack_load(request.request_id)
-        if not keys:
-            return
-        self._inflight[request.request_id] = keys
-        for key in keys:
+            hashes = self._layout.group_hashes(self._layout.groups[lease.sid], hashes_of)
+            rec.inflight.extend(
+                (lease.sid, hashes[b]) for b in sorted(lease.wanted) if b < len(hashes)
+            )
+        for key in rec.inflight:
             self._inflight_refs[key] = self._inflight_refs.get(key, 0) + 1
 
-    def _untrack_load(self, req_id: str) -> None:
-        for key in self._inflight.pop(req_id, ()):
+    def _untrack_load(self, rec: _Req) -> None:
+        keys, rec.inflight = rec.inflight, []
+        for key in keys:
             n = self._inflight_refs[key] - 1
             if n:
                 self._inflight_refs[key] = n
@@ -457,7 +419,6 @@ class Scheduler:
                 if not hashes[sid] or g.sem.kind == "scratch":
                     present.append(frozenset())
                     continue
-                self.lookup_cost["rpcs"] += 1
                 ans = self._rpc.query_prefetch(
                     self._instance_id, hashes[sid], request.request_id, False, sid
                 )
@@ -479,15 +440,15 @@ class Scheduler:
             raise
         return _Lookup(leases, tuple(present), loading)
 
-    def _plan_hit(self, request: Any, num_computed: int, lookup: _Lookup) -> _Hit | None:
+    def _plan_hit(self, rec: _Req, num_computed: int, lookup: _Lookup) -> _Hit | None:
         """Pick ``p`` and the blocks to load; releases nothing (the caller does)."""
         groups = [g.sem for g in self._layout.groups]
-        p = self._sem.resolve(groups, lookup.present, request.num_tokens)
+        p = self._sem.resolve(groups, lookup.present, rec.request.num_tokens)
         # The policy gets frozensets in a tuple: it cannot add blocks the server
         # never reported, and its answer can only lower p.
         accepted = operator.index(self._policy.accept(p, lookup.present))
         p = max(0, min(accepted, p))
-        self._count_miss(request, num_computed, lookup.present, p)
+        self._count_miss(rec, num_computed, lookup.present, p)
         if p <= num_computed or p % self._layout.step:
             return None
         kept = self._assign(p, num_computed, lookup.present, lookup.leases)
@@ -536,7 +497,8 @@ class Scheduler:
 
     def loaded_group_ids(self, req_id: str) -> tuple[int, ...]:
         """vLLM groups the pending hit writes into (vLLM skips zeroing them)."""
-        hit = self._hits.get(req_id)
+        rec = self._reqs.get(req_id)
+        hit = rec.hit if rec is not None else None
         if hit is None:
             return ()
         return tuple(sorted({self._layout.groups[lease.sid].gid for lease in hit.leases}))
@@ -545,8 +507,11 @@ class Scheduler:
         self, request: Any, block_ids: tuple[list[int], ...], num_external_tokens: int
     ) -> None:
         req_id = request.request_id
-        self._deferred_since.pop(req_id, None)  # scheduled: a later wait starts afresh
-        hit = self._hits.pop(req_id, None)
+        rec = self._reqs.get(req_id)
+        if rec is None:
+            return
+        rec.deferred_since = None  # scheduled: a later wait starts afresh
+        hit, rec.hit = rec.hit, None
         if hit is None:
             return
         if num_external_tokens == 0:
@@ -577,10 +542,8 @@ class Scheduler:
             plan.loads = []
         else:
             self._release_unkept(hit.leases, leases or [])
-            if plan.sync:
-                self._count("sync_planned")
-            else:  # a sync load's blocks are cached at once
-                self._track_load(request, leases or [])
+            if not plan.sync:  # a sync load's blocks are cached at once
+                self._track_load(rec, leases or [])
         # The load writes its target blocks this step. A failed sync load,
         # planned or not, leaves its covered blocks to be recomputed by the
         # running request (kv_load_failure_policy=recompute): no later table
@@ -720,7 +683,8 @@ class Scheduler:
             for req_id in preempted:
                 self._plan.flush = True
                 # The flush finishes the saves of its freed blocks.
-                self._saved_blocks.pop(req_id, None)
+                if (rec := self._reqs.get(req_id)) is not None:
+                    rec.saved_blocks = {}
         self._plan.flush |= self._flush_always
         if self._plan.flush:
             # Every save planned before this step is done before it writes.
@@ -732,7 +696,6 @@ class Scheduler:
                     "[PegaKVConnectorV2] vLLM's KV cache usage is unavailable (cache "
                     "manager not bound): saves are sent every step, batching is off"
                 )
-            self._plan.kv_usage_unknown = True
             self._plan.send_saves = True
         elif kv_usage >= self._policy.save_batch_max_kv_usage:
             self._plan.send_saves = True
@@ -740,13 +703,14 @@ class Scheduler:
             return
         items: list[SaveItem] = []
         for req_id, computed, n_sched in scheduled:
-            request = self._requests.get(req_id)
-            if request is None or n_sched <= 0:
+            rec = self._reqs.get(req_id)
+            if rec is None or n_sched <= 0:
                 continue
+            request = rec.request
             # Only tokens vLLM already knows have hashes; draft (spec-decode) or
             # not-yet-sampled (async scheduling) positions are offered by a
             # later step, which starts from where this one stopped.
-            before = min(computed, self._saved_upto.get(req_id, computed))
+            before = computed if rec.saved_upto is None else min(computed, rec.saved_upto)
             after = min(computed + n_sched, request.num_tokens)
             if after <= before:
                 continue
@@ -760,12 +724,12 @@ class Scheduler:
                 if block_ids is None:
                     # No block ids this step: keep `before` so a later step
                     # offers this range again.
-                    self._saved_upto[req_id] = before
+                    rec.saved_upto = before
                     continue
                 if self._unconfirmed and self._touches_unconfirmed(block_ids):
                     # Computed on top of a sync load whose outcome vLLM has
                     # not processed yet (or sharing its blocks): hold.
-                    self._saved_upto[req_id] = before
+                    rec.saved_upto = before
                     continue
                 for g, blocks in ranges:
                     if g.sem.kind == "checkpoint":
@@ -778,7 +742,7 @@ class Scheduler:
             # `after` is capped at num_tokens (every full block has a hash) and
             # blocks written this step are allocated, not null. A checkpoint
             # vLLM did not offer (it did not retain that boundary) is skipped.
-            self._saved_upto[req_id] = after
+            rec.saved_upto = after
         if not items:
             return
         offered = {item: item for item in items}
@@ -800,7 +764,7 @@ class Scheduler:
                 continue
             seen.add(item)
             if not self._pin_saves:
-                self._saved_blocks.setdefault(item.req_id, {})[item.block_id] = step
+                self._reqs[item.req_id].saved_blocks[item.block_id] = step
             sid = sid_of[item.group]
             save = by_key.setdefault((sid, item.req_id), GroupSave(sid, [], []))
             save.block_ids.append(item.block_id)
@@ -890,7 +854,7 @@ class Scheduler:
         return bool(self._pins) or self._last_save_step > self._saved_through
 
     def _count_miss(
-        self, request: Any, num_computed: int, present: tuple[frozenset[int], ...], p: int
+        self, rec: _Req, num_computed: int, present: tuple[frozenset[int], ...], p: int
     ) -> None:
         """Group coherence: at the longest resume point the full groups back,
         which other groups are missing (``hit stats`` log line)."""
@@ -900,12 +864,12 @@ class Scheduler:
         contiguous = 0
         while contiguous in present[0]:
             contiguous += 1
-        cap = max(request.num_tokens - 1, 0)
+        cap = max(rec.request.num_tokens - 1, 0)
         p_full = min(contiguous * groups[0].sem.block_tokens, cap) // step * step
         key = (num_computed, p_full)
-        if self._counted.get(request.request_id) == key:
+        if rec.counted == key:
             return
-        self._counted[request.request_id] = key
+        rec.counted = key
         stats = self.hit_stats
         stats["lookups"] = stats.get("lookups", 0) + 1
         if p_full > max(p, num_computed):
@@ -929,11 +893,7 @@ class Scheduler:
         final counters must not depend on it."""
         self._hit_dirty = False
         self._hit_logged_at = self._clock()
-        logger.info(
-            "[PegaKVConnectorV2] hit stats %s lookup_cost %s",
-            dict(sorted(self.hit_stats.items())),
-            self.lookup_cost,
-        )
+        logger.info("[PegaKVConnectorV2] hit stats %s", dict(sorted(self.hit_stats.items())))
 
     def _touches_unconfirmed(self, block_ids: tuple[list[int], ...]) -> bool:
         return any(
@@ -968,17 +928,14 @@ class Scheduler:
         freed only later, by its last holder: the fence stays until the save
         is done, whoever frees it. A preempted request's saves are covered by
         the step's flush."""
-        self._drop_hit(req_id)
-        self._loading_since.pop(req_id, None)
-        self._untrack_load(req_id)  # aborted while loading: never cached
-        self._deferred_since.pop(req_id, None)
-        self._saved_upto.pop(req_id, None)
-        self._requests.pop(req_id, None)
-        self._counted.pop(req_id, None)
-        if self._hit_dirty and not self._requests:
+        rec = self._reqs.pop(req_id, None)
+        if self._hit_dirty and not self._reqs:
             self.report_hit_stats()  # idle: the counters are final for now
-        saved = self._saved_blocks.pop(req_id, None)
-        for block, step in (saved or {}).items():
+        if rec is None:
+            return False
+        self._drop_hit(rec)
+        self._untrack_load(rec)  # aborted while loading: never cached
+        for block, step in rec.saved_blocks.items():
             if step > self._fence_floor and self._fenced.get(block, -1) < step:
                 self._fenced[block] = step
                 self._fence_steps.setdefault(step, []).append(block)
@@ -987,15 +944,15 @@ class Scheduler:
     def shutdown(self) -> None:
         if self._hit_dirty:
             self.report_hit_stats()
-        for req_id in list(self._hits):
-            self._drop_hit(req_id)
+        for rec in self._reqs.values():
+            self._drop_hit(rec)
         # Load plans never handed to the workers still hold their leases.
         self._release_tokens(lease for lp in self._plan.loads for lease, _ in lp.loads)
         self._plan.loads.clear()
 
-    def _drop_hit(self, req_id: str) -> None:
-        hit = self._hits.pop(req_id, None)
-        if hit is not None:
+    def _drop_hit(self, rec: _Req) -> None:
+        if rec.hit is not None:
+            hit, rec.hit = rec.hit, None
             self._release(hit.leases)
 
     def _release_unkept(self, held: list[_Lease], kept: list[_Lease]) -> None:

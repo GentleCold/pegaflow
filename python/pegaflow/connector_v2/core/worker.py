@@ -67,8 +67,6 @@ def _save_settled(e: Exception) -> bool:
 class _Batch:
     state: Any  # PyLoadState
     req_ids: list[str]
-    polls: int = 0  # poll() calls that saw it, the landing one included
-    issued_at: float = 0.0  # worker clock when its step's start_load_kv began
 
 
 @dataclass
@@ -91,41 +89,19 @@ def _wire_bytes(saves: list[tuple[str, list[int], list[bytes]]]) -> int:
 
 @dataclass
 class SaveStats:
-    """Save cost since the last report (grep "save stats" in vllm.log), and
-    the sync-load wait, the worker's other cost on the step's critical path."""
+    """Save counters since the last report (grep "save stats" in vllm.log):
+    the fail-closed paths, and the waits on the step's critical path."""
 
     steps: int = 0  # wait_for_save calls
-    save_steps: int = 0  # steps that queued a save job
-    blocks: int = 0  # (layer, block) copies requested
-    bytes: int = 0
-    submit_s: float = 0.0  # step thread: building and queueing jobs (on the critical path)
-    flushes: int = 0  # preemption flushes that had to wait
-    flush_s: float = 0.0  # step thread: blocked in flush (on the critical path)
-    wait_s: float = 0.0  # saver thread: waiting for the compute stream
-    rpc_s: float = 0.0  # saver thread: save RPC (server copies GPU->CPU inside it)
-    max_job_s: float = 0.0  # saver thread: wait + rpc of one job
-    max_pending: int = 0  # jobs queued or running at submit time
+    rpcs: int = 0  # save RPCs sent
     failed: int = 0  # jobs that did not store their blocks
     raised: int = 0  # save RPCs that raised with a copy possibly running (each quiesces)
-    rpcs: int = 0  # save RPCs sent (one per released batch not dropped by a quiesce)
-    pressure_rpcs: int = 0  # batches released early on KV pressure (StepPlan.send_saves)
-    kv_usage_unknown_steps: int = 0  # steps without vLLM's KV usage (batching off)
+    flushes: int = 0  # flushes that had to wait
+    flush_s: float = 0.0
     fences: int = 0  # steps that waited for saves before writing a freed block
-    fence_s: float = 0.0  # step thread: blocked on those waits (on the critical path)
-    max_fence_s: float = 0.0
-    sync_loads: int = 0  # sync loads whose RPC was accepted (failed RPCs are not waited for)
-    sync_first_steps: int = 0  # steps where a sync load was moved ahead of an async one
-    sync_wait_s: float = 0.0  # step thread: waiting for their copies (on the critical path)
-    max_sync_wait_s: float = 0.0  # longest wait of one step
-    load_steps: int = 0  # steps with any load plan
-    load_issue_s: float = 0.0  # step thread: all of _start_loads (RPCs + sync wait)
-    max_load_issue_s: float = 0.0
-    async_done: int = 0  # async load RPCs seen ready (landed or failed) by poll()
-    async_first_poll: int = 0  # of those, ready at the first poll (the issuing step's)
-    async_polls: int = 0  # their polls, the landing one included
-    max_async_polls: int = 0
-    async_ready_s: float = 0.0  # their step's start_load_kv -> the poll that saw them ready
-    max_async_ready_s: float = 0.0
+    fence_s: float = 0.0
+    sync_wait_s: float = 0.0  # waiting for sync-load copies
+    max_job_s: float = 0.0  # saver thread: compute wait + RPC of one job
     _since: float = field(default=0.0, repr=False)
 
 
@@ -150,16 +126,11 @@ class Worker:
     # Quiesce window after a save RPC raised without proving its copy over
     # (``_save_settled``): no save RPC is sent and the job's fences and pins
     # hold for this long, then the job counts as done and saving resumes.
-    # A heuristic, not a proof: the server reports no bound on a copy it
-    # may still run. Gate logs (277 v2 runs, 3853 ``save stats`` windows)
-    # show a whole job (compute wait + RPC) at p99 0.63 s and at most 2.98 s
-    # (one 557 MB RPC); 10 s is over 3x that. It is also the longest a fence
-    # or pin on the raised job can hold vLLM's step. Each consecutive raise
-    # doubles the window up to SAVE_QUIESCE_MAX_S, so a cause that persists
-    # (a pinned pool that stays exhausted) stalls fences less often; a save
-    # RPC that stores its blocks resets it.
+    # A heuristic, not a proof: the server reports no bound on a copy it may
+    # still run. It must stay well above the longest save job (compute wait
+    # + RPC; evidence in rsi-notes), and it is the longest a fence or pin on
+    # the raised job can hold vLLM's step.
     SAVE_QUIESCE_S = 10.0
-    SAVE_QUIESCE_MAX_S = 60.0
 
     def __init__(
         self,
@@ -173,17 +144,12 @@ class Worker:
         mark_compute: Callable[[], Any],
         clock: Callable[[], float] = time.perf_counter,
         batch_steps: int = 1,
-        pinned_saves: bool = False,
     ):
         """``batch_steps`` (policy ``save_batch_steps``): a step's save job is
         held and merged with later steps' jobs into one save RPC until the
         oldest held job has seen ``batch_steps`` steps or waited
         ``SAVE_HOLD_MAX_S``, whichever comes first (<= 1 sends every step).
         ``flush`` and ``StepPlan.send_saves`` send held jobs at once.
-
-        ``pinned_saves``: the scheduler pins the blocks of each plan's saves
-        until ``saved_through`` reports that plan's step (``Scheduler``
-        ``pin_saves``), so saves need no batching.
         """
         self._layout = layout
         self._rpc = rpc
@@ -198,7 +164,6 @@ class Worker:
         self._new_load_state = new_load_state
         self._mark_compute = mark_compute
         self._clock = clock
-        self._layer_bytes: dict[str, int] = {}  # bytes one block of a layer stores
         self.save_stats = SaveStats(_since=clock())
         # Registered layer names per storage group (index into layout.groups).
         self._layers: list[list[str]] = [[] for _ in layout.groups]
@@ -226,7 +191,6 @@ class Worker:
         self._held_bytes = 0  # estimated wire size of the held jobs' save entries
         # (job seq, plan step) of submitted jobs not known done, and the last
         # plan step seen by ``save`` (``saved_through``).
-        self._pinned = pinned_saves
         self._job_steps: collections.deque[tuple[int, int]] = collections.deque()
         self._last_step = -1
         # The saver thread exited: it reads no block any more, so every hold
@@ -235,7 +199,6 @@ class Worker:
         # A save RPC raised and its window (SAVE_QUIESCE_S) runs: new saves
         # are dropped (future misses). Set and cleared by the saver thread.
         self._quiescing = False
-        self._quiesce_s = self.SAVE_QUIESCE_S  # next window (saver thread only)
         self._stop = threading.Event()  # shutdown: ends a quiesce window early
         self._jobs: queue.SimpleQueue[_SaveJob | None] = queue.SimpleQueue()
         self._saver = threading.Thread(
@@ -280,7 +243,6 @@ class Worker:
                 segments.append(len(decl.segments))
                 group_ids.append(sid)
                 self._layers[sid].append(name)
-                self._layer_bytes[name] = view.bytes_per_block * len(decl.segments)
         if not names:
             raise Unsupported("no transferable KV cache layer on this worker")
         par = self._par
@@ -351,13 +313,8 @@ class Worker:
         after the step's async loads would stall the step for their copies
         too.
         """
-        if not plan.loads:
-            return
-        t0 = self._clock()
         sync: list[tuple[Any, list[int]]] = []
-        ordered = sorted(plan.loads, key=lambda lp: not lp.sync)
-        reordered = ordered != plan.loads
-        for lp in ordered:
+        for lp in sorted(plan.loads, key=lambda lp: not lp.sync):
             if lp.fail:
                 if lp.sync:
                     self._invalid.update(lp.covered)
@@ -376,16 +333,9 @@ class Worker:
                 elif lp.sync:
                     sync.append((state, lp.covered))
                 else:
-                    self._batches.append(_Batch(state, [lp.req_id], issued_at=t0))
+                    self._batches.append(_Batch(state, [lp.req_id]))
         if sync:
             self._wait_sync(sync)
-        issued = self._clock() - t0
-        with self._cv:
-            stats = self.save_stats
-            stats.sync_first_steps += reordered
-            stats.load_steps += 1
-            stats.load_issue_s += issued
-            stats.max_load_issue_s = max(stats.max_load_issue_s, issued)
 
     def _start_load(self, req_id: str, loads: list[tuple[bytes, list[list[int | None]]]]) -> Any:
         """Issue the load RPC; the load state, or None if the RPC failed."""
@@ -434,12 +384,8 @@ class Worker:
                     len(covered),
                 )
                 self._invalid.update(covered)
-        waited = self._clock() - t0
         with self._cv:
-            stats = self.save_stats
-            stats.sync_loads += len(loads)
-            stats.sync_wait_s += waited
-            stats.max_sync_wait_s = max(stats.max_sync_wait_s, waited)
+            self.save_stats.sync_wait_s += self._clock() - t0
 
     def take_invalid(self) -> set[int]:
         """GPU blocks whose sync load failed since the last call."""
@@ -487,30 +433,15 @@ class Worker:
             elif plan.send_saves:
                 # KV pressure: freed blocks are reused soon, and a fence on a
                 # held job would wait for the whole batch.
-                with self._cv:
-                    self.save_stats.pressure_rpcs += 1
                 self._release_held()
         if plan.step > self._last_step:
             self._last_step = plan.step
             self._step_seqs.append((plan.step, self._submitted))
-        t1 = self._clock()
         with self._cv:
-            stats = self.save_stats
-            stats.steps += 1
-            stats.submit_s += t1 - t0
-            stats.kv_usage_unknown_steps += plan.kv_usage_unknown
-            if saves:
-                stats.save_steps += 1
-                stats.blocks += sum(len(ids) for _, ids, _ in saves)
-                stats.bytes += sum(len(ids) * self._layer_bytes[name] for name, ids, _ in saves)
-                stats.max_pending = max(stats.max_pending, self._submitted - self._completed)
-            report = stats.steps >= self.SAVE_LOG_EVERY
+            self.save_stats.steps += 1
+            report = self.save_stats.steps >= self.SAVE_LOG_EVERY
         if report:
             self.report_save_stats()
-
-    @property
-    def pinned_saves(self) -> bool:
-        return self._pinned
 
     def saved_through(self) -> int:
         """The latest plan step whose saves, and every earlier one's, are done
@@ -537,9 +468,8 @@ class Worker:
         all. Each step keeps its own layer entries (a layer may appear once per
         held step), so the server sees the same entries as unbatched saves.
         The server pins one region per entry, freed only once all of its
-        blocks are evicted: folding steps into one entry per layer makes
-        regions span more requests and strands more evicted bytes (measured
-        in the full-only batching A/B, rsi-notes).
+        blocks are evicted: folding steps into one entry per layer would make
+        regions span more requests and strand evicted bytes.
         """
         if not self._held:
             return
@@ -580,11 +510,8 @@ class Worker:
                 return
             while not self._cv.wait_for(lambda: self._settled(target), self.STALL_LOG_S):
                 self._log_stall("fence", t0, target)
-            waited = self._clock() - t0
-            stats = self.save_stats
-            stats.fences += 1
-            stats.fence_s += waited
-            stats.max_fence_s = max(stats.max_fence_s, waited)
+            self.save_stats.fences += 1
+            self.save_stats.fence_s += self._clock() - t0
 
     def flush(self, timeout: float | None = None) -> bool:
         """Block until every submitted save job is done; False on timeout.
@@ -623,15 +550,13 @@ class Worker:
 
     def _quiesce(self, raised: _SaveJob) -> bool:
         """After ``raised``'s RPC raised: send nothing for the window
-        (``SAVE_QUIESCE_S``, doubled per consecutive raise) while its fences
-        and pins hold (its copy may still run), then count it done and
+        (``SAVE_QUIESCE_S``) while its fences and pins hold (its copy may still run), then count it done and
         resume. Jobs queued behind it, held (batched) jobs released during
         the window included, are completed as failed without an RPC (no copy
         of theirs started): under the pressure that made the RPC raise they
         would likely raise too, each holding fences for another window.
         Shutdown ends the window early. False if shutdown came during it."""
-        window = self._quiesce_s
-        self._quiesce_s = min(2 * window, self.SAVE_QUIESCE_MAX_S)
+        window = self.SAVE_QUIESCE_S
         self._quiesce_wait(window)
         last, dropped, stop = raised.seq, 0, False
         while True:
@@ -676,7 +601,6 @@ class Worker:
         future miss.
         """
         t0 = self._clock()
-        t1 = t2 = t0
         # over: no copy of this job can still be running
         ok = over = raised = sent = False
         try:
@@ -685,7 +609,6 @@ class Worker:
             except Exception as e:  # the forward failed: its KV is not valid
                 ok, over, msg = False, True, f"compute wait failed: {e!r}"
             else:
-                t1 = self._clock()
                 sent = True
                 try:
                     ok, msg = self._rpc.save(
@@ -699,11 +622,10 @@ class Worker:
                 except Exception as e:
                     ok, over, msg = False, _save_settled(e), repr(e)
                     raised = not over
-            t2 = self._clock()
             if not over:
                 logger.error(
                     "[PegaKVConnectorV2] save RPC raised, saves pause %.0f s (fail closed): %s",
-                    self._quiesce_s,
+                    self.SAVE_QUIESCE_S,
                     msg,
                 )
             elif not ok:
@@ -712,13 +634,9 @@ class Worker:
         finally:
             with self._cv:
                 stats = self.save_stats
-                stats.wait_s += t1 - t0
-                stats.rpc_s += t2 - t1
-                stats.max_job_s = max(stats.max_job_s, t2 - t0)
+                stats.max_job_s = max(stats.max_job_s, self._clock() - t0)
                 stats.failed += not ok
                 stats.rpcs += sent
-                if ok:
-                    self._quiesce_s = self.SAVE_QUIESCE_S  # stored: backoff resets
                 if over:
                     # Failed or not, the copy is over: held blocks are released.
                     self._completed = job.seq
@@ -738,48 +656,21 @@ class Worker:
         if not s.steps:
             return
         logger.info(
-            "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
-            "blocks=%d bytes=%d submit_ms=%.1f flushes=%d flush_ms=%.1f wait_ms=%.1f "
-            "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d raised=%d rpcs=%d "
-            "pressure_rpcs=%d fences=%d fence_ms=%.1f max_fence_ms=%.2f kv_usage_unknown_steps=%d "
-            "sync_loads=%d sync_first_steps=%d sync_wait_ms=%.1f max_sync_wait_ms=%.2f "
-            "load_steps=%d load_issue_ms=%.1f max_load_issue_ms=%.2f "
-            "async_done=%d async_first_poll=%d async_polls=%d max_async_polls=%d "
-            "async_ready_ms=%.1f max_async_ready_ms=%.2f",
+            "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d rpcs=%d failed=%d "
+            "raised=%d flushes=%d flush_ms=%.1f fences=%d fence_ms=%.1f sync_wait_ms=%.1f "
+            "max_job_ms=%.2f",
             self._par.tp_rank,
             now - s._since,
             s.steps,
-            s.save_steps,
-            s.blocks,
-            s.bytes,
-            s.submit_s * 1e3,
-            s.flushes,
-            s.flush_s * 1e3,
-            s.wait_s * 1e3,
-            s.rpc_s * 1e3,
-            s.max_job_s * 1e3,
-            s.max_pending,
+            s.rpcs,
             s.failed,
             s.raised,
-            s.rpcs,
-            s.pressure_rpcs,
+            s.flushes,
+            s.flush_s * 1e3,
             s.fences,
             s.fence_s * 1e3,
-            s.max_fence_s * 1e3,
-            s.kv_usage_unknown_steps,
-            s.sync_loads,
-            s.sync_first_steps,
             s.sync_wait_s * 1e3,
-            s.max_sync_wait_s * 1e3,
-            s.load_steps,
-            s.load_issue_s * 1e3,
-            s.max_load_issue_s * 1e3,
-            s.async_done,
-            s.async_first_poll,
-            s.async_polls,
-            s.max_async_polls,
-            s.async_ready_s * 1e3,
-            s.max_async_ready_s * 1e3,
+            s.max_job_s * 1e3,
         )
 
     def shutdown(self) -> None:
@@ -803,30 +694,15 @@ class Worker:
         self._forget_done_steps(completed)
         finished, self._done = self._done, set()
         pending: list[_Batch] = []
-        landed: list[int] = []
-        ready_s: list[float] = []
-        now = self._clock() if self._batches else 0.0
         for b in self._batches:
-            b.polls += 1
             if not b.state.is_ready():
                 pending.append(b)
                 continue
-            landed.append(b.polls)
-            ready_s.append(now - b.issued_at)
             finished.update(b.req_ids)
             state = b.state.get_state()
             if state != 1:
                 logger.warning("[PegaKVConnectorV2] load state=%s reqs=%s", state, b.req_ids)
                 self._failed.update(b.req_ids)
         self._batches = pending
-        if landed:
-            with self._cv:
-                stats = self.save_stats
-                stats.async_done += len(landed)
-                stats.async_first_poll += landed.count(1)
-                stats.async_polls += sum(landed)
-                stats.max_async_polls = max(stats.max_async_polls, *landed)
-                stats.async_ready_s += sum(ready_s)
-                stats.max_async_ready_s = max(stats.max_async_ready_s, *ready_s)
         failed, self._failed = self._failed, set()
         return sending, finished | failed, failed

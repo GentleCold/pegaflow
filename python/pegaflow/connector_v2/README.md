@@ -5,8 +5,7 @@ vLLM KV connector driven by `pegaflow.semantics`. Load it with
 ```
 --kv-transfer-config '{"kv_connector": "PegaKVConnectorV2",
   "kv_connector_module_path": "pegaflow.connector_v2", "kv_role": "kv_both",
-  "kv_load_failure_policy": "recompute",
-  "kv_connector_extra_config": {"model_profile": "default"}}'
+  "kv_load_failure_policy": "recompute"}'
 ```
 
 Use `kv_load_failure_policy=recompute`. Under vLLM's default `fail`, any failed
@@ -23,7 +22,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
 | `connector.py` | vLLM connector API | models, policy |
 | `core/` | semantics + server contract (query, lease, load, save) | vLLM imports, spec classes |
 | `adapters/` | one vLLM `KVCacheSpec` class each | requests, server |
-| `policy.py` + `models/*.toml` | choices inside the semantic range | GPU layout, server |
+| `policy.py` | choices inside the semantic range | GPU layout, server |
 
 - **Hits.** Each transferable group is queried. Storage group 0 is a full
   group and uses the server's prefix query, which can prefetch. The other
@@ -36,15 +35,10 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     not past the local hit, the remaining groups are not queried and
     create no lease (group 0's lease is released). A full-only layout
     skips only when no full block lies past the local hit.
-  - A hit vLLM did not allocate (for example, its KV pool was short) is
-    kept with its leases. vLLM asks again for the same waiting head every
-    pass; if its local hit is unchanged and the hit is younger than
-    `Scheduler.HIT_REUSE_MAX_S` (2 s), the same hit is offered again
-    without a server query or `policy.accept` (neither input changed).
-    That cap is a bound, not a tuned value: it is far below the server's
-    lease TTL (600 s) and bounds how long a longer hit, saved meanwhile by
-    another request, goes unseen. Otherwise the held leases are released
-    and the request is looked up again (or waits, see below).
+  - A hit vLLM did not allocate (for example, its KV pool was short) keeps
+    its leases until vLLM asks again for the request (every scheduling
+    pass): then they are released and the request is looked up again (or
+    waits, see below).
   - `semantics.resolve` gives the longest legal `p`. `policy.accept` may lower it.
   - Only the blocks in `semantics.needed(g, p)` that are past vLLM's local hit get loaded.
   - Leases that cover none of those blocks are released immediately. Unwanted
@@ -148,10 +142,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     saves are dropped, and the raised job's fences and pins (and those of
     every later job) hold. Then the job counts as done, the jobs queued
     behind it (held batches released meanwhile included) are dropped
-    without an RPC, and saving resumes. Each consecutive raise doubles the
-    window, up to `SAVE_QUIESCE_MAX_S` (60 s); a save RPC that stores its
-    blocks resets it. Shutdown ends a window early. Each raise is logged
-    and counted as `raised` in `save stats`.
+    without an RPC, and saving resumes. Shutdown ends a window early. Each
+    raise is logged and counted as `raised` in `save stats`.
     During a window, earlier steps' fences clear as usual. A step waits
     for the rest of the window if it writes a block fenced on the raised
     step or later (also blocks whose save was dropped: the scheduler does
@@ -163,8 +155,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     class as transport errors (`PegaFlowError`), and the client also
     reports its own decode and HTTP/2 errors as Internal. The window is a
     heuristic, not a proof: no reply bounds a copy the server may still
-    run. It is over 3x the longest save job seen in the gate logs (2.98 s
-    for compute wait plus RPC; p99 0.63 s over 3853 `save stats` windows).
+    run, so it is kept well above the longest save job seen in gate logs.
     A saver thread that dies stops saving for good: fences and holds are
     released, later saves are dropped, and no other copy runs.
     Server limitations:
@@ -203,14 +194,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   were lost, counted once per request and resume point (vLLM re-queries a
   waiting request every scheduling pass) (`missing=` with no group: the policy lowered `p`). This is the
   group-coherence signal for server eviction. Load counters:
-  - `deferred`: requests that waited for another request's async load;
-  - `sync_planned`: sync loads planned (a sync load is a short hit loaded
-    before the forward).
-
-  The same line carries `lookup_cost`: `calls` / `us` / `max_us`, the wall
-  time of every server lookup vLLM's scheduler thread waited for (re-queries
-  of a waiting request included), `rpcs`, its `query_prefetch` calls, and
-  `reused`, re-asks answered from a held hit without a lookup (see Hits).
+  `deferred` counts requests that waited for another request's async load.
 - **Namespace.** It is a hash of:
   - the adapters' declarations: group kinds, block sizes, per-rank segments
     and shards, transfer backend, page_first, and `LayerDecl.layout` when an
@@ -224,31 +208,12 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   Declarations carry sizes, not byte order. So an adapter must reject any byte
   order that neither its declaration nor `kv_cache_layout` names. For example,
   `full_attention` rejects kernel-split HNC pages.
-- **Save cost.** Every 500 `wait_for_save` calls (and at shutdown) each worker
-  logs `save stats`:
-  - steps, and steps with a save;
-  - blocks and bytes;
-  - on the step thread: `submit_ms`, preemption `flushes` / `flush_ms`, and
-    `fences` / `fence_ms` / `max_fence_ms` (steps that waited for a save
-    before writing a freed block, and that wait);
-  - on the saver thread: `wait_ms` (compute event), `rpc_ms`, `max_job_ms`,
-    `max_pending` jobs;
-  - failed saves, and `raised` (save RPCs that raised with a copy possibly
-    running; each starts a quiesce window); `rpcs` counts save RPCs sent,
-    `pressure_rpcs` batches released early on KV pressure;
-  - loads, on the step thread: `sync_loads` (sync loads whose RPC the server
-    accepted), `sync_first_steps` (steps where a sync load was moved ahead
-    of an async one), `sync_wait_ms` / `max_sync_wait_ms` (waiting for the
-    sync copies, per step), and `load_steps` / `load_issue_ms` /
-    `max_load_issue_ms` (all of `start_load_kv`: every load RPC plus the
-    sync wait, over steps with a load plan);
-  - async loads, in `get_finished`: `async_done` (load RPCs seen ready,
-    landed or failed), `async_first_poll` (of those, ready at the first
-    poll, the issuing step's), `async_polls` / `max_async_polls` (polls
-    until ready, the landing one included), and `async_ready_ms` /
-    `max_async_ready_ms` (from the start of the issuing step's
-    `start_load_kv` to the poll that saw it ready). vLLM promotes a request the step after the poll that reports
-    it, so 1 poll is its minimum round trip.
+- **Save stats.** Every 500 `wait_for_save` calls (and at shutdown) each
+  worker logs `save stats`: `steps`, save `rpcs` sent, `failed` saves,
+  `raised` (save RPCs that raised with a copy possibly running; each starts
+  a quiesce window), the step-thread waits `flushes` / `flush_ms`, `fences`
+  / `fence_ms` and `sync_wait_ms`, and `max_job_ms` (compute wait plus RPC
+  of one save job). Per-step timing belongs in the gate's probe, not here.
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;
   - every TP rank's declarations must pass `semantics.seal_plan` (V0).
@@ -275,21 +240,17 @@ The shared rules live in the semantics crate, so an adapter only declares
 facts: the dependency kind, the tokens per block, the bytes per segment, and
 the shard. It never decides what to load or save.
 
-## Model profiles (the RSI surface)
+## Policy (the RSI surface)
 
-`policy.py` is the place to tune behaviour. Knobs are read from
-`models/default.toml`, then from `models/<profile>.toml` if that file exists.
-The profile is `kv_connector_extra_config["model_profile"]`, else vLLM's
-`model_config.architecture`.
+`policy.py` is the place to tune behaviour. Its knobs are constants shared by
+every model. The policy can only narrow what semantics allows:
 
-- Unknown knobs are an error. Profile names must match `[A-Za-z0-9_.-]+`.
-- The policy can only narrow what semantics allows:
-  - it sees immutable copies (`frozenset`s, a tuple of `SaveItem`s);
-  - `accept` is capped at the legal `p`, and the result is re-checked against
-    the server answers;
-  - `choose_saves` may only return offered items. Anything else raises.
+- it sees immutable copies (`frozenset`s, a tuple of `SaveItem`s);
+- `accept` is capped at the legal `p`, and the result is re-checked against
+  the server answers;
+- `choose_saves` may only return offered items. Anything else raises.
 
-  So a bad policy costs hit rate, never correctness.
+So a bad policy costs hit rate, never correctness.
 
 ## Tests
 

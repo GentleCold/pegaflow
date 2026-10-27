@@ -37,7 +37,7 @@ from .core import (
     layer_specs,
     may_zero_or_copy_blocks,
 )
-from .policy import load_policy
+from .policy import Policy
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -149,7 +149,6 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         self._scheduler: Scheduler | None = None
         self._pins_bound = False
         self._worker: Worker | None = None
-        profile = extra.get("model_profile") or getattr(mc, "architecture", None)
         if role == KVConnectorRole.SCHEDULER:
             if getattr(self._kv_transfer_config, "kv_load_failure_policy", None) == "fail":
                 # vLLM's scheduler reads the TOP-LEVEL kv_transfer_config. Under
@@ -169,7 +168,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             )
             self._scheduler = Scheduler(
                 self._layout,
-                load_policy(profile),
+                Policy(),
                 self._rpc,
                 self._instance_id,
                 sync_loads=sync_loads,
@@ -196,7 +195,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             # The scheduler pins what these layouts save (_pin_saves): the
             # saves stay asynchronous, unbatched so blocks stay pinned briefly.
             pinned = _pin_saves(kv_cache_config, self._layout)
-            policy = load_policy(profile)
+            policy = Policy()
             batch_steps = 1 if pinned else policy.save_batch_steps
             logger.info(
                 "[PegaKVConnectorV2] saves=%s batch_steps=%d max_kv_usage=%s",
@@ -214,7 +213,6 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 PyLoadState,
                 _mark_compute,
                 batch_steps=batch_steps,
-                pinned_saves=pinned,
             )
 
     @property
