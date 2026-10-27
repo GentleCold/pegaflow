@@ -121,10 +121,14 @@ def _offered_ids(g: GroupInfo, blocks: range, offers: Sequence[tuple[int, int, i
 
 class Scheduler:
     HIT_LOG_S = 30.0  # min seconds between "hit stats" lines while lookups run
-    # Age cap for reusing an unallocated hit, not a tuned policy: far below
-    # the server's lease TTL, and it bounds how long a newer save of the
-    # request's blocks goes unseen. vLLM re-asks for a head it could not
-    # allocate every scheduling pass.
+    # Age cap for reusing an unallocated hit; a bound, not a tuned policy.
+    # vLLM re-asks for a head it did not allocate every scheduling pass. The
+    # cap bounds how long a newer save of the request's blocks goes unseen,
+    # and stays far below the server's lease TTL (600 s). In a TP1 replay
+    # gate diag (2026-10-26, ebe69db) the longest wait was 1.5 s, so
+    # 2 s answers each wait with one query; 0.5 s would add about 11% more
+    # queries, still about 1 ms each. A reused hit skips `Policy.accept`:
+    # its inputs (`p`, the server answers) are unchanged.
     HIT_REUSE_MAX_S = 2.0
 
     def __init__(
@@ -244,16 +248,15 @@ class Scheduler:
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
         self._requests.setdefault(req_id, request)
-        # A previous hit vLLM could not allocate: reused if nothing it rests on
-        # changed, else stale.
-        reuse = self._reusable_hit(req_id, num_computed)
         if self._defer_for_inflight(request, num_computed):
-            if reuse is not None:
-                self._release(reuse.leases)
+            self._drop_hit(req_id)
             # Its own clock bounds this wait: a prefetch wait before it must not
             # expire the moment the request is looked up again.
             self._loading_since.pop(req_id, None)
             return None, False
+        # A previous hit vLLM did not allocate: reused if nothing it rests on
+        # changed, else stale.
+        reuse = self._reusable_hit(req_id, num_computed)
         if reuse is not None:
             self.lookup_cost["reused"] += 1
             self._hit_dirty = True

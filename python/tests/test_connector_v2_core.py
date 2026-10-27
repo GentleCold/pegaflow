@@ -1189,6 +1189,24 @@ def test_unallocated_hit_is_reused(computed, age, reused):
     assert [lp.req_id for lp in sched.take_plan().loads] == ["r"]
 
 
+def test_held_hit_released_when_deferred():
+    """A held hit whose request starts waiting for another request's async
+    load of its blocks is released, not reused (the wait holds no lease)."""
+    layout = _layout(StubSemantics, StubFullSpec())
+    rpc = FakeRpc({0: Ready(3, b"B")})
+    policy = Policy(sync_load_tokens=0)
+    sched = Scheduler(layout, policy, rpc, "inst", clock=Clock(), semantics=StubSemantics)
+    b = _other()
+    assert sched.get_num_new_matched_tokens(b, 0) == (12, True)  # held: not allocated
+    rpc.answers = {0: Ready(3, b"A")}
+    a = _req(req_id="a")
+    sched.update_state_after_alloc(a, (FULL_IDS,), sched.get_num_new_matched_tokens(a, 0)[0])
+    sched.take_plan()
+    rpc.queried.clear()
+    assert sched.get_num_new_matched_tokens(b, 0) == (None, False)
+    assert (rpc.queried, rpc.released, sched.lookup_cost["reused"]) == ([], [b"B"], 0)
+
+
 def test_hit_stats_logged_when_idle_and_on_cadence():
     """The gate force-kills the engine core (no ``shutdown``): the counters
     must reach the log when the last request finishes and every HIT_LOG_S."""

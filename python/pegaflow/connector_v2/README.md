@@ -36,14 +36,15 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     not past the local hit, the remaining groups are not queried and
     create no lease (group 0's lease is released). A full-only layout
     skips only when no full block lies past the local hit.
-  - A hit vLLM could not allocate (its KV pool was short) is kept with its
-    leases. vLLM asks again for the same waiting head every pass; if its
-    local hit is unchanged and the hit is younger than
+  - A hit vLLM did not allocate (for example, its KV pool was short) is
+    kept with its leases. vLLM asks again for the same waiting head every
+    pass; if its local hit is unchanged and the hit is younger than
     `Scheduler.HIT_REUSE_MAX_S` (2 s), the same hit is offered again
-    without a server query. That cap is not a tuned value: it is far below
-    the server's lease TTL (600 s) and bounds how long a longer hit, saved
-    meanwhile by another request, goes unseen. Otherwise the held leases
-    are released and the request is looked up again.
+    without a server query or `policy.accept` (neither input changed).
+    That cap is a bound, not a tuned value: it is far below the server's
+    lease TTL (600 s) and bounds how long a longer hit, saved meanwhile by
+    another request, goes unseen. Otherwise the held leases are released
+    and the request is looked up again (or waits, see below).
   - `semantics.resolve` gives the longest legal `p`. `policy.accept` may lower it.
   - Only the blocks in `semantics.needed(g, p)` that are past vLLM's local hit get loaded.
   - Leases that cover none of those blocks are released immediately. Unwanted
