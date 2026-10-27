@@ -2178,6 +2178,35 @@ def test_worker_reports_saved_through():
     worker.shutdown()
 
 
+def test_failed_compute_wait_is_a_failed_save():
+    """The forward failed: its KV is not valid, so no save RPC is sent and the
+    job completes as failed (its blocks are released)."""
+
+    class BadMark:
+        def synchronize(self):
+            raise RuntimeError("CUDA error: an illegal memory access")
+
+    rpc, calls = FakeRpc(), []
+    rpc.save = lambda *args: calls.append(args) or (True, "")
+    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
+    worker._mark_compute = BadMark
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker.save(_save_plan(0))
+    assert worker.flush(5) and calls == [] and worker.saved_through() == 0
+    assert (worker.save_stats.failed, worker.save_stats.raised) == (1, 0)
+    worker.shutdown()
+
+
+def test_worker_metadata_aggregates_the_min_over_ranks():
+    """vLLM folds every worker's metadata into one: pins and fences clear only
+    once every rank saved the step."""
+    pytest.importorskip("vllm")
+    from pegaflow.connector_v2.connector import PegaWorkerMetadata
+
+    got = PegaWorkerMetadata(5).aggregate(PegaWorkerMetadata(3)).aggregate(PegaWorkerMetadata(7))
+    assert got.saved_through == 3
+
+
 # --------------------------------------------------------------------- layout
 @BOTH
 @pytest.mark.parametrize(

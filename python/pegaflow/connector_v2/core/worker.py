@@ -550,8 +550,8 @@ class Worker:
 
     def _quiesce(self, raised: _SaveJob) -> bool:
         """After ``raised``'s RPC raised: send nothing for the window
-        (``SAVE_QUIESCE_S``) while its fences and pins hold (its copy may still run), then count it done and
-        resume. Jobs queued behind it, held (batched) jobs released during
+        (``SAVE_QUIESCE_S``) while its fences and pins hold (its copy may
+        still run), then count it done and resume. Jobs queued behind it, held (batched) jobs released during
         the window included, are completed as failed without an RPC (no copy
         of theirs started): under the pressure that made the RPC raise they
         would likely raise too, each holding fences for another window.

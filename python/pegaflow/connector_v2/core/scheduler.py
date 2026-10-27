@@ -244,8 +244,8 @@ class Scheduler:
     def get_num_new_matched_tokens(
         self, request: Any, num_computed: int
     ) -> tuple[int | None, bool]:
-        req_id = request.request_id
         rec = self._rec(request)
+        request, req_id = rec.request, rec.request.request_id
         # vLLM re-asks for a request it did not allocate: its previous hit is
         # released and the request looked up afresh.
         self._drop_hit(rec)
@@ -359,13 +359,13 @@ class Scheduler:
 
     def _track_load(self, rec: _Req, leases: list[_Lease]) -> None:
         self._untrack_load(rec)
-        hashes_of = rec.request.block_hashes
+        keys: list[tuple[int, bytes]] = []
         for lease in leases:
-            hashes = self._layout.group_hashes(self._layout.groups[lease.sid], hashes_of)
-            rec.inflight.extend(
-                (lease.sid, hashes[b]) for b in sorted(lease.wanted) if b < len(hashes)
-            )
-        for key in rec.inflight:
+            g = self._layout.groups[lease.sid]
+            hashes = self._layout.group_hashes(g, rec.request.block_hashes)
+            keys.extend((lease.sid, hashes[b]) for b in sorted(lease.wanted) if b < len(hashes))
+        rec.inflight = keys
+        for key in keys:
             self._inflight_refs[key] = self._inflight_refs.get(key, 0) + 1
 
     def _untrack_load(self, rec: _Req) -> None:
