@@ -129,26 +129,43 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     checkpoint layout;
   - a save the server reports failed still releases its blocks (a failed
     save is a future miss). The save handler reports engine errors as a
-    gRPC status, so the RPC raises. Only InvalidArgument (the binding's
-    `ValueError`; tonic's client never makes it) proves no copy runs: the
-    handler returns it before it copies or after its copy synchronized, so
+    gRPC status, so the RPC raises. Only the binding's `ValueError` proves
+    no copy runs. The binding raises it for InvalidArgument, or before any
+    RPC is sent; tonic's client never makes InvalidArgument, and the
+    handler returns it before it copies or after its copy synchronized. So
     it counts as a failed save.
-    Any other raise stops the saver for good (fail closed), as does a
-    saver thread that dies: fences and holds are released, later saves are
-    dropped, and no other copy runs. That includes server errors such as an
-    exhausted pinned pool (Internal) or an unknown instance
-    (FailedPrecondition), which the binding raises as the same class as
-    transport errors (`PegaFlowError`); the client also reports its own
-    decode and HTTP/2 errors as Internal. Server limitations: the server
-    seals a job's blocks only after its copy synchronized, but the job
-    whose RPC raised may still be copying, and vLLM may reuse its blocks
-    meanwhile: a GPU copy that fails part-way returns Internal with earlier
-    copies still queued, and a call the client drops (no reply) is
-    cancelled on the server only when the connection notices. Closing that
-    needs a server that answers only once no copy of the job runs. A
-    save RPC that hangs blocks `flush` and fences for good (logged every
-    10 s): the client has no per-call deadline, and the server may still be
-    copying.
+  - any other raise quiesces the saver (fail closed, then bounded
+    recovery). For `Worker.SAVE_QUIESCE_S` (10 s) no save RPC is sent, new
+    saves are dropped, and the raised job's fences and pins (and those of
+    every later job) hold. Then the job counts as done, the jobs queued
+    behind it are dropped without an RPC, and saving resumes. Each raise
+    is logged and counted as `raised` in `save stats`. This covers server
+    errors such as an exhausted pinned pool (Internal) or an unknown
+    instance (FailedPrecondition). The binding raises those as the same
+    class as transport errors (`PegaFlowError`), and the client also
+    reports its own decode and HTTP/2 errors as Internal. The window is a
+    heuristic, not a proof: no reply bounds a copy the server may still
+    run. It is over 3x the longest save job seen in the gate logs (2.98 s
+    for compute wait plus RPC; p99 0.63 s over 3853 `save stats` windows).
+    A saver thread that dies stops saving for good: fences and holds are
+    released, later saves are dropped, and no other copy runs.
+    Server limitations:
+    - The server seals a job's blocks only after its copy synchronized. But
+      the job whose RPC raised may still be copying, and vLLM may reuse its
+      blocks once the window ends. A GPU copy that fails part-way returns
+      Internal with earlier copies still queued. A call the client drops (no
+      reply) is cancelled on the server only when the connection notices.
+      Closing that needs a server that answers only once no copy of the job
+      runs.
+    - An exhausted pinned pool fails in allocation, before any copy of the
+      request is issued, so it needs no window. The server reports it as
+      Internal, like a part-way copy failure, so the connector cannot tell
+      them apart. A distinct reply for errors raised before the copy (for
+      example `SaveResponse.status.ok = false`) would make it a plain failed
+      save.
+    - A save RPC that hangs blocks `flush` and fences for good (logged every
+      10 s): the client has no per-call deadline, and the server may still
+      be copying.
 - **Checkpoint groups** (Mamba / GDN state, vLLM `mamba_cache_mode="align"`).
   vLLM's block table for such a group is null except the running state
   block, so positions do not say which block holds which state. Saves come
@@ -197,7 +214,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     before writing a freed block, and that wait);
   - on the saver thread: `wait_ms` (compute event), `rpc_ms`, `max_job_ms`,
     `max_pending` jobs;
-  - failed saves;
+  - failed saves, and `raised` (save RPCs that raised with a copy possibly
+    running; each starts a quiesce window);
   - loads, on the step thread: `sync_loads` (sync loads whose RPC the server
     accepted), `sync_first_steps` (steps where a sync load was moved ahead
     of an async one), `sync_wait_ms` / `max_sync_wait_ms` (waiting for the

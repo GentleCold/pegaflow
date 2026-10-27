@@ -1439,19 +1439,21 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     after the compute mark. The fence clears once the save is done, stored
     or not (a reported failure, or a rejected request, is a future miss).
     S4: any other raised save RPC is not a finished copy (the server may
-    still copy): like a dying saver thread it stops the saver (fail closed). The fence is released instead of
-    hanging, the job is not counted done, and later saves are dropped, so
-    no further copy reads a reused block.
+    still copy): the fence holds for the quiesce window, saves submitted
+    meanwhile are dropped, then the job counts done and saving resumes.
+    A dying saver thread stops saving for good: the fence is released
+    instead of hanging, and later saves are dropped.
     """
     import threading
 
-    gate = threading.Event()
+    gate, window = threading.Event(), threading.Event()
     rpc = FakeRpc()
     calls = []
     save = _save_outcome(outcome)
     rpc.save = lambda *args: save(calls, args[-1])
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=lambda: FakeMark(gate))
+    worker._quiesce_wait = lambda: window.wait(5)
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
 
     sched, _ = _sched(StubSemantics, {}, layout=layout)
@@ -1479,16 +1481,27 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     assert waiter.is_alive() and calls == []  # the copy has not run: no KV write yet
 
     gate.set()
+    raises = outcome == "raises"
+    if raises:
+        with worker._cv:
+            assert worker._cv.wait_for(lambda: worker._quiescing, 5)
+        assert waiter.join(0.2) is None and waiter.is_alive()  # the window holds the fence
+        worker.save(step0)  # dropped: no RPC while the raised copy may run
+        window.set()
     waiter.join(5)
     assert not waiter.is_alive() and len(calls) == 1
-    assert worker.save_stats.fences == 1 and worker.save_stats.max_fence_s > 0
-    assert worker.save_stats.failed == (0 if outcome == "saved" else 1)
+    s = worker.save_stats
+    assert s.fences == 1 and s.max_fence_s > 0
+    assert (s.failed, s.raised) == ({"saved": 0, "raises": 2}.get(outcome, 1), int(raises))
     worker.save(step1)
     sched.on_saved_through(worker.saved_through())
     assert not sched.has_pending_saves()
-    stopped = outcome in ("raises", "saver-dies")
-    assert worker._completed == (0 if stopped else 1)
-    if stopped:
+    dies = outcome == "saver-dies"
+    assert worker._completed == (0 if dies else 1)
+    if raises:  # saving resumed: the next save sends its RPC
+        worker.save(step0)
+        assert worker.flush(5) and len(calls) == 2
+    if dies:
         worker._saver.join(5)
         assert not worker._saver.is_alive()
         worker.save(step0)
@@ -1602,6 +1615,7 @@ def _fence_rig(outcomes=None, policy=None):
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=lambda: FakeMark(next(marks)))
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    worker._quiesce_wait = lambda: None
     sched, _ = _sched(StubSemantics, {}, policy=policy, layout=layout)
     tables = {"a": [10, 11, 12, 13], "b": [20, 21, 22, 23], "c": [30, 31, 32, 33]}
     for rid in tables:
@@ -1636,9 +1650,10 @@ A_FENCED, B_FENCED = {10: 0, 11: 0, 12: 0}, {20: 1, 21: 1, 22: 1}
         pytest.param(None, [[1], [0]], [{**A_FENCED, **B_FENCED}, {}], id="fifo"),
         # A failed save still clears the fence (future miss).
         pytest.param(["save-failed", "saved"], [[0], [1]], [B_FENCED, {}], id="own-job-failed"),
-        # A raising save RPC stops the saver (fail closed): every fence clears
-        # and b's job never sends a copy.
-        pytest.param(["raises", "saved"], [[0], [1]], [{}, {}], id="raise-fails-closed"),
+        # A raising save RPC quiesces (its window is cut to 0 here): then a's
+        # job counts done, and b's, queued behind it, is dropped without a
+        # copy, so every fence clears.
+        pytest.param(["raises", "saved"], [[0], [1]], [{}, {}], id="raise-quiesces"),
         # A rejected request copied nothing: a future miss, the saver goes on.
         pytest.param(["rejected", "saved"], [[0], [1]], [B_FENCED, {}], id="rejected"),
     ],
@@ -1977,8 +1992,11 @@ def test_pinned_saves_hold_blocks_until_every_worker_saved():
 
 @pytest.mark.parametrize("outcome", ["rejected", "raises"])
 def test_pinned_saves_released_when_a_save_raises(outcome):
-    """A raised save releases its pins either way; only a raise other than a
-    rejected request stops the saver, so the next job sends no copy."""
+    """A raised save releases its pins: at once if the request was rejected,
+    after the quiesce window otherwise (its copy may still run). Saving goes
+    on either way."""
+    import threading
+
     pool = FakePool()
     sched = _pinned_sched(_layout(StubSemantics, StubFullSpec()), pool)
     sched.on_new_request(_req())
@@ -1990,14 +2008,22 @@ def test_pinned_saves_released_when_a_save_raises(outcome):
     rpc.save = lambda *args: save(calls, args[-1])
     worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    window = threading.Event()
+    worker._quiesce_wait = lambda: window.wait(5)
     worker.save(plan)
+    if outcome == "raises":
+        with worker._cv:
+            assert worker._cv.wait_for(lambda: worker._quiescing, 5)
+        sched.on_saved_through(worker.saved_through())
+        assert pool.refs == {10: 1, 11: 1, 12: 1}  # held for the window
+        window.set()
     with worker._cv:
         assert worker._cv.wait_for(lambda: worker._settled(1), 5)
     sched.on_saved_through(worker.saved_through())
     assert pool.refs == {} and not sched.has_pending_saves()
+    window.set()
     worker.save(StepPlan(saves=plan.saves, step=1))
-    assert worker.flush(5)
-    assert len(calls) == (2 if outcome == "rejected" else 1)
+    assert worker.flush(5) and len(calls) == 2
     worker.shutdown()
 
 

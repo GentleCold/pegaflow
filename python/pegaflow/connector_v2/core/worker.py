@@ -106,6 +106,7 @@ class SaveStats:
     max_job_s: float = 0.0  # saver thread: wait + rpc of one job
     max_pending: int = 0  # jobs queued or running at submit time
     failed: int = 0  # jobs that did not store their blocks
+    raised: int = 0  # save RPCs that raised with a copy possibly running (each quiesces)
     rpcs: int = 0  # save RPCs issued (one per released batch)
     pressure_rpcs: int = 0  # of those, sent early on KV pressure (StepPlan.send_saves)
     kv_usage_unknown_steps: int = 0  # steps without vLLM's KV usage (batching off)
@@ -146,6 +147,15 @@ class Worker:
     # batch past it sends the batch first, so a merged RPC is at most this big
     # (or one step's size, the unbatched behaviour, if a single step is bigger).
     SAVE_RPC_MAX_BYTES = 16 << 20
+    # Quiesce window after a save RPC raised without proving its copy over
+    # (``_save_settled``): no save RPC is sent and the job's fences and pins
+    # hold for this long, then the job counts as done and saving resumes.
+    # A heuristic, not a proof: the server reports no bound on a copy it
+    # may still run. Gate logs (277 v2 runs, 3853 ``save stats`` windows)
+    # show a whole job (compute wait + RPC) at p99 0.63 s and at most 2.98 s
+    # (one 557 MB RPC); 10 s is over 3x that. It is also the longest a fence
+    # or pin on the raised job can hold vLLM's step.
+    SAVE_QUIESCE_S = 10.0
 
     def __init__(
         self,
@@ -218,6 +228,9 @@ class Worker:
         # The saver thread exited: it reads no block any more, so every hold
         # is released and later saves are dropped (future misses).
         self._saver_dead = False
+        # A save RPC raised and its window (SAVE_QUIESCE_S) runs: new saves
+        # are dropped (future misses). Set and cleared by the saver thread.
+        self._quiescing = False
         self._jobs: queue.SimpleQueue[_SaveJob | None] = queue.SimpleQueue()
         self._saver = threading.Thread(
             target=self._save_loop, name="pegaflow-v2-saver", daemon=True
@@ -443,7 +456,7 @@ class Worker:
         for gs in plan.saves if self._writer else ():
             for name in self._layers[gs.sid]:
                 saves.append((name, gs.block_ids, gs.block_hashes))
-        if saves and self._saver_dead:
+        if saves and (self._saver_dead or self._quiescing):
             with self._cv:
                 self.save_stats.failed += 1
             saves = []
@@ -594,32 +607,66 @@ class Worker:
     def _save_loop(self) -> None:
         try:
             while (job := self._jobs.get()) is not None:
-                if not self._run_job(job):
+                if not self._run_job(job) and not self._quiesce(job):
                     break
         finally:
             with self._cv:
                 self._saver_dead = True
                 self._cv.notify_all()
 
+    def _quiesce(self, raised: _SaveJob) -> bool:
+        """After ``raised``'s RPC raised: send nothing for ``SAVE_QUIESCE_S``
+        while its fences and pins hold (its copy may still run), then count
+        it done and resume. Jobs queued behind it are completed as failed
+        without an RPC (no copy of theirs started): under the pressure that
+        made the RPC raise they would likely raise too, each holding fences
+        for another window. False if shutdown came during the window."""
+        self._quiesce_wait()
+        last, dropped, stop = raised.seq, 0, False
+        while True:
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                break
+            if job is None:
+                stop = True
+                break
+            last, dropped = job.seq, dropped + 1
+        with self._cv:
+            self._completed = last
+            self.save_stats.failed += dropped
+            self._quiescing = False
+            self._cv.notify_all()
+        logger.warning(
+            "[PegaKVConnectorV2] saves resume after %.0f s quiesce (%d queued jobs dropped)",
+            self.SAVE_QUIESCE_S,
+            dropped,
+        )
+        return not stop
+
+    def _quiesce_wait(self) -> None:  # tests replace it
+        time.sleep(self.SAVE_QUIESCE_S)
+
     def _run_job(self, job: _SaveJob) -> bool:
-        """Run one save job; False if the saver must stop (fail closed).
+        """Run one save job; False if its copy may still run.
 
         A save RPC that raises (``_save_settled`` false) is not a finished
-        save: the server may still copy the job's blocks. Its fences cannot
-        wait for a copy nobody will report, so the saver stops instead, as
-        it does when the thread dies mid-job: the job is not counted as
-        completed, no later job sends an RPC (no other copy reads a block
-        that gets reused), and every fence and hold is released through
-        ``_saver_dead``. Only that one job's copy may race a reuse; closing
-        that needs a server that reports such a copy only once it stopped
-        (a server limitation).
+        save: the server may still copy the job's blocks. The job is not
+        counted as completed, so its fences and pins (and every later job's)
+        hold, and ``_quiescing`` drops new saves; ``_quiesce`` then waits
+        out the window and resumes. A saver thread that dies mid-job stops
+        saving for good instead (``_saver_dead``): it reads no block any
+        more, so every fence and hold is released and later saves are
+        dropped. Only the raised job's copy may race a reuse, and only if
+        it outlasts the window; closing that needs a server that reports
+        such a copy only once it stopped (a server limitation).
         A failed reply, a rejected request (``_save_settled``), or a failed
         compute wait (no RPC sent) completes the job as a failed save: a
         future miss.
         """
         t0 = self._clock()
         t1 = t2 = t0
-        ok = over = False  # over: no copy of this job can still be running
+        ok = over = raised = False  # over: no copy of this job can still be running
         try:
             try:
                 job.ready.synchronize()
@@ -638,10 +685,13 @@ class Worker:
                     over = True
                 except Exception as e:
                     ok, over, msg = False, _save_settled(e), repr(e)
+                    raised = not over
             t2 = self._clock()
             if not over:
                 logger.error(
-                    "[PegaKVConnectorV2] save RPC raised, saves stop (fail closed): %s", msg
+                    "[PegaKVConnectorV2] save RPC raised, saves pause %.0f s (fail closed): %s",
+                    self.SAVE_QUIESCE_S,
+                    msg,
                 )
             elif not ok:
                 # Best effort: a dropped save is a future miss, not a wrong hit.
@@ -656,7 +706,10 @@ class Worker:
                 if over:
                     # Failed or not, the copy is over: held blocks are released.
                     self._completed = job.seq
-                else:
+                elif raised:  # the thread lives on and quiesces
+                    stats.raised += 1
+                    self._quiescing = True
+                else:  # the thread dies mid-job
                     self._saver_dead = True
                 self._cv.notify_all()
         return over
@@ -671,8 +724,8 @@ class Worker:
         logger.info(
             "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d save_steps=%d "
             "blocks=%d bytes=%d submit_ms=%.1f flushes=%d flush_ms=%.1f wait_ms=%.1f "
-            "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d rpcs=%d pressure_rpcs=%d "
-            "fences=%d fence_ms=%.1f max_fence_ms=%.2f kv_usage_unknown_steps=%d "
+            "rpc_ms=%.1f max_job_ms=%.2f max_pending=%d failed=%d raised=%d rpcs=%d "
+            "pressure_rpcs=%d fences=%d fence_ms=%.1f max_fence_ms=%.2f kv_usage_unknown_steps=%d "
             "sync_loads=%d sync_first_steps=%d sync_wait_ms=%.1f max_sync_wait_ms=%.2f "
             "load_steps=%d load_issue_ms=%.1f max_load_issue_ms=%.2f "
             "async_done=%d async_first_poll=%d async_polls=%d max_async_polls=%d "
@@ -691,6 +744,7 @@ class Worker:
             s.max_job_s * 1e3,
             s.max_pending,
             s.failed,
+            s.raised,
             s.rpcs,
             s.pressure_rpcs,
             s.fences,
