@@ -2603,6 +2603,113 @@ per run (warm_timed .7965-.8338 here). A connector cannot steer it.
 Fixing it needs a server-side change, for example blockwise or size-class
 save allocation, or a reclaim bound.
 
+## Qwen3-4B stop attribution (2026-10-27): reviewed, TP2 stop not supported
+
+The question: should the Qwen3-4B iterations stop on dc4a4e0, given two G4
+gaps? TP1 TTFT-window steps p50 is 22-24 for v2 vs 12-14 for native, and
+TP2 replay rps is −1 to −2.6%.
+
+Diag passes, values warm2 / warm3:
+- `2026-10-27-qwen3-4b-p5-h8-diag-tp1-ee249b7`;
+- `2026-10-27-qwen3-4b-p5-diag-tp2-dc4a4e0`.
+
+Tools are in `~/kexi/tmp/p5-it3-attr/`. An independent reviewer checked the
+first draft. It refuted the TP2 verdict and parts of the TP1 argument. The
+corrected reading follows. Some of the reviewer's checks could not run:
+.44 became unreachable mid-review (jump host → 10.1.0.44 auth failure).
+
+### TP1: v2 is ahead in throughput. The step gap is not explained.
+
+| | native | v2 |
+|---|---|---|
+| pass seconds | 28.01 / 28.28 | 24.92 / 24.98 (rps +9.7%) |
+| client TTFT p50 (s) | 0.550 / 0.506 | 0.507 / 0.528 |
+| TTFT-window steps p50 | 12 / 14 | 24 / 22 |
+| TTFT-window wall p50 (ms) | 643 / 626 | 639 / 588 |
+
+- What holds: rps +9.7%, and equal TTFT-window wall with shorter v2 steps.
+- Client TTFT p50 is mixed: v2 is better on warm2 and 4% worse on warm3.
+- The draft's counterfactual (`diagcf`) is **circular**. With equal wall,
+  dividing native's wall by v2's ms/step must give back v2's step count. It
+  does not test the cause (less prefill per step), which needs tokens per
+  step. Native's p50 lies in the transition between its modes, not on its
+  fast mode. The bimodality argument is withdrawn.
+- Connector step-thread cost is about **0.37 ms/step**: submit 0.042 +
+  load_issue 0.287 + flush 0.003 + fence 0.040. sync_wait sits inside
+  load_issue (`worker._start_loads`), and the draft counted it twice.
+
+### TP2: the connector step-thread cost is the gap
+
+- G4 on the diag run: rps −0.95% (`within_noise`), TTFT p50 −16.7% (v2
+  better). Earlier runs: it5 5c3ab63 −2.0%, 02b6767 −2.6%.
+- The `save stats` windows are deltas (`report_save_stats` resets them).
+  Over warm2 + warm3 only (the window that spans the pass boundary split
+  in half), per pass:
+  - load_issue about 0.37 s, of which sync_wait about 0.21 s;
+  - submit about 0.04 s, on most steps rather than only admitting ones.
+
+  That is about **0.41 s/pass**. The first draft's 0.33 s diluted it with
+  the warmup/cold window, which has no loads.
+- The `diagivl` net v2 excess is +0.04 / +0.14 s. The connector cost is
+  larger than that net, so on this run it alone accounts for the TP2 gap.
+  The "server copy contention" share was inferred from an it3/TP1
+  coefficient, not measured at TP2. It is withdrawn.
+- `diagivl` is biased: each gap run starts at a logged (admitting) step,
+  and that step is booked as "decode-only". So "decode-only equal" is not
+  established. Pass seconds also leave about 0.7 s/pass outside the diag
+  clock, unattributed.
+- **sync_wait is inflated.** It is 3.0-5.2 ms per sync load (window sums
+  178.8 / 194.1 / 242.6 ms over 60 / 37 / 48 sync loads; max 66-81 ms),
+  against the ~1 ms design figure in the README. At TP2, sync loads queue
+  behind other copies on the server's per-device serial loader. This is the
+  largest connector cost, and it sits on the critical path.
+- Rank skew: tp0 load_issue is always above tp1 (316 vs 267, 378 vs 324 ms
+  per window). The step waits for the slower rank, which one rank's sum
+  understates.
+- Lookup: the negative slopes (−0.60 TP1, −1.59 TP2) are confounded (queue
+  state, tokens, admission kind) and prove nothing. At TP2, lookups cost
+  about 264 per pass x 0.92 ms ≈ 0.24 s/pass of scheduler CPU, and
+  `reused` is 0, so H8 does not help there. Whether vLLM's async
+  scheduling hides this is not established.
+
+### Hypotheses tried
+
+| | change | result | kept |
+|---|---|---|---|
+| H3 (d201ac3) | fence a finished request on its own last save | neutral to slightly + | yes |
+| H4 (it4) | defer behind in-flight async loads | + at TP1; cap075 ext moves to local (accounting) | yes |
+| H5 (b8501b2) | part 1: sync loads first; part 2: `async_demote` | part 1 accepted; part 2 no effect | part 1 kept, knob deleted |
+| it5 (H7) | fence reused blocks, `request_finished` → False | + (TP1 TTFT p50 −10.5% then) | yes |
+| H8 | reuse an unallocated hit | neutral, −72% queries at TP1, 0 reuse at TP2 | yes |
+| H6 | — | skipped on Qwen3.5 | — |
+
+The first draft's row "H3: sync short loads" was wrong. Sync short loads
+predate these iterations, and H5 part 1 only reordered them.
+
+### Open (connector-side, TP2)
+
+- **H9: sync-wait inflation.** Candidates, one per iteration:
+  - (a) lower `sync_load_tokens` at TP2 via the profile, or make it
+    TP-aware (generic, no model name);
+  - (b) batch a step's sync loads into one RPC, falling back to
+    per-request on failure.
+
+  Bound: up to about 0.21 s/pass (≈1.5%).
+- **Load RPC batching** (all of a step's loads): at most about 0.17 s/pass
+  (≈1.2%), the RPC part of load_issue. The draft's "correctness trade" is
+  overstated. Under the required `kv_load_failure_policy=recompute`, a
+  failed batch means recompute, not wrong output. The real cost is the
+  recompute blast radius, and a per-request fallback bounds it.
+- Measurement debt before any of these is judged:
+  - fix `diagivl`'s leading-step bias;
+  - attribute the ~0.7 s/pass outside the diag clock;
+  - report per-rank load_issue.
+
+Verdict: TP1 can stop (rps +9.7%, wall equal or better). TP2 cannot be
+closed as "nothing connector-side left". About 0.41 s/pass of step-thread
+cost, sync-wait inflation the largest part, is the same size as the
+1-2.6% gap. H9 comes first once .44 is reachable again.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
