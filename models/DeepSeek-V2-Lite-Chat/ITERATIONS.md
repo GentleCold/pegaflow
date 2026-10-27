@@ -2610,6 +2610,7 @@ Verdicts. v2 fails one check, `G0.spec`:
 | G2.digest_self.cap | pass, 510868 ext, 0 mismatched | pass | pass | pass |
 | G2.digest_vs_baseline.gsm8k | pass, 9982 ext, coverage 1.0 | pass | pass | fail (S7 coverage signature, 0 mismatched) |
 | G2.gsm8k cold / warm vs baseline | +0.00 / +0.53 pp | +0.00 / +0.45 | +0.00 / +0.45 | +0.00 / −0.08 |
+| G4.gsm8k_warm.seconds | pass | pass | pass | fail |
 
 Perf vs in-run native (replay; warm = warm2 / warm3):
 
@@ -2637,9 +2638,10 @@ Hits:
 
 - **vs M2 (it7 a59a254, unofficial).** Warm TTFT p50 vs native improved
   from +11.9 / +12.1% to +6.2 / −6.2% (gate median about −0.2%). Warm
-  req/s moved from −4.8 / −5.3% to −6.1 / −2.5% (gate median −4.3%). The
-  cold numbers are now at parity.
-- **G5 at 0.5:** v2 equals LRU (0.847). native is +0.004, within noise.
+  req/s moved from −4.8 / −5.3% to −6.1 / −2.5% (gate median −4.3%,
+  outside noise). The cold numbers are now at parity.
+- **G5 at 0.5:** v2 equals LRU (0.847). native is +0.004 (one run per
+  arm, no G5 noise estimate).
   `efficiency_c` stays below the 0.9 reference on every arm, a reported
   server-limited value.
 - **The req/s gap matches the Qwen3-4B TP2 shape.** TPOT is +1.8 to
