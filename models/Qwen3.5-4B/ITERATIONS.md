@@ -2815,6 +2815,49 @@ closed as "nothing connector-side left". About 0.41 s/pass of step-thread
 cost, sync-wait inflation the largest part, is the same size as the
 1-2.6% gap. H9 comes first once .44 is reachable again.
 
+### H9(a) screen (2026-10-27): lower `sync_load_tokens` at TP2, rejected
+
+Three TP2 replay runs on the base server, `--gpu 3,4`, each with native
+in the same run. Arms are dc4a4e0 (default 256), 8a81412 (0) and d51d48d
+(64). The two lowered arms are diag commits on `diag/p5-h9-sync` that
+override `models/Qwen3ForCausalLM.toml`. Tags are
+`qwen3-4b-p5-h9-tp2-<rev>`. TTFT values are client-side. TPOT is the mean
+of vLLM's `request_time_per_output_token`, computed as sum/count; its
+buckets are too coarse for p50/p90. Tool: `p5-it3-attr/h9rep.py`.
+
+| arm | pass | rps nat / v2 | TTFT p50 nat / v2 ms | TTFT p90 nat / v2 ms | TPOT nat / v2 ms | v2 vs nat: rps / p50 / p90 / TPOT |
+|---|---|---|---|---|---|---|
+| 256 (dc4a4e0) | warm2 | 18.86 / 18.72 | 176 / 141 | 259 / 214 | 16.79 / 17.64 | −0.7 / −19.9 / −17.4 / +5.1% |
+| | warm3 | 19.00 / 18.22 | 158 / 150 | 245 / 360 | 16.78 / 17.71 | −4.1 / −4.8 / +46.7 / +5.5% |
+| 0 (8a81412) | warm2 | 18.96 / 18.50 | 177 / 150 | 244 / 211 | 16.71 / 17.45 | −2.4 / −15.5 / −13.8 / +4.4% |
+| | warm3 | 18.92 / 17.78 | 174 / 156 | 242 / 255 | 16.74 / 18.08 | −6.0 / −10.4 / +5.3 / +8.0% |
+| 64 (d51d48d) | warm2 | 18.96 / 18.51 | 176 / 154 | 253 / 209 | 16.70 / 17.41 | −2.4 / −12.7 / −17.2 / +4.2% |
+| | warm3 | 18.96 / 17.94 | 176 / 155 | 259 / 244 | 16.74 / 17.95 | −5.4 / −12.2 / −5.7 / +7.2% |
+
+- Native is stable across the three runs: rps 18.86-19.00, TPOT
+  16.70-16.79 ms. The arm-to-arm differences therefore come from v2.
+- v2 itself varies from run to run. The default arm's warm3 rps was −1.3%
+  in the diag run and −4.1% here. That ~3 pp spread is the same size as
+  the differences between arms.
+- Neither lowered arm beats the default on rps in either pass. On warm2,
+  both lose 1.7 pp vs −0.7%. TPOT warm3 gets worse: +8.0% and +7.2%, vs
+  +5.5%.
+- No arm wins, so main's "repeat the top arm" step does not apply.
+  Repeats could only confirm a no-gain result, which does not change the
+  decision.
+- Turning sync loads off (0) moves each short hit to an async load plus
+  a scheduling round trip. The step thread saves the sync wait but loses
+  more than that. At 64, TP2 still sees a few sync loads (7-14 per save
+  window). With max sync_wait 0.8-51 ms per window, the inflation is not
+  specific to large loads.
+- Verdict: keep the default at 256 and do not add a TP-aware rule.
+- H9(b) (one RPC for a step's sync loads) stays parked. Its upper bound
+  is still the ~0.21 s/pass of sync wait, and that is below the run
+  spread here.
+- The consistent signal is TPOT, +4-6% in every TP2 run including all
+  arms here. It is the next item: a per-step split of connector cost
+  (`PEGA_CONN` diag hook, run `qwen3-4b-p5-tpot-tp2-dc4a4e0`).
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
