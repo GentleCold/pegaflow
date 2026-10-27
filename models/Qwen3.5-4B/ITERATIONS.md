@@ -2642,6 +2642,36 @@ copies tracked blobs only, so the run used the defaults (log: batch_steps
 diag-only branch `diag/p5-sb1-dc4a4e0` (0b144c2). A guard that fails the
 run on dropped files is pending on rsi-gates.
 
+**More repeats and save_batch_steps=1.** These ran before the .44 outage
+and were collected afterwards. Both sb1 runs are on 0b144c2 (provenance
+verified, log `batch_steps=1`, about 189 save RPCs per window vs 15).
+
+| run | warm2 ev / need | gap after warm2 | warm3 ev / need | gap after warm3 | ext warm / warm2 / warm3 | warm_timed |
+|---|---|---|---|---|---|---|
+| 33666ce c | 2009 / 1162 | 0.83 GiB | 1536 / 1191 | 0.50 | 2832 / 1936 / 0 | .7976 |
+| sb1 a | 1536 / 1235 | 0.38 | 1536 / 1412 | 0.17 | 7456 / 5200 / 5200 | .8266 |
+| sb1 b | 1536 / 1084 | 0.18 | 2560 / 1526 | 0.18 | 7456 / 7504 / 0 | .8167 |
+
+(gap = pool used − resident)
+
+- **33666ce drains as well** (c matches dc4a4e0 a/d block for block).
+  Tally: 33666ce 1 of 3, dc4a4e0 4 of 5. One mode per run, independent of
+  rev in this range.
+- **save_batch_steps=1 changes the trajectory.** The cold-pass gap drops
+  0.20-0.21 → 0.13. Warm and warm2 never over-evict. Warm ext is 7456,
+  vs 2832-5088 batched, because more of the shared prefix's tails stay.
+- **It does not remove the zero-hit pass.** sb1 b warm3 evicts 2560
+  (5 x 512) against a need of 1526. Resident drops to 494 and the warm3
+  first t0 (c6) gets 0 server blocks. The fragmentation gap is only
+  0.18 GiB there. So per-RPC region stranding is not the only trigger: an
+  over-eviction of about 1000 blocks happens at low fragmentation too.
+  The reviewer's alternatives remain open (two ranks racing in reclaim;
+  regions still held by in-flight copies). Telling them apart needs the
+  server's per-call debug log (`mod.rs:622`) or `--blockwise-alloc`.
+- So the recorded limit stands as "reclaim can over-evict to an empty
+  read cache". The fragmentation explanation is downgraded from
+  mechanism to contributing factor.
+
 ## Qwen3-4B stop attribution (2026-10-27): reviewed, TP2 stop not supported
 
 The question: should the Qwen3-4B iterations stop on dc4a4e0, given two G4
