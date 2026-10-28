@@ -3096,6 +3096,63 @@ clears the run spread.
     `~/kexi/rsi-runs/p5-tp2-stop-tools.tar.gz` so every number here
     stays reproducible from the kept run summaries and logs.
 
+## Backend diag (2026-10-28): `transfer_backend` kernel vs direct, direct kept
+
+Server-options rule: measure every server option before settling. Run
+`2026-10-28-qwen3.5-4b-p5-bk-tp1-4dedd10`:
+- gate 3b44827, base server, TP1, GPU 0, workloads replay+cap;
+- `RUST_LOG=info,pegaflow_core::gpu_worker=debug`;
+- under test: diag branch `diag/backend-771fed2` at 4dedd10. This is the
+  connector before the pinned-only simplification, and it adds the
+  `PegaKVConnectorV2Kernel` arm, which differs from v2 only in the declared
+  `transfer_backend`.
+
+Not official (no gsm8k or preempt by design). Correctness checks:
+- `G2.digest_self.replay` and `.cap` pass for native, v2 and v2-kernel.
+- `G2.digest_groups` fails on every arm, baseline included, with "spec dump
+  missing" (no gsm8k probe). This is expected for the run shape.
+
+Hit rates are equal:
+- G3 replay_warm is 0.9462 on all three arms.
+- G5 is 0.7886 (native), 0.7939 (v2), 0.7939 (kernel).
+
+Server task stats come from `Load/Save task completed`. ms values are
+p50/p90/p99. GB/s is the aggregate (sum bytes / sum elapsed).
+
+| Arm | Workload | Load n | Load ms | Load GB/s | Save n | Save ms | Save GB/s |
+|---|---|---|---|---|---|---|---|
+| v2 (direct) | replay | 698 | 4.69/10.80/14.28 | 19.9 | 195 | 5.82/9.66/16.45 | 15.7 |
+| v2-kernel | replay | 698 | 8.36/20.64/28.30 | 10.3 | 196 | 10.57/17.66/37.64 | 9.4 |
+| v2 (direct) | cap | 6261 | 8.27/12.45/14.77 | 19.5 | 5696 | 5.68/9.20/11.81 | 16.2 |
+| v2-kernel | cap | 6261 | 14.75/21.46/25.42 | 11.1 | 5631 | 25.13/84.71/139.36 | 2.8 |
+
+Task sizes match across arms: load p50 is 86.5 MB (replay) and 155.7 MB
+(cap), save p50 is 86.5 MB. So kernel is about 1.8x slower on loads. On cap
+saves it is 4-12x slower in the tail, where the saves overlap the forward.
+
+End to end. Each cell is TTFT p50 s / req/s / TPOT ms, with % vs in-run native
+in brackets.
+
+| Pass | native | v2 (direct) | v2-kernel |
+|---|---|---|---|
+| replay cold | 1.144 / 6.97 / 39.74 | 0.583 / 7.64 / 39.66 (−49.1 / +9.6 / −0.2) | 0.633 / 7.17 / 42.32 (−44.7 / +2.9 / +6.5) |
+| replay warm2 | 0.185 / 12.48 / 24.25 | 0.309 / 14.09 / 20.76 (+66.7 / +12.9 / −14.4) | 0.339 / 13.44 / 21.37 (+83.0 / +7.7 / −11.9) |
+| replay warm3 | 0.184 / 12.44 / 24.45 | 0.341 / 13.95 / 20.70 (+86.0 / +12.1 / −15.4) | 0.401 / 13.24 / 21.52 (+118.3 / +6.4 / −12.0) |
+| cap cold | 0.640 / 5.99 / 70.12 | 0.683 / 6.11 / 68.08 (+6.8 / +2.1 / −2.9) | 0.749 / 5.88 / 70.67 (+17.2 / −1.9 / +0.8) |
+| cap warm2 | 0.622 / 5.91 / 71.18 | 0.725 / 6.07 / 68.44 (+16.6 / +2.8 / −3.9) | 0.819 / 5.19 / 80.68 (+31.7 / −12.2 / +13.3) |
+| cap warm3 | 0.614 / 5.84 / 71.81 | 0.623 / 6.00 / 70.47 (+1.5 / +2.7 / −1.9) | 0.843 / 5.08 / 81.52 (+37.2 / −13.0 / +13.5) |
+
+**Verdict: kernel loses on every cell.** Server copy time roughly doubles on
+loads, and cap saves collapse to about 2.8 GB/s. End to end on cap warm, req/s
+is −12 to −13% and TPOT +13% vs native, where direct is +2.7% and −2%. The
+adapter declaration stays `direct`.
+
+Other options:
+- `page_first`: not applicable (4 storage groups: 3 GDN checkpoint + 1 full).
+- `--blockwise-alloc` (`qwen3.5-4b-p5-bw-tp1-4dedd10`): not run. It was
+  queued after this run and dropped when the work froze on 2026-10-28.
+  Status: todo.
+
 ## PROGRESS log entries (migrated from `feat/rsi-qwen3.5-4b` 4bb7d8d, 2026-10-26)
 
 The P5 bullets of the code branch's `PROGRESS.md` log, moved here
