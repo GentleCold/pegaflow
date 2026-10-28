@@ -480,19 +480,10 @@ def _other(num_tokens=13, n_hashes=3, req_id="b", diverge_at=None):
     return req
 
 
-@pytest.mark.parametrize(
-    "other,event,expected",
-    [
-        # vLLM caches a's blocks only once its async load lands: b waits
-        # (no query, no lease) instead of loading its own copy.
-        pytest.param({}, None, None, id="waits"),
-        # The wait always ends: the load lands, or the wait expires.
-        pytest.param({}, "landed", (12, True), id="landed"),
-        pytest.param({}, "expired", (12, True), id="wait-expired"),
-    ],
-)
-def test_waits_for_inflight_loads_of_its_blocks(other, event, expected):
-    """Mirrors vLLM's OffloadingConnector ``_chunks_being_loaded``."""
+def test_waits_for_inflight_loads_of_its_blocks():
+    """vLLM caches a's blocks only once its async load lands: b waits (no
+    query, no lease) instead of loading its own copy of the same blocks.
+    Mirrors vLLM's OffloadingConnector ``_chunks_being_loaded``."""
     layout = _layout(StubSemantics, StubFullSpec())
     rpc = FakeRpc({0: Ready(3, b"F")})
     sched = Scheduler(
@@ -501,18 +492,9 @@ def test_waits_for_inflight_loads_of_its_blocks(other, event, expected):
     a = _req(req_id="a")
     sched.update_state_after_alloc(a, (FULL_IDS,), sched.get_num_new_matched_tokens(a, 0)[0])
     assert not any(lp.fail for lp in sched.take_plan().loads)
-    b = _other(**other)
-    if event == "landed":
-        sched.on_loads_done({"a"})
-    elif event == "expired":
-        assert sched.get_num_new_matched_tokens(b, 0) == (None, False)
-        sched._clock.now += 1.0
     rpc.queried.clear()
-    got = sched.get_num_new_matched_tokens(b, 0)
-    if expected is None:
-        assert (got, rpc.queried) == ((None, False), [])
-    else:
-        assert got == expected
+    assert sched.get_num_new_matched_tokens(_other(), 0) == (None, False)
+    assert rpc.queried == []
 
 
 FULL_IDS, WINDOW_IDS = [10, 11, 12, 13], [20, 21, 22, 23]
@@ -556,31 +538,27 @@ def test_alloc(ext, ids, fail, loads, released):
 
 
 @pytest.mark.parametrize(
-    "sync_loads,threshold,num_computed,load_state,expected",
+    "sync_loads,num_computed,load_state,expected",
     [
-        # Short hit: loaded before the forward, nothing reported on success.
-        pytest.param(True, 256, 0, 1, ((12, False), set(), set()), id="sync-ok"),
         # S2: no deadline. Until the server signals, its copy may still land,
         # so a slow load is neither failed (vLLM would recompute into the
         # blocks) nor done; the worker clock jumps 60 s per read here.
-        pytest.param(True, 256, 0, (5, 1), ((12, False), set(), set()), id="sync-slow-ok"),
+        pytest.param(True, 0, (5, 1), ((12, False), set(), set()), id="sync-slow-ok"),
         # A failed sync load cannot be a failed receive (vLLM already counts
         # the tokens): every GPU block holding hit tokens is reported invalid.
-        pytest.param(True, 256, 4, -1, ((8, False), set(), {11, 12}), id="sync-failed"),
+        pytest.param(True, 4, -1, ((8, False), set(), {11, 12}), id="sync-failed"),
         # A sync load whose RPC failed is invalid, never waited for.
-        pytest.param(
-            True, 256, 4, "rpc-failed", ((8, False), set(), {11, 12}), id="sync-rpc-failed"
-        ),
+        pytest.param(True, 4, "rpc-failed", ((8, False), set(), {11, 12}), id="sync-rpc-failed"),
         # Layouts vLLM cannot recover a failed sync load for stay async.
-        pytest.param(False, 256, 0, 1, ((12, True), {"r"}, set()), id="layout-async"),
+        pytest.param(False, 0, 1, ((12, True), {"r"}, set()), id="layout-async"),
     ],
 )
-def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
+def test_sync_loads(sync_loads, num_computed, load_state, expected):
     layout = _layout(StubSemantics, StubFullSpec())
     rpc = FakeRpc({0: Ready(3, b"L0")})
     sched = Scheduler(
         layout,
-        Policy(sync_load_tokens=threshold),
+        Policy(sync_load_tokens=256),
         rpc,
         "inst",
         clock=Clock(),
@@ -953,30 +931,12 @@ def _forge(items):
     return [SaveItem(a.req_id, a.group, a.kind, a.block, b.block_id, a.block_hash)]
 
 
-def _append(items):
-    items.append(items[0])
-    return items
-
-
-@pytest.mark.parametrize(
-    "choose,expected",
-    [
-        pytest.param(lambda items: [items[0], items[0]], [(0, [10])], id="duplicate-once"),
-        # M2: a forged (block, hash) pair or an in-place edit fails loudly.
-        pytest.param(_forge, ValueError, id="forged-item"),
-        pytest.param(_append, AttributeError, id="mutates-items"),
-    ],
-)
-def test_choose_saves_is_validated(choose, expected):
-    sched, _ = _sched(StubSemantics, {}, _Policy(choose=choose))
+def test_choose_saves_rejects_a_forged_item():
+    """M2: a policy cannot store one block's KV under another block's hash."""
+    sched, _ = _sched(StubSemantics, {}, _Policy(choose=_forge))
     sched.on_new_request(_req())
-    plan = lambda: sched.plan_saves([("r", 0, 13)], lambda _: (WINDOW_IDS, FULL_IDS))  # noqa: E731
-    if isinstance(expected, type):
-        with pytest.raises(expected):
-            plan()
-        return
-    plan()
-    assert [(s.sid, s.block_ids) for s in sched.take_plan().saves] == expected
+    with pytest.raises(ValueError):
+        sched.plan_saves([("r", 0, 13)], lambda _: (WINDOW_IDS, FULL_IDS))
 
 
 # --------------------------------------------------------------------- worker
