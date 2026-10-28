@@ -615,7 +615,7 @@ class Scheduler:
             self._saves_disabled = True
             logger.error(
                 "[PegaKVConnectorV2] vLLM bound no block pool: saves need pinned "
-                "blocks, saves disabled for this process"
+                "blocks, saves and sync loads disabled for this process"
             )
         if self._saves_disabled:
             return

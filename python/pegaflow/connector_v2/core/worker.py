@@ -322,8 +322,7 @@ class Worker:
     # ----------------------------------------------------------------- saves
     def save(self, plan: StepPlan) -> None:
         """Queue this step's saves behind a mark on the compute stream. Never
-        blocks. vLLM calls this every engine step, also steps without a
-        forward, so ``saved_through`` advances on idle steps too."""
+        blocks."""
         saves: list[tuple[str, list[int], list[bytes]]] = []
         # A replica that is not its part's writer stores nothing: the writer's
         # copy seals the block and every holder loads from it.
@@ -420,8 +419,9 @@ class Worker:
 
         A save RPC that raises (``_save_settled`` false) is not a finished
         save: the server may still copy the job's blocks. The job is not
-        counted as completed, so its pins (and every later job's) hold, and ``_quiescing`` drops new saves; ``_quiesce`` then waits
-        out the window and resumes. Any BaseException out of the RPC (e.g.
+        counted as completed, so its pins (and every later job's) hold,
+        and ``_quiescing`` drops new saves; ``_quiesce`` then waits out the
+        window and resumes. Any BaseException out of the RPC (e.g.
         a Rust panic in the binding) counts as such a raise. Only the
         raised job's copy may race a reuse, and only if it outlasts the
         window; closing that needs a server that reports such a copy only

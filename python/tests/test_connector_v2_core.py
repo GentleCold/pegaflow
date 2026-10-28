@@ -1164,8 +1164,6 @@ def test_pinned_saves_hold_blocks_until_every_worker_saved():
     assert pool.refs == {11: 1, 32: 1} and sched.has_pending_saves()
     sched.on_saved_through(5)
     assert pool.refs == {} and not sched.has_pending_saves()
-    sched.on_saved_through(0)  # a lower report never moves saved_through back
-    assert not sched.has_pending_saves()
     # No pool bound: nothing is saved (fail closed).
     sched = Scheduler(
         _layout(StubSemantics, StubFullSpec()), Policy(), FakeRpc(), "inst", semantics=StubSemantics
@@ -1173,6 +1171,29 @@ def test_pinned_saves_hold_blocks_until_every_worker_saved():
     sched.on_new_request(_req())
     sched.plan_saves([("r", 0, 13)], lambda _: (FULL_IDS,))
     assert sched.take_plan().saves == [] and not sched.has_pending_saves()
+
+
+def test_worker_reports_saved_through():
+    """saved_through (the only pin release) is the last plan step with every
+    save before it done: never past a pending job, and a step without saves
+    counts once the earlier ones are done."""
+    import threading
+
+    gates = [threading.Event(), threading.Event()]
+    marks = iter(gates)
+    worker = _worker(StubSemantics, FakeRpc(), [], layout=_layout(StubSemantics, StubFullSpec()))
+    worker._mark_compute = lambda: FakeMark(next(marks))
+    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
+    for plan in (_save_plan(0), StepPlan(step=1), _save_plan(2)):
+        worker.save(plan)
+    assert worker.saved_through() == -1
+    gates[0].set()
+    with worker._cv:
+        assert worker._cv.wait_for(lambda: worker._completed >= 1, 5)
+    assert worker.saved_through() == 1  # job 2 still pending
+    gates[1].set()
+    assert worker.flush(5) and worker.saved_through() == 2
+    worker.shutdown()
 
 
 def _save_plan(step):

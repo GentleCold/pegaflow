@@ -101,17 +101,18 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   after the GPU->CPU copy completed) or failed; with one FIFO saver per worker
   that covers every earlier job. A pinned block is never handed out again, so
   vLLM cannot zero, copy into or reuse it while it is read, whether its request
-  finished, was preempted, or slid it out of a window. So:
+  finished, was preempted, or slid it out of a window. Consequences:
   - `request_finished` always returns `False`: vLLM frees the blocks at once,
     as with its own `OffloadingConnector`, and the pins keep the ones a save
     still reads;
   - there is no flush and no fence in `handle_preemptions`, and saves are not
     batched across steps (each step's saves are one RPC, pins stay short);
   - `has_pending_push_work` keeps vLLM stepping until every pin is released;
-  - without a bound block pool nothing is saved (fail closed);
+  - without a bound block pool nothing is saved, and sync loads are off
+    (fail closed);
   - a pin raises the block's `ref_cnt`; vLLM 0.32 reads `ref_cnt == 1`
     (`is_block_writable`) only for speculative Mamba blocks, so check this
-    before enabling spec decode on a checkpoint layout.
+    before enabling spec decode on a checkpoint layout;
   - a save the server reports failed still releases its blocks (a failed
     save is a future miss). The save handler reports engine errors as a
     gRPC status, so the RPC raises. Only the binding's `ValueError` proves
@@ -126,8 +127,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     dropped without an RPC, and saving resumes. Shutdown ends a window
     early. Each raise is logged and counted as `raised` in `save stats`.
     No step waits for the window, but the pins of its planned saves stay
-    in vLLM's block pool until it ends. This covers server
-    errors such as an exhausted pinned pool (Internal) or an unknown
+    in vLLM's block pool until it ends. This covers server errors such as an exhausted pinned pool (Internal) or an unknown
     instance (FailedPrecondition). The binding raises those as the same
     class as transport errors (`PegaFlowError`), and the client also
     reports its own decode and HTTP/2 errors as Internal. The window is a
