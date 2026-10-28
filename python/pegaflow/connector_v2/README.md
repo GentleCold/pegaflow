@@ -156,8 +156,10 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     reports its own decode and HTTP/2 errors as Internal. The window is a
     heuristic, not a proof: no reply bounds a copy the server may still
     run, so it is kept well above the longest save job seen in gate logs.
-    A saver thread that dies stops saving for good: fences and holds are
-    released, later saves are dropped, and no other copy runs.
+    Any other BaseException out of the RPC (a panic in the binding) counts
+    as a raise too. A saver thread that dies with no copy possibly running
+    (its compute wait raised) stops saving for good: fences and holds are
+    released and later saves are dropped.
     Server limitations:
     - The server seals a job's blocks only after its copy synchronized. But
       the job whose RPC raised may still be copying, and vLLM may reuse its

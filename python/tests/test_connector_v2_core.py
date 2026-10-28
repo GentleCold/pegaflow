@@ -1414,8 +1414,8 @@ def test_worker_save_by_storage_group():
     worker.shutdown()
 
 
-class _SaverExit(BaseException):
-    """Escapes ``except Exception``: ends the saver thread."""
+class _Panic(BaseException):
+    """Like pyo3's PanicException: escapes ``except Exception``."""
 
 
 def _save_outcome(outcome):
@@ -1425,8 +1425,8 @@ def _save_outcome(outcome):
             raise ValueError("save RPC failed: code: 'Client specified an invalid argument'")
         if outcome == "raises":  # any other status: a copy may still run
             raise RuntimeError("save RPC failed: code: 'Internal error'")
-        if outcome == "saver-dies":
-            raise _SaverExit
+        if outcome == "panics":  # a binding panic, possibly after the request was sent
+            raise _Panic("rust panic in save")
         return outcome == "saved", ""
 
     return save
@@ -1442,8 +1442,7 @@ def _blocked(fn, *args):
     return t
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-@pytest.mark.parametrize("outcome", ["saved", "save-failed", "rejected", "raises", "saver-dies"])
+@pytest.mark.parametrize("outcome", ["saved", "save-failed", "rejected", "raises", "panics"])
 def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     """vLLM gets a finished request's blocks back at once (request_finished is
     always False, no finished_sending hold), but a step that writes one of
@@ -1453,11 +1452,10 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     The step thread never waits on the GPU for a save: the save RPC runs
     after the compute mark. The fence clears once the save is done, stored
     or not (a reported failure, or a rejected request, is a future miss).
-    S4: any other raised save RPC is not a finished copy (the server may
-    still copy): the fence holds for the quiesce window, saves submitted
-    meanwhile are dropped, then the job counts done and saving resumes.
-    A dying saver thread stops saving for good: the fence is released
-    instead of hanging, and later saves are dropped.
+    S4: any other raised save RPC, a binding panic (BaseException)
+    included, is not a finished copy (the server may still copy): the fence
+    holds for the quiesce window, saves submitted meanwhile are dropped,
+    then the job counts done and saving resumes.
     """
     import threading
 
@@ -1496,7 +1494,7 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     assert waiter.is_alive() and calls == []  # the copy has not run: no KV write yet
 
     gate.set()
-    raises = outcome == "raises"
+    raises = outcome in ("raises", "panics")
     if raises:
         with worker._cv:
             assert worker._cv.wait_for(lambda: worker._quiescing, 5)
@@ -1507,21 +1505,13 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     assert not waiter.is_alive() and len(calls) == 1
     s = worker.save_stats
     assert s.fences == 1 and s.fence_s > 0
-    assert (s.failed, s.raised) == ({"saved": 0, "raises": 2}.get(outcome, 1), int(raises))
+    assert (s.failed, s.raised) == (2 if raises else int(outcome != "saved"), int(raises))
     worker.save(step1)
     sched.on_saved_through(worker.saved_through())
     assert not sched.has_pending_saves()
-    dies = outcome == "saver-dies"
-    assert worker._completed == (0 if dies else 1)
     if raises:  # saving resumed: the next save sends its RPC
         worker.save(step0)
         assert worker.flush(5) and len(calls) == 2
-    if dies:
-        worker._saver.join(5)
-        assert not worker._saver.is_alive()
-        worker.save(step0)
-        assert worker.flush(5) and len(calls) == 1
-        assert worker.save_stats.failed == 2
     worker.shutdown()
 
 
@@ -2178,13 +2168,17 @@ def test_worker_reports_saved_through():
     worker.shutdown()
 
 
-def test_failed_compute_wait_is_a_failed_save():
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+@pytest.mark.parametrize("error", [RuntimeError, _Panic], ids=["failed", "saver-dies"])
+def test_failed_compute_wait_sends_no_save(error):
     """The forward failed: its KV is not valid, so no save RPC is sent and the
-    job completes as failed (its blocks are released)."""
+    job completes as failed (its blocks are released). A BaseException there
+    ends the saver thread; no copy runs, so holds are released too and later
+    saves are dropped."""
 
     class BadMark:
         def synchronize(self):
-            raise RuntimeError("CUDA error: an illegal memory access")
+            raise error("CUDA error: an illegal memory access")
 
     rpc, calls = FakeRpc(), []
     rpc.save = lambda *args: calls.append(args) or (True, "")
@@ -2193,7 +2187,11 @@ def test_failed_compute_wait_is_a_failed_save():
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
     worker.save(_save_plan(0))
     assert worker.flush(5) and calls == [] and worker.saved_through() == 0
-    assert (worker.save_stats.failed, worker.save_stats.raised) == (1, 0)
+    worker.save(_save_plan(1))  # dropped once the saver died
+    assert worker.flush(5) and calls == [] and worker.saved_through() == 1
+    assert worker.save_stats.raised == 0
+    worker._saver.join(0 if error is RuntimeError else 5)
+    assert worker._saver.is_alive() is (error is RuntimeError)
     worker.shutdown()
 
 

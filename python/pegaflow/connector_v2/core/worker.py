@@ -44,7 +44,7 @@ from .scheduler import StepPlan
 logger = logging.getLogger(__name__)
 
 
-def _save_settled(e: Exception) -> bool:
+def _save_settled(e: BaseException) -> bool:
     """True if a raised save RPC proves that no copy of the job runs.
 
     Only an InvalidArgument status does: the binding raises ``ValueError``
@@ -58,7 +58,9 @@ def _save_settled(e: Exception) -> bool:
     - no reply (Unavailable, Cancelled, DeadlineExceeded, Unknown): the
       handler may still run;
     - FailedPrecondition (unknown instance) raises the same exception
-      class as those, so it fails closed too.
+      class as those, so it fails closed too;
+    - a Rust panic in the binding (pyo3 ``PanicException``, a
+      BaseException) may come after the request was sent.
     """
     return isinstance(e, ValueError)
 
@@ -193,8 +195,8 @@ class Worker:
         # plan step seen by ``save`` (``saved_through``).
         self._job_steps: collections.deque[tuple[int, int]] = collections.deque()
         self._last_step = -1
-        # The saver thread exited: it reads no block any more, so every hold
-        # is released and later saves are dropped (future misses).
+        # The saver thread exited with no copy of its jobs possibly running:
+        # every hold is released and later saves are dropped (future misses).
         self._saver_dead = False
         # A save RPC raised and its window (SAVE_QUIESCE_S) runs: new saves
         # are dropped (future misses). Set and cleared by the saver thread.
@@ -545,7 +547,9 @@ class Worker:
                     break
         finally:
             with self._cv:
-                self._saver_dead = True
+                # Dying while a raised job's copy may run: its holds stay for good.
+                if not self._quiescing:
+                    self._saver_dead = True
                 self._cv.notify_all()
 
     def _quiesce(self, raised: _SaveJob) -> bool:
@@ -590,12 +594,14 @@ class Worker:
         save: the server may still copy the job's blocks. The job is not
         counted as completed, so its fences and pins (and every later job's)
         hold, and ``_quiescing`` drops new saves; ``_quiesce`` then waits
-        out the window and resumes. A saver thread that dies mid-job stops
-        saving for good instead (``_saver_dead``): it reads no block any
-        more, so every fence and hold is released and later saves are
-        dropped. Only the raised job's copy may race a reuse, and only if
-        it outlasts the window; closing that needs a server that reports
-        such a copy only once it stopped (a server limitation).
+        out the window and resumes. Any BaseException out of the RPC (e.g.
+        a Rust panic in the binding) counts as such a raise. Only the
+        raised job's copy may race a reuse, and only if it outlasts the
+        window; closing that needs a server that reports such a copy only
+        once it stopped (a server limitation). A compute wait that raises
+        past ``except Exception`` ends the saver thread (``_saver_dead``):
+        no RPC was sent, so every hold is released and later saves are
+        dropped.
         A failed reply, a rejected request (``_save_settled``), or a failed
         compute wait (no RPC sent) completes the job as a failed save: a
         future miss.
@@ -619,7 +625,7 @@ class Worker:
                         job.saves,
                     )
                     over = True
-                except Exception as e:
+                except BaseException as e:  # incl. a binding panic: the copy may run
                     ok, over, msg = False, _save_settled(e), repr(e)
                     raised = not over
             if not over:
@@ -643,7 +649,7 @@ class Worker:
                 elif raised:  # the thread lives on and quiesces
                     stats.raised += 1
                     self._quiescing = True
-                else:  # the thread dies mid-job
+                else:  # the compute wait raised a BaseException: no RPC was sent
                     self._saver_dead = True
                 self._cv.notify_all()
         return over
