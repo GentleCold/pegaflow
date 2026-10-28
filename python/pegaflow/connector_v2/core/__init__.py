@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from .layout import GroupInfo, Layout, build_layout, layer_specs, may_zero_or_copy_blocks
+from .layout import GroupInfo, Layout, build_layout, layer_specs
 from .scheduler import GroupSave, LoadPlan, Scheduler, StepPlan
 from .worker import Worker
 
@@ -33,5 +33,4 @@ __all__ = [
     "build_layout",
     "endpoint_of",
     "layer_specs",
-    "may_zero_or_copy_blocks",
 ]

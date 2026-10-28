@@ -93,43 +93,25 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   that became storable. `policy.choose_saves` filters them. The saves are
   asynchronous: `wait_for_save` records a CUDA event on the compute stream and
   queues the job; a saver thread waits on the event, then issues the save RPC.
-  The step thread never waits on the GPU. Block lifetime:
-  - `request_finished` always returns `False`: vLLM frees the blocks at
-    once, as with its own `OffloadingConnector`. Each block of the request's
-    chosen saves (since its last preemption) is fenced on the plan step of
-    its last save. The scheduler sees every block a step writes before the
-    forward: new requests' tables past their prefix hit, blocks appended to
-    running requests, resumed requests' tables, zeroed and copy-on-write
-    target blocks, and load targets. If one is fenced, the plan's
-    `fence_step` asks every worker to wait in `handle_preemptions` until the
-    saves of plans up to that step are done. A save is done once its RPC
-    returned (the server replies after the GPU->CPU copy completed) or
-    failed; with one FIFO saver per worker that covers every earlier job.
-    A fence clears once every worker reports that step saved
-    (`PegaWorkerMetadata.saved_through`, min over ranks), or once a planned
-    fence or flush covers it. A block the request shares through the prefix
-    cache stays fenced whoever frees it. A fence on a batched (held) job
-    sends the batch first (see `save_batch_steps`);
-  - a step whose plan has `flush` (vLLM preempted a request and freed its
-    blocks, or the layout has window groups whose blocks are freed while the
-    request runs) waits for all pending saves in `handle_preemptions`. That
-    is before the step's forward writes any block, but vLLM's V2 model runner
-    zeroes new blocks and applies copy-on-write copies before it. So layouts
-    where vLLM may zero (`needs_kv_cache_zeroing`) or copy (`hash_block_size`
-    smaller than a group's `block_size`) blocks, or that have a checkpoint
-    group, pin their saves instead: the scheduler takes one reference per
-    saved block in vLLM's `BlockPool` (`touch`) when it plans the save and
-    drops it (`free_blocks`) once every worker reports that step's saves
-    done (`PegaWorkerMetadata.saved_through`, min over ranks). A pinned block
-    is never handed out again, so vLLM cannot zero, copy into or reuse it
-    while it is read. Such layouts need no flush and no fence, and their
-    saves are not batched (pins stay short). `has_pending_push_work` keeps
-    vLLM stepping until every planned save is reported done (pins released,
-    held batches sent). Without a bound block
-    pool these layouts save nothing (fail closed). A pin raises the block's
-    `ref_cnt`; vLLM 0.32 reads `ref_cnt == 1` (`is_block_writable`) only for
-    speculative Mamba blocks, so check this before enabling spec decode on a
-    checkpoint layout;
+  The step thread never waits on the GPU. Block lifetime: every block a plan
+  saves is pinned in vLLM's `BlockPool` (`touch`, one reference per saved
+  block) when the scheduler plans the save, and unpinned (`free_blocks`) once
+  every worker reports that step's saves done (`PegaWorkerMetadata.saved_through`,
+  min over ranks). A save is done once its RPC returned (the server replies
+  after the GPU->CPU copy completed) or failed; with one FIFO saver per worker
+  that covers every earlier job. A pinned block is never handed out again, so
+  vLLM cannot zero, copy into or reuse it while it is read, whether its request
+  finished, was preempted, or slid it out of a window. So:
+  - `request_finished` always returns `False`: vLLM frees the blocks at once,
+    as with its own `OffloadingConnector`, and the pins keep the ones a save
+    still reads;
+  - there is no flush and no fence in `handle_preemptions`, and saves are not
+    batched across steps (each step's saves are one RPC, pins stay short);
+  - `has_pending_push_work` keeps vLLM stepping until every pin is released;
+  - without a bound block pool nothing is saved (fail closed);
+  - a pin raises the block's `ref_cnt`; vLLM 0.32 reads `ref_cnt == 1`
+    (`is_block_writable`) only for speculative Mamba blocks, so check this
+    before enabling spec decode on a checkpoint layout.
   - a save the server reports failed still releases its blocks (a failed
     save is a future miss). The save handler reports engine errors as a
     gRPC status, so the RPC raises. Only the binding's `ValueError` proves
@@ -139,17 +121,12 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     it counts as a failed save.
   - any other raise quiesces the saver (fail closed, then bounded
     recovery). For `Worker.SAVE_QUIESCE_S` (10 s) no save RPC is sent, new
-    saves are dropped, and the raised job's fences and pins (and those of
-    every later job) hold. Then the job counts as done, the jobs queued
-    behind it (held batches released meanwhile included) are dropped
-    without an RPC, and saving resumes. Shutdown ends a window early. Each
-    raise is logged and counted as `raised` in `save stats`.
-    During a window, earlier steps' fences clear as usual. A step waits
-    for the rest of the window if it writes a block fenced on the raised
-    step or later (also blocks whose save was dropped: the scheduler does
-    not know), and every flush does (preemption, window-group layouts).
-    Pinned layouts never wait, but their pins of the window's planned
-    saves stay in vLLM's block pool until it ends. This covers server
+    saves are dropped, and the raised job's pins (and those of every later
+    job) hold. Then the job counts as done, the jobs queued behind it are
+    dropped without an RPC, and saving resumes. Shutdown ends a window
+    early. Each raise is logged and counted as `raised` in `save stats`.
+    No step waits for the window, but the pins of its planned saves stay
+    in vLLM's block pool until it ends. This covers server
     errors such as an exhausted pinned pool (Internal) or an unknown
     instance (FailedPrecondition). The binding raises those as the same
     class as transport errors (`PegaFlowError`), and the client also
@@ -158,7 +135,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
     run, so it is kept well above the longest save job seen in gate logs.
     Any other BaseException out of the RPC (a panic in the binding) counts
     as a raise too. A saver thread that dies with no copy possibly running
-    (its compute wait raised) stops saving for good: fences and holds are
+    (its compute wait raised) stops saving for good: its pins are
     released and later saves are dropped.
     Server limitations:
     - The server seals a job's blocks only after its copy synchronized. But
@@ -174,8 +151,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
       them apart. A distinct reply for errors raised before the copy (for
       example `SaveResponse.status.ok = false`) would make it a plain failed
       save.
-    - A save RPC that hangs blocks `flush` and fences for good (logged every
-      10 s): the client has no per-call deadline, and the server may still
+    - A save RPC that hangs keeps its pins (and every later job's) for
+      good: the client has no per-call deadline, and the server may still
       be copying.
 - **Checkpoint groups** (Mamba / GDN state, vLLM `mamba_cache_mode="align"`).
   vLLM's block table for such a group is null except the running state
@@ -185,8 +162,8 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
   boundary a step computed, and only an offer for exactly that boundary is
   saved. A boundary vLLM did not offer (it retains only what
   `--prefix-cache-retention-interval` keeps) is not saved. An offered block
-  holds its state only until vLLM frees or reuses it, so layouts with a
-  checkpoint group pin it (see Saves) until the copy is done. Loads need nothing
+  holds its state only until vLLM frees or reuses it; the pin (see Saves)
+  keeps it until the copy is done. Loads need nothing
   special: the needed block `[p - bt, p)` is always past the local hit, and
   vLLM allocates a fresh state block for an external hit.
 - **Hit stats.** The scheduler logs `hit stats` (cumulative) at most every
@@ -213,8 +190,7 @@ Endpoint: `pegaflow_host` / `pegaflow_port` in the extra config, then
 - **Save stats.** Every 500 `wait_for_save` calls (and at shutdown) each
   worker logs `save stats`: `steps`, save `rpcs` sent, `failed` saves,
   `raised` (save RPCs that raised with a copy possibly running; each starts
-  a quiesce window), the step-thread waits `flushes` / `flush_ms`, `fences`
-  / `fence_ms` and `sync_wait_ms`, and `max_job_ms` (compute wait plus RPC
+  a quiesce window), the step-thread wait `sync_wait_ms`, and `max_job_ms` (compute wait plus RPC
   of one save job). Per-step timing belongs in the gate's probe, not here.
 - **Init checks.** These run on both roles:
   - unknown spec classes are `Unsupported`;

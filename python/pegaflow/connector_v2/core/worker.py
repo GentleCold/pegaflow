@@ -9,21 +9,10 @@ with fakes.
 Saves are asynchronous: ``save`` only marks the compute stream and queues the
 job; a saver thread waits for the mark and then issues the save RPC (the server
 copies GPU->CPU on its own stream and replies once the copy is done). The
-source blocks must stay untouched until the copy is done, so before a step
-writes any KV:
-
-- a step that writes a block vLLM freed while a save may still read it
-  (``StepPlan.fence_step``) first calls ``wait_saved``: every save of plans up
-  to that step is done;
-- a step that reuses a preempted request's blocks first calls ``flush``.
-
-Both run in vLLM's ``handle_preemptions``, which vLLM's V1 model runner
-calls before it zeroes or copies (copy-on-write) any block, but the V2 runner
-calls after. Layouts where vLLM may zero or copy blocks, or free a checkpoint
-state block right after offering it, use pinned saves instead: the scheduler
-keeps every block it plans to save allocated in vLLM's block pool until all
-workers report the step's saves done (``saved_through``), so no such block is
-reallocated meanwhile.
+source blocks must stay untouched until the copy is done: the scheduler keeps
+every block it plans to save pinned in vLLM's block pool until all workers
+report the step's saves done (``saved_through``), so no such block is
+reallocated, zeroed or copied into meanwhile.
 """
 
 from __future__ import annotations
@@ -78,17 +67,6 @@ class _SaveJob:
     saves: list[tuple[str, list[int], list[bytes]]]
 
 
-def _wire_bytes(saves: list[tuple[str, list[int], list[bytes]]]) -> int:
-    """Upper bound on the protobuf size of these SaveLayer entries.
-
-    Per entry: name plus framing; per block: a uint32 id (<= 5 B varint) and a
-    length-prefixed hash (+ 2 B tag/length, +1 B packed-field slack).
-    """
-    return sum(
-        len(name) + 16 + sum(len(h) for h in hashes) + 8 * len(ids) for name, ids, hashes in saves
-    )
-
-
 @dataclass
 class SaveStats:
     """Save counters since the last report (grep "save stats" in vllm.log):
@@ -98,10 +76,6 @@ class SaveStats:
     rpcs: int = 0  # save RPCs sent
     failed: int = 0  # jobs that did not store their blocks
     raised: int = 0  # save RPCs that raised with a copy possibly running (each quiesces)
-    flushes: int = 0  # flushes that had to wait
-    flush_s: float = 0.0
-    fences: int = 0  # steps that waited for saves before writing a freed block
-    fence_s: float = 0.0
     sync_wait_s: float = 0.0  # waiting for sync-load copies
     max_job_s: float = 0.0  # saver thread: compute wait + RPC of one job
     _since: float = field(default=0.0, repr=False)
@@ -111,27 +85,16 @@ class Worker:
     # wait_for_save calls between save-cost log lines.
     SAVE_LOG_EVERY = 500
     SHUTDOWN_FLUSH_S = 30.0
-    # Waits that never give up (sync loads, flush) log this often.
+    # Waits that never give up (sync loads) log this often.
     STALL_LOG_S = 10.0
     # Sync-load poll interval: doubles from the first value up to the cap.
     SYNC_POLL_S = (20e-6, 200e-6)
-    # Staleness cap for batched saves, not a tuned policy: held saves are sent
-    # once the oldest has waited this long, so other requests see a step's
-    # blocks in the store within about this bound when steps are slow. It is
-    # checked once per step, so a hold can exceed it by about one step.
-    SAVE_HOLD_MAX_S = 1.0
-    # Wire-size budget of one merged save RPC: a quarter of the 64 MiB gRPC
-    # message limit (python/src/lib.rs). A step whose job would push the held
-    # batch past it sends the batch first, so a merged RPC is at most this big
-    # (or one step's size, the unbatched behaviour, if a single step is bigger).
-    SAVE_RPC_MAX_BYTES = 16 << 20
     # Quiesce window after a save RPC raised without proving its copy over
-    # (``_save_settled``): no save RPC is sent and the job's fences and pins
-    # hold for this long, then the job counts as done and saving resumes.
-    # A heuristic, not a proof: the server reports no bound on a copy it may
-    # still run. It must stay well above the longest save job (compute wait
-    # + RPC; evidence in rsi-notes), and it is the longest a fence or pin on
-    # the raised job can hold vLLM's step.
+    # (``_save_settled``): no save RPC is sent and the job's pins (and every
+    # later job's) hold for this long, then the job counts as done and saving
+    # resumes. A heuristic, not a proof: the server reports no bound on a copy
+    # it may still run. It must stay well above the longest save job (compute
+    # wait + RPC; evidence in rsi-notes).
     SAVE_QUIESCE_S = 10.0
 
     def __init__(
@@ -145,14 +108,7 @@ class Worker:
         new_load_state: Callable[[], Any],
         mark_compute: Callable[[], Any],
         clock: Callable[[], float] = time.perf_counter,
-        batch_steps: int = 1,
     ):
-        """``batch_steps`` (policy ``save_batch_steps``): a step's save job is
-        held and merged with later steps' jobs into one save RPC until the
-        oldest held job has seen ``batch_steps`` steps or waited
-        ``SAVE_HOLD_MAX_S``, whichever comes first (<= 1 sends every step).
-        ``flush`` and ``StepPlan.send_saves`` send held jobs at once.
-        """
         self._layout = layout
         self._rpc = rpc
         self._instance_id = instance_id
@@ -178,19 +134,6 @@ class Worker:
         self._cv = threading.Condition()
         self._submitted = 0  # step thread only
         self._completed = 0  # saver thread, under _cv
-        # (plan step, _submitted after that step's save) for steps whose jobs
-        # are not known done, in step order; ``_done_seq`` is the newest
-        # sequence number dropped from the front (done). A fence on a step
-        # maps to that step's entry (``_fence_of``).
-        self._step_seqs: collections.deque[tuple[int, int]] = collections.deque()
-        self._done_seq = 0
-        # Save batching (step thread only). Held jobs already own their
-        # sequence numbers, so fences and flush cover them.
-        self._batch_steps = batch_steps
-        self._held: list[_SaveJob] = []
-        self._held_steps = 0  # steps seen by the oldest held job
-        self._held_since = 0.0
-        self._held_bytes = 0  # estimated wire size of the held jobs' save entries
         # (job seq, plan step) of submitted jobs not known done, and the last
         # plan step seen by ``save`` (``saved_through``).
         self._job_steps: collections.deque[tuple[int, int]] = collections.deque()
@@ -282,24 +225,6 @@ class Worker:
     def start(self, plan: StepPlan) -> None:
         """Start this step's loads."""
         self._start_loads(plan)
-
-    def _fence_of(self, step: int) -> int:
-        """The sequence number of the last job submitted by the end of plan
-        ``step``'s ``save``: once it is done, so is every job of that step and
-        of the steps before it (one saver thread, jobs complete in order)."""
-        if step > self._last_step:
-            return self._submitted  # not seen yet (cannot happen in vLLM): wait for all
-        fence = self._done_seq
-        for s, seq in self._step_seqs:
-            if s > step:
-                break
-            fence = seq
-        return fence
-
-    def _forget_done_steps(self, completed: int) -> None:
-        steps = self._step_seqs
-        while steps and steps[0][1] <= completed:
-            self._done_seq = steps.popleft()[1]
 
     def _start_loads(self, plan: StepPlan) -> None:
         """One ``load`` RPC per request, the step's sync loads first.
@@ -396,14 +321,9 @@ class Worker:
 
     # ----------------------------------------------------------------- saves
     def save(self, plan: StepPlan) -> None:
-        """Queue this step's saves behind a mark on the compute stream.
-
-        Never blocks. With batching, the job is held and sent merged with later steps' jobs
-        (``_release_due``). vLLM calls this every engine step, also steps
-        without a forward, so held jobs keep aging while requests wait on
-        ``finished_sending``.
-        """
-        t0 = self._clock()
+        """Queue this step's saves behind a mark on the compute stream. Never
+        blocks. vLLM calls this every engine step, also steps without a
+        forward, so ``saved_through`` advances on idle steps too."""
         saves: list[tuple[str, list[int], list[bytes]]] = []
         # A replica that is not its part's writer stores nothing: the writer's
         # copy seals the block and every holder loads from it.
@@ -420,25 +340,8 @@ class Worker:
             ready = self._mark_compute()
             self._submitted += 1
             self._job_steps.append((self._submitted, plan.step))
-            size = _wire_bytes(saves)
-            if self._held and self._held_bytes + size > self.SAVE_RPC_MAX_BYTES:
-                # One merged RPC must stay well under the gRPC message limit.
-                self._release_held()
-            if not self._held:
-                self._held_steps, self._held_since = 0, t0
-            self._held.append(_SaveJob(self._submitted, ready, saves))
-            self._held_bytes += size
-        if self._held:
-            self._held_steps += 1
-            if self._release_due(t0):
-                self._release_held()
-            elif plan.send_saves:
-                # KV pressure: freed blocks are reused soon, and a fence on a
-                # held job would wait for the whole batch.
-                self._release_held()
-        if plan.step > self._last_step:
-            self._last_step = plan.step
-            self._step_seqs.append((plan.step, self._submitted))
+            self._jobs.put(_SaveJob(self._submitted, ready, saves))
+        self._last_step = max(self._last_step, plan.step)
         with self._cv:
             self.save_stats.steps += 1
             report = self.save_stats.steps >= self.SAVE_LOG_EVERY
@@ -455,90 +358,15 @@ class Worker:
             steps.popleft()
         return steps[0][1] - 1 if steps else self._last_step
 
-    def _release_due(self, now: float) -> bool:
-        if self._batch_steps <= 1:
-            return True
-        return (
-            self._held_steps >= self._batch_steps or now - self._held_since >= self.SAVE_HOLD_MAX_S
-        )
-
-    def _release_held(self) -> None:
-        """Send the held jobs as one: the last job's sequence number and mark.
-
-        The compute stream is in order, so the last mark covers every earlier
-        step's forward, and completing the last sequence number completes them
-        all. Each step keeps its own layer entries (a layer may appear once per
-        held step), so the server sees the same entries as unbatched saves.
-        The server pins one region per entry, freed only once all of its
-        blocks are evicted: folding steps into one entry per layer would make
-        regions span more requests and strand evicted bytes.
-        """
-        if not self._held:
-            return
-        jobs, self._held = self._held, []
-        self._held_bytes = 0
-        job = jobs[-1]
-        if len(jobs) > 1:
-            job = _SaveJob(job.seq, job.ready, [s for j in jobs for s in j.saves])
-        self._jobs.put(job)
-
     def _settled(self, target: int) -> bool:
         return self._saver_dead or self._completed >= target
 
-    def _log_stall(self, what: str, t0: float, target: int) -> None:
-        """A stuck fence or flush (under ``_cv``). Waiting out a quiesce window
-        is expected (bounded), not a stall."""
-        log = logger.warning if self._quiescing else logger.error
-        log(
-            "[PegaKVConnectorV2] save %s waiting %.0f s (job %d of %d done%s)",
-            what,
-            self._clock() - t0,
-            self._completed,
-            target,
-            ", save quiesce window" if self._quiescing else "",
-        )
-
-    def wait_saved(self, step: int) -> None:
-        """Block until the saves of plans up to ``step`` are done (the GPU->CPU
-        copies completed, or the save failed): this step writes blocks they
-        read. Held (batched) jobs among them are sent first. Waits for good,
-        like ``flush``."""
-        target = self._fence_of(step)
-        if self._held and self._held[0].seq <= target:
-            self._release_held()
-        t0 = self._clock()
-        with self._cv:
-            if self._settled(target):
-                return
-            while not self._cv.wait_for(lambda: self._settled(target), self.STALL_LOG_S):
-                self._log_stall("fence", t0, target)
-            self.save_stats.fences += 1
-            self.save_stats.fence_s += self._clock() - t0
-
-    def flush(self, timeout: float | None = None) -> bool:
-        """Block until every submitted save job is done; False on timeout.
-
-        Without a timeout it waits for good: a save RPC has no deadline (the
-        client offers none), and a timed-out one may still be copying on the
-        server, so its blocks cannot be handed back early. It logs while stuck.
-        Held (batched) jobs are sent first.
-        """
-        self._release_held()
+    def flush(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` s until every submitted save job is done
+        (shutdown, tests); False on timeout."""
         target = self._submitted
-        t0 = self._clock()
         with self._cv:
-            if self._settled(target):
-                return True
-            if timeout is not None:
-                done = self._cv.wait_for(lambda: self._settled(target), timeout)
-            else:
-                while not (
-                    done := self._cv.wait_for(lambda: self._settled(target), self.STALL_LOG_S)
-                ):
-                    self._log_stall("flush", t0, target)
-            self.save_stats.flushes += 1
-            self.save_stats.flush_s += self._clock() - t0
-        return done
+            return self._cv.wait_for(lambda: self._settled(target), timeout)
 
     def _save_loop(self) -> None:
         try:
@@ -554,11 +382,11 @@ class Worker:
 
     def _quiesce(self, raised: _SaveJob) -> bool:
         """After ``raised``'s RPC raised: send nothing for the window
-        (``SAVE_QUIESCE_S``) while its fences and pins hold (its copy may
-        still run), then count it done and resume. Jobs queued behind it, held (batched) jobs released during
-        the window included, are completed as failed without an RPC (no copy
-        of theirs started): under the pressure that made the RPC raise they
-        would likely raise too, each holding fences for another window.
+        (``SAVE_QUIESCE_S``) while its pins hold (its copy may still run),
+        then count it done and resume. Jobs queued behind it are completed as
+        failed without an RPC (no copy of theirs started): under the pressure
+        that made the RPC raise they would likely raise too, each holding
+        pins for another window.
         Shutdown ends the window early. False if shutdown came during it."""
         window = self.SAVE_QUIESCE_S
         self._quiesce_wait(window)
@@ -592,8 +420,7 @@ class Worker:
 
         A save RPC that raises (``_save_settled`` false) is not a finished
         save: the server may still copy the job's blocks. The job is not
-        counted as completed, so its fences and pins (and every later job's)
-        hold, and ``_quiescing`` drops new saves; ``_quiesce`` then waits
+        counted as completed, so its pins (and every later job's) hold, and ``_quiescing`` drops new saves; ``_quiesce`` then waits
         out the window and resumes. Any BaseException out of the RPC (e.g.
         a Rust panic in the binding) counts as such a raise. Only the
         raised job's copy may race a reuse, and only if it outlasts the
@@ -644,7 +471,7 @@ class Worker:
                 stats.failed += not ok
                 stats.rpcs += sent
                 if over:
-                    # Failed or not, the copy is over: held blocks are released.
+                    # Failed or not, the copy is over: its pins are released.
                     self._completed = job.seq
                 elif raised:  # the thread lives on and quiesces
                     stats.raised += 1
@@ -663,18 +490,13 @@ class Worker:
             return
         logger.info(
             "[PegaKVConnectorV2] save stats tp=%d window_s=%.1f steps=%d rpcs=%d failed=%d "
-            "raised=%d flushes=%d flush_ms=%.1f fences=%d fence_ms=%.1f sync_wait_ms=%.1f "
-            "max_job_ms=%.2f",
+            "raised=%d sync_wait_ms=%.1f max_job_ms=%.2f",
             self._par.tp_rank,
             now - s._since,
             s.steps,
             s.rpcs,
             s.failed,
             s.raised,
-            s.flushes,
-            s.flush_s * 1e3,
-            s.fences,
-            s.fence_s * 1e3,
             s.sync_wait_s * 1e3,
             s.max_job_s * 1e3,
         )
@@ -692,12 +514,9 @@ class Worker:
         """Returns (finished_sending, finished_recving, failed_recving).
 
         Failed receives are in both receive sets. Nothing is ever sending:
-        finished requests are not held (fences cover their blocks).
+        finished requests are not held (pins cover their blocks).
         """
         sending: set[str] = set()
-        with self._cv:
-            completed = self._submitted if self._saver_dead else self._completed
-        self._forget_done_steps(completed)
         finished, self._done = self._done, set()
         pending: list[_Batch] = []
         for b in self._batches:
