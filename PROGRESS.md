@@ -29,6 +29,7 @@ state the rule only; the date and quote live here.
 | 2026-10-24 | Hit rate not gated ("命中率那块，不要设置硬性门槛，只要agent自己判断命中率足够就行了，不要差太多"); agent writes a hit-rate judgment, reviewer checks | GATES.md "Hit rate" |
 | 2026-10-24 | Server stays at the base version ("server还是保持原始版本，把server的局限问题汇报给人就行，gate不要被server受限，命中率不用过度追求最高"); limits are reported, not fixed | GATES.md "Known server limits", skill step 5 |
 | 2026-10-24 | PR CI must pass (cz on every commit, typos, clippy) | skill Lessons "PR" |
+| 2026-10-28 | No connector optimization that compensates for a server limit ("如果你觉得主要是server端的问题，那就propose这个server的问题，然后不要做为其兜底的优化 ... 如果因为server的问题阻塞就停下"); server limits go to a proposal for the user to decide; a server-blocked gate stops the loop. Also agreed: the perf line ends after the Q1 cleanup, new perf ideas run as diag subclasses on experiment branches first, stats code leaves the hot path, gemma gets adapter + correctness only | `server-proposal.md` |
 | 2026-10-24 | Store pool for unlimited runs 64gb, NUMA affinity off (technical, after the .44 move) | GATES.md G3 |
 | 2026-10-26 | G4 warm must also beat vLLM native offload (`*_vs_native`); overhead checks stay vs baseline. The hard part was superseded the same day ("close enough", below); native stays a required arm | GATES.md G4 |
 | 2026-10-26 | Process / incremental docs (PROGRESS, ITERATIONS, reviews, sha-map) out of the PR, onto this branch, with compaction ("还有很多文档，都是增量进行的，我觉得这些都不要进入pr，另外这些增量文档后面都需要重新优化下不然会一直增长") | README.md, skill "Notes and code branches" |
