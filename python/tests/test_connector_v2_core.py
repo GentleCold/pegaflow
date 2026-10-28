@@ -2198,8 +2198,10 @@ def test_failed_compute_wait_sends_no_save(error):
 def test_worker_metadata_aggregates_the_min_over_ranks():
     """vLLM folds every worker's metadata into one: pins and fences clear only
     once every rank saved the step."""
-    pytest.importorskip("vllm")
-    from pegaflow.connector_v2.connector import PegaWorkerMetadata
+    try:  # a real vLLM: other test modules install partial vllm stubs
+        from pegaflow.connector_v2.connector import PegaWorkerMetadata
+    except ImportError:
+        pytest.skip("needs vLLM")
 
     got = PegaWorkerMetadata(5).aggregate(PegaWorkerMetadata(3)).aggregate(PegaWorkerMetadata(7))
     assert got.saved_through == 3
