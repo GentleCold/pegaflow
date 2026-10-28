@@ -11,10 +11,10 @@ from typing import Any
 
 
 def __getattr__(name: str) -> Any:
-    if name == "PegaKVConnectorV2":
-        from .connector import PegaKVConnectorV2
+    if name in ("PegaKVConnectorV2", "PegaKVConnectorV2Kernel"):
+        from . import connector
 
-        return PegaKVConnectorV2
+        return getattr(connector, name)
     raise AttributeError(name)
 
 
