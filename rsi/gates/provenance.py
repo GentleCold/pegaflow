@@ -231,7 +231,7 @@ class Trees:
         if rev_file.is_symlink() or not rev_file.is_file():
             return {"how": "unknown", "rev": "unknown", "reason": "not a git toplevel, no .rsi-rev"}, None  # fmt: skip
         rev = rev_file.read_text().strip()
-        if not re.fullmatch(r"[0-9a-f]{40}", rev):
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", rev):
             # A remote serves a commit by its full sha only (a short one fails the fetch).
             return {"how": "rsi-rev", "rev": rev, "reason": f".rsi-rev {rev!r} is not a full 40-hex sha"}, None  # fmt: skip
         got = self._fetched(rev)

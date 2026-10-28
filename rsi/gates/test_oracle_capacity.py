@@ -1415,7 +1415,7 @@ def test_tree_rev_is_verified_blob_for_blob(tmp_path, case, verified):
     assert rec["verified"] is verified, rec
     if case == "rsi-rev-native":
         assert list(rec["native_sha256"]) == [provenance.native_module()]
-    if case == "short-rev":  # a file:// remote would serve it; GitHub does not
+    if case == "short-rev":  # no remote serves one (fetch takes it as a ref name)
         assert "not a full 40-hex sha" in rec["reason"], rec
     if verified:
         assert rec["rev"] == rev

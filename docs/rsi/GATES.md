@@ -1023,7 +1023,8 @@ shared venv on the GPU hosts is already built: only the last line is needed.
 ### Usage
 
 Host trees carry no bytecode: `git archive <rev> | tar -x -C <dir>` plus
-`echo <rev> > <dir>/.rsi-rev`, or `tar --exclude=__pycache__
+`git rev-parse <rev> > <dir>/.rsi-rev` (the full sha: a short one is
+rejected), or `tar --exclude=__pycache__
 --exclude='*.pyc'`; then build or copy `pegaflow<EXT_SUFFIX>` into
 `python/pegaflow/`. On the 4090 host 10.1.0.44, from the feature dir:
 

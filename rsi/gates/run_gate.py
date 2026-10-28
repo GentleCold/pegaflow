@@ -4563,8 +4563,14 @@ def main(argv: list[str] | None = None) -> int:
     prov = record_provenance(args, run_dir)
     print(f"[gate] provenance {json.dumps(prov, default=str)}", flush=True)
     ut = prov.get("under_test") or {}
-    dropped = ut.get("dropped")
-    if args.under_test_path and not dropped and not (
+    if ut.get("dropped"):
+        # The arm would run the rev without these files: fail before any stage.
+        ap.error(
+            f"--under-test-path {args.under_test_path}: untracked files are not in the "
+            f"snapshot the arm imports: {ut['dropped'][:10]}. Commit them (profile overrides "
+            "included) and pass that rev's tree."
+        )
+    if args.under_test_path and not (
         ut.get("verified") and (Path(args.under_test_overlay) / "pegaflow/__init__.py").is_file()
     ):  # fmt: skip
         # G0: the arm would import another pegaflow (the venv's) or an
@@ -4572,13 +4578,6 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(
             f"--under-test-path {args.under_test_path}: snapshot not verified "
             f"({ut.get('reason') or 'overlay empty'}); nothing would measure that tree"
-        )
-    if dropped:
-        # The arm would run the rev without these files: fail before any stage.
-        ap.error(
-            f"--under-test-path {args.under_test_path}: untracked files are not in the "
-            f"snapshot the arm imports: {dropped[:10]}. Commit them (profile overrides "
-            "included) and pass that rev's tree."
         )
     watch = ProvenanceWatch(args, model_dir)
     cuda = cuda_env()

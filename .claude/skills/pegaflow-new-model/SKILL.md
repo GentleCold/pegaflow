@@ -198,8 +198,9 @@ Host and build:
   (`~/kexi/cuda13` comes from the venv wheels `nvidia-cuda-nvcc`,
   `nvidia-cuda-crt` and `nvidia-nvvm`, pinned to 13.0.x).
 - A tree for `--under-test-path`, and the gate / feature tree the run
-  starts from, must hold no `.pyc` and carry `.rsi-rev` (else provenance is
-  unverified and the run not official): extract with `git archive <rev> | tar -x` (+ `echo <rev> > .rsi-rev`) or
+  starts from, must hold no `.pyc` and carry `.rsi-rev` holding the full sha
+  (else provenance is unverified: the run is not official, and with
+  `--under-test-path` it does not start): extract with `git archive <rev> | tar -x` (+ `git rev-parse <rev> > .rsi-rev`) or
   sync with `tar --exclude=__pycache__ --exclude='*.pyc'`; never import from
   it before the run.
 - vLLM 0.32 + flashinfer-python 0.7.0.post1: remove stale `flashinfer-cubin`
