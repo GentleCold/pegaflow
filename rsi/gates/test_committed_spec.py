@@ -172,6 +172,47 @@ def test_main_withholds_the_controls_record_from_unclean_runs(tmp_path, monkeypa
         assert s["controls_record_withheld"].startswith(withheld), s["controls_record_withheld"]
 
 
+@pytest.mark.parametrize(
+    "verified,overlay,error",
+    [
+        (False, True, "snapshot not verified (cannot fetch r)"),
+        (True, False, "snapshot not verified (overlay empty)"),
+        (True, True, None),
+    ],
+    ids=["unverified", "overlay-empty", "verified"],
+)
+def test_unverified_under_test_snapshot_does_not_start(tmp_path, monkeypatch, capsys, verified, overlay, error):  # fmt: skip
+    """G0: with ``--under-test-path``, an unverified snapshot or an empty
+    overlay stops the run before any stage (the arm would import the venv's
+    ``pegaflow`` instead)."""
+    repo = _gate_repo(tmp_path)
+    ran: list[str] = []
+    _stub_main(monkeypatch, repo, lambda _a, _g, arm, wl, _o, **_k: ran.append(arm) or {"arm": arm, "workload": wl})  # fmt: skip
+
+    def prov(args, _run_dir):
+        if overlay:
+            (Path(args.under_test_overlay) / "pegaflow").mkdir(parents=True)
+            (Path(args.under_test_overlay) / "pegaflow/__init__.py").write_text("")
+        ut = {"verified": verified} | ({} if verified else {"reason": "cannot fetch r"})
+        return {"under_test": ut}
+
+    monkeypatch.setattr(run_gate, "record_provenance", prov)
+    monkeypatch.setattr(run_gate, "estimate_unique", lambda _a, _s, w: {"workload": w, "unique_bytes": 0, "how": "stub"})  # fmt: skip
+    monkeypatch.setattr(run_gate, "verdicts", lambda *_a, **_k: {})
+    argv = ["--model", "/m/Qwen3-4B", "--tag", "t", "--runs-root", str(tmp_path / "runs"),
+            "--arms", "pegaflow.m:C", "--workloads", "gsm8k", "--tp", "1", "--gpu", "0",
+            "--under-test-path", str(tmp_path / "ut")]  # fmt: skip
+    if error is None:
+        assert run_gate.main(argv) == 1  # never official: sliced arms, provenance stubbed
+        assert ran == ["pegaflow.m:C"]
+        return
+    with pytest.raises(SystemExit) as e:
+        run_gate.main(argv)
+    assert e.value.code == 2
+    assert error in capsys.readouterr().err
+    assert ran == []
+
+
 def test_preempt_without_this_tps_dump_does_not_start(tmp_path, monkeypatch, capsys):
     """The preempt pool is sized from this TP's dump only: none, no run (an
     argument error before the run dir, provenance or any stage)."""

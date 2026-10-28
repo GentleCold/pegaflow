@@ -877,7 +877,9 @@ PR), and a gap they cause is explained, not fixed.
   module `pegaflow<EXT_SUFFIX>` into `<run>/under-test-overlay/pegaflow`,
   re-verified after the copy (blob ids, sha256), first on the arm under
   test's `PYTHONPATH` only. Any symlink, untracked / ignored file, other
-  `.so` or `.pyc` in the source unverifies it.
+  `.so` or `.pyc` in the source unverifies it. An unverified snapshot
+  (`.rsi-rev` not a full 40-hex sha, rev not fetchable, tree differs) or an
+  empty overlay stops the run before any stage (argument error, exit 2).
 - Bytecode: every vLLM / server process gets a fresh
   `PYTHONPYCACHEPREFIX=<run>/.pycache-stages/<arm>/<workload>` no later stage
   reads; the gate re-execs with `<run>/.pycache`. Gate and venv trees may

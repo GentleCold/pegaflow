@@ -231,6 +231,9 @@ class Trees:
         if rev_file.is_symlink() or not rev_file.is_file():
             return {"how": "unknown", "rev": "unknown", "reason": "not a git toplevel, no .rsi-rev"}, None  # fmt: skip
         rev = rev_file.read_text().strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", rev):
+            # A remote serves a commit by its full sha only (a short one fails the fetch).
+            return {"how": "rsi-rev", "rev": rev, "reason": f".rsi-rev {rev!r} is not a full 40-hex sha"}, None  # fmt: skip
         got = self._fetched(rev)
         if isinstance(got, str):
             return {"how": "rsi-rev", "rev": rev, "reason": got}, None
@@ -301,7 +304,7 @@ def stage(under_test: Path, dest: Path, trees: Trees) -> dict[str, Any]:
     ``python/``) into ``<dest>/pegaflow``. The source must verify with no
     ``.pyc`` at all; the rev's blobs and the native module are copied and
     the copy is verified again. ``verified`` is false if either check failed
-    (the snapshot is still written: the run goes on, non-official)."""
+    (the snapshot is still written; ``run_gate.main`` refuses to start)."""
     pkg = under_test / "pegaflow"
     if pkg.is_symlink() or not (pkg / "__init__.py").is_file():
         raise ValueError(f"{under_test}: no pegaflow package dir (or it is a symlink)")

@@ -1383,7 +1383,8 @@ def _native(pkg):
 @pytest.mark.parametrize(
     "case,verified",
     [("git-clean", True), ("git-dirty", False), ("rsi-rev", True), ("rsi-rev-edited", False),
-     ("rsi-rev-extra-py", False), ("rsi-rev-native", True), ("unknown-rev", False), ("no-rev", False)],
+     ("rsi-rev-extra-py", False), ("rsi-rev-native", True), ("unknown-rev", False), ("short-rev", False),
+     ("no-rev", False)],
 )  # fmt: skip
 def test_tree_rev_is_verified_blob_for_blob(tmp_path, case, verified):
     """M3: a run is official with a tree under test only if its rev is
@@ -1404,7 +1405,7 @@ def test_tree_rev_is_verified_blob_for_blob(tmp_path, case, verified):
         root = _copy(
             repo,
             tmp_path,
-            "0" * 40 if case == "unknown-rev" else rev,
+            {"unknown-rev": "0" * 40, "short-rev": rev[:7]}.get(case, rev),
             edit="x = 2\n" if case == "rsi-rev-edited" else None,
             extra={"b.py": b""} if case == "rsi-rev-extra-py" else None,
         )
@@ -1414,6 +1415,8 @@ def test_tree_rev_is_verified_blob_for_blob(tmp_path, case, verified):
     assert rec["verified"] is verified, rec
     if case == "rsi-rev-native":
         assert list(rec["native_sha256"]) == [provenance.native_module()]
+    if case == "short-rev":  # a file:// remote would serve it; GitHub does not
+        assert "not a full 40-hex sha" in rec["reason"], rec
     if verified:
         assert rec["rev"] == rev
 
