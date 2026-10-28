@@ -11,7 +11,7 @@ from typing import Any
 
 
 def __getattr__(name: str) -> Any:
-    if name in ("PegaKVConnectorV2", "PegaKVConnectorV2Kernel"):
+    if name.startswith("PegaKVConnectorV2"):
         from . import connector
 
         return getattr(connector, name)

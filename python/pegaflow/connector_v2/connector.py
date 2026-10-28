@@ -28,7 +28,7 @@ from vllm.logger import init_logger
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
-from .adapters import Parallel
+from .adapters import Parallel, Unsupported
 from .core import (
     Scheduler,
     StepPlan,
@@ -98,7 +98,8 @@ def _pin_saves(kv_cache_config: Any, layout: Any) -> bool:
 
 class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
     _cache_hit_source = CacheHitSource.HOST
-    _DIAG_BACKEND: str | None = None  # backend diag arm only (diag branch)
+    _DIAG_BACKEND: str | None = None  # backend diag arms only (diag branch)
+    _DIAG_PAGE_FIRST = False
 
     def __init__(
         self,
@@ -133,10 +134,16 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         }
         # Raises adapters.Unsupported on both roles for unknown spec classes.
         self._layout = build_layout(kv_cache_config, par, identity)
-        if self._DIAG_BACKEND:  # diag arm: every layer on another RegisterContext backend
-            ns = hashlib.sha256(f"{self._layout.namespace}:{self._DIAG_BACKEND}".encode())
+        if self._DIAG_BACKEND or self._DIAG_PAGE_FIRST:  # diag arms: other RegisterContext modes
+            if self._DIAG_PAGE_FIRST and len(self._layout.groups) != 1:
+                raise Unsupported("diag page_first: single storage group only")
+            backend = self._DIAG_BACKEND or self._layout.transfer_backend
+            mode = f"{self._layout.namespace}:{backend}:{self._DIAG_PAGE_FIRST}"
             self._layout = dataclasses.replace(
-                self._layout, transfer_backend=self._DIAG_BACKEND, namespace=ns.hexdigest()[:8]
+                self._layout,
+                transfer_backend=backend,
+                page_first=self._DIAG_PAGE_FIRST,
+                namespace=hashlib.sha256(mode.encode()).hexdigest()[:8],
             )
         self._instance_id = (
             os.environ.get("PEGAFLOW_INSTANCE_ID") or self._kv_transfer_config.engine_id
@@ -470,3 +477,16 @@ class PegaKVConnectorV2Kernel(PegaKVConnectorV2):
     """Backend diag arm: transfer_backend="kernel" for every layer."""
 
     _DIAG_BACKEND = "kernel"
+
+
+class PegaKVConnectorV2PageFirst(PegaKVConnectorV2):
+    """Backend diag arm: direct + page_first (single-group layouts, e.g. MLA)."""
+
+    _DIAG_PAGE_FIRST = True
+
+
+class PegaKVConnectorV2KernelPageFirst(PegaKVConnectorV2):
+    """Backend diag arm: kernel + page_first (single-group layouts, e.g. MLA)."""
+
+    _DIAG_BACKEND = "kernel"
+    _DIAG_PAGE_FIRST = True
