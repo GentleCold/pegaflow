@@ -151,9 +151,10 @@ Invariants the simplification must keep, each a unit test against public
 behaviour:
 
 1. A GPU block in a plan's saves stays pinned in vLLM's block pool until
-   `saved_through >= plan.step` on every rank. A raise that does not prove
-   the copy is over keeps it pinned for the window, or for good once the
-   saver is dead.
+   `saved_through >= plan.step` on every rank. Anything raised out of the
+   save RPC that does not prove the copy is over (a binding panic included)
+   keeps it pinned for the quiesce window. Only a saver that dies with no
+   copy possibly running (its compute wait raised) releases the holds.
 2. `saved_through` is the min over ranks, never decreases, and never passes
    a job whose RPC has not returned (ok, `ok=false`, `ValueError`) or whose
    compute wait has not failed.
