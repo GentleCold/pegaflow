@@ -21,6 +21,18 @@ and `reviews/complexity-e1bab80.md`. The connector mechanism ids
 | S5 | eviction is per (hash, group) key, not group-coherent | a resume point needs every group; measured negligible on Qwen3.5-4B (≤ 4 of ~7400 lookups) | evict a block's groups together | none today; may matter for gemma-4's sliding window | low: watch on gemma |
 | S6 | server copies run in their own CUDA context and time-slice with vLLM | ~0.85 ms/step extra at TP2 while loads run | copy engine / stream priority choice on the server | none (the connector can only copy fewer bytes) | low |
 
+## Existing server options to rule out first
+
+Before any item above counts as a server limit, the options the server
+already has must be measured on that layout. Not done yet:
+
+- S4: the `kernel` transfer backend was measured only on Qwen3-4B (64 KiB
+  pages, +26% per load, rejected). DSV2 (MLA) and Qwen3.5-4B (Mamba
+  checkpoint pages) inherited `direct` without a measurement. Queued after
+  Q1.
+- S2: `--blockwise-alloc` has two diag runs on Qwen3.5-4B (fragmentation
+  gone, prefix loss not). No perf measurement yet.
+
 ## What the connector does meanwhile
 
 - Existing compensations stay as they are; Q1 may still delete those
