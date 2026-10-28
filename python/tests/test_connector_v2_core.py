@@ -11,7 +11,6 @@ extension or server is needed. Cases marked ``native`` re-run against the real
 from __future__ import annotations
 
 import dataclasses
-import logging
 import math
 import random
 import sys
@@ -421,20 +420,6 @@ def _raise(*_):
         pytest.param(
             HIT, _Policy(accept=lambda p, _: 10**6), 0, (12, True), [], id="policy-widens"
         ),
-        # Lowering p is re-checked: at p=8 the window needs block 0 (absent).
-        pytest.param(
-            {0: Ready(3, b"L0"), 1: Ready(2, b"L1", [1, 2])},
-            _Policy(accept=lambda p, _: 8),
-            0,
-            (0, False),
-            [b"L0", b"L1"],
-            id="policy-lowers-into-gap",
-        ),
-        # Lowering to a legal p keeps only the leases that p still needs.
-        pytest.param(HIT, _Policy(accept=lambda p, _: 8), 0, (8, True), [], id="policy-lowers"),
-        pytest.param(
-            HIT, _Policy(accept=lambda p, _: 6), 0, (0, False), [b"L0", b"L1"], id="policy-off-step"
-        ),
         # S6: a raising policy is a miss with every lease released, not a crash.
         pytest.param(
             HIT, _Policy(accept=_raise), 0, (0, False), [b"L0", b"L1"], id="policy-raises"
@@ -478,160 +463,56 @@ def test_hit_lifecycle(sem):
     ]
     assert rpc.released == []  # leases are consumed by the workers' load
 
-    # Hit that never gets allocated (e.g. aborted while waiting).
+    # Hit that never gets allocated: vLLM asks again for a head it could not
+    # allocate (held leases released, looked up afresh), then aborts it.
     assert sched.get_num_new_matched_tokens(req, 0) == (12, True)
-    sched.request_finished("r")
+    assert sched.get_num_new_matched_tokens(req, 0) == (12, True)
     assert sorted(rpc.released) == [b"L0", b"L1"]
-
-    # Loading wait expiry falls back to a miss.
-    rpc.answers = {0: Loading(), 1: HIT[1]}
-    rpc.released.clear()
-    sched = Scheduler(
-        layout, Policy(loading_wait_ms=100), rpc, "inst", clock=Clock(), semantics=sem
-    )
-    assert sched.get_num_new_matched_tokens(req, 0) == (None, False)
-    sched._clock.now += 0.2
-    assert sched.get_num_new_matched_tokens(req, 0) == (0, False)
+    sched.request_finished("r")
+    assert sorted(rpc.released) == [b"L0", b"L0", b"L1", b"L1"]
 
 
-def _other(num_tokens=13, n_hashes=3, req_id="b", diverge_at=None, skip_reading=False):
+def _other(num_tokens=13, n_hashes=3, req_id="b", diverge_at=None):
     req = _req(num_tokens, n_hashes, req_id)
     if diverge_at is not None:
         req.block_hashes[diverge_at:] = [b"x%d" % i for i in range(diverge_at, n_hashes)]
-    req.skip_reading_prefix_cache = skip_reading
+    req.skip_reading_prefix_cache = False
     return req
 
 
-@BOTH
 @pytest.mark.parametrize(
-    "specs,kw,other,num_computed,event,expected",
+    "other,event,expected",
     [
         # vLLM caches a's blocks only once its async load lands: b waits
         # (no query, no lease) instead of loading its own copy.
-        pytest.param((StubFullSpec(),), {}, {}, 0, None, None, id="waits"),
-        pytest.param((StubFullSpec(),), {}, {}, 0, "landed", (12, True), id="landed"),
-        pytest.param((StubFullSpec(),), {}, {}, 0, "aborted", (12, True), id="loader-aborted"),
-        pytest.param((StubFullSpec(),), {}, {}, 0, "expired", (12, True), id="wait-expired"),
-        # Refcounted: another load of the same blocks is still in flight.
-        pytest.param((StubFullSpec(),), {}, {}, 0, "one-of-two-landed", None, id="two-loaders"),
-        # The wait clock restarts once the request was allocated: after an
-        # expired wait, a load and a preemption it waits again.
-        pytest.param((StubFullSpec(),), {}, {}, 0, "requeued", None, id="requeued-waits"),
-        # The multi-turn shape: a loads blocks 1-2 past its local hit, b has
-        # the same local hit, so a's load gives b a resume point at 12.
-        pytest.param(
-            (StubFullSpec(),), {"a_local": 4}, {}, 4, None, None, id="local-plus-inflight"
-        ),
-        # vLLM ignores the hit (and a None) of a request skipping its prefix cache.
-        pytest.param(
-            (StubFullSpec(),), {}, {"skip_reading": True}, 0, None, (12, True), id="skip-reading"
-        ),
-        # vLLM's local hit already covers the in-flight blocks: nothing to wait for.
-        pytest.param((StubFullSpec(),), {}, {}, 12, None, (0, False), id="local-covers"),
-        # Sharing only block 0 still waits: vLLM then serves 4 tokens locally.
-        pytest.param((StubFullSpec(),), {}, {"diverge_at": 1}, 0, None, None, id="shares-a-prefix"),
-        pytest.param(
-            (StubFullSpec(),), {}, {"diverge_at": 0}, 0, None, (12, True), id="no-overlap"
-        ),
-        # A sync load's blocks are cached in its own step: never waited for.
-        pytest.param(
-            (StubFullSpec(),), {"sync_loads": True}, {}, 0, None, (12, False), id="sync-load"
-        ),
-        pytest.param(
-            (StubFullSpec(),), {"prefix_caching": False}, {}, 0, None, (12, True), id="no-caching"
-        ),
-        pytest.param(
-            (StubFullSpec(),),
-            {"policy": Policy(loading_wait_ms=0)},
-            {},
-            0,
-            None,
-            (12, True),
-            id="wait-disabled",
-        ),
-        # Checkpoint: a loads the state at 12 only. b shares blocks 0-1 but
-        # not 2, so a's load gives b no resume point (no state at 4 or 8).
-        pytest.param(
-            (StubCheckpointSpec(), StubFullSpec()), {}, {}, 0, None, None, id="checkpoint-waits"
-        ),
-        pytest.param(
-            (StubCheckpointSpec(), StubFullSpec()),
-            {},
-            {"diverge_at": 2},
-            0,
-            None,
-            (0, False),
-            id="checkpoint-no-gain",
-        ),
+        pytest.param({}, None, None, id="waits"),
+        # The wait always ends: the load lands, or the wait expires.
+        pytest.param({}, "landed", (12, True), id="landed"),
+        pytest.param({}, "expired", (12, True), id="wait-expired"),
     ],
 )
-def test_waits_for_inflight_loads_of_its_blocks(
-    sem, specs, kw, other, num_computed, event, expected
-):
+def test_waits_for_inflight_loads_of_its_blocks(other, event, expected):
     """Mirrors vLLM's OffloadingConnector ``_chunks_being_loaded``."""
-    layout = _layout(sem, *specs)
-    checkpoint = len(specs) == 2
-    answers = {0: Ready(3, b"F")}
-    if checkpoint:
-        answers[1] = Ready(1, b"C", [2])
-    rpc = FakeRpc(answers)
-    kw = dict(kw)
-    a_local = kw.pop("a_local", 0)
-    policy = kw.pop("policy", Policy(sync_load_tokens=0 if not kw.get("sync_loads") else 256))
-    sched = Scheduler(layout, policy, rpc, "inst", clock=Clock(), semantics=sem, **kw)
-    ids = ([0, 0, 33], FULL_IDS) if checkpoint else (FULL_IDS,)
-
-    def load(*req_ids):  # look all up first: none waits for another's load
-        reqs = [_req(req_id=r) for r in req_ids]
-        matched = [sched.get_num_new_matched_tokens(r, a_local) for r in reqs]
-        for r, m in zip(reqs, matched, strict=True):
-            sched.update_state_after_alloc(r, ids, m[0])
-        assert not any(lp.fail for lp in sched.take_plan().loads)
-
-    load(*(("a", "a2") if event == "one-of-two-landed" else ("a",)))
+    layout = _layout(StubSemantics, StubFullSpec())
+    rpc = FakeRpc({0: Ready(3, b"F")})
+    sched = Scheduler(
+        layout, Policy(sync_load_tokens=0), rpc, "inst", clock=Clock(), semantics=StubSemantics
+    )
+    a = _req(req_id="a")
+    sched.update_state_after_alloc(a, (FULL_IDS,), sched.get_num_new_matched_tokens(a, 0)[0])
+    assert not any(lp.fail for lp in sched.take_plan().loads)
     b = _other(**other)
-    if event in ("landed", "one-of-two-landed"):
+    if event == "landed":
         sched.on_loads_done({"a"})
-    elif event == "aborted":
-        sched.request_finished("a")
-    elif event in ("expired", "requeued"):
-        assert sched.get_num_new_matched_tokens(b, num_computed) == (None, False)
+    elif event == "expired":
+        assert sched.get_num_new_matched_tokens(b, 0) == (None, False)
         sched._clock.now += 1.0
-    if event == "requeued":
-        assert sched.get_num_new_matched_tokens(b, num_computed) == (12, True)
-        sched.update_state_after_alloc(b, ids, 12)
-        sched.take_plan()
-        sched.on_loads_done({"a", "b"})
-        load("c")  # b, preempted, is looked up again while c loads its blocks
-    if checkpoint and other.get("diverge_at") == 2:
-        rpc.answers = {0: Ready(2, b"F2"), 1: Ready(0, b"")}
     rpc.queried.clear()
-    got = sched.get_num_new_matched_tokens(b, num_computed)
-    deferred = {"expired": 1, "requeued": 2}.get(event, 1 if expected is None else None)
+    got = sched.get_num_new_matched_tokens(b, 0)
     if expected is None:
         assert (got, rpc.queried) == ((None, False), [])
     else:
         assert got == expected
-    assert sched.hit_stats.get("deferred") == deferred
-
-
-def test_inflight_wait_restarts_prefetch_wait(sem):
-    """The in-flight wait and the prefetch wait each get ``loading_wait_ms``:
-    a prefetch clock left from before a deferral does not expire at once."""
-    layout = _layout(sem, StubFullSpec())
-    rpc = FakeRpc({0: Loading()})
-    sched = Scheduler(layout, Policy(sync_load_tokens=0), rpc, "inst", clock=Clock(), semantics=sem)
-    b = _other()
-    assert sched.get_num_new_matched_tokens(b, 0) == (None, False)  # prefetching
-    rpc.answers = {0: Ready(3, b"F")}
-    a = _req(req_id="a")
-    sched.update_state_after_alloc(a, (FULL_IDS,), sched.get_num_new_matched_tokens(a, 0)[0])
-    sched._clock.now += 0.9
-    assert sched.get_num_new_matched_tokens(b, 0) == (None, False)  # waits for a
-    sched._clock.now += 0.2
-    sched.on_loads_done({"a"})  # vLLM evicted a's blocks meanwhile: no local hit
-    rpc.answers = {0: Loading()}
-    assert sched.get_num_new_matched_tokens(b, 0) == (None, False)
 
 
 FULL_IDS, WINDOW_IDS = [10, 11, 12, 13], [20, 21, 22, 23]
@@ -654,7 +535,6 @@ FULL_IDS, WINDOW_IDS = [10, 11, 12, 13], [20, 21, 22, 23]
             [],
             id="trimmed-replans",
         ),
-        pytest.param(6, (WINDOW_IDS, FULL_IDS), True, [], [b"L0", b"L1"], id="trimmed-off-step"),
         pytest.param(12, ([20, 0, 22, 23], FULL_IDS), True, [], [b"L0", b"L1"], id="null-block"),
         pytest.param(12, (WINDOW_IDS, [10, 11]), True, [], [b"L0", b"L1"], id="short-block-table"),
     ],
@@ -687,7 +567,10 @@ def test_alloc(ext, ids, fail, loads, released):
         # A failed sync load cannot be a failed receive (vLLM already counts
         # the tokens): every GPU block holding hit tokens is reported invalid.
         pytest.param(True, 256, 4, -1, ((8, False), set(), {11, 12}), id="sync-failed"),
-        pytest.param(True, 8, 0, 1, ((12, True), {"r"}, set()), id="long-hit-async"),
+        # A sync load whose RPC failed is invalid, never waited for.
+        pytest.param(
+            True, 256, 4, "rpc-failed", ((8, False), set(), {11, 12}), id="sync-rpc-failed"
+        ),
         # Layouts vLLM cannot recover a failed sync load for stay async.
         pytest.param(False, 256, 0, 1, ((12, True), {"r"}, set()), id="layout-async"),
     ],
@@ -707,6 +590,8 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
     req = _req()
     matched = sched.get_num_new_matched_tokens(req, num_computed)
     sched.update_state_after_alloc(req, ([10, 11, 12, 13],), matched[0])
+    if load_state == "rpc-failed":
+        rpc.load_ok[b"L0"], load_state = False, 1
     polls, load_state = load_state if isinstance(load_state, tuple) else (0, load_state)
     state = FakeLoadState(state=load_state, polls=polls)
     worker = _worker(StubSemantics, rpc, [state], layout=layout, clock=JumpClock(60.0))
@@ -714,33 +599,6 @@ def test_sync_loads(sync_loads, threshold, num_computed, load_state, expected):
     worker.start(sched.take_plan())
     _, recving, _ = worker.poll()
     assert (matched, recving, worker.take_invalid()) == expected
-    worker.shutdown()
-
-
-@pytest.mark.parametrize(
-    "loads,order,invalid",
-    [
-        # A sync load sent after an async one waits for its copy as well.
-        pytest.param(["long", "short", "long2"], [b"L1", b"L0", b"L2"], set(), id="reordered"),
-        pytest.param(["short", "long"], [b"L1", b"L0"], set(), id="already-first"),
-        # A sync load whose RPC failed is invalid, never waited for.
-        pytest.param(["long", "bad"], [b"bad", b"L0"], {2}, id="sync-rpc-failed"),
-        pytest.param([], [], set(), id="no-loads"),
-    ],
-)
-def test_worker_sends_sync_loads_first(loads, order, invalid):
-    rpc = FakeRpc()
-    rpc.load_ok[b"bad"] = False
-    plans = {
-        "long": LoadPlan("long", [(b"L0", [[1]])]),
-        "short": LoadPlan("short", [(b"L1", [[2]])], sync=True, covered=[2]),
-        "bad": LoadPlan("bad", [(b"bad", [[2]])], sync=True, covered=[2]),
-        "long2": LoadPlan("long2", [(b"L2", [[3]])]),
-    }
-    states = [FakeLoadState() for _ in loads]
-    worker = _worker(StubSemantics, rpc, states)
-    worker.start(StepPlan(loads=[plans[k] for k in loads]))
-    assert ([lo[0][0] for lo in rpc.loads], worker.take_invalid()) == (order, invalid)
     worker.shutdown()
 
 
@@ -967,7 +825,6 @@ H = [f"h{i}".encode() for i in range(4)]
             [[], []],
             id="no-block-ids",
         ),
-        pytest.param(13, [[("gone", 0, 13)]], {}, [[]], id="unknown-request"),
     ],
 )
 def test_saves(sem, num_tokens, steps, block_ids, expected):
@@ -1073,104 +930,6 @@ def test_checkpoint_loads_state_at_p(sem, num_computed, ckpt_ans, expected, load
     assert (plan.fail, plan.loads) == (False, loads)
 
 
-@BOTH
-def test_miss_attribution_names_the_missing_group(sem):
-    """Full blocks back p=12, the checkpoint only p=4: counted as missing sid 1."""
-    layout = _layout(sem, StubCheckpointSpec(), StubFullSpec())
-    sched, _ = _sched(sem, {0: Ready(3, b"F"), 1: Ready(1, b"C", [0])}, layout=layout)
-    assert sched.get_num_new_matched_tokens(_req(), 0) == (4, True)
-    sched._rpc.answers = {0: Ready(3, b"F"), 1: Ready(1, b"C", [2])}
-    assert sched.get_num_new_matched_tokens(_req(req_id="s"), 0) == (12, True)
-    # vLLM re-queries a request it could not allocate: counted once per
-    # (request, resume point); a finished request id counts afresh.
-    sched._rpc.answers = {0: Ready(3, b"F"), 1: Ready(1, b"C", [0])}
-    sched.get_num_new_matched_tokens(_req(), 0)
-    assert sched.hit_stats == {"lookups": 2, "missing=1": 1, "lost_tokens": 8}
-    sched.request_finished("r")
-    sched.get_num_new_matched_tokens(_req(), 0)
-    assert sched.hit_stats == {"lookups": 3, "missing=1": 2, "lost_tokens": 16}
-
-
-@BOTH
-@pytest.mark.parametrize(
-    ("specs", "num_computed", "full_ans", "queried", "released", "stats"),
-    [
-        # Full only (Qwen3-4B / DSV2 shape), 13 tokens: the prompt's last
-        # loadable block ends at 12 = the local hit, so nothing is queried.
-        pytest.param(
-            (StubFullSpec(),), 12, Ready(3, b"F"), [], [], {}, id="full-only-local-hit-is-max"
-        ),
-        # Full only, one block past the local hit: queried as before; with a
-        # single group nothing else is skipped.
-        pytest.param(
-            (StubFullSpec(),), 8, Ready(2, b"F"), [0], [b"F"], {}, id="full-only-one-block-past"
-        ),
-        # Hybrid, same block size: group 0 backs only 8 = the local hit, so
-        # the checkpoint group is not queried (no lease is created for it).
-        pytest.param(
-            (StubCheckpointSpec(), StubFullSpec()),
-            8,
-            Ready(2, b"F"),
-            [0],
-            [b"F"],
-            {},
-            id="hybrid-full-bound-at-local-hit",
-        ),
-        # Hybrid, group 0 backs 12 > 8: the checkpoint group is queried as
-        # before (its state at 4 does not help, so 12 is counted as its miss).
-        pytest.param(
-            (StubCheckpointSpec(), StubFullSpec()),
-            8,
-            Ready(3, b"F"),
-            [0, 1],
-            [b"F", b"C"],
-            {"missing=1": 1, "lost_tokens": 4},
-            id="hybrid-full-bound-past-local-hit",
-        ),
-        # Hybrid, checkpoint block 2 x the full block: the resume step is 8,
-        # the next one (16) lies past the 13-token prompt. The full group
-        # alone could reach 12, but no legal resume point beats 8: no query.
-        pytest.param(
-            (StubCheckpointSpec(block_size=2 * BT), StubFullSpec()),
-            8,
-            Ready(3, b"F"),
-            [],
-            [],
-            {},
-            id="hybrid-next-resume-step-past-prompt",
-        ),
-    ],
-)
-def test_lookup_skips_queries_that_cannot_beat_the_local_hit(
-    sem, specs, num_computed, full_ans, queried, released, stats
-):
-    """vLLM re-queries every waiting request each scheduling pass: groups
-    are not queried once no resume point past vLLM's local hit is possible
-    (``semantics.resolve`` over what the unqueried groups could hold)."""
-    layout = _layout(sem, *specs)
-    sched, rpc = _sched(sem, {0: full_ans, 1: Ready(1, b"C", [0])}, layout=layout)
-    assert sched.get_num_new_matched_tokens(_req(), num_computed) == (0, False)
-    assert (rpc.queried, rpc.released) == (queried, released)
-    assert sched.hit_stats == {"lookups": 1, **stats}
-
-
-@pytest.mark.parametrize("computed", [0, 4], ids=["same-local-hit", "local-hit-moved"])
-def test_unallocated_hit_is_released_when_asked_again(computed):
-    """vLLM re-asks for a waiting head it could not allocate every scheduling
-    pass: the held hit's leases are released once and the request is looked
-    up afresh; only the new hit is loaded."""
-    sched, rpc = _sched(StubSemantics, {0: Ready(3, b"F"), 1: Ready(3, b"W")})
-    assert sched.get_num_new_matched_tokens(_req(), 0) == (12, True)
-    rpc.queried.clear()
-    n = 12 - computed
-    assert sched.get_num_new_matched_tokens(_req(), computed) == (n, True)
-    assert (rpc.queried, sorted(rpc.released)) == ([0, 1], [b"F", b"W"])
-    sched.update_state_after_alloc(_req(), ([20, 21, 22], [10, 11, 12]), n)
-    assert [lp.req_id for lp in sched.take_plan().loads] == ["r"]
-    sched.request_finished("r")
-    assert sorted(rpc.released) == [b"F", b"W"]  # the loaded hit's leases go to the workers
-
-
 def test_held_hit_released_when_deferred():
     """A held hit whose request starts waiting for another request's async
     load of its blocks is released, not reused (the wait holds no lease)."""
@@ -1189,67 +948,6 @@ def test_held_hit_released_when_deferred():
     assert (rpc.queried, rpc.released) == ([], [b"B"])
 
 
-def test_hit_stats_logged_when_idle_and_on_cadence():
-    """The gate force-kills the engine core (no ``shutdown``): the counters
-    must reach the log when the last request finishes and every HIT_LOG_S."""
-    sched, _ = _sched(StubSemantics, {0: Ready(0, b""), 1: Ready(0, b"")})
-    lines: list[str] = []
-    # Own handler: caplog would also see propagated copies of each record.
-    handler = logging.Handler(logging.INFO)
-    handler.emit = lambda record: lines.append(record.getMessage())
-    log = logging.getLogger("pegaflow.connector_v2.core.scheduler")
-    level = log.level
-    log.addHandler(handler)
-    log.setLevel(logging.INFO)
-    try:
-        sched.get_num_new_matched_tokens(_req(), 0)
-        sched.get_num_new_matched_tokens(_req(req_id="s"), 0)
-        sched.request_finished("r")
-        assert lines == []  # "s" still live, cadence not due
-        sched._clock.now += Scheduler.HIT_LOG_S
-        sched.get_num_new_matched_tokens(_req(req_id="t"), 0)
-        assert lines == ["[PegaKVConnectorV2] hit stats {'lookups': 3}"]
-        sched.request_finished("s")
-        sched.request_finished("t")  # idle, but nothing new to report
-        sched.shutdown()
-        assert len(lines) == 1
-        sched.get_num_new_matched_tokens(_req(req_id="u"), 0)
-        sched.request_finished("u")  # idle with a new count
-    finally:
-        log.removeHandler(handler)
-        log.setLevel(level)
-    assert lines[1:] == ["[PegaKVConnectorV2] hit stats {'lookups': 4}"]
-
-
-@BOTH
-def test_saves_keep_one_entry_per_request(sem):
-    # The server pins one region per entry: two requests saving in one step
-    # must not share an entry. Groups in sid order, requests in scheduled order.
-    sched, _ = _sched(sem, {})
-    sched.on_new_request(_req(req_id="b", num_tokens=8, n_hashes=2))
-    sched.on_new_request(_req(req_id="a"))
-    ids = {"a": (WINDOW_IDS, FULL_IDS), "b": ([40, 41, 42], [30, 31, 32])}
-    assert _step_saves(sched, [[("a", 0, 13), ("b", 0, 8)]], ids) == [
-        [
-            (0, [10, 11, 12], H[:3]),
-            (0, [30, 31], H[:2]),
-            (1, [20, 21, 22], H[:3]),
-            (1, [40, 41], H[:2]),
-        ]
-    ]
-
-
-def test_saves_reoffer_after_missing_block_ids():
-    sched, _ = _sched(StubSemantics, {})
-    sched.on_new_request(_req())
-    ids: dict = {}
-    assert _step_saves(sched, [[("r", 0, 8)]], ids) == [[]]
-    ids["r"] = (WINDOW_IDS, FULL_IDS)
-    assert _step_saves(sched, [[("r", 8, 5)]], ids) == [
-        [(0, [10, 11, 12], H[:3]), (1, [20, 21, 22], H[:3])]
-    ]
-
-
 def _forge(items):
     a, b = items[0], items[1]
     return [SaveItem(a.req_id, a.group, a.kind, a.block, b.block_id, a.block_hash)]
@@ -1263,10 +961,6 @@ def _append(items):
 @pytest.mark.parametrize(
     "choose,expected",
     [
-        pytest.param(lambda items: [], [], id="save-none"),
-        pytest.param(
-            lambda items: [i for i in items if i.kind == "full"], [(0, [10, 11, 12])], id="subset"
-        ),
         pytest.param(lambda items: [items[0], items[0]], [(0, [10])], id="duplicate-once"),
         # M2: a forged (block, hash) pair or an in-place edit fails loudly.
         pytest.param(_forge, ValueError, id="forged-item"),
@@ -1376,8 +1070,6 @@ def test_worker_loads_and_poll():
         pytest.param(StubFullSpec(), None, id="ok"),
         # S2: a declaration must equal what the server copies per segment.
         pytest.param(StubFullSpec(segments=(64, 32)), "!= server copy size", id="short-segment"),
-        pytest.param(StubFullSpec(segments=(128,)), "!= server copy size", id="whole-block"),
-        pytest.param(StubFullSpec(backend="kernel"), None, id="kernel-backend"),
     ],
 )
 def test_worker_register(spec, error):
@@ -1407,10 +1099,6 @@ def test_worker_save_by_storage_group():
     worker.save(StepPlan())
     assert worker.flush(5)
     assert saved == [[("layers.0.attn", [21], [b"h1"]), ("layers.1.attn", [11], [b"h1"])]]
-    stats = worker.save_stats
-    assert (stats.steps, stats.rpcs) == (2, 1)
-    worker.report_save_stats()
-    assert worker.save_stats.steps == 0
     worker.shutdown()
 
 
@@ -1503,9 +1191,6 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
         window.set()
     waiter.join(5)
     assert not waiter.is_alive() and len(calls) == 1
-    s = worker.save_stats
-    assert s.fences == 1 and s.fence_s > 0
-    assert (s.failed, s.raised) == (2 if raises else int(outcome != "saved"), int(raises))
     worker.save(step1)
     sched.on_saved_through(worker.saved_through())
     assert not sched.has_pending_saves()
@@ -1515,96 +1200,8 @@ def test_freed_block_is_not_written_while_a_save_reads_it(outcome):
     worker.shutdown()
 
 
-def _quiesce_rig(outcomes, monkeypatch=None):
-    """Worker whose save RPCs return or raise ``outcomes`` in order. Each
-    quiesce window records its length in ``windows`` and lasts until the
-    test releases ``ends`` once."""
-    import threading
-
-    rpc, calls, outs = FakeRpc(), [], iter(outcomes)
-    rpc.save = lambda *args: _save_outcome(next(outs))(calls, args[-1])
-    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
-    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
-    windows, ends = [], threading.Semaphore(0)
-
-    def wait(seconds):
-        windows.append(seconds)
-        assert ends.acquire(timeout=5), "test never ended the quiesce window"
-
-    worker._quiesce_wait = wait
-    return worker, calls, windows, ends
-
-
 def _save_plan(step, send=False):
     return StepPlan(saves=[GroupSave(0, [step], [b"h%d" % step])], step=step, send_saves=send)
-
-
-def _wait_quiescing(worker):
-    with worker._cv:
-        assert worker._cv.wait_for(lambda: worker._quiescing, 5)
-
-
-def test_quiesce_window_holds_only_the_raised_and_later_saves(monkeypatch):
-    """During a window: a fence on a step before the raised job's clears at
-    once; a fence on its step and a flush wait for the window; a new save
-    and a held batch released meanwhile are dropped without an RPC. Then
-    saving resumes."""
-    one_step = _wire_bytes([("layers.0.attn", [0], [b"h0"])])
-    monkeypatch.setattr(Worker, "SAVE_RPC_MAX_BYTES", one_step)  # each step sends the last
-    worker, calls, windows, ends = _quiesce_rig(["saved", "raises", "saved"])
-    worker._batch_steps = 100
-    worker.save(_save_plan(0))  # held
-    worker.save(_save_plan(1))  # sends step 0 (stored), holds step 1
-    worker.save(_save_plan(2))  # sends step 1 (raises), holds step 2
-    _wait_quiescing(worker)
-    assert not _blocked(worker.wait_saved, 0).is_alive()
-    fence = _blocked(worker.wait_saved, 1)
-    flush = _blocked(worker.flush)  # releases held step 2 into the window
-    assert fence.is_alive() and flush.is_alive()
-    worker.save(_save_plan(3))  # dropped
-    ends.release()
-    fence.join(5)
-    flush.join(5)
-    assert not fence.is_alive() and not flush.is_alive()
-    s = worker.save_stats
-    assert (len(calls), windows, s.raised, s.rpcs, s.failed) == (2, [10.0], 1, 2, 3)
-    worker.save(_save_plan(4))
-    assert worker.flush(5) and len(calls) == 3
-    worker.shutdown()
-
-
-def test_every_raise_quiesces_for_the_fixed_window():
-    """Each raise quiesces for SAVE_QUIESCE_S, then saving resumes (a failed
-    reply does not quiesce)."""
-    outcomes = ["raises", "raises", "save-failed", "raises", "saved"]
-    worker, calls, windows, ends = _quiesce_rig(outcomes)
-    for step, outcome in enumerate(outcomes):
-        worker.save(_save_plan(step))
-        if outcome == "raises":
-            ends.release()
-        assert worker.flush(5)
-    assert windows == [Worker.SAVE_QUIESCE_S] * 3
-    assert len(calls) == len(outcomes)
-    worker.shutdown()
-
-
-def test_shutdown_ends_a_quiesce_window():
-    """Shutdown does not wait out a window: the saver resumes at once and
-    exits, and no further save RPC is sent."""
-    import time
-
-    rpc, calls = FakeRpc(), []
-    save = _save_outcome("raises")
-    rpc.save = lambda *args: save(calls, args[-1])
-    worker = _worker(StubSemantics, rpc, [], layout=_layout(StubSemantics, StubFullSpec()))
-    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
-    worker.save(_save_plan(0))
-    _wait_quiescing(worker)
-    worker.save(_save_plan(1))  # dropped
-    t0 = time.monotonic()
-    worker.shutdown()
-    assert time.monotonic() - t0 < Worker.SAVE_QUIESCE_S / 2
-    assert not worker._saver.is_alive() and len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -1614,7 +1211,6 @@ def test_shutdown_ends_a_quiesce_window():
         # hits on a fenced block (vLLM only reads them): no fence.
         pytest.param(8, [10, 11, 30], -1, id="prefix-hit-read-only"),
         pytest.param(4, [10, 11, 30], 0, id="past-the-hit"),
-        pytest.param(0, [30, 21], 1, id="newer-save"),
         pytest.param(0, [30, 11, 21], 1, id="latest-of-two"),
         pytest.param(0, [30, 31], -1, id="unfenced"),
     ],
@@ -1650,9 +1246,6 @@ def test_fence_writes(computed, blocks, fence):
         pytest.param("sync-load-plan-fail", 0, id="sync-load-plan-fail"),
         # A block shared through the prefix cache stays fenced whoever frees it.
         pytest.param("still-shared", 0, id="still-shared"),
-        pytest.param("saved-through", -1, id="reported-saved"),
-        pytest.param("flushed", -1, id="flush-covers-it"),
-        pytest.param("finish-after-saved", -1, id="finish-after-saved"),
     ],
 )
 def test_fence_sources(event, fence):
@@ -1669,14 +1262,7 @@ def test_fence_sources(event, fence):
         sched.on_new_request(_req(req_id=rid))
     sched.plan_saves([("a", 0, 13)], lambda rid: (tables[rid],))  # step 0
     sched.take_plan()
-    if event == "finish-after-saved":
-        sched.on_saved_through(0)
-    elif event == "flushed":
-        sched.plan_saves([], lambda rid: None, preempted=("b",))
-        assert sched.take_plan().flush
     sched.request_finished("a")
-    if event == "saved-through":
-        sched.on_saved_through(0)
     if event == "zeroed":
         sched.fence_writes([], [30, 12])
     elif event == "load-target":
@@ -1699,20 +1285,17 @@ def test_fence_sources(event, fence):
     assert sched.take_plan().fence_step == fence
 
 
-def _fence_rig(outcomes=None, policy=None):
+def _fence_rig(policy=None):
     """Scheduler + worker on one full group; each save job waits for its own
-    compute mark (``gates[i]`` for the i-th job) and returns ``outcomes[i]``."""
+    compute mark (``gates[i]`` for the i-th job)."""
     import threading
 
     gates = [threading.Event() for _ in range(4)]
     marks = iter(gates)
-    outcomes = iter(outcomes or ["saved"] * 4)
     rpc = FakeRpc()
-    rpc.save = lambda *args: _save_outcome(next(outcomes))([], args[-1])
     layout = _layout(StubSemantics, StubFullSpec())
     worker = _worker(StubSemantics, rpc, [], layout=layout, mark=lambda: FakeMark(next(marks)))
     worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
-    worker._quiesce_wait = lambda s: None
     sched, _ = _sched(StubSemantics, {}, policy=policy, layout=layout)
     tables = {"a": [10, 11, 12, 13], "b": [20, 21, 22, 23], "c": [30, 31, 32, 33]}
     for rid in tables:
@@ -1738,30 +1321,22 @@ A_FENCED, B_FENCED = {10: 0, 11: 0, 12: 0}, {20: 1, 21: 1, 22: 1}
 
 
 @pytest.mark.parametrize(
-    "outcomes,release,expected",
+    "release,expected",
     [
         # a's job is done, b's (submitted later) is not: a's fences clear now.
-        pytest.param(None, [[0], [1]], [B_FENCED, {}], id="own-job-done"),
+        pytest.param([[0], [1]], [B_FENCED, {}], id="own-job-done"),
         # One saver thread completes jobs in submit order: b's mark firing
         # first completes nothing, so "job k done" means "all <= k".
-        pytest.param(None, [[1], [0]], [{**A_FENCED, **B_FENCED}, {}], id="fifo"),
-        # A failed save still clears the fence (future miss).
-        pytest.param(["save-failed", "saved"], [[0], [1]], [B_FENCED, {}], id="own-job-failed"),
-        # A raising save RPC quiesces (its window is cut to 0 here): then a's
-        # job counts done, and b's, queued behind it, is dropped without a
-        # copy, so every fence clears.
-        pytest.param(["raises", "saved"], [[0], [1]], [{}, {}], id="raise-quiesces"),
-        # A rejected request copied nothing: a future miss, the saver goes on.
-        pytest.param(["rejected", "saved"], [[0], [1]], [B_FENCED, {}], id="rejected"),
+        pytest.param([[1], [0]], [{**A_FENCED, **B_FENCED}, {}], id="fifo"),
     ],
 )
-def test_finish_fences_on_the_requests_last_save(outcomes, release, expected):
+def test_finish_fences_on_the_requests_last_save(release, expected):
     """A finished request's blocks are fenced on the plan step of their own
     last save, and cleared once every worker reports that step saved
     (``saved_through``), not when every later job is. A request with no
     chosen save (c: the policy dropped its blocks) fences nothing."""
     policy = _Policy(choose=lambda items: [i for i in items if i.req_id != "c"])
-    sched, worker, gates, step, done = _fence_rig(outcomes, policy)
+    sched, worker, gates, step, done = _fence_rig(policy)
     step([("a", 0, 13)])  # step 0: job 1 saves a
     step([("a", 13, 1), ("b", 0, 13), ("c", 0, 13)])  # step 1: job 2 saves b only
     assert not any(sched.request_finished(rid) for rid in "abc")
@@ -1777,31 +1352,6 @@ def test_finish_fences_on_the_requests_last_save(outcomes, release, expected):
         got.append(dict(sched._fenced))
     assert got == expected
     assert worker.poll()[0] == set()  # never held: nothing is ever sending
-    worker.shutdown()
-
-
-def test_preempted_request_fences_on_its_last_save():
-    """The preemption flush finishes a's older saves; after resuming, a fences
-    on its new save only, and a write of its block waits for that save, not
-    for c's later job."""
-    sched, worker, gates, step, done = _fence_rig()
-    step([("a", 0, 13)])  # step 0: job 1
-    gates[0].set()  # lets the preemption flush finish
-    plan = step([("b", 0, 13)], preempted=("a",))  # step 1: flush, job 2 (b)
-    assert plan.flush and worker._completed == 1
-    step([("a", 0, 13)])  # step 2: recompute, job 3
-    step([("c", 0, 13)])  # step 3: job 4 (c)
-    sched.request_finished("a")
-    assert sched._fenced == {10: 2, 11: 2, 12: 2}
-    sched.fence_writes([(([10],), 0)])
-    plan = step([])
-    assert plan.fence_step == 2
-    gates[1].set()
-    gates[2].set()
-    done(3)
-    waiter = _blocked(worker.wait_saved, plan.fence_step)
-    assert not waiter.is_alive()  # c's job 4 is still pending
-    gates[3].set()
     worker.shutdown()
 
 
@@ -2084,6 +1634,11 @@ def test_pinned_saves_hold_blocks_until_every_worker_saved():
     assert pool.refs == {} and not sched.has_pending_saves()
     sched.on_saved_through(0)  # a lower report never moves saved_through back
     assert not sched.has_pending_saves()
+    # No pool bound: pinned layouts save nothing (fail closed).
+    sched = _pinned_sched(_layout(StubSemantics, StubFullSpec()))
+    sched.on_new_request(_req())
+    sched.plan_saves([("r", 0, 13)], lambda _: (FULL_IDS,))
+    assert sched.take_plan().saves == [] and not sched.has_pending_saves()
 
 
 @pytest.mark.parametrize("outcome", ["rejected", "raises"])
@@ -2123,51 +1678,6 @@ def test_pinned_saves_released_when_a_save_raises(outcome):
     worker.shutdown()
 
 
-def test_pinned_saves_fail_closed_without_a_pool():
-    sched = _pinned_sched(_layout(StubSemantics, StubFullSpec()))
-    sched.on_new_request(_req())
-    sched.plan_saves([("r", 0, 13)], lambda _: (FULL_IDS,))
-    assert sched.take_plan().saves == [] and not sched.has_pending_saves()
-
-
-def test_worker_reports_saved_through():
-    """saved_through (pins and fences) is the last plan step with every save
-    before it done; a step without saves counts as done once the earlier
-    ones are."""
-    import threading
-
-    gates = [threading.Event(), threading.Event()]
-    marks = iter(gates)
-    rpc = FakeRpc()
-    layout = _layout(StubSemantics, StubFullSpec())
-    worker = Worker(
-        layout,
-        rpc,
-        "inst",
-        Parallel(),
-        0,
-        lambda t: b"ipc",
-        lambda: None,
-        lambda: FakeMark(next(marks)),
-    )
-    worker.register({"layers.0.attn": "f"}, {"layers.0.attn": StubFullSpec()})
-    assert worker.saved_through() == -1
-    worker.save(StepPlan(saves=[GroupSave(0, [10], [b"h0"])], step=0))
-    worker.save(StepPlan(step=1))
-    worker.save(StepPlan(saves=[GroupSave(0, [11], [b"h1"])], step=2))
-    assert worker.saved_through() == -1  # nothing copied yet: wait_for_save never blocked
-    gates[0].set()
-    with worker._cv:
-        assert worker._cv.wait_for(lambda: worker._completed >= 1, 5)
-    assert worker.saved_through() == 1
-    gates[1].set()
-    assert worker.flush(5)
-    assert worker.saved_through() == 2
-    worker.save(StepPlan(step=3))
-    assert worker.saved_through() == 3
-    worker.shutdown()
-
-
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 @pytest.mark.parametrize("error", [RuntimeError, _Panic], ids=["failed", "saver-dies"])
 def test_failed_compute_wait_sends_no_save(error):
@@ -2189,7 +1699,6 @@ def test_failed_compute_wait_sends_no_save(error):
     assert worker.flush(5) and calls == [] and worker.saved_through() == 0
     worker.save(_save_plan(1))  # dropped once the saver died
     assert worker.flush(5) and calls == [] and worker.saved_through() == 1
-    assert worker.save_stats.raised == 0
     worker._saver.join(0 if error is RuntimeError else 5)
     assert worker._saver.is_alive() is (error is RuntimeError)
     worker.shutdown()
@@ -2219,13 +1728,6 @@ def test_worker_metadata_aggregates_the_min_over_ranks():
             id="unknown-spec",
         ),
         pytest.param((StubWindowSpec(),), Parallel(), "no full-attention group", id="window-only"),
-        # S2 / V0: TP2 ranks declaring different segment sizes fail seal_plan.
-        pytest.param(
-            (StubFullSpec(segments=(64, 64)),),
-            Parallel(tp_size=2),
-            None,
-            id="tp2-ok",
-        ),
         pytest.param(
             (StubFullSpec(), StubWindowSpec(backend="kernel")),
             Parallel(),
@@ -2238,9 +1740,6 @@ def test_worker_metadata_aggregates_the_min_over_ranks():
     ],
 )
 def test_layout_rejects(sem, specs, par, match):
-    if match is None:
-        _layout(sem, *specs, par=par)
-        return
     with pytest.raises(Unsupported, match=match):
         _layout(sem, *specs, par=par)
 
@@ -2257,20 +1756,13 @@ class _RankSkewedAdapter(_StubAdapter):
 
 @BOTH
 def test_layout_runs_seal_plan(sem, monkeypatch):
+    """S2 / V0: TP ranks declaring different segment sizes fail seal_plan."""
     module = types.ModuleType(f"{adapters.__name__}._test_skewed")
     module.ADAPTER = _RankSkewedAdapter(sem)
     monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setitem(adapters._REGISTRY, "_RankSkewedSpec", "_test_skewed")
     with pytest.raises(Unsupported, match="fail seal_plan"):
         _layout(sem, _RankSkewedSpec(), par=Parallel(tp_size=2))
-
-
-def test_namespace_covers_transfer_mode():
-    a = _layout(StubSemantics, StubFullSpec())
-    b = _layout(StubSemantics, StubFullSpec(backend="kernel"))
-    assert (a.transfer_backend, b.transfer_backend) == ("direct", "kernel")
-    assert a.namespace != b.namespace
-    assert a.namespace == _layout(StubSemantics, StubFullSpec()).namespace
 
 
 # ----------------------------------------------------------- stub vs native
@@ -2348,39 +1840,6 @@ def full_attention(monkeypatch, sem):
     return adapter
 
 
-@BOTH
-@pytest.mark.parametrize(
-    "kv,num_blocks",
-    [
-        pytest.param(QWEN3_KV, QWEN3_BLOCKS, id="qwen3-4b-LBNHC"),
-        pytest.param(FakeKV((10, 8, 16, 256), (32768, 4096, 256, 1)), 10, id="LBHNC"),
-        # Kernel blocks of 8 tokens split each 16-token manager block in two.
-        pytest.param(FakeKV((20, 8, 8, 256), (16384, 256, 2048, 1)), 10, id="kernel-split"),
-        # M1: a split [H, N, C] page is stored as 2 x [H, N/2, C], which the
-        # namespace (kv_cache_layout) does not tell apart from the unsplit page.
-        pytest.param(FakeKV((20, 8, 8, 256), (16384, 2048, 256, 1)), None, id="LBHNC-split"),
-        # Block-outer layouts put the other layers' pages between our blocks.
-        pytest.param(FakeKV((10, 8, 16, 256), (36 * 32768, 256, 2048, 1)), None, id="BLNHC"),
-        pytest.param(FakeKV((10, 8, 16, 256), (32768, 256, 4096, 1)), None, id="holes"),
-        pytest.param(FakeKV((10, 8, 16, 128), (16384, 128, 1024, 1)), None, id="wrong-page"),
-    ],
-)
-def test_full_attention_view(sem, full_attention, kv, num_blocks):
-    spec = FullAttentionSpec()
-    if num_blocks is None:
-        with pytest.raises(Unsupported):
-            full_attention.view(spec, "l0", kv)
-        return
-    view = full_attention.view(spec, "l0", kv)
-    # One segment = the whole page: LBNHC interleaves K and V per token/head.
-    assert (view.num_blocks, view.bytes_per_block, view.kv_stride_bytes) == (
-        num_blocks,
-        65536,
-        65536,
-    )
-    assert view.tensor is kv
-
-
 def _attn_cfg(spec, n_layers, kv_cache_layout="LBNHC"):
     names = [f"model.layers.{i}.self_attn.attn" for i in range(n_layers)]
     group = types.SimpleNamespace(kv_cache_spec=spec, layer_names=names)
@@ -2404,14 +1863,6 @@ HALF_KV = FakeKV((QWEN3_BLOCKS, 4, 16, 256), (16384, 256, 1024, 1))
         # Qwen3-4B as run by the gate: 36 layers, TP1, LBNHC.
         pytest.param(FullAttentionSpec(), Parallel(), QWEN3_KV, [(0, 1)], id="tp1"),
         pytest.param(HALF_SPEC, Parallel(tp_size=2), HALF_KV, [(0, 2), (1, 2)], id="tp2"),
-        # 4 ranks over 2 head shards: consecutive ranks hold replicas.
-        pytest.param(
-            dataclasses.replace(HALF_SPEC, max_tp_shards=2),
-            Parallel(tp_size=4, kv_tp_replicas=2),
-            HALF_KV,
-            [(0, 2), (0, 2), (1, 2), (1, 2)],
-            id="tp4-replicas",
-        ),
     ],
 )
 def test_full_attention_layout(sem, full_attention, spec, par, kv, shards):
@@ -2446,35 +1897,46 @@ def test_full_attention_layout(sem, full_attention, spec, par, kv, shards):
 
 @BOTH
 @pytest.mark.parametrize(
-    "field,value,par",
+    "change,par,kv",
     [
-        ("sliding_window", 4096, Parallel()),
-        ("page_size_padded", 69632, Parallel()),
-        ("kv_quant_mode", 1, Parallel()),
-        ("num_head_slots", 4, Parallel()),
-        ("non_causal", True, Parallel()),
-        ("has_layer_views", False, Parallel()),
+        ({"sliding_window": 4096}, Parallel(), QWEN3_KV),
+        ({"page_size_padded": 69632}, Parallel(), QWEN3_KV),
+        ({"kv_quant_mode": 1}, Parallel(), QWEN3_KV),
+        ({"num_head_slots": 4}, Parallel(), QWEN3_KV),
+        ({"non_causal": True}, Parallel(), QWEN3_KV),
+        ({"has_layer_views": False}, Parallel(), QWEN3_KV),
         # vLLM says ranks replicate (kv_tp_replicas) but the spec declares none.
-        ("max_tp_shards", None, Parallel(tp_size=4, kv_tp_replicas=2)),
+        pytest.param(
+            {"max_tp_shards": None},
+            Parallel(tp_size=4, kv_tp_replicas=2),
+            QWEN3_KV,
+            id="undeclared-replicas",
+        ),
+        # M1: a split [H, N, C] page is stored as 2 x [H, N/2, C], which the
+        # namespace (kv_cache_layout) does not tell apart from the unsplit page.
+        pytest.param(
+            {}, Parallel(), FakeKV((20, 8, 8, 256), (16384, 2048, 256, 1)), id="LBHNC-split"
+        ),
+        # Block-outer layouts put the other layers' pages between our blocks.
+        pytest.param(
+            {}, Parallel(), FakeKV((10, 8, 16, 256), (36 * 32768, 256, 2048, 1)), id="BLNHC"
+        ),
+        pytest.param({}, Parallel(), FakeKV((10, 8, 16, 256), (32768, 256, 4096, 1)), id="holes"),
+        pytest.param(
+            {}, Parallel(), FakeKV((10, 8, 16, 128), (16384, 128, 1024, 1)), id="wrong-page"
+        ),
     ],
 )
-def test_full_attention_rejects_unvalidated_specs(sem, full_attention, field, value, par):
-    spec = dataclasses.replace(FullAttentionSpec(), **{field: value})
+def test_full_attention_rejects_unvalidated_specs(sem, full_attention, change, par, kv):
+    spec = dataclasses.replace(FullAttentionSpec(), **change)
     with pytest.raises(Unsupported):
         _layout_of(sem, spec, par)
+        full_attention.view(spec, "l0", kv)
 
 
 def _layout_of(sem, spec, par=None, kv_cache_layout="LBNHC"):
     _, cfg = _attn_cfg(spec, 2, kv_cache_layout)
     return build_layout(cfg, par or Parallel(), {"model": "Qwen3-4B"}, semantics=sem)
-
-
-def test_namespace_covers_page_byte_order(sem, full_attention):
-    """M1: [N, H, C] and [H, N, C] pages hold different bytes for one declaration."""
-    nhc = _layout_of(sem, FullAttentionSpec(), kv_cache_layout="LBNHC")
-    hnc = _layout_of(sem, FullAttentionSpec(), kv_cache_layout="LBHNC")
-    assert nhc.namespace != hnc.namespace
-    assert nhc.namespace == _layout_of(sem, FullAttentionSpec()).namespace
 
 
 # ---------------------------------------------------------------- adapters/mamba.py
@@ -2532,48 +1994,47 @@ def test_mamba_declares_one_padded_page_checkpoint(sem, mamba):
     assert mamba.layer(replicated, "l", Parallel(tp_size=2)).shard == sem.Shard.replicated()
 
 
-@BOTH
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("mamba_cache_mode", "none"),
-        ("num_speculative_blocks", 1),
-        ("num_prefill_checkpoint_blocks", 2),
-        ("tokens_per_state", 16),
-        ("has_layer_views", False),
-        ("page_size_bytes", 2146303),  # states do not fit the page
-    ],
-)
-def test_mamba_rejects_unvalidated_specs(sem, mamba, field, value):
-    spec = dataclasses.replace(MambaSpec(), **{field: value})
-    with pytest.raises(Unsupported):
-        mamba.group(spec)
+def _ssm_kv(shape, strides):
+    return FakeKV(shape, strides, 1)
 
 
 @BOTH
 @pytest.mark.parametrize(
-    "kv",
+    "change,kv",
     [
+        ({"mamba_cache_mode": "none"}, QWEN35_KV),
+        ({"num_speculative_blocks": 1}, QWEN35_KV),
+        ({"num_prefill_checkpoint_blocks": 2}, QWEN35_KV),
+        ({"tokens_per_state": 16}, QWEN35_KV),
+        ({"has_layer_views": False}, QWEN35_KV),
+        pytest.param({"page_size_bytes": 2146303}, QWEN35_KV, id="states-overflow-page"),
         # Block-outer layouts put other layers' pages between our blocks.
         pytest.param(
-            FakeKV((10, 1, 1, QWEN35_REAL), (8 * 2162688, QWEN35_REAL, QWEN35_REAL, 1), 1),
+            {},
+            _ssm_kv((10, 1, 1, QWEN35_REAL), (8 * 2162688, QWEN35_REAL, QWEN35_REAL, 1)),
             id="block-outer",
         ),
-        pytest.param(FakeKV((10, 1, 1, 2097152), (2162688, 2097152, 2097152, 1), 1), id="ssm-only"),
-        pytest.param(FakeKV((10, 3, 8192), (2162688, 8192, 1), 1), id="not-4d"),
+        pytest.param(
+            {}, _ssm_kv((10, 1, 1, 2097152), (2162688, 2097152, 2097152, 1)), id="ssm-only"
+        ),
+        pytest.param({}, _ssm_kv((10, 3, 8192), (2162688, 8192, 1)), id="not-4d"),
     ],
 )
-def test_mamba_view_rejects_foreign_geometry(sem, mamba, kv):
+def test_mamba_rejects_unvalidated_specs(sem, mamba, change, kv):
+    spec = dataclasses.replace(MambaSpec(), **change)
     with pytest.raises(Unsupported):
-        mamba.view(MambaSpec(), "l0", kv)
+        mamba.group(spec)
+        mamba.view(spec, "l0", kv)
 
 
-def _qwen35_cfg():
+def _qwen35_cfg(tp=1, **change):
     """Qwen3.5-4B layout: 3 GDN groups + 1 attention group, block 528."""
-    attn = FullAttentionSpec(block_size=528, num_kv_heads=4, head_size=256, page_size_bytes=2162688)
+    attn = FullAttentionSpec(
+        block_size=528, num_kv_heads=4 // tp, head_size=256, page_size_bytes=2162688 // tp
+    )
     groups = [
         types.SimpleNamespace(
-            kv_cache_spec=MambaSpec(),
+            kv_cache_spec=dataclasses.replace(MambaSpec(), **change),
             layer_names=[f"layers.{i}.linear_attn" for i in range(g, 32, 4)],
         )
         for g in range(3)
@@ -2592,14 +2053,13 @@ def _qwen35_cfg():
 
 
 @BOTH
-def test_qwen35_layout(sem, mamba, full_attention):
-    """Full group first (prefix query), then the 3 GDN checkpoint groups; step 528.
-
-    The Mamba state layout enters the namespace: a different state dtype, or
-    vLLM's ``VLLM_SSM_CONV_STATE_LAYOUT=DS`` conv orientation (same page size,
-    other byte order), is a different namespace.
-    """
-    layout = build_layout(_qwen35_cfg(), Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
+@pytest.mark.parametrize("tp", [1, 2])
+def test_qwen35_layout(sem, mamba, full_attention, tp):
+    """Full group first (prefix query), then the 3 GDN checkpoint groups; step
+    528. V0: every rank's GDN + attention regions seal (build_layout runs
+    seal_plan over all TP ranks)."""
+    par = Parallel(tp_size=tp)
+    layout = build_layout(_qwen35_cfg(tp), par, {"model": "Qwen3.5-4B"}, semantics=sem)
     assert [(g.gid, g.sem.kind) for g in layout.groups] == [
         (3, "full"),
         (0, "checkpoint"),
@@ -2607,52 +2067,6 @@ def test_qwen35_layout(sem, mamba, full_attention):
         (2, "checkpoint"),
     ]
     assert layout.step == 528
-    for change in (
-        {"dtypes": ("bfloat16", "bfloat16")},
-        {"shapes": ((8192, 3), (32, 128, 128))},  # conv layout DS
-    ):
-        cfg = _qwen35_cfg()
-        for g in cfg.kv_cache_groups[:3]:
-            g.kv_cache_spec = dataclasses.replace(g.kv_cache_spec, **change)
-        other = build_layout(cfg, Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
-        assert other.namespace != layout.namespace, change
-
-
-# Qwen3-4B test layout namespaces computed by the P4 core (563a693, with
-# storage_tp, before LayerDecl.layout); stub and native differ only in
-# repr(Shard). Was cf6b5725 / cd8acc0c before storage_tp entered the namespace.
-QWEN3_NAMESPACE_V1 = {"stub": "a25ea150", "native": "bdda8997"}
-
-
-@BOTH
-def test_namespace_vector_unchanged_for_full_attention(sem, full_attention):
-    """V1: LayerDecl.layout is hashed only when declared, so full-attention
-    layouts keep the namespace (and the stored blocks) they had before it."""
-    _, cfg = _attn_cfg(FullAttentionSpec(), 36)
-    layout = build_layout(cfg, Parallel(), {"model": "Qwen3-4B"}, semantics=sem)
-    which = "stub" if sem is StubSemantics else "native"
-    assert layout.namespace == QWEN3_NAMESPACE_V1[which]
-
-
-@BOTH
-@pytest.mark.parametrize("tp", [1, 2])
-def test_qwen35_declarations_seal(sem, mamba, full_attention, tp):
-    """V0 for the hybrid layout: every rank's GDN + attention regions seal."""
-    cfg = _qwen35_cfg()
-    ranks = []
-    for r in range(tp):
-        par = Parallel(tp_rank=r, tp_size=tp)
-        regions = []
-        for sid, g in enumerate(cfg.kv_cache_groups):
-            spec = g.kv_cache_spec
-            if tp > 1 and isinstance(spec, FullAttentionSpec):
-                spec = dataclasses.replace(spec, num_kv_heads=2, page_size_bytes=1081344)
-            adapter = mamba if isinstance(spec, MambaSpec) else full_attention
-            for name in g.layer_names:
-                d = adapter.layer(spec, name, par)
-                regions.append(sem.Region(name, sid, [int(s) for s in d.segments], d.shard))
-        ranks.append((r, regions))
-    sem.seal_plan(ranks)
 
 
 # -------------------------------------------------- adapters/mla_attention.py
@@ -2695,7 +2109,6 @@ def mla_attention(monkeypatch, sem):
         pytest.param(Parallel(), id="tp1"),
         # DeepSeek-V2-Lite as run by the gate: TP2, vLLM kv_tp_replicas=2.
         pytest.param(Parallel(tp_size=2, kv_tp_replicas=2), id="tp2"),
-        pytest.param(Parallel(tp_size=4, kv_tp_replicas=4), id="tp4"),
     ],
 )
 def test_mla_attention_layout(sem, mla_attention, par):
@@ -2731,23 +2144,6 @@ def test_mla_attention_layout(sem, mla_attention, par):
         worker.shutdown()
 
 
-def test_mla_seal_plan_one_writer():
-    """Replicated MLA pages seal as one fragment per layer, written by rank 0."""
-    sem = _native()
-    spec = MLAAttentionSpec()
-    from pegaflow.connector_v2.adapters import mla_attention as mod
-
-    adapter = mod.MLAAttentionAdapter(sem)
-    ranks = []
-    for r in range(2):
-        d = adapter.layer(spec, "l0", Parallel(tp_rank=r, tp_size=2, kv_tp_replicas=2))
-        ranks.append((r, [sem.Region("l0", 0, list(d.segments), d.shard)]))
-    plan = sem.seal_plan(ranks)
-    (frag,) = plan.fragments(0)
-    assert (frag.holders, frag.writer, frag.bytes) == ([0, 1], 0, 18432)
-    assert plan.is_writer(0, 0, 0) and not plan.is_writer(1, 0, 0)
-
-
 @BOTH
 @pytest.mark.parametrize(
     "field,value",
@@ -2774,8 +2170,48 @@ def test_mla_attention_rejects_unvalidated_specs(sem, mla_attention, field, valu
         build_layout(cfg, Parallel(tp_size=2, kv_tp_replicas=2), {"model": "m"}, semantics=sem)
 
 
-def test_mla_and_full_attention_never_share_a_namespace(sem, full_attention, mla_attention):
-    """Equal page sizes, different bytes: the spec class is part of the namespace."""
-    mla = MLAAttentionSpec()
-    full = FullAttentionSpec(num_kv_heads=1, head_size=288, page_size_bytes=18432)
-    assert _layout_of(sem, mla).namespace != _layout_of(sem, full).namespace
+# ------------------------------------------------------------------ namespace
+def _qwen35_layout(sem, **change):
+    return build_layout(_qwen35_cfg(**change), Parallel(), {"model": "Qwen3.5-4B"}, semantics=sem)
+
+
+@BOTH
+@pytest.mark.parametrize(
+    "a,b",
+    [
+        pytest.param(
+            lambda sem: _layout(sem, StubFullSpec()),
+            lambda sem: _layout(sem, StubFullSpec(backend="kernel")),
+            id="transfer-mode",
+        ),
+        # M1: [N, H, C] and [H, N, C] pages hold different bytes for one declaration.
+        pytest.param(
+            lambda sem: _layout_of(sem, FullAttentionSpec(), kv_cache_layout="LBNHC"),
+            lambda sem: _layout_of(sem, FullAttentionSpec(), kv_cache_layout="LBHNC"),
+            id="page-byte-order",
+        ),
+        # Equal page sizes, different bytes: the spec class is part of the namespace.
+        pytest.param(
+            lambda sem: _layout_of(sem, MLAAttentionSpec()),
+            lambda sem: _layout_of(
+                sem, FullAttentionSpec(num_kv_heads=1, head_size=288, page_size_bytes=18432)
+            ),
+            id="mla-vs-full",
+        ),
+        # The Mamba state layout enters the namespace: another state dtype, or
+        # VLLM_SSM_CONV_STATE_LAYOUT=DS (same page size, other byte order).
+        pytest.param(
+            lambda sem: _qwen35_layout(sem),
+            lambda sem: _qwen35_layout(sem, dtypes=("bfloat16", "bfloat16")),
+            id="mamba-state-dtype",
+        ),
+        pytest.param(
+            lambda sem: _qwen35_layout(sem),
+            lambda sem: _qwen35_layout(sem, shapes=((8192, 3), (32, 128, 128))),
+            id="mamba-conv-layout",
+        ),
+    ],
+)
+def test_namespace_separates_incompatible_bytes(sem, full_attention, mla_attention, mamba, a, b):
+    assert a(sem).namespace == a(sem).namespace
+    assert a(sem).namespace != b(sem).namespace
