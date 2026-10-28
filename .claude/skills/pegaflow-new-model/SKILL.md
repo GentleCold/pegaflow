@@ -84,6 +84,13 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    review agent audit it.
 3. **Adapter/policy**: add the minimum adapter code for unknown spec classes;
    put model knobs in `models/<model>`. Prefer policy changes over adapter changes.
+   Use what the server already offers. For each new layout, list the
+   server's per-instance choices (today: `transfer_backend` direct/kernel,
+   `page_first`, `--blockwise-alloc`) and measure each one that could apply
+   to this page geometry before you settle on one. A default is a choice:
+   inheriting it from an earlier model is not evidence, and a measurement on
+   one page size does not carry over to another. Record the per-layout
+   table in the model's ITERATIONS.
 4. **Gates**: on the 4090 host (10.1.0.44) from the feature dir, run the
    command in GATES.md "Usage" with `--arms baseline,native,<module>:<Class>`
    and `--under-test-path`. `baseline` is the correctness reference, `native`
@@ -138,8 +145,10 @@ connector is a black-box baseline (run it, read its numbers, not its code).
    from `feat/semantics-rsi`, and agents do not change or tune it. When the
    evidence points at the server (eviction, admission, pools, allocator,
    query), attribute the gap with numbers (GATES.md "Known server limits";
-   new ones go to the notes' "Server limitations") and go on: explained,
-   not fixed, never blocking. Connector code stays model-agnostic: per-model
+   new ones go to the notes' "Server limitations" and `server-proposal.md`).
+   Do not add connector logic that compensates for a server limit; if a
+   model is blocked only by one, stop and report it. Before you call a gap
+   a server limit, check that no existing server option (step 3) closes it. Connector code stays model-agnostic: per-model
    differences live only in `connector_v2/models/<model>.toml`.
    Policy complexity rules (keep policy growing with Kinds, not with models):
    - no model names and no vLLM spec class names in `policy.py`; decide only
